@@ -1,10 +1,10 @@
-# YouTube 视频下载 + AI 字幕生成 + 时间码美化
+# YouTube 视频下载 + AI 字幕生成 + 时间码美化 + 翻译 + 硬压
 
-一键流水线：从 YouTube 链接直达美化后的 SRT 字幕。
+一键流水线：从 YouTube 链接直达 burned.mkv 硬字幕视频。
 
 ## 🛠 前置依赖
 
-### WSL (推荐)
+### WSL (必需)
 
 ```bash
 # Python 包管理器 (用于运行 WhisperX)
@@ -16,35 +16,90 @@ sudo chmod a+rx /usr/local/bin/yt-dlp
 
 # FFmpeg — 音视频处理 + 场景检测
 sudo apt update && sudo apt install -y ffmpeg
+
+# Node.js — yt-dlp YouTube 验证
+sudo apt install -y nodejs
 ```
 
 ### Windows (可选)
 
 | 工具 | 用途 |
 |------|------|
-| `yt-dlp` | `download.ps1` 视频下载 |
 | `mpv` | `mpv-burn.ps1` 字幕硬压 |
+| `yt-dlp` | `download.ps1` 仅下载 |
+
+---
+
+## ⚙️ 配置文件 .env
+
+在项目根目录创建 `.env` 文件，所有脚本 (`pipeline.sh`, `pipeline.ps1`, `translate_srt.py`) 均从这里读取配置：
+
+```ini
+# ── 翻译默认配置 ──
+TRANSLATE_PROVIDER=deepseek       # 翻译后端: openrouter | deepseek | gemini
+TRANSLATE_MODEL=deepseek-v4-pro   # 模型名, 留空则使用后端内置默认
+
+# ── API keys (至少配置一个对应 TRANSLATE_PROVIDER 的 key) ──
+OPENROUTER_API_KEY=sk-or-v1-xxx   # https://openrouter.ai/keys
+DEEPSEEK_API_KEY=sk-xxx           # https://platform.deepseek.com
+GEMINI_API_KEY=xxx                # https://aistudio.google.com
+```
+
+| 变量 | 必填 | 说明 |
+|------|:--:|------|
+| `TRANSLATE_PROVIDER` | 否 | 翻译后端，不设默认 `openrouter`。所有脚本均读取 |
+| `TRANSLATE_MODEL` | 否 | 模型名，不设使用后端内置默认 |
+| `OPENROUTER_API_KEY` | * | OpenRouter API key |
+| `DEEPSEEK_API_KEY` | * | DeepSeek API key |
+| `GEMINI_API_KEY` | * | Gemini API key |
+
+> \* 至少配置一个与你选择的 `TRANSLATE_PROVIDER` 对应的 key
+
+**读取优先级**：
+| 脚本 | 优先级 (高→低) |
+|------|---------------|
+| `pipeline.ps1` | CLI 参数 → `.env` → 默认值 |
+| `pipeline.sh` | 环境变量 → `.env` → 默认值 |
+| `translate_srt.py` | CLI 参数 → `.env` → 默认值 |
+
+`.env` 已 gitignored，不要提交。换行符支持 LF / CRLF（脚本自动处理 `\r`）。
 
 ---
 
 ## 🚀 快速开始
 
-```bash
-# 进入 WSL
-wsl -u root
+### 超级流水线 (PowerShell, 推荐)
 
-# 一键流水线: 下载 → 字幕 → 美化 (推荐)
-./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+```powershell
+# 一键: YouTube URL → burned.mkv
+.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
+
+# 仅翻译不压制
+.\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
 ```
 
-执行后会在当前目录生成：
+### WSL 流水线
+
+```bash
+# 一键: 下载 → 字幕 → 美化 → 翻译 → 硬压
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+
+# 跳过硬压
+BURN=0 ./pipeline.sh "url"
+```
+
+执行后在视频目录生成：
 
 ```
 视频标题/
 ├── 视频标题.webm           # 视频文件
-├── 视频标题.srt            # 美化后的英文字幕 ✨
+├── 视频标题.srt            # 原始英文字幕 (WhisperX)
+├── 视频标题.beautified.srt # 美化后的英文字幕 (Netflix 规范)
+├── 视频标题.zh.srt         # 中文 SRT 翻译缓存 (二次运行跳过 LLM)
+├── 视频标题.zh.ass         # 仅中文 ASS (style=zh)
+├── 视频标题.zh-en.ass      # 双语 ASS (bi-en + bi-zh, 硬压用) ✨
 ├── 视频标题.webp           # 封面缩略图
-├── 视频标题.info.json      # 元数据
+├── 视频标题.info.json      # yt-dlp 元数据
 └── 视频标题.description    # 视频简介
 ```
 
@@ -52,93 +107,195 @@ wsl -u root
 
 ## 📖 命令参考
 
-### `pipeline.sh` — 一键流水线 (推荐)
+### `pipeline.ps1` — 超级流水线 (PowerShell)
 
-串联下载 + 字幕生成 + 时间码美化，从 URL 一步到位。
+从 YouTube URL 到硬字幕 burned.mkv。自动调用 WSL 完成下载/字幕/美化/翻译，再调用 Windows mpv 硬压。
+
+```powershell
+# 基础用法
+.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
+
+# 选择翻译后端和模型
+.\pipeline.ps1 "https://youtu.be/xxxxx" -TranslateProvider deepseek -TranslateModel deepseek-v4-pro
+
+# 自定义编码 + 输出
+.\pipeline.ps1 "https://youtu.be/xxxxx" -o result.mkv -Ovc libx265 -Ovcopts crf=23
+
+# 仅翻译不压制
+.\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
+
+# 使用已有双语 ASS
+.\pipeline.ps1 "https://youtu.be/xxxxx" -ExistingAss path/to/existing.zh-en.ass
+
+# 预览命令
+.\pipeline.ps1 "https://youtu.be/xxxxx" -DryRun
+
+# 透传 mpv 补帧滤镜
+.\pipeline.ps1 "https://youtu.be/xxxxx" --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-Url` | (必选) | YouTube 视频链接 |
+| `-o, -Output` | `burned.mkv` | 输出路径 |
+| `-p, -TranslateProvider` | openrouter | 翻译后端 |
+| `-tm, -TranslateModel` | 后端默认 | 翻译模型 |
+| `-m, -MpvPath` | mpv-lazy | mpv.com 路径 |
+| `-Ovc` | `hevc_nvenc` | 视频编码器 |
+| `-Ovcopts` | `qp=20` | 编码器参数 |
+| `-Oac` | `aac` | 音频编码器 |
+| `-SkipDownload` | — | 跳过下载 |
+| `-SkipBeautify` | — | 跳过美化 |
+| `-SkipTranslate` | — | 跳过翻译 |
+| `-SkipBurn` | — | 跳过压制 |
+| `-ExistingAss` | — | 已有 .zh-en.ass 路径 |
+| `-DryRun` | — | 仅打印命令 |
+
+### `pipeline.sh` — WSL 流水线
+
+串联下载 → 字幕 → 美化 → 翻译 → 硬压（默认全开）。
 
 ```bash
 # 基础用法
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 # 传递美化选项 (-- 之后)
-./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --backup --scene-threshold 0.2
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --preview
+./pipeline.sh "url" -- --backup --scene-threshold 0.2
 
 # 跳过某些步骤
-SKIP_BEAUTIFY=1 ./pipeline.sh "url"     # 仅下载+字幕, 跳过美化
-SKIP_DOWNLOAD=1 ./pipeline.sh "url"     # 仅美化已有视频
+SKIP_DOWNLOAD=1 ./pipeline.sh "url"
+SKIP_BEAUTIFY=1 ./pipeline.sh "url"
+SKIP_TRANSLATE=1 ./pipeline.sh "url"
+BURN=0 ./pipeline.sh "url"
+
+# 使用已有产物
+EXISTING_SRT=/path/to/beautified.srt ./pipeline.sh "url"
+EXISTING_ASS=/path/to/existing.zh-en.ass ./pipeline.sh "url"
+
+# 选择翻译后端
+TRANSLATE_PROVIDER=deepseek TRANSLATE_MODEL=deepseek-v4-pro ./pipeline.sh "url"
 ```
 
-### `download_and_sub.sh` — 下载 + 字幕
+**流程**：yt-dlp 下载 → WhisperX 字幕 → 场景检测美化 → LLM 翻译 → mpv 硬压
 
-单视频下载并生成 WhisperX 英文字幕（不做时间码美化）。
+**成果物链**：`VIDEO_PATH` → `BEAUTIFIED_SRT` → `ASS_PATH` → `burned.mkv`
+- 每步输出作为下一步输入，已存在的中间产物自动跳过
+- `.zh.srt` 翻译缓存存在时自动跳过 LLM
+
+| 环境变量 | 默认值 | 说明 |
+|------|--------|------|
+| `SKIP_DOWNLOAD` | 0 | 跳过下载 |
+| `SKIP_BEAUTIFY` | 0 | 跳过美化 |
+| `SKIP_TRANSLATE` | 0 | 跳过翻译 |
+| `EXISTING_SRT` | — | 已有美化 SRT 路径 |
+| `EXISTING_ASS` | — | 已有 .zh-en.ass 路径 |
+| `TRANSLATE_PROVIDER` | openrouter | 翻译后端 |
+| `TRANSLATE_MODEL` | 后端默认 | 翻译模型 |
+| `BURN` | 1 | 0=跳过硬压 |
+| `BURN_OVC` | hevc_nvenc | 视频编码器 |
+| `BURN_OVCOPTS` | qp=20 | 编码器参数 |
+| `BURN_OAC` | aac | 音频编码器 |
+
+### `download_and_sub.sh` — 下载 + WhisperX 字幕
 
 ```bash
 ./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
-
-# 批量下载
-./download_and_sub.sh "URL1" && ./download_and_sub.sh "URL2"
+# 输出: OUTPUT_VIDEO=<绝对路径>  (供 pipeline.sh 解析)
 ```
 
 ### `beautify_srt.sh` — 字幕时间码美化
 
-用 ffmpeg/ffprobe 检测场景切换，按 Netflix 规范将字幕时间码吸附对齐到场景变化点。自动检测视频帧率，所有帧数参数按实际 fps 换算。
-
 ```bash
-# 自动查找同目录 .srt 并原位覆盖
+# 自动查找同目录 .srt → .beautified.srt (不覆盖原文件)
 ./beautify_srt.sh video.webm
 
-# 指定字幕 + 备份
-./beautify_srt.sh video.webm subtitle.srt --backup
+# 指定字幕 + 输出
+./beautify_srt.sh video.webm subtitle.srt
+./beautify_srt.sh video.webm -o result.srt
 
-# 仅预览变化 (不写入)
+# 覆盖原文件 (显式指定)
+./beautify_srt.sh video.webm -o video.srt --backup
+
+# 仅预览变化
 ./beautify_srt.sh video.webm --preview
-
-# 激进对齐 (对剪辑密集的视频)
-./beautify_srt.sh video.webm --scene-threshold 0.2 --snap-frames 10
-
-# 保守对齐 (对长镜头视频)
-./beautify_srt.sh video.webm --scene-threshold 0.35 --snap-frames 4
 ```
 
 **算法流程**：帧率检测 → 场景检测 (≥7帧间隔) → 入点吸附到场景 → 出点吸附到场景前2帧 → 重叠/间隙修复 → 时长约束
 
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
-| `--scene-threshold` | `0.25` | 场景检测灵敏度 (越小越灵敏) |
+| `-o, --output` | `<原名>.beautified.srt` | 输出路径 (默认不覆盖原文件) |
+| `--scene-threshold` | `0.25` | 场景检测灵敏度 |
 | `--snap-frames` | `7` | 吸附到场景切换的最大帧数 |
-| `--end-offset-frames` | `2` | 出点对齐到场景切换前 N 帧 |
+| `--end-offset-frames` | `2` | 出点对齐到场景前 N 帧 |
 | `--min-scene-interval-frames` | `7` | 场景切换最小帧间隔 |
-| `--min-duration` | `1.0` | 最短字幕时长 (秒, Netflix: 1000ms) |
-| `--max-duration` | `8.0` | 最长字幕时长 (秒, Netflix: 8000ms) |
-| `--min-gap` | `0.083` | 字幕最小间距 (秒, Netflix: 2帧) |
-| `--max-gap-merge` | `0.5` | 小于此值的间隙合并 (秒, Netflix: 500ms) |
-| `--use-keyframes` | 关闭 | 启用关键帧吸附 (默认不启用) |
-| `--extend` | 关闭 | 延伸字幕填充到场景切换前 |
-| `--no-scene-snap` | — | 完全跳过场景吸附 |
+| `--min-duration` | `1.0` | 最短字幕时长 (秒) |
+| `--max-duration` | `8.0` | 最长字幕时长 (秒) |
+| `--min-gap` | `0.083` | 字幕最小间距 (秒) |
+| `--max-gap-merge` | `0.5` | 间隙合并阈值 (秒) |
+| `--use-keyframes` | 关闭 | 启用关键帧吸附 |
+| `--extend` | 关闭 | 延伸字幕填充间隙 |
+| `--no-scene-snap` | — | 跳过场景吸附 |
 | `--preview` | — | 仅预览, 不写入 |
-| `--backup` | — | 覆盖前备份为 `.bak` |
+| `--backup` | — | 覆盖前备份 |
 
-### `download.ps1` — 仅下载 (PowerShell)
+### `translate_srt.py` — 字幕翻译
 
-Windows 环境下仅下载视频，不生成字幕。
+将英文 SRT 翻译为中文，输出三类文件：
+- `.zh.srt` — 中文翻译缓存（同目录已存在则跳过 LLM）
+- `.zh.ass` — 仅中文 ASS（style=zh）
+- `.zh-en.ass` — 双语 ASS（bi-en + bi-zh，硬压用）
+- 中文自动插入 `\N` 软换行（解决 CJK 无空格无法换行问题）
 
-```powershell
-.\download.ps1 "https://www.youtube.com/watch?v=xxxxx"
+```bash
+# 基础翻译 (从 .env 读取 provider/model)
+python3 translate_srt.py video.srt
+
+# 指定后端
+python3 translate_srt.py video.srt --provider deepseek --model deepseek-v4-pro
+
+# 自定义输出
+python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 ```
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--provider` | openrouter | LLM 后端 |
+| `--model` | 后端默认 | 模型名称 |
+| `--batch-size` | `50` | 每批翻译行数 |
+| `--title` | SRT 文件名 | 视频标题 (写入 ASS Title) |
+| `--template` | `./template.ass` | ASS 模板路径 |
+| `-o, --output` | 自动 | 输出 `.zh-en.ass` (`.zh.srt` + `.zh.ass` 同目录) |
+
+### `mpv-burn.sh` — 字幕硬压 (WSL)
+
+```bash
+# 基础用法
+./mpv-burn.sh path/to/video.webm --sub-file video.zh-en.ass
+
+# 自定义编码器
+./mpv-burn.sh video.webm --sub-file sub.ass -o result.mkv --ovc libx265 --ovcopts crf=23
+
+# 透传 mpv 补帧滤镜
+./mpv-burn.sh video.webm --sub-file sub.ass -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
+```
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `-o, --output` | `burned.mkv` | 输出路径 |
+| `--mpv-path` | `/mnt/c/Users/oculi/mpv-lazy/mpv.com` | mpv.com 路径 |
+| `--sub-file` | — | 字幕文件路径 |
+| `--ovc` | `hevc_nvenc` | 视频编码器 |
+| `--ovcopts` | `qp=20` | 编码器参数 |
+| `--oac` | `aac` | 音频编码器 |
+| `--dry-run` | — | 仅打印命令 |
 
 ### `mpv-burn.ps1` — 字幕硬压 (PowerShell)
 
-将 SRT 字幕硬压到视频中，输出 hevc_nvenc 编码的 mkv。
-
 ```powershell
-.\mpv-burn.ps1 "C:\path\to\video.webm"
-# 输出: burned.mkv (同目录, hevc_nvenc qp=20, aac 音频)
-```
-
-### 从 PowerShell 调用 WSL
-
-```powershell
-wsl -u root bash -lc "sh ./pipeline.sh 'https://www.youtube.com/watch?v=xxxxx'"
+.\mpv-burn.ps1 "C:\path\to\video.webm" -SubFile video.zh-en.ass
+# 输出: burned.mkv (同目录)
 ```
 
 ---
@@ -147,17 +304,25 @@ wsl -u root bash -lc "sh ./pipeline.sh 'https://www.youtube.com/watch?v=xxxxx'"
 
 ```
 Subtitle translation/
-├── pipeline.sh               # 一键流水线入口 (下载 → 字幕 → 美化)
+├── pipeline.ps1              # 超级流水线 (PowerShell): URL → burned.mkv
+├── pipeline.sh               # WSL 流水线 (下载 → 美化 → 翻译 → 硬压)
 ├── download_and_sub.sh       # 下载视频 + 生成英文字幕
 ├── beautify_srt.sh           # 字幕时间码美化入口
 ├── beautify_srt.py           # 美化核心算法 (场景检测 + Netflix 帧对齐)
+├── translate_srt.py          # 字幕翻译: LLM 英→中 → .zh.srt + .zh.ass + .zh-en.ass
+├── mpv-burn.sh               # WSL: 字幕硬压 (调用 Windows mpv.com)
+├── mpv-burn.ps1              # PowerShell: 字幕硬压
+├── template.ass              # ASS 模板 (bi-en / bi-zh / zh 样式定义)
 ├── download.ps1              # PowerShell: 仅下载 (不含字幕)
-├── mpv-burn.ps1              # PowerShell: 字幕硬压 (NVENC)
-├── .env                      # API keys (gitignored)
+├── .env                      # API keys + 翻译默认配置 (gitignored)
 ├── cookies.txt               # YouTube 登录凭证 (gitignored)
-└── <Video Title>/            # 每个视频独立的输出目录
+└── <Video Title>/             # 每个视频独立的输出目录
     ├── <Video Title>.<ext>   # 视频文件 (webm/mp4/mkv)
-    ├── <Video Title>.srt     # WhisperX 生成的美化英文字幕
+    ├── <Video Title>.srt     # 原始英文字幕 (WhisperX)
+    ├── <Video Title>.beautified.srt  # 美化后英文字幕
+    ├── <Video Title>.zh.srt  # 中文 SRT 翻译缓存
+    ├── <Video Title>.zh.ass  # 仅中文 ASS
+    ├── <Video Title>.zh-en.ass  # 双语 ASS (硬压用)
     ├── <Video Title>.webp    # 封面缩略图
     ├── <Video Title>.info.json     # yt-dlp 元数据
     └── <Video Title>.description   # 视频简介
@@ -165,12 +330,68 @@ Subtitle translation/
 
 ---
 
+## 🎬 完整用例
+
+### 方案 A: 超级流水线 (一条命令)
+
+```powershell
+.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
+```
+
+```
+YouTube URL
+  │  pipeline.ps1
+  ▼
+┌─────────────────────────────────────────────────────┐
+│ 1. yt-dlp 下载视频 + SponsorBlock 去广告             │  WSL
+│ 2. WhisperX large-v3 生成英文字幕 (.srt)             │  WSL
+│ 3. ffmpeg 场景检测 → 时间码美化 → .beautified.srt    │  WSL
+│ 4. LLM 英→中翻译 → .zh.srt + .zh.ass + .zh-en.ass   │  WSL
+│ 5. mpv 编码硬压双语字幕 → burned.mkv                 │  Windows
+└─────────────────────────────────────────────────────┘
+```
+
+### 方案 B: WSL 分步
+
+```bash
+./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
+./beautify_srt.sh "视频标题/视频标题.webm"
+python3 translate_srt.py "视频标题/视频标题.srt" --provider openrouter
+./mpv-burn.sh "视频标题/视频标题.webm" --sub-file "视频标题/视频标题.zh-en.ass"
+```
+
+### 方案 C: 分离翻译 + 压制
+
+```bash
+# WSL 中完成所有字幕工作
+TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
+# 输出: OUTPUT_VIDEO=... OUTPUT_ASS=...
+```
+```powershell
+# Windows 端单独压制
+.\mpv-burn.ps1 "C:\...\video.webm" -SubFile video.zh-en.ass
+```
+
+### 环境要求
+
+| 阶段 | 环境 | 依赖 |
+|------|------|------|
+| 下载 + 字幕 | WSL | `yt-dlp`, `uvx` (whisperx + large-v3) |
+| 时间码美化 | WSL | `ffmpeg`, `ffprobe`, `python3` |
+| LLM 翻译 | WSL | `.env` 中 API key |
+| 硬压字幕 | Windows | `mpv.com` (mpv-lazy) |
+
+---
+
 ## 💡 注意事项
 
-- **WhisperX 首次运行**：会自动下载 `large-v3` 模型（数 GB），保持网络畅通。
-- **GPU 加速**：WhisperX 默认使用 float16 + GPU。无 NVIDIA 显卡时需修改脚本中的 `--compute_type` 为 `int8` 或添加 `--device cpu`。
-- **cookies.txt**：包含 YouTube 登录凭证，过期后需重新导出。已 gitignored。
-- **场景检测耗时**：对长视频可能较慢（~5 分钟/小时视频）。
-- **字幕格式验证**：美化脚本会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
-- **帧率自适应**：所有帧数参数 (`--snap-frames`, `--end-offset-frames`, `--min-scene-interval-frames`) 会按实际视频帧率自动换算为秒。
-- **关键帧吸附**：默认关闭，如需启用加 `--use-keyframes`（支持 H.264/H.265/VP9，三级回退策略）。
+- **WhisperX 首次运行**：自动下载 `large-v3` 模型（数 GB），保持网络畅通。
+- **GPU 加速**：WhisperX 默认 float16 + GPU。无 NVIDIA 显卡需 `--compute_type int8` 或 `--device cpu`。
+- **cookies.txt**：YouTube 登录凭证，过期后需重新导出。已 gitignored。
+- **场景检测耗时**：长视频可能较慢（~5 分钟/小时视频）。
+- **美化默认不覆盖**：输出 `.beautified.srt`，不修改原始字幕。流水线检测到已存在的自动跳过。
+- **翻译缓存**：`.zh.srt` 存在时自动跳过 LLM，直接合成 `.zh.ass` + `.zh-en.ass`。
+- **双语字幕**：`.zh-en.ass` 先排英文 (bi-en, 36px)，后排中文 (bi-zh, 72px)，中文自动 `\N` 换行。
+- **硬压默认开启**：`pipeline.sh` 默认 BURN=1，设 `BURN=0` 跳过硬压。`pipeline.ps1` 的 burn 在 Windows 端执行。
+- **帧率自适应**：所有帧数参数按实际视频 fps 换算为秒。
+- **关键帧吸附**：默认关闭 (`--use-keyframes` 启用)，支持 H.264/H.265/VP9。

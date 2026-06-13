@@ -536,18 +536,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s video.mp4                      # 自动查找同目录 .srt, 原位覆盖
-  %(prog)s video.mp4 subtitle.srt         # 指定字幕文件
-  %(prog)s video.mp4 -o beautified.srt    # 输出到新文件
+  %(prog)s video.mp4                      # 自动查找同目录 .srt → .beautified.srt
+  %(prog)s video.mp4 subtitle.srt         # 指定字幕 → .beautified.srt
+  %(prog)s video.mp4 -o result.srt        # 输出到指定文件
+  %(prog)s video.mp4 -o video.srt         # 覆盖原文件 (需显式指定 -o)
   %(prog)s video.mp4 --scene-threshold 0.2 --snap-frames 5
   %(prog)s video.mp4 --preview            # 预览变化 (不写入)
-  %(prog)s video.mp4 --backup             # 原地覆盖前备份原文件
+  %(prog)s video.mp4 --backup             # 覆盖前备份原文件 (仅 -o 同文件时有效)
         """,
     )
 
     parser.add_argument('video', help='视频文件路径')
     parser.add_argument('srt', nargs='?', help='SRT 字幕文件路径 (未指定则自动查找)')
-    parser.add_argument('-o', '--output', help='输出 SRT 路径 (默认覆盖原文件)')
+    parser.add_argument('-o', '--output',
+                        help='输出 SRT 路径 (默认: <原名>.beautified.srt, 不覆盖原文件)')
 
     # 场景检测
     parser.add_argument('--scene-threshold', type=float, default=0.25,
@@ -730,7 +732,13 @@ Examples:
         if remaining > 25:
             print(f"  ... and {remaining - 25} more changed subtitles")
     else:
-        output_path = args.output or srt_path
+        if args.output:
+            output_path = args.output
+        else:
+            # 默认不覆盖原文件, 输出 <原名>.beautified.srt
+            srt_dir = os.path.dirname(os.path.abspath(srt_path))
+            srt_base = os.path.splitext(os.path.basename(srt_path))[0]
+            output_path = os.path.join(srt_dir, f"{srt_base}.beautified.srt")
 
         if args.backup and output_path == srt_path:
             backup_path = srt_path + '.bak'
@@ -741,6 +749,7 @@ Examples:
         write_srt(beautified, output_path)
         if not args.quiet:
             print(f"\nBeautified SRT saved: {output_path}")
+        print(f"OUTPUT_SRT={os.path.abspath(output_path)}")
 
 
 if __name__ == '__main__':

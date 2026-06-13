@@ -9,11 +9,12 @@
 #   ./beautify_srt.sh <视频文件> [SRT文件] [选项...]
 #
 # 示例:
-#   ./beautify_srt.sh video.mp4                     # 自动查找同目录 .srt
-#   ./beautify_srt.sh video.mp4 subtitle.srt        # 指定字幕
+#   ./beautify_srt.sh video.mp4                     # 自动查找 .srt → .beautified.srt
+#   ./beautify_srt.sh video.mp4 subtitle.srt        # 指定字幕 → .beautified.srt
+#   ./beautify_srt.sh video.mp4 -o result.srt       # 输出到指定文件
+#   ./beautify_srt.sh video.mp4 -o video.srt        # 覆盖原文件 (显式指定)
 #   ./beautify_srt.sh video.mp4 --preview           # 仅预览
-#   ./beautify_srt.sh video.mp4 --backup            # 备份原文件后覆盖
-#   ./beautify_srt.sh video.mp4 --scene-threshold 0.35 --snap-frames 5
+#   ./beautify_srt.sh video.mp4 --backup            # 备份原文件后覆盖 (需 -o)
 #
 # 依赖: python3, ffmpeg, ffprobe
 # =============================================================================
@@ -38,9 +39,10 @@ beautify_srt.sh — 美化 SRT 字幕时间码
   自动修复字幕重叠和过小间隙，确保最短/最长时长。
 
 示例:
-  ./beautify_srt.sh video.mp4                     # 自动查找同目录 .srt
-  ./beautify_srt.sh video.mp4 subtitle.srt        # 指定字幕文件
-  ./beautify_srt.sh video.mp4 -o result.srt       # 输出到新文件
+  ./beautify_srt.sh video.mp4                     # 自动查找同目录 .srt → .beautified.srt
+  ./beautify_srt.sh video.mp4 subtitle.srt        # 指定字幕 → .beautified.srt
+  ./beautify_srt.sh video.mp4 -o result.srt       # 输出到指定文件
+  ./beautify_srt.sh video.mp4 -o video.srt        # 覆盖原文件 (显式指定 -o)
   ./beautify_srt.sh video.mp4 --preview           # 仅预览变化 (不写入)
   ./beautify_srt.sh video.mp4 --backup            # 覆盖前备份原文件为 .bak
 
