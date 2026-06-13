@@ -64,3 +64,7 @@ uvx whisperx "$VIDEO_FILE" \
 echo "============================================="
 echo "Finish! 所有文件已保存在文件夹：$FOLDER_NAME"
 echo "============================================="
+
+# 输出视频文件绝对路径，方便下游脚本 (如 pipeline.sh) 串联
+VIDEO_ABS_PATH="$(realpath "$VIDEO_FILE" 2>/dev/null || readlink -f "$VIDEO_FILE" 2>/dev/null || echo "$PWD/$VIDEO_FILE")"
+echo "OUTPUT_VIDEO=$VIDEO_ABS_PATH"

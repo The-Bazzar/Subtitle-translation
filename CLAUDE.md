@@ -10,19 +10,20 @@ YouTube 视频下载 + WhisperX AI 字幕生成流水线。项目维护在一个
 
 ```
 Subtitle translation/
-├── download_and_sub.sh      # 主流水线 (WSL/bash): 下载视频 → 生成英文字幕
-├── beautify_srt.sh          # WSL/bash: 字幕时间码美化入口 (调用 beautify_srt.py)
-├── beautify_srt.py          # Python: 场景检测 + 关键帧对齐 → 美化 SRT 时间码
-├── download.ps1             # Windows PowerShell 备用脚本: 仅下载 (不含字幕生成)
-├── mpv-burn.ps1             # Windows PowerShell: 用 mpv 将字幕硬压到视频中 (NVENC)
-├── .env                     # API keys (OpenRouter, DeepSeek, Gemini) — gitignored
-├── cookies.txt              # YouTube cookies for yt-dlp — gitignored
-└── <Video Title>/           # 每个视频独立的输出目录
-    ├── <Video Title>.<ext>  # 视频文件 (webm/mp4/mkv)
-    ├── <Video Title>.srt    # WhisperX 生成的英文字幕
-    ├── <Video Title>.webp   # 封面缩略图
-    ├── <Video Title>.info.json    # yt-dlp 元数据
-    └── <Video Title>.description  # 视频简介文本
+├── pipeline.sh               # WSL/bash: 一键流水线入口 (download → beautify)
+├── download_and_sub.sh       # 主流程: 下载视频 → 生成英文字幕
+├── beautify_srt.sh           # 字幕时间码美化入口 (调用 beautify_srt.py)
+├── beautify_srt.py           # Python: 场景检测 + 关键帧对齐 → 美化 SRT 时间码
+├── download.ps1              # Windows PowerShell 备用: 仅下载 (不含字幕生成)
+├── mpv-burn.ps1              # Windows PowerShell: mpv 字幕硬压 (NVENC)
+├── .env                      # API keys — gitignored
+├── cookies.txt               # YouTube cookies — gitignored
+└── <Video Title>/            # 每个视频独立的输出目录
+    ├── <Video Title>.<ext>   # 视频文件 (webm/mp4/mkv)
+    ├── <Video Title>.srt     # WhisperX 生成的英文字幕
+    ├── <Video Title>.webp    # 封面缩略图
+    ├── <Video Title>.info.json     # yt-dlp 元数据
+    └── <Video Title>.description   # 视频简介文本
 ```
 
 ## Key Commands
@@ -30,10 +31,17 @@ Subtitle translation/
 ### 主流程 (WSL 中运行)
 
 ```bash
-# 下载视频 + 生成英文字幕
-./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
+# 一键流水线: 下载 + 字幕 + 美化 (推荐)
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
-# 批量处理
+# 传递美化选项
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --backup --scene-threshold 0.25
+
+# 仅下载 + 字幕 (不美化)
+SKIP_BEAUTIFY=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+
+# 分步执行
+./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
 ./download_and_sub.sh "URL1" && ./download_and_sub.sh "URL2"
 ```
 
@@ -78,12 +86,20 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 ./beautify_srt.sh --help
 ```
 
+## Pipeline Steps (pipeline.sh)
+
+1. **下载 + 字幕** — 调用 `download_and_sub.sh`，捕获输出的 `OUTPUT_VIDEO` 路径
+2. **时间码美化** — 调用 `beautify_srt.sh` 对齐到场景切换 & 关键帧
+3. 支持通过 `SKIP_DOWNLOAD=1` `/` `SKIP_BEAUTIFY=1` 跳过指定阶段
+4. 通过 `--` 分隔符向 beautify 传递自定义参数
+
 ## Pipeline Steps (download_and_sub.sh)
 
 1. **获取标题** — `yt-dlp --get-title` 获取视频标题，过滤文件名非法字符后创建目录
 2. **下载** — `yt-dlp` 下载视频/缩略图/元数据/简介，自动移除 sponsor 和 selfpromo 片段 (SponsorBlock)
 3. **定位视频文件** — 在目录中查找 `.mp4/.mkv/.webm/.flv/.avi` 文件
 4. **生成字幕** — `uvx whisperx` 使用 `large-v3` 模型 + `float16` 计算生成英文 SRT 字幕
+5. **输出路径** — 打印 `OUTPUT_VIDEO=<绝对路径>` 供下游脚本解析
 
 ## Dependencies
 
