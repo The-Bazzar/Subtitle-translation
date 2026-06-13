@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-beautify_srt.py — 美化 SRT 字幕时间码，对齐到场景切换和关键帧
-Similar to Subtitle Edit's "Beautify timecodes" feature.
+beautify_srt.py — 美化 SRT 字幕时间码，对齐到场景切换
+Similar to Subtitle Edit's "Beautify timecodes" feature (Netflix 规范).
 
-算法:
-  1. 用 ffmpeg 检测视频场景切换点 (scene changes)
-  2. 用 ffprobe 提取关键帧 (I-frame) 时间戳
-  3. 将每条字幕的起止时间吸附到最近的场景切换点 (可配置阈值)
-  4. 再吸附到最近的关键帧做微调
-  5. 修复连续字幕之间的重叠和间隙问题
-  6. 强制最短时长和最小间距
+算法 (Netflix Timed Text Style Guide):
+  0. 检测视频帧率, 所有帧数参数按实际 fps 换算为秒
+  1. 用 ffmpeg 检测视频场景切换点 (最小间隔 7 帧)
+  2. 字幕入点吸附到前一个场景切换点 (7 帧以内)
+  3. 字幕出点吸附到下一个场景切换点前 2 帧 (7 帧以内)
+  4. 修复连续字幕之间的重叠和间隙问题 (>500ms 合并)
+  5. 强制最短 1000ms / 最长 8000ms 时长
 """
 
 import argparse
@@ -36,18 +36,21 @@ class Subtitle:
 
 @dataclass
 class BeautifyOptions:
-    scene_threshold: float = 0.3   # 场景检测灵敏度 (0-1, 越低越灵敏)
-    snap_distance: float = 0.2     # 吸附到场景切换的最大距离 (秒)
-    keyframe_snap: float = 0.1     # 吸附到关键帧的最大距离 (秒)
-    min_duration: float = 0.5      # 最短字幕时长 (秒)
-    max_duration: float = 8.0      # 最长字幕时长 (秒)
-    min_gap: float = 0.05          # 字幕最小间距 (秒)
-    max_gap_merge: float = 0.15    # 小于此值的间隙合并 (秒)
-    extend_to_scene: bool = True   # 字幕结尾靠近场景切换时自动延伸
-    no_scene_snap: bool = False    # 禁用场景吸附
-    no_keyframe_snap: bool = False # 禁用关键帧吸附
+    scene_threshold: float = 0.25       # 场景检测灵敏度 (0-1)
+    snap_frames: int = 7                # 吸附到场景切换的最大帧数
+    end_offset_frames: int = 2          # 出点对齐到场景前 N 帧
+    min_scene_interval_frames: int = 7  # 场景切换最小帧间隔
+    use_keyframes: bool = False         # 默认不用关键帧 (各视频帧率不同)
+    keyframe_snap_frames: int = 2       # 关键帧吸附最大帧数 (仅 --use-keyframes)
+    min_duration: float = 1.0           # 最短字幕时长 (秒) — Netflix: 1000ms
+    max_duration: float = 8.0           # 最长字幕时长 (秒) — Netflix: 8000ms
+    min_gap: float = 0.083              # 字幕最小间距 (秒) — Netflix: 2帧
+    max_gap_merge: float = 0.5          # 小于此值的间隙合并 (秒) — Netflix: 500ms
+    extend_to_scene: bool = False       # 延伸到场景切换 (Netflix 不启用)
+    no_scene_snap: bool = False         # 完全跳过场景吸附
     preview: bool = False
     quiet: bool = False
+    fps: float = 24.0                   # 视频帧率 (运行时由 ffprobe 检测)
 
 
 # ─── SRT 时间格式转换 ──────────────────────────────────────────────────────────
@@ -90,13 +93,11 @@ def parse_srt(filepath: str) -> list[Subtitle]:
         if len(lines) < 2:
             continue
 
-        # 跳过可能的 BOM 或非数字首行
         try:
             index = int(lines[0])
         except ValueError:
             continue
 
-        # 匹配时间行
         time_match = re.match(
             r'(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})',
             lines[1]
@@ -129,15 +130,44 @@ def write_srt(subtitles: list[Subtitle], filepath: str):
             f.write(f"{sub.text}\n\n")
 
 
-# ─── 视频分析: 场景切换 + 关键帧 ───────────────────────────────────────────────
+# ─── 视频分析: 帧率 + 场景切换 + 关键帧 ───────────────────────────────────────
 
-def get_scene_changes(video_path: str, threshold: float = 0.3,
+def get_frame_rate(video_path: str) -> float:
+    """
+    用 ffprobe 检测视频帧率.
+    返回 fps (float), 检测失败时回退到 24.0.
+    """
+    cmd = [
+        'ffprobe', '-v', 'quiet',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=r_frame_rate',
+        '-of', 'csv=p=0',
+        video_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        fps_str = result.stdout.strip()
+        if '/' in fps_str:
+            num, den = fps_str.split('/')
+            if den == '0':
+                return 24.0
+            return float(num) / float(den)
+        if fps_str:
+            return float(fps_str)
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+    return 24.0
+
+
+def get_scene_changes(video_path: str, threshold: float = 0.25,
+                      min_interval_sec: float = 0.3,
                       quiet: bool = False) -> list[float]:
     """
     用 ffmpeg 的 select + showinfo 滤镜检测场景切换.
     返回场景切换点的时间戳列表 (秒).
+
+    min_interval_sec: 合并间距小于此值的相邻场景切换 (Netflix: 7帧)
     """
-    # showinfo 会把每帧的 pts_time 输出到 stderr
     cmd = [
         'ffmpeg',
         '-i', video_path,
@@ -154,7 +184,7 @@ def get_scene_changes(video_path: str, threshold: float = 0.3,
         result = subprocess.run(
             cmd,
             capture_output=True, text=True,
-            timeout=600,  # 10 min timeout for long videos
+            timeout=600,
         )
     except subprocess.TimeoutExpired:
         print("Warning: Scene detection timed out (10 min). Skipping.",
@@ -164,9 +194,7 @@ def get_scene_changes(video_path: str, threshold: float = 0.3,
         print("Error: ffmpeg not found. Is it installed?", file=sys.stderr)
         return []
 
-    # 从 stderr 解析 pts_time (showinfo 输出到 stderr)
     times: list[float] = []
-    # showinfo 输出格式: [Parsed_showinfo_...] ... pts_time:XXXX ...
     pts_re = re.compile(r'pts_time:([0-9]+\.?[0-9]*)')
 
     for line in result.stderr.split('\n'):
@@ -177,20 +205,21 @@ def get_scene_changes(video_path: str, threshold: float = 0.3,
             except ValueError:
                 pass
 
-    # 去重排序, 合并太近的切换点 (< 100ms)
+    # 去重排序, 合并太近的切换点
     times = sorted(set(times))
     merged: list[float] = []
     for t in times:
-        if not merged or t - merged[-1] >= 0.1:
+        if not merged or t - merged[-1] >= min_interval_sec:
             merged.append(t)
-        # 否则跳过 (与前一个场景切换太近)
     return merged
 
 
 def get_keyframes(video_path: str, quiet: bool = False) -> list[float]:
     """
     用 ffprobe 提取所有关键帧 (I-frame) 的时间戳.
-    优先使用 -skip_frame nokey (速度快), 失败时回退到 packet 解析.
+    3 级回退策略: -skip_frame nokey → packet flags → frame key_frame.
+
+    注意: 默认流程不调用此函数 (各视频编码/帧率差异大, 场景吸附已足够).
     """
     times: list[float] = []
 
@@ -216,7 +245,7 @@ def get_keyframes(video_path: str, quiet: bool = False) -> list[float]:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # 方法 2: 如果方法 1 无结果, 回退到解析 packet flags (更慢但兼容性更好)
+    # 方法 2: 解析 packet flags (更慢但兼容性更好)
     if not times:
         if not quiet:
             print("  Method 1 returned no keyframes, trying packet-based method...",
@@ -240,7 +269,7 @@ def get_keyframes(video_path: str, quiet: bool = False) -> list[float]:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
-    # 方法 3: 解析 frame 信息中的 key_frame 标志 (最慢, 最后手段)
+    # 方法 3: 解析 frame key_frame 标志 (最慢)
     if not times:
         if not quiet:
             print("  Method 2 returned no keyframes, trying frame-based method...",
@@ -273,21 +302,9 @@ def get_keyframes(video_path: str, quiet: bool = False) -> list[float]:
 
 # ─── 核心算法 ──────────────────────────────────────────────────────────────────
 
-def snap_to_nearest(value: float, targets: list[float],
-                    max_distance: float) -> float:
-    """将 value 吸附到 targets 中最近的值, 距离不超过 max_distance."""
-    if not targets:
-        return value
-
-    best = min(targets, key=lambda t: abs(t - value))
-    if abs(best - value) <= max_distance:
-        return best
-    return value
-
-
 def snap_to_previous(value: float, targets: list[float],
                      max_distance: float) -> float:
-    """将 value 吸附到 targets 中最近的前一个值 (≤ value)."""
+    """将 value 吸附到 targets 中最近的前一个值 (≤ value), 距离不超过 max_distance."""
     if not targets:
         return value
 
@@ -301,18 +318,37 @@ def snap_to_previous(value: float, targets: list[float],
     return value
 
 
-def snap_to_next(value: float, targets: list[float],
-                 max_distance: float) -> float:
-    """将 value 吸附到 targets 中最近的后一个值 (≥ value)."""
+def snap_end_to_scene_before(end: float, scene_changes: list[float],
+                              snap_sec: float, end_offset: float) -> float:
+    """
+    Netflix 规则: 字幕出点对齐到场景切换前 N 帧.
+    查找 end 之后的第一个场景切换, 将 end 吸附到 scene - offset,
+    前提是距离在 snap_sec 以内.
+    """
+    if not scene_changes:
+        return end
+
+    later = [s for s in scene_changes if s >= end]
+    if not later:
+        return end
+
+    next_scene = min(later)
+    target = next_scene - end_offset
+    if target < 0:
+        target = 0.0
+    if abs(target - end) <= snap_sec:
+        return target
+    return end
+
+
+def snap_to_nearest(value: float, targets: list[float],
+                    max_distance: float) -> float:
+    """将 value 吸附到 targets 中最近的值, 距离不超过 max_distance."""
     if not targets:
         return value
 
-    candidates = [t for t in targets if t >= value]
-    if not candidates:
-        return value
-
-    best = min(candidates)
-    if best - value <= max_distance:
+    best = min(targets, key=lambda t: abs(t - value))
+    if abs(best - value) <= max_distance:
         return best
     return value
 
@@ -324,45 +360,52 @@ def beautify_subtitles(
     opts: BeautifyOptions,
 ) -> list[Subtitle]:
     """
-    核心美化流程:
-      1. 吸附起止时间到场景切换点
-      2. 微调起止时间到关键帧
-      3. 延伸字幕到下一个场景切换点 (可选)
-      4. 修复重叠、合并小间隙
-      5. 强制最短/最长时长
+    核心美化流程 (Netflix 规范):
+      1. 入点吸附到前一个场景切换点 (7帧内)
+      2. 出点吸附到下一个场景切换点前 2 帧 (7帧内)
+      3. (可选) 微调到关键帧
+      4. (可选) 延伸到场景切换
+      5. 修复重叠、合并小间隙
+      6. 强制最短/最长时长
     """
+
+    snap_sec = opts.snap_frames / opts.fps          # 吸附距离 (秒)
+    end_offset = opts.end_offset_frames / opts.fps   # 出点偏移 (秒)
 
     # ── 第 1 步: 吸附到场景切换 ──────────────────────────────────────────
     if scene_changes and not opts.no_scene_snap:
         for sub in subs:
-            # 起始时间: 优先吸附到前面的场景切换 (字幕不该在场景切换中间开始)
-            sub.start = snap_to_previous(sub.start, scene_changes, opts.snap_distance)
-            # 结束时间: 优先吸附到后面的场景切换 (字幕结尾跟着场景切换走)
-            sub.end = snap_to_next(sub.end, scene_changes, opts.snap_distance)
+            # 入点: 吸附到前一个场景切换 (字幕不该在场景切换中间开始)
+            sub.start = snap_to_previous(sub.start, scene_changes, snap_sec)
+            # 出点: 吸附到下一个场景切换前 2 帧 (Netflix 规范)
+            sub.end = snap_end_to_scene_before(
+                sub.end, scene_changes, snap_sec, end_offset
+            )
 
-    # ── 第 2 步: 微调到关键帧 ────────────────────────────────────────────
-    if keyframes and not opts.no_keyframe_snap:
+    # ── 第 2 步: (可选) 微调到关键帧 ──────────────────────────────────────
+    if keyframes and opts.use_keyframes:
+        kf_snap_sec = opts.keyframe_snap_frames / opts.fps
         for sub in subs:
-            sub.start = snap_to_nearest(sub.start, keyframes, opts.keyframe_snap)
-            sub.end = snap_to_nearest(sub.end, keyframes, opts.keyframe_snap)
+            sub.start = snap_to_nearest(sub.start, keyframes, kf_snap_sec)
+            sub.end = snap_to_nearest(sub.end, keyframes, kf_snap_sec)
 
-    # ── 第 3 步: 延伸到下一个场景切换 ─────────────────────────────────────
+    # ── 第 3 步: (可选) 延伸到场景切换 ────────────────────────────────────
     if opts.extend_to_scene and scene_changes and not opts.no_scene_snap:
         for i, sub in enumerate(subs):
             later_scenes = [s for s in scene_changes if s > sub.end]
             if not later_scenes:
                 continue
             next_scene = min(later_scenes)
-            # 如果字幕结束距下一个场景切换很近，延伸到场景切换
-            gap_to_scene = next_scene - sub.end
-            if gap_to_scene <= opts.snap_distance * 1.5:
-                # 但不能超过下一条字幕
+            # 延伸到场景切换 (保留 end_offset 不出戏)
+            target = next_scene - end_offset
+            gap_to_target = target - sub.end
+            if 0 < gap_to_target <= snap_sec * 1.5:
                 if i + 1 < len(subs):
                     max_extend = subs[i + 1].start - opts.min_gap
-                    if next_scene <= max_extend:
-                        sub.end = next_scene
+                    if target <= max_extend:
+                        sub.end = target
                 else:
-                    sub.end = next_scene
+                    sub.end = target
 
     # ── 第 4 步: 修复重叠和间隙 ──────────────────────────────────────────
     for i in range(len(subs)):
@@ -385,7 +428,6 @@ def beautify_subtitles(
         duration = sub.end - sub.start
 
         if duration < opts.min_duration:
-            # 延长时间到最短时长
             desired_end = sub.start + opts.min_duration
             if i + 1 < len(subs):
                 max_end = subs[i + 1].start - opts.min_gap
@@ -394,13 +436,9 @@ def beautify_subtitles(
                 sub.end = desired_end
 
         elif duration > opts.max_duration:
-            # 对于过长的字幕 (如长段落), 不做强制分割(会改变文本结构)
-            # 仅做轻微收缩: 让结束时间靠近下一条字幕开始
             if i + 1 < len(subs):
                 desired_end = sub.start + opts.max_duration
-                # 只在不会造成重叠的前提下收缩
                 sub.end = min(sub.end, subs[i + 1].start - opts.min_gap)
-                # 但不切到 desired_end 之前 —— 保留原文时间
 
     # ── 最终检查 ─────────────────────────────────────────────────────────
     for sub in subs:
@@ -414,8 +452,8 @@ def beautify_subtitles(
 
 # ─── 变化摘要 ──────────────────────────────────────────────────────────────────
 
-def summarize_changes(subs: list[Subtitle]) -> str:
-    """生成美化前后的对比摘要."""
+def summarize_changes(subs: list[Subtitle], fps: float) -> str:
+    """生成美化前后的对比摘要 (帧数按实际 fps 换算)."""
     total_start_shift = 0.0
     total_end_shift = 0.0
     changed_count = 0
@@ -429,11 +467,15 @@ def summarize_changes(subs: list[Subtitle]) -> str:
             changed_count += 1
 
     n = len(subs) if subs else 1
+    frame_ms = 1000.0 / fps if fps > 0 else 41.7
     lines = [
+        f"  Frame rate:           {fps:.2f} fps ({frame_ms:.1f} ms/frame)",
         f"  Total subtitles:      {len(subs)}",
         f"  Subtitles modified:   {changed_count} ({changed_count*100/n:.0f}%)",
-        f"  Avg start shift:      {total_start_shift/n*1000:.1f} ms",
-        f"  Avg end shift:        {total_end_shift/n*1000:.1f} ms",
+        f"  Avg start shift:      {total_start_shift/n*1000:.1f} ms "
+        f"({total_start_shift/n*1000/frame_ms:.1f} frames)",
+        f"  Avg end shift:        {total_end_shift/n*1000:.1f} ms "
+        f"({total_end_shift/n*1000/frame_ms:.1f} frames)",
     ]
     return '\n'.join(lines)
 
@@ -445,7 +487,6 @@ def is_valid_srt(filepath: str) -> bool:
     try:
         with open(filepath, 'r', encoding='utf-8-sig') as f:
             head = f.read(256).lstrip()
-        # 真正的 SRT 以数字开头 (字幕序号)
         return bool(re.match(r'\d+\s*\n', head))
     except (OSError, UnicodeDecodeError):
         return False
@@ -456,7 +497,6 @@ def find_srt(video_path: str) -> Optional[str]:
     video_dir = os.path.dirname(os.path.abspath(video_path))
     video_name = os.path.splitext(os.path.basename(video_path))[0]
 
-    # 候选文件名 (按优先级)
     candidates = [
         os.path.join(video_dir, f"{video_name}.srt"),
         os.path.join(video_dir, f"{video_name}.en.srt"),
@@ -492,14 +532,14 @@ def find_srt(video_path: str) -> Optional[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='美化 SRT 字幕时间码 — 对齐到场景切换和关键帧.',
+        description='美化 SRT 字幕时间码 — 对齐到场景切换 (Netflix 规范).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s video.mp4                      # 自动查找同目录 .srt, 原位覆盖
   %(prog)s video.mp4 subtitle.srt         # 指定字幕文件
   %(prog)s video.mp4 -o beautified.srt    # 输出到新文件
-  %(prog)s video.mp4 --scene-threshold 0.4 --snap-distance 0.15
+  %(prog)s video.mp4 --scene-threshold 0.2 --snap-frames 5
   %(prog)s video.mp4 --preview            # 预览变化 (不写入)
   %(prog)s video.mp4 --backup             # 原地覆盖前备份原文件
         """,
@@ -508,26 +548,40 @@ Examples:
     parser.add_argument('video', help='视频文件路径')
     parser.add_argument('srt', nargs='?', help='SRT 字幕文件路径 (未指定则自动查找)')
     parser.add_argument('-o', '--output', help='输出 SRT 路径 (默认覆盖原文件)')
-    parser.add_argument('--scene-threshold', type=float, default=0.3,
-                        help='场景检测阈值, 越低越灵敏 (0.1-0.5, 默认: 0.3)')
-    parser.add_argument('--snap-distance', type=float, default=0.2,
-                        help='吸附到场景切换的最大距离, 秒 (默认: 0.2)')
-    parser.add_argument('--keyframe-snap', type=float, default=0.1,
-                        help='吸附到关键帧的最大距离, 秒 (默认: 0.1)')
-    parser.add_argument('--min-duration', type=float, default=0.5,
-                        help='最短字幕时长, 秒 (默认: 0.5)')
+
+    # 场景检测
+    parser.add_argument('--scene-threshold', type=float, default=0.25,
+                        help='场景检测灵敏度 (0.1-0.5, 默认: 0.25)')
+
+    # 帧数参数 (按实际 fps 换算为秒)
+    parser.add_argument('--snap-frames', type=int, default=7,
+                        help='吸附到场景切换的最大帧数 (默认: 7)')
+    parser.add_argument('--end-offset-frames', type=int, default=2,
+                        help='出点对齐到场景切换前 N 帧 (默认: 2)')
+    parser.add_argument('--min-scene-interval-frames', type=int, default=7,
+                        help='场景切换最小帧间隔 (默认: 7)')
+
+    # 关键帧 (默认关闭)
+    parser.add_argument('--use-keyframes', action='store_true',
+                        help='启用关键帧吸附 (默认关闭, 各视频帧率不同建议不用)')
+    parser.add_argument('--keyframe-snap-frames', type=int, default=2,
+                        help='关键帧吸附最大帧数 (默认: 2, 需 --use-keyframes)')
+
+    # 时长 / 间距
+    parser.add_argument('--min-duration', type=float, default=1.0,
+                        help='最短字幕时长, 秒 (默认: 1.0, Netflix: 1000ms)')
     parser.add_argument('--max-duration', type=float, default=8.0,
-                        help='最长字幕时长, 秒 (默认: 8.0)')
-    parser.add_argument('--min-gap', type=float, default=0.05,
-                        help='字幕最小间距, 秒 (默认: 0.05)')
-    parser.add_argument('--max-gap-merge', type=float, default=0.15,
-                        help='小于此值的间隙自动合并, 秒 (默认: 0.15)')
-    parser.add_argument('--no-extend', action='store_true',
-                        help='不延伸字幕到下一个场景切换')
+                        help='最长字幕时长, 秒 (默认: 8.0, Netflix: 8000ms)')
+    parser.add_argument('--min-gap', type=float, default=0.083,
+                        help='字幕最小间距, 秒 (默认: 0.083, Netflix: 2帧)')
+    parser.add_argument('--max-gap-merge', type=float, default=0.5,
+                        help='小于此值的间隙自动合并, 秒 (默认: 0.5, Netflix: 500ms)')
+
+    # 行为开关
+    parser.add_argument('--extend', action='store_true',
+                        help='延伸字幕填充到场景切换前的间隙 (Netflix 默认不启用)')
     parser.add_argument('--no-scene-snap', action='store_true',
-                        help='跳过场景切换吸附 (仅关键帧对齐)')
-    parser.add_argument('--no-keyframe-snap', action='store_true',
-                        help='跳过关键帧吸附 (仅场景切换对齐)')
+                        help='完全跳过场景切换吸附')
     parser.add_argument('--preview', action='store_true',
                         help='仅预览变化, 不写入文件')
     parser.add_argument('--backup', action='store_true',
@@ -541,6 +595,12 @@ Examples:
     if not os.path.isfile(args.video):
         print(f"Error: Video file not found: {args.video}", file=sys.stderr)
         sys.exit(1)
+
+    # ── 检测帧率 ─────────────────────────────────────────────────────────
+    fps = get_frame_rate(args.video)
+    if not args.quiet:
+        print(f"Video:  {args.video}")
+        print(f"Frame rate: {fps:.2f} fps")
 
     # 确定 SRT 路径
     if args.srt:
@@ -557,7 +617,6 @@ Examples:
         sys.exit(1)
 
     if not args.quiet:
-        print(f"Video:  {args.video}")
         print(f"SRT:    {srt_path}")
         print()
 
@@ -575,38 +634,57 @@ Examples:
     # 组装选项
     opts = BeautifyOptions(
         scene_threshold=args.scene_threshold,
-        snap_distance=args.snap_distance,
-        keyframe_snap=args.keyframe_snap,
+        snap_frames=args.snap_frames,
+        end_offset_frames=args.end_offset_frames,
+        min_scene_interval_frames=args.min_scene_interval_frames,
+        use_keyframes=args.use_keyframes,
+        keyframe_snap_frames=args.keyframe_snap_frames,
         min_duration=args.min_duration,
         max_duration=args.max_duration,
         min_gap=args.min_gap,
         max_gap_merge=args.max_gap_merge,
-        extend_to_scene=not args.no_extend,
+        extend_to_scene=args.extend,
         no_scene_snap=args.no_scene_snap,
-        no_keyframe_snap=args.no_keyframe_snap,
         preview=args.preview,
         quiet=args.quiet,
+        fps=fps,
     )
+
+    # 打印帧数→秒的换算
+    if not args.quiet:
+        snap_sec = opts.snap_frames / fps
+        end_off_sec = opts.end_offset_frames / fps
+        min_int_sec = opts.min_scene_interval_frames / fps
+        print(f"\n  Netflix parameters @ {fps:.2f} fps:")
+        print(f"    snap distance:        {opts.snap_frames} frames = {snap_sec*1000:.0f} ms")
+        print(f"    end offset:           {opts.end_offset_frames} frames = {end_off_sec*1000:.0f} ms")
+        print(f"    min scene interval:   {opts.min_scene_interval_frames} frames = {min_int_sec*1000:.0f} ms")
 
     # ── 场景检测 ─────────────────────────────────────────────────────────
     scene_changes: list[float] = []
     if not opts.no_scene_snap:
+        min_interval_sec = opts.min_scene_interval_frames / fps
         if not args.quiet:
-            print(f"\nDetecting scene changes (threshold={opts.scene_threshold})...")
-        scene_changes = get_scene_changes(args.video, opts.scene_threshold,
-                                          quiet=args.quiet)
+            print(f"\nDetecting scene changes "
+                  f"(threshold={opts.scene_threshold}, "
+                  f"min interval={opts.min_scene_interval_frames} frames)...")
+        scene_changes = get_scene_changes(
+            args.video, opts.scene_threshold,
+            min_interval_sec=min_interval_sec,
+            quiet=args.quiet,
+        )
         if not args.quiet:
             print(f"  Found {len(scene_changes)} scene changes")
             if scene_changes:
                 duration = scene_changes[-1] - scene_changes[0] if len(scene_changes) > 1 else 0
-                print(f"  Avg interval: {duration/len(scene_changes):.1f}s"
-                      if len(scene_changes) > 1 else "")
+                if duration > 0:
+                    print(f"  Avg interval: {duration/len(scene_changes):.1f}s")
 
-    # ── 关键帧提取 ───────────────────────────────────────────────────────
+    # ── 关键帧提取 (仅 --use-keyframes) ──────────────────────────────────
     keyframes: list[float] = []
-    if not opts.no_keyframe_snap:
+    if opts.use_keyframes:
         if not args.quiet:
-            print("\nExtracting keyframes...")
+            print("\nExtracting keyframes (--use-keyframes enabled)...")
         keyframes = get_keyframes(args.video, quiet=args.quiet)
         if not args.quiet:
             print(f"  Found {len(keyframes)} keyframes")
@@ -622,7 +700,7 @@ Examples:
 
     # ── 输出 ─────────────────────────────────────────────────────────────
     print()
-    print(summarize_changes(beautified))
+    print(summarize_changes(beautified, fps))
 
     if args.preview:
         print("\n── Preview (first 25 changes) ──")

@@ -1,117 +1,176 @@
-# YouTube 视频下载与 AI 字幕生成工具
+# YouTube 视频下载 + AI 字幕生成 + 时间码美化
 
-## 🛠 前置依赖安装
+一键流水线：从 YouTube 链接直达美化后的 SRT 字幕。
 
-在运行脚本之前，请确保你的系统已安装以下必要的开发工具和运行环境。
+## 🛠 前置依赖
 
-### 1. Python 环境与 UV (推荐)
-脚本使用 `uvx` 来运行 WhisperX，它可以省去手动配置 Python 虚拟环境的麻烦。
-* **安装 UV**：
+### WSL (推荐)
+
 ```bash
-curl -lsSf https://astral.sh/uv/install.sh | sh
-```
+# Python 包管理器 (用于运行 WhisperX)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-### 2. JavaScript / TypeScript 运行时 (Node.js & Deno)
-
-* **Node.js** (建议LTS)：
-```bash
-# 使用 nvm 或 系统的包管理器安装
-curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-sudo apt-get install -y nodejs
-```
-
-* **Deno** (现代安全 JS/TS 运行时)：
-```bash
-curl -fsSL https://deno.land/x/install/install.sh | sh
-```
-
-### 3. 多媒体工具 (yt-dlp & FFmpeg)
-
-* **yt-dlp**：用于下载视频。
-```bash
+# yt-dlp — 视频下载
 sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
 sudo chmod a+rx /usr/local/bin/yt-dlp
-```
 
-* **FFmpeg**：`yt-dlp` 和 `WhisperX` 处理视音频的核心底层依赖。
-```bash
-# Ubuntu/Debian
+# FFmpeg — 音视频处理 + 场景检测
 sudo apt update && sudo apt install -y ffmpeg
-# macOS
-brew install ffmpeg
 ```
 
+### Windows (可选)
+
+| 工具 | 用途 |
+|------|------|
+| `yt-dlp` | `download.ps1` 视频下载 |
+| `mpv` | `mpv-burn.ps1` 字幕硬压 |
 
 ---
 
-## 📦 准备工作
+## 🚀 快速开始
 
-1. **获取脚本**：将脚本内容保存为 `download_and_sub.sh`。
-2. **赋予执行权限**：
 ```bash
-chmod +x download_and_sub.sh
+# 进入 WSL
+wsl -u root
+
+# 一键流水线: 下载 → 字幕 → 美化 (推荐)
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ```
 
-3. **Cookie 凭证（可选）**：
-如果有需要请在脚本同级目录下放置一份 `cookies.txt` 文件。
+执行后会在当前目录生成：
+
+```
+视频标题/
+├── 视频标题.webm           # 视频文件
+├── 视频标题.srt            # 美化后的英文字幕 ✨
+├── 视频标题.webp           # 封面缩略图
+├── 视频标题.info.json      # 元数据
+└── 视频标题.description    # 视频简介
+```
+
 ---
 
-## 📖 使用方法
+## 📖 命令参考
 
-进入wsl虚拟机：
+### `pipeline.sh` — 一键流水线 (推荐)
 
-``` bath
-wsl -u root
+串联下载 + 字幕生成 + 时间码美化，从 URL 一步到位。
+
+```bash
+# 基础用法
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+
+# 传递美化选项 (-- 之后)
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --backup --scene-threshold 0.2
+
+# 跳过某些步骤
+SKIP_BEAUTIFY=1 ./pipeline.sh "url"     # 仅下载+字幕, 跳过美化
+SKIP_DOWNLOAD=1 ./pipeline.sh "url"     # 仅美化已有视频
 ```
 
-直接在终端中运行脚本，并将 YouTube 视频链接作为第一个参数传入：
+### `download_and_sub.sh` — 下载 + 字幕
+
+单视频下载并生成 WhisperX 英文字幕（不做时间码美化）。
 
 ```bash
 ./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
+
+# 批量下载
+./download_and_sub.sh "URL1" && ./download_and_sub.sh "URL2"
 ```
 
-使用`&&`🔗多条命令：
+### `beautify_srt.sh` — 字幕时间码美化
+
+用 ffmpeg/ffprobe 检测场景切换，按 Netflix 规范将字幕时间码吸附对齐到场景变化点。自动检测视频帧率，所有帧数参数按实际 fps 换算。
 
 ```bash
-./download_and_sub.sh "https://www.youtube.com/watch?v=xxx1" \
-    && ./download_and_sub.sh "https://www.youtube.com/watch?v=xxx2" \
-    && ./download_and_sub.sh "https://www.youtube.com/watch?v=xxx3"
+# 自动查找同目录 .srt 并原位覆盖
+./beautify_srt.sh video.webm
+
+# 指定字幕 + 备份
+./beautify_srt.sh video.webm subtitle.srt --backup
+
+# 仅预览变化 (不写入)
+./beautify_srt.sh video.webm --preview
+
+# 激进对齐 (对剪辑密集的视频)
+./beautify_srt.sh video.webm --scene-threshold 0.2 --snap-frames 10
+
+# 保守对齐 (对长镜头视频)
+./beautify_srt.sh video.webm --scene-threshold 0.35 --snap-frames 4
 ```
 
+**算法流程**：帧率检测 → 场景检测 (≥7帧间隔) → 入点吸附到场景 → 出点吸附到场景前2帧 → 重叠/间隙修复 → 时长约束
 
-或者直接用`powershell`操作：
-``` powershell
-wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=xxxxx"
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--scene-threshold` | `0.25` | 场景检测灵敏度 (越小越灵敏) |
+| `--snap-frames` | `7` | 吸附到场景切换的最大帧数 |
+| `--end-offset-frames` | `2` | 出点对齐到场景切换前 N 帧 |
+| `--min-scene-interval-frames` | `7` | 场景切换最小帧间隔 |
+| `--min-duration` | `1.0` | 最短字幕时长 (秒, Netflix: 1000ms) |
+| `--max-duration` | `8.0` | 最长字幕时长 (秒, Netflix: 8000ms) |
+| `--min-gap` | `0.083` | 字幕最小间距 (秒, Netflix: 2帧) |
+| `--max-gap-merge` | `0.5` | 小于此值的间隙合并 (秒, Netflix: 500ms) |
+| `--use-keyframes` | 关闭 | 启用关键帧吸附 (默认不启用) |
+| `--extend` | 关闭 | 延伸字幕填充到场景切换前 |
+| `--no-scene-snap` | — | 完全跳过场景吸附 |
+| `--preview` | — | 仅预览, 不写入 |
+| `--backup` | — | 覆盖前备份为 `.bak` |
+
+### `download.ps1` — 仅下载 (PowerShell)
+
+Windows 环境下仅下载视频，不生成字幕。
+
+```powershell
+.\download.ps1 "https://www.youtube.com/watch?v=xxxxx"
 ```
 
-### ⏳ 运行流程
+### `mpv-burn.ps1` — 字幕硬压 (PowerShell)
 
-1. **步骤 1**：抓取视频标题并创建独立文件夹。
-2. **步骤 2**：调用 `yt-dlp` 下载视频、元数据及封面（自动剔除赞助广告）。
-3. **步骤 3**：在文件夹中自动检索下载完成的视频文件。
-4. **步骤 4**：使用 `uvx whisperx` 挂载 `large-v3` 模型生成 `.srt` 字幕文件。
+将 SRT 字幕硬压到视频中，输出 hevc_nvenc 编码的 mkv。
+
+```powershell
+.\mpv-burn.ps1 "C:\path\to\video.webm"
+# 输出: burned.mkv (同目录, hevc_nvenc qp=20, aac 音频)
+```
+
+### 从 PowerShell 调用 WSL
+
+```powershell
+wsl -u root bash -lc "sh ./pipeline.sh 'https://www.youtube.com/watch?v=xxxxx'"
+```
 
 ---
 
-## 📂 目录输出结构
+## 📂 项目结构
 
-执行成功后，会在当前目录下生成类似如下的结构：
-
-```text
-├── download_and_sub.sh
-├── cookies.txt (可选)
-└── 视频标题_文件夹/
-    ├── 视频标题.mp4            # 视频文件
-    ├── 视频标题.jpg            # 视频封面
-    ├── 视频标题.info.json      # 视频元数据
-    ├── 视频标题.description    # 视频简介
-    └── 视频标题.srt            # AI 生成的英文副标题
-
+```
+Subtitle translation/
+├── pipeline.sh               # 一键流水线入口 (下载 → 字幕 → 美化)
+├── download_and_sub.sh       # 下载视频 + 生成英文字幕
+├── beautify_srt.sh           # 字幕时间码美化入口
+├── beautify_srt.py           # 美化核心算法 (场景检测 + Netflix 帧对齐)
+├── download.ps1              # PowerShell: 仅下载 (不含字幕)
+├── mpv-burn.ps1              # PowerShell: 字幕硬压 (NVENC)
+├── .env                      # API keys (gitignored)
+├── cookies.txt               # YouTube 登录凭证 (gitignored)
+└── <Video Title>/            # 每个视频独立的输出目录
+    ├── <Video Title>.<ext>   # 视频文件 (webm/mp4/mkv)
+    ├── <Video Title>.srt     # WhisperX 生成的美化英文字幕
+    ├── <Video Title>.webp    # 封面缩略图
+    ├── <Video Title>.info.json     # yt-dlp 元数据
+    └── <Video Title>.description   # 视频简介
 ```
 
 ---
 
 ## 💡 注意事项
 
-> ⚠️ **首次运行提示**：由于脚本中配置的 WhisperX 模型为 `large-v3`，首次运行时 `uvx` 会自动下载该模型权重（通常需要几 GB 的空间），请保持网络畅通。
-> ⚙️ **硬件加速**：WhisperX 默认会尝试使用 GPU 加速。如果你的设备没有 NVIDIA 显卡或未配置好 CUDA，可能需要在脚本中将 `--compute_type float16` 调整为 `int8` 或指定 `--device cpu` 以确保兼容性。
+- **WhisperX 首次运行**：会自动下载 `large-v3` 模型（数 GB），保持网络畅通。
+- **GPU 加速**：WhisperX 默认使用 float16 + GPU。无 NVIDIA 显卡时需修改脚本中的 `--compute_type` 为 `int8` 或添加 `--device cpu`。
+- **cookies.txt**：包含 YouTube 登录凭证，过期后需重新导出。已 gitignored。
+- **场景检测耗时**：对长视频可能较慢（~5 分钟/小时视频）。
+- **字幕格式验证**：美化脚本会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
+- **帧率自适应**：所有帧数参数 (`--snap-frames`, `--end-offset-frames`, `--min-scene-interval-frames`) 会按实际视频帧率自动换算为秒。
+- **关键帧吸附**：默认关闭，如需启用加 `--use-keyframes`（支持 H.264/H.265/VP9，三级回退策略）。

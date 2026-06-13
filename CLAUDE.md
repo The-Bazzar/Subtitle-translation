@@ -13,7 +13,7 @@ Subtitle translation/
 ├── pipeline.sh               # WSL/bash: 一键流水线入口 (download → beautify)
 ├── download_and_sub.sh       # 主流程: 下载视频 → 生成英文字幕
 ├── beautify_srt.sh           # 字幕时间码美化入口 (调用 beautify_srt.py)
-├── beautify_srt.py           # Python: 场景检测 + 关键帧对齐 → 美化 SRT 时间码
+├── beautify_srt.py           # Python: 场景检测 + 帧率自适应 → 美化 SRT 时间码 (Netflix 规范)
 ├── download.ps1              # Windows PowerShell 备用: 仅下载 (不含字幕生成)
 ├── mpv-burn.ps1              # Windows PowerShell: mpv 字幕硬压 (NVENC)
 ├── .env                      # API keys — gitignored
@@ -35,7 +35,7 @@ Subtitle translation/
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 # 传递美化选项
-./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --backup --scene-threshold 0.25
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --backup --scene-threshold 0.2
 
 # 仅下载 + 字幕 (不美化)
 SKIP_BEAUTIFY=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
@@ -76,11 +76,11 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 # 仅预览变化 (不写入)
 ./beautify_srt.sh video.webm --preview
 
-# 激进对齐
-./beautify_srt.sh video.webm --scene-threshold 0.25 --snap-distance 0.25
+# 激进对齐 (剪辑密集)
+./beautify_srt.sh video.webm --scene-threshold 0.2 --snap-frames 10
 
-# 保守对齐
-./beautify_srt.sh video.webm --scene-threshold 0.4 --snap-distance 0.12
+# 保守对齐 (长镜头)
+./beautify_srt.sh video.webm --scene-threshold 0.35 --snap-frames 4
 
 # 完整选项列表
 ./beautify_srt.sh --help
@@ -115,13 +115,13 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 
 ## Pipeline Steps (beautify_srt.sh)
 
-1. **场景检测** — `ffmpeg -vf "select='gt(scene,0.3)',showinfo"` 检测视频中的硬切场景切换
-2. **关键帧提取** — `ffprobe` 从视频流中提取 I-frame 时间戳 (兼容 VP9/H.264/H.265)
-3. **吸附对齐** — 字幕起始时间优先吸附到前一个场景切换，结束时间吸附到后一个场景切换
-4. **关键帧微调** — 在场景切换基础上微调到最近的关键帧
-5. **延伸填充** — 若字幕结束靠近下一个场景切换，自动延伸到该切换点
-6. **重叠修复** — 检测并修复字幕重叠，合并过小间隙
-7. **时长约束** — 强制最短/最长字幕时长
+1. **帧率检测** — `ffprobe` 检测视频帧率, 所有帧数参数按实际 fps 换算为秒
+2. **场景检测** — `ffmpeg -vf "select='gt(scene,0.25)',showinfo"` 检测硬切场景切换 (Netflix: 7帧最小间隔)
+3. **入点吸附** — 字幕起始时间吸附到前一个场景切换 (7帧以内)
+4. **出点吸附** — 字幕结束时间吸附到下一个场景切换前 2 帧 (7帧以内, Netflix 规范)
+5. **重叠修复** — 检测并修复字幕重叠, 间距 <500ms 自动合并
+6. **时长约束** — 强制最短 1000ms / 最长 8000ms 字幕时长
+7. **(可选) 关键帧微调** — `--use-keyframes` 启用, ffprobe 3 级回退提取 I-frame
 
 ## Important Notes
 
@@ -131,4 +131,6 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 - 无 NVIDIA GPU 时需将 `--compute_type float16` 改为 `int8`，或添加 `--device cpu`。
 - 每个视频目录名即为 `yt-dlp --get-title` 的结果 (特殊字符替换为 `_`)。
 - `beautify_srt.sh` 运行在 WSL 中，会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
-- 场景检测对长视频可能耗时较久（~5 分钟/小时视频），关键帧提取有三级回退策略确保兼容性。
+- 场景检测对长视频可能耗时较久（~5 分钟/小时视频）。
+- 所有帧数参数 (`--snap-frames`, `--end-offset-frames`, `--min-scene-interval-frames`) 会按实际视频帧率自动换算为秒。
+- 关键帧吸附默认关闭 (`--use-keyframes` 启用)，因各视频编码/帧率差异大，场景吸附已足够。
