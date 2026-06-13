@@ -33,6 +33,7 @@ yt-dlp -o "$FOLDER_NAME/%(title)s.%(ext)s" \
 	--write-description \
 	--no-mtime \
 	--sponsorblock-remove sponsor,selfpromo \
+	--print-to-file tags "%(title)s/%(title)s_tags.txt" \
 	"$URL"
 
 echo "============================================="
