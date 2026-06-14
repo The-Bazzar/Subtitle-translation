@@ -1,0 +1,26 @@
+{
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "default_model": "anthropic/claude-sonnet-4-6",
+        "env_key": "OPENROUTER_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {
+            "HTTP-Referer": "https://github.com/oculr/Subtitle-translation",
+            "X-Title": "Subtitle Translation"
+        }
+    },
+    "deepseek": {
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "default_model": "deepseek-v4-pro",
+        "env_key": "DEEPSEEK_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {}
+    },
+    "gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "default_model": "gemini-2.5-pro",
+        "env_key": "GEMINI_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {}
+    }
+}

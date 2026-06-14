@@ -75,6 +75,32 @@ GEMINI_API_KEY=xxx                # https://aistudio.google.com
 
 `.env` 已 gitignored，不要提交。换行符支持 LF / CRLF（脚本自动处理 `\r`）。
 
+### `providers.json` — LLM 提供商配置
+
+定义翻译/校对可用的 LLM 后端。内置 `openrouter`、`deepseek`、`gemini` 三个，可自行添加/修改：
+
+```json
+{
+    "my_provider": {
+        "url": "https://api.example.com/v1/chat/completions",
+        "default_model": "my-model",
+        "env_key": "MY_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {}
+    }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `url` | API 端点 (OpenAI 兼容) |
+| `default_model` | 默认模型名 |
+| `env_key` | `.env` 中对应的 API key 变量名 |
+| `auth_header` | 认证头模板，`{api_key}` 替换为实际 key |
+| `extra_headers` | 额外请求头 (如 HTTP-Referer) |
+
+`translate_srt.py` 的 `--provider` 参数从 `providers.json` 的 key 动态生成选项。
+
 ---
 
 ## 🚀 快速开始

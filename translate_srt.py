@@ -95,15 +95,14 @@ def parse_srt(filepath: str) -> list[dict]:
 
 # ─── LLM 翻译 ──────────────────────────────────────────────────────────────────
 
-# Provider configurations (OpenAI-compatible endpoints)
-PROVIDERS = {
+# 内置默认提供商 (providers.json 缺失时的回退)
+_BUILTIN_PROVIDERS = {
     'openrouter': {
         'url': 'https://openrouter.ai/api/v1/chat/completions',
         'default_model': 'anthropic/claude-sonnet-4-6',
         'env_key': 'OPENROUTER_API_KEY',
-        'headers': lambda key: {
-            'Authorization': f'Bearer {key}',
-            'Content-Type': 'application/json',
+        'auth_header': 'Bearer {api_key}',
+        'extra_headers': {
             'HTTP-Referer': 'https://github.com/oculr/Subtitle-translation',
             'X-Title': 'Subtitle Translation',
         },
@@ -112,21 +111,50 @@ PROVIDERS = {
         'url': 'https://api.deepseek.com/v1/chat/completions',
         'default_model': 'deepseek-v4-pro',
         'env_key': 'DEEPSEEK_API_KEY',
-        'headers': lambda key: {
-            'Authorization': f'Bearer {key}',
-            'Content-Type': 'application/json',
-        },
+        'auth_header': 'Bearer {api_key}',
+        'extra_headers': {},
     },
     'gemini': {
         'url': 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
         'default_model': 'gemini-2.5-pro',
         'env_key': 'GEMINI_API_KEY',
-        'headers': lambda key: {
-            'Authorization': f'Bearer {key}',
-            'Content-Type': 'application/json',
-        },
+        'auth_header': 'Bearer {api_key}',
+        'extra_headers': {},
     },
 }
+
+_providers_cache = None
+
+def load_providers() -> dict:
+    """从 providers.json 加载提供商配置 (不存在则用内置默认)."""
+    global _providers_cache
+    if _providers_cache is not None:
+        return _providers_cache
+    import json as _json
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'providers.json')
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as _f:
+                _providers_cache = _json.load(_f)
+            if _providers_cache:
+                return _providers_cache
+        except (_json.JSONDecodeError, OSError):
+            pass
+    _providers_cache = dict(_BUILTIN_PROVIDERS)
+    return _providers_cache
+
+
+def make_headers(provider_cfg: dict, api_key: str) -> dict[str, str]:
+    """根据 provider 配置构造请求头."""
+    auth = provider_cfg.get('auth_header', 'Bearer {api_key}')
+    headers = {'Content-Type': 'application/json'}
+    headers['Authorization'] = auth.replace('{api_key}', api_key)
+    for k, v in provider_cfg.get('extra_headers', {}).items():
+        headers[k] = v
+    return headers
+
+
+PROVIDER_KEYS = list(_BUILTIN_PROVIDERS.keys())
 
 TRANSLATION_SYSTEM_PROMPT = """You are a professional subtitle translator specializing in English→Simplified Chinese translation.
 
@@ -185,7 +213,7 @@ def load_env(script_dir: str) -> dict[str, str]:
 
 def get_api_key(provider: str, env: dict[str, str]) -> str:
     """Retrieve API key from environment or .env file."""
-    key_name = PROVIDERS[provider]['env_key']
+    key_name = load_providers()[provider]['env_key']
     key = env.get(key_name, '')
     if not key:
         print(f"Error: {key_name} not found in environment or .env file.",
@@ -212,7 +240,7 @@ def translate_batch(
     import urllib.request
     import urllib.error
 
-    cfg = PROVIDERS[provider]
+    cfg = load_providers()[provider]
 
     # Build numbered prompt
     prompt_lines = [f"[{i}] {t}" for i, t in enumerate(texts, 1)]
@@ -232,7 +260,7 @@ def translate_batch(
     }
 
     data = json.dumps(payload).encode('utf-8')
-    headers = cfg['headers'](api_key)
+    headers = make_headers(cfg, api_key)
 
     last_error = None
     for attempt in range(retries):
@@ -310,7 +338,7 @@ def translate_subtitles(
     texts = [s['text'] for s in subtitles]
 
     if model is None:
-        model = PROVIDERS[provider]['default_model']
+        model = load_providers()[provider].get('default_model', '')
 
     # Load API key
     env = load_env(os.path.dirname(os.path.abspath(__file__)))
@@ -360,7 +388,7 @@ def proofread_subtitles(
     en_texts = [s['text'] for s in subtitles]
 
     if model is None:
-        model = PROVIDERS[provider]['default_model']
+        model = load_providers()[provider].get('default_model', '')
 
     env = load_env(os.path.dirname(os.path.abspath(__file__)))
     if api_key is None:
@@ -524,7 +552,7 @@ def translate_description(
         env = load_env(os.path.dirname(os.path.abspath(__file__)))
         api_key = get_api_key(provider, env)
 
-    cfg = PROVIDERS[provider]
+    cfg = load_providers()[provider]
     payload = {
         'model': model,
         'messages': [
@@ -536,7 +564,7 @@ def translate_description(
     }
 
     data = json.dumps(payload).encode('utf-8')
-    headers = cfg['headers'](api_key)
+    headers = make_headers(cfg, api_key)
 
     try:
         req = urllib.request.Request(cfg['url'], data=data, headers=headers, method='POST')
@@ -692,7 +720,12 @@ def main():
     # 从 .env 读取默认配置 (命令行参数可覆盖)
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _env = load_env(_script_dir)
-    _env_provider = _env.get('TRANSLATE_PROVIDER', 'openrouter')
+    _providers = load_providers()
+    _provider_keys = list(_providers.keys())
+    if _provider_keys:
+        _env_provider = _env.get('TRANSLATE_PROVIDER', _provider_keys[0])
+    else:
+        _env_provider = 'openrouter'
     _env_model = _env.get('TRANSLATE_MODEL', '') or None
 
     parser = argparse.ArgumentParser(
@@ -716,7 +749,7 @@ Examples:
                         help='template.ass 模板路径 (默认: 脚本同目录)')
     parser.add_argument('-o', '--output',
                         help='输出 .zh-en.ass 路径 (默认: SRT 同目录, 同名 .zh-en.ass)')
-    parser.add_argument('--provider', choices=['openrouter', 'deepseek', 'gemini'],
+    parser.add_argument('--provider', choices=_provider_keys,
                         default=_env_provider,
                         help=f'LLM 后端 (默认: {_env_provider}, 来自 .env)')
     parser.add_argument('--model', default=_env_model,
@@ -729,7 +762,7 @@ Examples:
                         help='自定义翻译提示词 (默认: 内置 Netflix 规范提示词)')
     parser.add_argument('--proofread', action='store_true', default=True,
                         help='中英校对 (默认开启)')
-    parser.add_argument('--proofread-provider', choices=['openrouter', 'deepseek', 'gemini'],
+    parser.add_argument('--proofread-provider', choices=_provider_keys,
                         help='校对专用后端 (默认: 同翻译后端)')
     parser.add_argument('--proofread-model',
                         help='校对专用模型 (默认: 同翻译模型)')
