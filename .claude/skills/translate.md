@@ -87,9 +87,10 @@ beautify_srt.sh
     │
     ▼
 translate_srt.py
-  ├─ 检测 .zh.srt 缓存 → 跳过 LLM
+  ├─ Pass 1: 检测 .zh.srt 缓存 → 跳过 LLM
   ├─ 或: LLM API 分批翻译 (英→中)
-  ├─ 输出 .zh.srt (缓存)
+  ├─ (可选) Pass 2: LLM 中英校对 (--proofread)
+  ├─ 输出 .zh.srt (缓存, 校对后覆盖)
   ├─ 输出 .zh.ass (仅中文)
   └─ 输出 .zh-en.ass (双语) ✨
 ```
@@ -116,10 +117,42 @@ DEEPSEEK_API_KEY=sk-xxx
 | `--provider` | openrouter | LLM 后端 |
 | `--model` | 后端默认 | 模型名称 |
 | `--batch-size` | `50` | 每批翻译行数 |
+| `--proofread` | 关闭 | 启用两轮中英校对 |
+| `--proofread-prompt` | 内置默认 | 自定义校对提示词 |
+| `--system-prompt` | 内置默认 | 自定义翻译提示词 |
 | `--title` | SRT 文件名 | 视频标题 (写入 ASS) |
 | `--template` | `./template.ass` | ASS 模板 |
 | `-o, --output` | 自动 | 输出 `.zh-en.ass` 路径 |
 | `-q, --quiet` | — | 静默模式 |
+
+### 两轮校对模式 (`--proofread`)
+
+```
+Pass 1: English → LLM → 中文初译 (.zh.srt)
+Pass 2: (English + 中文初译) → LLM → 中文精校 (.zh.srt 覆盖)
+```
+
+两轮 LLM 调用上下文隔离，校对轮独立审校不继承翻译轮思维链。
+
+```bash
+# 开启校对
+python3 translate_srt.py video.srt --proofread
+
+# 校对轮用自定义提示词
+python3 translate_srt.py video.srt --proofread --proofread-prompt "你的校对提示词"
+```
+
+## .env 提示词配置
+
+```ini
+# 翻译/校对系统提示词 (留空使用内置 Netflix 规范默认)
+TRANSLATE_SYSTEM_PROMPT=
+PROOFREAD_SYSTEM_PROMPT=
+```
+
+优先级：`CLI 参数 > .env > 内置默认`
+
+内置翻译提示词遵循 Netflix 中文规范：去除所有标点（仅保留 `《》`），用空格替代停顿。
 
 ## 注意事项
 

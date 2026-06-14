@@ -1,4 +1,6 @@
 .env
 /*/
-!/.claude/skills/*
+!/.claude/
+/.claude/*
+!/.claude/skills/
 cookies.txt
