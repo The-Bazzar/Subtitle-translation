@@ -4,3 +4,4 @@
 /.claude/*
 !/.claude/skills/
 cookies.txt
+batch-result.txt
