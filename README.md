@@ -55,6 +55,8 @@ GEMINI_API_KEY=xxx                # https://aistudio.google.com
 | `TRANSLATE_MODEL` | 否 | 模型名，不设使用后端内置默认 |
 | `TRANSLATE_SYSTEM_PROMPT` | 否 | 翻译系统提示词，留空使用内置 Netflix 规范提示词 |
 | `PROOFREAD_SYSTEM_PROMPT` | 否 | 校对系统提示词，留空使用内置校对提示词 |
+| `PROOFREAD_PROVIDER` | 否 | 校对专用后端，留空与翻译共用（可实现交叉校对） |
+| `PROOFREAD_MODEL` | 否 | 校对专用模型，留空与翻译共用 |
 | `OPENROUTER_API_KEY` | * | OpenRouter API key |
 | `DEEPSEEK_API_KEY` | * | DeepSeek API key |
 | `GEMINI_API_KEY` | * | Gemini API key |

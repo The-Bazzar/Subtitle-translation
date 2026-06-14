@@ -570,6 +570,10 @@ Examples:
                         help='自定义翻译提示词 (默认: 内置 Netflix 规范提示词)')
     parser.add_argument('--proofread', action='store_true', default=True,
                         help='中英校对 (默认开启)')
+    parser.add_argument('--proofread-provider', choices=['openrouter', 'deepseek', 'gemini'],
+                        help='校对专用后端 (默认: 同翻译后端)')
+    parser.add_argument('--proofread-model',
+                        help='校对专用模型 (默认: 同翻译模型)')
     parser.add_argument('--proofread-prompt', metavar='PROMPT',
                         help='自定义校对提示词 (默认: 内置校对提示词)')
     parser.add_argument('--title',
@@ -657,14 +661,17 @@ Examples:
 
     # ── 校对 (Pass 2): 英文原文 + 中文初译 → LLM 审校 ────────────────────
     # 默认开启, PROOFREAD=0 环境变量可关闭
+    # 校对专用后端/模型: CLI > .env > 翻译后端/模型
     if args.proofread and _env.get('PROOFREAD', '1') != '0':
         if not args.quiet:
             print()
+        pr_provider = args.proofread_provider or _env.get('PROOFREAD_PROVIDER', '') or args.provider
+        pr_model   = args.proofread_model   or _env.get('PROOFREAD_MODEL', '')   or args.model
         translations = proofread_subtitles(
             subtitles,
             translations,
-            provider=args.provider,
-            model=args.model,
+            provider=pr_provider,
+            model=pr_model,
             api_key=args.api_key,
             system_prompt=proofread_prompt,
             batch_size=args.batch_size,
