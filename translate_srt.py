@@ -406,17 +406,21 @@ def proofread_subtitles(
 
 # ─── ASS 输出 ──────────────────────────────────────────────────────────────────
 
-DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following YouTube video title and description from English to Simplified Chinese.
+DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following YouTube video title, description, and tags from English to Simplified Chinese.
 
 The input format is:
   Title: <original title>
   Description:
   <description text>
+  Tags:
+  <comma-separated tags>
 
 Rules:
 - First line of your response: translated title ONLY (one line)
 - Then a blank line
 - Then the translated description
+- Then a blank line
+- Then "标签：" followed by the translated tags (comma-separated)
 - Preserve all URLs, email addresses, and social media handles exactly as-is
 - Preserve all line breaks and paragraph structure in the description
 - Translate naturally while keeping the original tone
@@ -475,8 +479,38 @@ def translate_description(
     with open(desc_path, 'r', encoding='utf-8') as f:
         desc_text = f.read()
 
-    # 组合标题 + 简介一起发送, 一次 API 调用完成标题和简介翻译
+    # 读取视频标签 (.tags.txt, yt-dlp Python list 格式)
+    tags_text = ""
+    tags_path = os.path.join(srt_dir, f"{desc_base}.tags.txt")
+    if os.path.isfile(tags_path):
+        try:
+            with open(tags_path, 'r', encoding='utf-8') as f:
+                raw = f.read().strip()
+            all_tags = []
+            for line in raw.split('\n'):
+                line = line.strip()
+                if line.startswith('[') and line.endswith(']'):
+                    try:
+                        parsed = __import__('ast').literal_eval(line)
+                        if isinstance(parsed, list):
+                            all_tags.extend(parsed)
+                    except (ValueError, SyntaxError):
+                        pass
+            seen = set()
+            unique = []
+            for t in all_tags:
+                if t.lower() not in seen:
+                    seen.add(t.lower())
+                    unique.append(t)
+            if unique:
+                tags_text = ', '.join(unique)
+        except Exception:
+            pass
+
+    # 组合标题 + 简介 + 标签, 一次 API 调用完成翻译
     prompt = f"Title: {title}\n\nDescription:\n{desc_text}"
+    if tags_text:
+        prompt += f"\n\nTags:\n{tags_text}"
 
     if not desc_text.strip() and not title:
         with open(zh_path, 'w', encoding='utf-8') as f:

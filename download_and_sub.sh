@@ -54,7 +54,7 @@ yt-dlp -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
 	--write-description \
 	--no-mtime \
 	--sponsorblock-remove sponsor,selfpromo \
-	--print-to-file tags "$FOLDER_NAME/${FOLDER_NAME}_tags.txt" \
+	--print-to-file tags "$FOLDER_NAME/${FOLDER_NAME}.tags.txt" \
 	"$URL"
 
 echo "============================================="
