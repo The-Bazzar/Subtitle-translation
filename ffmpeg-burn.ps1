@@ -132,7 +132,8 @@ $FfmpegArgs = @(
     '-map', '0:v:1?',
     '-map_metadata', '0',
     '-disposition:v:1', 'attached_pic',
-    '-movflags', '+faststart'
+    '-movflags', '+faststart',
+    '-y'
 )
 if ($SubFile) {
     $FfmpegArgs += @('-map', '0:s?')

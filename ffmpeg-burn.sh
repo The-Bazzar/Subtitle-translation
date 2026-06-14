@@ -193,6 +193,7 @@ FFMPEG_CMD=(
     -map_metadata 0
     -disposition:v:1 attached_pic
     -movflags +faststart
+	-y
 )
 
 if [ -n "$SUB_FILE" ]; then
