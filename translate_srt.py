@@ -406,14 +406,21 @@ def proofread_subtitles(
 
 # ─── ASS 输出 ──────────────────────────────────────────────────────────────────
 
-DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following YouTube video description from English to Simplified Chinese.
+DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following YouTube video title and description from English to Simplified Chinese.
+
+The input format is:
+  Title: <original title>
+  Description:
+  <description text>
 
 Rules:
+- First line of your response: translated title ONLY (one line)
+- Then a blank line
+- Then the translated description
 - Preserve all URLs, email addresses, and social media handles exactly as-is
-- Preserve all line breaks and paragraph structure
-- Translate the text naturally while keeping the original tone
-- Do NOT add any explanations, preamble, or closing remarks
-- Output ONLY the translated description text"""
+- Preserve all line breaks and paragraph structure in the description
+- Translate naturally while keeping the original tone
+- Do NOT add any explanations, preamble, or closing remarks"""
 
 
 def translate_description(
@@ -440,18 +447,38 @@ def translate_description(
             with open(info_json, 'r', encoding='utf-8') as f:
                 info = json.load(f)
             title = info.get('title', '')
+            webpage_url = info.get('webpage_url', '')
             uploader = info.get('uploader', '') or info.get('channel', '')
-            upload_date = info.get('upload_date', '')  # YYYYMMDD
-            if upload_date and len(upload_date) == 8:
-                upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
-            metadata_header = f"原视频：{title}\n原作者：{uploader}\n上传时间：{upload_date}\n\n=====\n\n"
+            # ISO 8601 时间: timestamp 优先 (精确到秒+时区), upload_date 回退
+            ts = info.get('timestamp')
+            if ts:
+                from datetime import datetime, timezone
+                upload_time = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S%z')
+                # 插入冒号使时区符合 ISO 8601: +0000 → +00:00
+                upload_time = upload_time[:-2] + ':' + upload_time[-2:]
+            else:
+                upload_date = info.get('upload_date', '')
+                if upload_date and len(upload_date) == 8:
+                    upload_time = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+                else:
+                    upload_time = ''
+            metadata_header = (
+                f"原视频：{webpage_url}\n"
+                f"原标题：{title}\n"
+                f"原作者：{uploader}\n"
+                f"上传时间：{upload_time}\n"
+                f"\n=====\n\n"
+            )
         except Exception:
             pass
 
     with open(desc_path, 'r', encoding='utf-8') as f:
-        text = f.read()
+        desc_text = f.read()
 
-    if not text.strip():
+    # 组合标题 + 简介一起发送, 一次 API 调用完成标题和简介翻译
+    prompt = f"Title: {title}\n\nDescription:\n{desc_text}"
+
+    if not desc_text.strip() and not title:
         with open(zh_path, 'w', encoding='utf-8') as f:
             f.write(metadata_header)
         if not quiet:
@@ -468,10 +495,10 @@ def translate_description(
         'model': model,
         'messages': [
             {'role': 'system', 'content': DESCRIPTION_TRANSLATE_PROMPT},
-            {'role': 'user', 'content': text},
+            {'role': 'user', 'content': prompt},
         ],
         'temperature': 0.3,
-        'max_tokens': max(2048, len(text) * 3),
+        'max_tokens': max(2048, (len(prompt) * 2)),
     }
 
     data = json.dumps(payload).encode('utf-8')
@@ -481,14 +508,21 @@ def translate_description(
         req = urllib.request.Request(cfg['url'], data=data, headers=headers, method='POST')
         with urllib.request.urlopen(req, timeout=60) as resp:
             body = json.loads(resp.read().decode('utf-8'))
-        translated = body['choices'][0]['message']['content']
+        response = body['choices'][0]['message']['content']
     except Exception as e:
         print(f"  Warning: Description translation failed: {e}", file=sys.stderr)
         return zh_path
 
+    # 解析: 第一行=中文标题, 空行后=翻译简介
+    lines = response.strip().split('\n', 1)
+    zh_title = lines[0].strip() if lines else ''
+    zh_desc = lines[1].strip() if len(lines) > 1 else ''
+
     with open(zh_path, 'w', encoding='utf-8') as f:
+        if zh_title:
+            f.write(f"{zh_title}\n\n")
         f.write(metadata_header)
-        f.write(translated)
+        f.write(zh_desc)
 
     if not quiet:
         print(f"  .zh.description: {zh_path}")
