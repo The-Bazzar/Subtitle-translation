@@ -138,9 +138,10 @@ Rules:
 - Do NOT skip, merge, split, or add any items — exactly N input lines → N output lines
 
 Netflix Chinese subtitle formatting:
-- Do NOT use any punctuation marks — Chinese subtitles omit 。，！？ etc.
-- The ONLY punctuation allowed is 《》 (book title marks) — keep these if present in the original
-- Use a single space to replace all removed punctuation where natural pauses occur
+- Do NOT use 。，！？ (period, comma, exclamation, question) — Chinese subtitles omit these
+- Keep 、(enumeration comma) as a separator between list items
+- Keep 《》 (book title marks) if present in the original
+- Use a single space to replace other removed punctuation where natural pauses occur
 
 Respond ONLY with numbered lines in this exact format:
   [1] translation
@@ -154,7 +155,7 @@ Tasks:
 - Fix mistranslations, omissions, or added content — the Chinese must match the English meaning 1:1
 - Improve awkward or unnatural phrasing — the Chinese should read fluently as spoken subtitles
 - Fix tone mismatches — casual/formal/informal register must match the original
-- Ensure Netflix formatting: no punctuation except 《》, spaces for natural pauses
+- Ensure Netflix formatting: no 。，！？, keep 、and 《》, spaces for natural pauses
 - Preserve \\\\N line breaks exactly in their original positions
 - Do NOT merge, split, or reorder items — exactly N input pairs → N output lines
 
