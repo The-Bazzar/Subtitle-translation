@@ -148,6 +148,22 @@ Respond ONLY with numbered lines in this exact format:
   ...
 No explanations, no preamble, no closing remarks"""
 
+PROOFREAD_SYSTEM_PROMPT = """You are a Chinese subtitle proofreader. Review each numbered pair (EN original + ZH draft) against the English source.
+
+Tasks:
+- Fix mistranslations, omissions, or added content — the Chinese must match the English meaning 1:1
+- Improve awkward or unnatural phrasing — the Chinese should read fluently as spoken subtitles
+- Fix tone mismatches — casual/formal/informal register must match the original
+- Ensure Netflix formatting: no punctuation except 《》, spaces for natural pauses
+- Preserve \\\\N line breaks exactly in their original positions
+- Do NOT merge, split, or reorder items — exactly N input pairs → N output lines
+
+Respond ONLY with corrected numbered lines:
+  [1] corrected translation
+  [2] corrected translation
+  ...
+No explanations, no preamble, no closing remarks"""
+
 
 def load_env(script_dir: str) -> dict[str, str]:
     """Load key=value pairs from .env file (if present)."""
@@ -326,6 +342,67 @@ def translate_subtitles(
     return all_translations
 
 
+def proofread_subtitles(
+    subtitles: list[dict],
+    translations: list[str],
+    provider: str = 'deepseek',
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    system_prompt: str = "",
+    batch_size: int = 30,
+    quiet: bool = False,
+) -> list[str]:
+    """
+    中英校对: 将英文原文 + 中文初译成对送入 LLM 审校.
+    返回校对后的中文翻译列表.
+    """
+    en_texts = [s['text'] for s in subtitles]
+
+    if model is None:
+        model = PROVIDERS[provider]['default_model']
+
+    env = load_env(os.path.dirname(os.path.abspath(__file__)))
+    if api_key is None:
+        api_key = get_api_key(provider, env)
+
+    if not quiet:
+        print(f"Proofreader: {provider} / {model}")
+        print(f"Total lines: {len(en_texts)}")
+        print()
+
+    all_corrected = []
+    # 校对批次减半: 每个 item 包含 EN+ZH 双份文本
+    proof_batch_size = max(15, batch_size // 2)
+    total_batches = (len(en_texts) + proof_batch_size - 1) // proof_batch_size
+
+    for batch_idx in range(total_batches):
+        start_idx = batch_idx * proof_batch_size
+        end_idx = min(start_idx + proof_batch_size, len(en_texts))
+
+        # 每对 EN+ZH 作为 translate_batch 的一个 item
+        # translate_batch 会编号为 [1], [2], ...
+        pairs = []
+        for i in range(start_idx, end_idx):
+            pairs.append(
+                f"EN: {en_texts[i]}\n"
+                f"ZH: {translations[i]}"
+            )
+
+        if not quiet:
+            print(f"  Batch {batch_idx + 1}/{total_batches}: "
+                  f"proofreading lines {start_idx + 1}-{end_idx}...",
+                  file=sys.stderr)
+
+        corrected = translate_batch(
+            pairs, provider, model, api_key,
+            system_prompt=system_prompt,
+            quiet=quiet,
+        )
+        all_corrected.extend(corrected)
+
+    return all_corrected[:len(en_texts)]
+
+
 # ─── ASS 输出 ──────────────────────────────────────────────────────────────────
 
 def load_template(template_path: str) -> tuple[str, str]:
@@ -490,7 +567,11 @@ Examples:
     parser.add_argument('--batch-size', type=int, default=50,
                         help='每批翻译行数 (默认: 50)')
     parser.add_argument('--system-prompt', metavar='PROMPT',
-                        help='自定义系统提示词 (默认: 内置 Netflix 规范提示词)')
+                        help='自定义翻译提示词 (默认: 内置 Netflix 规范提示词)')
+    parser.add_argument('--proofread', action='store_true',
+                        help='启用中英校对 (翻译后送入 LLM 二次审校)')
+    parser.add_argument('--proofread-prompt', metavar='PROMPT',
+                        help='自定义校对提示词 (默认: 内置校对提示词)')
     parser.add_argument('--title',
                         help='视频标题 (默认: 从 SRT 文件名推断)')
     parser.add_argument('-q', '--quiet', action='store_true',
@@ -535,6 +616,7 @@ Examples:
 
     # 系统提示词: CLI > .env > 内置默认
     system_prompt = args.system_prompt or _env.get('TRANSLATE_SYSTEM_PROMPT', '') or ''
+    proofread_prompt = args.proofread_prompt or _env.get('PROOFREAD_SYSTEM_PROMPT', '') or ''
 
     # ── 获取中文翻译 ──────────────────────────────────────────────────────
     # 始终使用 .zh.srt 作为翻译缓存: 已存在则跳过 LLM, 否则翻译后写入
@@ -572,6 +654,25 @@ Examples:
         write_zh_srt(zh_srt_path, subtitles, translations)
         if not args.quiet:
             print(f"  .zh.srt:  {zh_srt_path}")
+
+    # ── 校对 (Pass 2): 英文原文 + 中文初译 → LLM 审校 ────────────────────
+    if args.proofread:
+        if not args.quiet:
+            print()
+        translations = proofread_subtitles(
+            subtitles,
+            translations,
+            provider=args.provider,
+            model=args.model,
+            api_key=args.api_key,
+            system_prompt=proofread_prompt,
+            batch_size=args.batch_size,
+            quiet=args.quiet,
+        )
+        # 覆盖 .zh.srt 为校对版
+        write_zh_srt(zh_srt_path, subtitles, translations)
+        if not args.quiet:
+            print(f"  .zh.srt:  {zh_srt_path} (updated with proofread)")
 
     # ── Write ASS ──────────────────────────────────────────────────────────
     # .zh.ass: 仅中文 (style=zh)

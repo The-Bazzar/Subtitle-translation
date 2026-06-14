@@ -39,6 +39,10 @@ sudo apt install -y nodejs
 TRANSLATE_PROVIDER=deepseek       # 翻译后端: openrouter | deepseek | gemini
 TRANSLATE_MODEL=deepseek-v4-pro   # 模型名, 留空则使用后端内置默认
 
+# ── 翻译/校对系统提示词 (留空使用内置默认) ──
+TRANSLATE_SYSTEM_PROMPT=
+PROOFREAD_SYSTEM_PROMPT=
+
 # ── API keys (至少配置一个对应 TRANSLATE_PROVIDER 的 key) ──
 OPENROUTER_API_KEY=sk-or-v1-xxx   # https://openrouter.ai/keys
 DEEPSEEK_API_KEY=sk-xxx           # https://platform.deepseek.com
@@ -49,6 +53,8 @@ GEMINI_API_KEY=xxx                # https://aistudio.google.com
 |------|:--:|------|
 | `TRANSLATE_PROVIDER` | 否 | 翻译后端，不设默认 `openrouter`。所有脚本均读取 |
 | `TRANSLATE_MODEL` | 否 | 模型名，不设使用后端内置默认 |
+| `TRANSLATE_SYSTEM_PROMPT` | 否 | 翻译系统提示词，留空使用内置 Netflix 规范提示词 |
+| `PROOFREAD_SYSTEM_PROMPT` | 否 | 校对系统提示词，留空使用内置校对提示词 |
 | `OPENROUTER_API_KEY` | * | OpenRouter API key |
 | `DEEPSEEK_API_KEY` | * | DeepSeek API key |
 | `GEMINI_API_KEY` | * | Gemini API key |
