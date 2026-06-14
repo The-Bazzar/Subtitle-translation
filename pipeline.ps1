@@ -38,6 +38,9 @@ param(
     [Parameter(HelpMessage = "Skip translation step")]
     [switch]$SkipTranslate,
 
+    [Parameter(HelpMessage = "Disable proofread (translate only, no review pass)")]
+    [switch]$NoProofread,
+
     [Parameter(HelpMessage = "Skip burn step (output subtitle files only)")]
     [switch]$SkipBurn,
 
@@ -85,6 +88,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv (硬字幕)
   -SkipDownload       跳过下载 (使用已有视频)
   -SkipBeautify       跳过时间码美化
   -SkipTranslate      跳过翻译
+  -NoProofread        关闭校对 (仅翻译, 不审校)
   -SkipBurn           跳过压制 (输出 .zh.srt + .zh.ass + .zh-en.ass)
   -ExistingAss        已有 .zh-en.ass 路径 (跳过翻译, 直接压制)
   -DryRun             仅打印命令, 不执行
@@ -141,6 +145,7 @@ $WslEnv = "BURN=0 "  # pipeline.ps1 handles burn on Windows, don't double-burn i
 if ($SkipDownload)   { $WslEnv += "SKIP_DOWNLOAD=1 " }
 if ($SkipBeautify)   { $WslEnv += "SKIP_BEAUTIFY=1 " }
 if ($SkipTranslate)  { $WslEnv += "SKIP_TRANSLATE=1 " }
+if ($NoProofread)    { $WslEnv += "PROOFREAD=0 " }
 if ($ExistingAss)    { $WslEnv += "EXISTING_ASS=$(WinToWsl $ExistingAss) " }
 
 $WslCmd = "cd '$WslScriptDir' && ${WslEnv}TRANSLATE_PROVIDER=$TranslateProvider"

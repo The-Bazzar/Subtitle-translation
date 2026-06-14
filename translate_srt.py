@@ -170,7 +170,7 @@ def load_env(script_dir: str) -> dict[str, str]:
     env = dict(os.environ)
     env_path = os.path.join(script_dir, '.env')
     if os.path.isfile(env_path):
-        with open(env_path, 'r') as f:
+        with open(env_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#') or '=' not in line:
@@ -568,8 +568,8 @@ Examples:
                         help='每批翻译行数 (默认: 50)')
     parser.add_argument('--system-prompt', metavar='PROMPT',
                         help='自定义翻译提示词 (默认: 内置 Netflix 规范提示词)')
-    parser.add_argument('--proofread', action='store_true',
-                        help='启用中英校对 (翻译后送入 LLM 二次审校)')
+    parser.add_argument('--proofread', action='store_true', default=True,
+                        help='中英校对 (默认开启)')
     parser.add_argument('--proofread-prompt', metavar='PROMPT',
                         help='自定义校对提示词 (默认: 内置校对提示词)')
     parser.add_argument('--title',
@@ -656,7 +656,8 @@ Examples:
             print(f"  .zh.srt:  {zh_srt_path}")
 
     # ── 校对 (Pass 2): 英文原文 + 中文初译 → LLM 审校 ────────────────────
-    if args.proofread:
+    # 默认开启, PROOFREAD=0 环境变量可关闭
+    if args.proofread and _env.get('PROOFREAD', '1') != '0':
         if not args.quiet:
             print()
         translations = proofread_subtitles(

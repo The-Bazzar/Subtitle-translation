@@ -24,6 +24,7 @@
 #   SKIP_TRANSLATE=1      跳过翻译
 #   TRANSLATE_PROVIDER    翻译后端: openrouter | deepseek | gemini (默认: openrouter)
 #   TRANSLATE_MODEL       翻译模型 (默认: 后端内置默认)
+#   PROOFREAD=0            关闭中英校对 (默认开启)
 #   EXISTING_SRT          已有美化后 SRT 路径 (跳过美化步骤, 直接用于翻译)
 #   EXISTING_ASS          已有 .zh-en.ass 路径 (跳过翻译步骤, 直接用于压制)
 #   BURN=0                跳过字幕硬压 (默认启用)
@@ -117,6 +118,7 @@ beautify 选项 (在 -- 之后, 默认值遵循 Netflix 规范):
   EXISTING_ASS            已有 .zh-en.ass 路径 (跳过翻译步骤)
   TRANSLATE_PROVIDER      翻译后端: openrouter | deepseek | gemini (默认: openrouter)
   TRANSLATE_MODEL         翻译模型 (默认: 后端内置默认)
+  PROOFREAD=0              关闭中英校对 (默认开启)
   BURN=0                  跳过字幕硬压 (默认启用)
   BURN_OVC                视频编码器 (默认: hevc_nvenc)
   BURN_OVCOPTS            编码器参数 (默认: qp=20)
@@ -294,6 +296,10 @@ else
     TRANSLATE_ARGS=(--provider "$TRANSLATE_PROVIDER")
     if [ -n "$TRANSLATE_MODEL" ]; then
         TRANSLATE_ARGS+=(--model "$TRANSLATE_MODEL")
+    fi
+    # 校对默认开启, PROOFREAD=0 关闭
+    if [ "${PROOFREAD:-1}" = "0" ]; then
+        export PROOFREAD=0
     fi
     python3 "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" -o "$ASS_PATH" "${TRANSLATE_ARGS[@]}"
 
