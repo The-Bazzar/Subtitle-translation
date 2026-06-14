@@ -25,7 +25,6 @@ sudo apt install -y nodejs
 
 | 工具 | 用途 |
 |------|------|
-| `mpv` | `mpv-burn.ps1` 字幕硬压 |
 | `yt-dlp` | `download.ps1` 仅下载 |
 
 ---
@@ -121,7 +120,7 @@ BURN=0 ./pipeline.sh "url"
 
 ### `pipeline.ps1` — 超级流水线 (PowerShell)
 
-从 YouTube URL 到硬字幕 burned.mkv。自动调用 WSL 完成下载/字幕/美化/翻译，再调用 Windows mpv 硬压。
+从 YouTube URL 到硬字幕 burned.mkv。自动调用 WSL 完成下载/字幕/美化/翻译，再调用 ffmpeg 硬压（保留封面图）。
 
 ```powershell
 # 基础用法
@@ -145,8 +144,8 @@ BURN=0 ./pipeline.sh "url"
 # 预览命令
 .\pipeline.ps1 "https://youtu.be/xxxxx" -DryRun
 
-# 透传 mpv 补帧滤镜
-.\pipeline.ps1 "https://youtu.be/xxxxx" --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
+# 透传 ffmpeg 额外参数
+.\pipeline.ps1 "https://youtu.be/xxxxx" -- -preset fast
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -199,7 +198,7 @@ PROOFREAD_PROVIDER=openrouter PROOFREAD_MODEL=anthropic/claude-sonnet-4-6 ./pipe
 PROOFREAD=0 ./pipeline.sh "url"
 ```
 
-**流程**：yt-dlp 下载 → WhisperX 字幕 → 场景检测美化 → LLM 翻译 → mpv 硬压
+**流程**：yt-dlp 下载 → WhisperX 字幕 → 场景检测美化 → LLM 翻译 → ffmpeg 硬压
 
 **成果物链**：`VIDEO_PATH` → `BEAUTIFIED_SRT` → `ASS_PATH` → `burned.mkv`
 - 每步输出作为下一步输入，已存在的中间产物自动跳过
@@ -402,7 +401,7 @@ YouTube URL
 │ 2. WhisperX large-v3 生成英文字幕 (.srt)             │  WSL
 │ 3. ffmpeg 场景检测 → 时间码美化 → .beautified.srt    │  WSL
 │ 4. LLM 翻译 + 校对 (双轮) → .zh.srt + .zh.ass + .zh-en.ass │  WSL
-│ 5. mpv 编码硬压双语字幕 → burned.mkv                 │  Windows
+│ 5. ffmpeg 硬压双语字幕 → burned.mkv (保留封面图)      │  Windows
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -412,7 +411,7 @@ YouTube URL
 ./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
 ./beautify_srt.sh "视频标题/视频标题.webm"
 python3 translate_srt.py "视频标题/视频标题.srt" --provider openrouter
-./mpv-burn.sh "视频标题/视频标题.webm" --sub-file "视频标题/视频标题.zh-en.ass"
+./ffmpeg-burn.sh "视频标题/视频标题.webm" --sub-file "视频标题/视频标题.zh-en.ass"
 ```
 
 ### 方案 C: 分离翻译 + 压制
@@ -424,7 +423,7 @@ TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
 ```
 ```powershell
 # Windows 端单独压制
-.\mpv-burn.ps1 "C:\...\video.webm" -SubFile video.zh-en.ass
+.\ffmpeg-burn.ps1 "C:\...\video.webm" -SubFile video.zh-en.ass
 ```
 
 ### 环境要求
@@ -434,7 +433,7 @@ TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
 | 下载 + 字幕 | WSL | `yt-dlp`, `uvx` (whisperx + large-v3) |
 | 时间码美化 | WSL | `ffmpeg`, `ffprobe`, `python3` |
 | LLM 翻译 | WSL | `.env` 中 API key |
-| 硬压字幕 | Windows | `mpv.com` (mpv-lazy) |
+| 硬压字幕 | WSL / Windows | `ffmpeg` |
 
 ---
 

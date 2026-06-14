@@ -153,7 +153,7 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 1. **下载 + 字幕** — 调用 `download_and_sub.sh`，捕获输出的 `OUTPUT_VIDEO` 路径
 2. **时间码美化** — 调用 `beautify_srt.sh` 对齐到场景切换，输出 `.beautified.srt` (Netflix 规范)
 3. **LLM 翻译** — 调用 `translate_srt.py` 翻译英文→中文，输出 `.zh.srt` (缓存) + `.zh.ass` + `.zh-en.ass` (双语)
-4. **硬压字幕** — 默认启用，调用 `mpv-burn.sh --sub-file .zh-en.ass` 输出 burned.mkv (BURN=0 跳过)
+4. **硬压字幕** — 默认启用，调用 `ffmpeg-burn.sh --sub-file .zh-en.ass` 输出 burned.mkv (BURN=0 跳过)
 5. 支持通过 `SKIP_DOWNLOAD=1` `SKIP_BEAUTIFY=1` `SKIP_TRANSLATE=1` `SKIP_BURN=1` 跳过指定阶段
 6. 通过 `--` 分隔符向 beautify 传递自定义参数
 7. `.zh.srt` 缓存存在时自动跳过 LLM，直接合成双语 ASS
@@ -167,7 +167,7 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 
 1. **WSL 流水线** — 调用 `wsl bash pipeline.sh <url>` 完成下载+美化+翻译
 2. **路径转换** — `wslpath -w` 将 WSL 路径转为 Windows 路径
-3. **硬压字幕** — 调用 `mpv-burn.ps1` 将 .zh.ass 硬压到视频 → burned.mkv
+3. **硬压字幕** — 调用 `ffmpeg-burn.ps1` 将 .zh-en.ass 硬压到视频 → burned.mkv (保留封面图)
 
 ## Pipeline Steps (download_and_sub.sh)
 
@@ -188,7 +188,7 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 | `ffprobe` | 场景切换检测 + 关键帧提取 (beautify_srt) |
 | `python3` | beautify_srt.py / translate_srt.py 运行环境 |
 | `OpenRouter` / `DeepSeek` / `Gemini` | LLM API 翻译后端 (translate_srt.py) |
-| `mpv` (Windows) | 字幕硬压 (mpv-burn.ps1) |
+| `ffmpeg` | 字幕硬压 (ffmpeg-burn) — 流水线默认 |
 
 ## Pipeline Steps (beautify_srt.sh)
 
