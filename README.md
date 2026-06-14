@@ -314,34 +314,41 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 | `--template` | `./template.ass` | ASS 模板路径 |
 | `-o, --output` | 自动 | 输出 `.zh-en.ass` (`.zh.srt` + `.zh.ass` 同目录) |
 
-### `mpv-burn.sh` — 字幕硬压 (WSL)
+### `ffmpeg-burn.sh` — 字幕硬压 (WSL, 默认)
+
+使用 ffmpeg 的 `ass` 滤镜硬压双语字幕，**保留原视频封面图**。流水线默认使用此脚本。
 
 ```bash
 # 基础用法
-./mpv-burn.sh path/to/video.webm --sub-file video.zh-en.ass
+./ffmpeg-burn.sh path/to/video.webm --sub-file video.zh-en.ass
 
 # 自定义编码器
-./mpv-burn.sh video.webm --sub-file sub.ass -o result.mkv --ovc libx265 --ovcopts crf=23
-
-# 透传 mpv 补帧滤镜
-./mpv-burn.sh video.webm --sub-file sub.ass -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
+./ffmpeg-burn.sh video.webm --sub-file sub.ass -o result.mkv --ovc libx265 --ovcopts crf=23
 ```
 
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
 | `-o, --output` | `burned.mkv` | 输出路径 |
-| `--mpv-path` | `/mnt/c/Users/oculi/mpv-lazy/mpv.com` | mpv.com 路径 |
 | `--sub-file` | — | 字幕文件路径 |
 | `--ovc` | `hevc_nvenc` | 视频编码器 |
 | `--ovcopts` | `qp=20` | 编码器参数 |
 | `--oac` | `aac` | 音频编码器 |
+| `--ffmpeg-path` | `ffmpeg` | ffmpeg 路径 |
 | `--dry-run` | — | 仅打印命令 |
 
-### `mpv-burn.ps1` — 字幕硬压 (PowerShell)
+### `ffmpeg-burn.ps1` — 字幕硬压 (PowerShell, 默认)
 
 ```powershell
-.\mpv-burn.ps1 "C:\path\to\video.webm" -SubFile video.zh-en.ass
-# 输出: burned.mkv (同目录)
+.\ffmpeg-burn.ps1 "C:\path\to\video.webm" -SubFile video.zh-en.ass
+# 输出: burned.mkv (同目录, 保留封面图)
+```
+
+### `mpv-burn.sh` / `mpv-burn.ps1` — 字幕硬压 (高级)
+
+mpv 编码模式，支持补帧滤镜等高级功能。仅手动使用，流水线默认用 ffmpeg-burn。
+
+```bash
+./mpv-burn.sh video.webm --sub-file sub.ass -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
 ```
 
 ---
@@ -356,8 +363,10 @@ Subtitle translation/
 ├── beautify_srt.sh           # 字幕时间码美化入口
 ├── beautify_srt.py           # 美化核心算法 (场景检测 + Netflix 帧对齐)
 ├── translate_srt.py          # 字幕翻译: LLM 英→中 → .zh.srt + .zh.ass + .zh-en.ass
-├── mpv-burn.sh               # WSL: 字幕硬压 (调用 Windows mpv.com)
-├── mpv-burn.ps1              # PowerShell: 字幕硬压
+├── ffmpeg-burn.sh            # WSL: 字幕硬压 (ffmpeg ass 滤镜, 默认)
+├── ffmpeg-burn.ps1           # PowerShell: 字幕硬压 (ffmpeg, 默认)
+├── mpv-burn.sh               # WSL: 字幕硬压 (mpv 编码, 高级)
+├── mpv-burn.ps1              # PowerShell: 字幕硬压 (mpv 编码, 高级)
 ├── template.ass              # ASS 模板 (bi-en / bi-zh / zh 样式定义)
 ├── download.ps1              # PowerShell: 仅下载 (不含字幕)
 ├── .env                      # API keys + 翻译默认配置 (gitignored)

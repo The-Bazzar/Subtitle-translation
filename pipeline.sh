@@ -39,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_SCRIPT="$SCRIPT_DIR/download_and_sub.sh"
 BEAUTIFY_SCRIPT="$SCRIPT_DIR/beautify_srt.sh"
 TRANSLATE_SCRIPT="$SCRIPT_DIR/translate_srt.py"
-BURN_SCRIPT="$SCRIPT_DIR/mpv-burn.sh"
+BURN_SCRIPT="$SCRIPT_DIR/ffmpeg-burn.sh"
 
 # ── 从 .env 读取默认配置 (环境变量优先, .env 次之, 硬编码兜底) ──────────────────
 

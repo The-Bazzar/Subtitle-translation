@@ -17,8 +17,8 @@ param(
     [string]$TranslateModel,
 
     [Alias("m")]
-    [Parameter(HelpMessage = "mpv.com path (default: mpv-lazy)")]
-    [string]$MpvPath = "C:\Users\oculi\mpv-lazy\mpv.com",
+    [Parameter(HelpMessage = "ffmpeg path for burning (default: ffmpeg in PATH)")]
+    [string]$FfmpegPath = "ffmpeg",
 
     [Parameter(HelpMessage = "Video encoder (default: hevc_nvenc)")]
     [string]$Ovc = "hevc_nvenc",
@@ -81,7 +81,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv (硬字幕)
   -Output             输出视频路径 (默认: 视频目录 burned.mkv)
   -TranslateProvider  翻译后端: openrouter | deepseek | gemini (默认: openrouter)
   -TranslateModel     翻译模型 (默认: provider 内置默认)
-  -MpvPath            mpv.com 路径 (默认: C:\Users\oculi\mpv-lazy\mpv.com)
+  -FfmpegPath         ffmpeg 路径 (默认: 系统 PATH)
   -Ovc                视频编码器 (默认: hevc_nvenc)
   -Ovcopts            视频编码器参数 (默认: qp=20)
   -Oac                音频编码器 (默认: aac)
@@ -137,7 +137,7 @@ if (-not $TranslateModel)    { $TranslateModel    = Get-EnvValue 'TRANSLATE_MODE
 # WSL 中的脚本目录 (/mnt/c/Users/...)
 $WslScriptDir = ($ScriptDir -replace '\\', '/') -replace '^C:', '/mnt/c'
 $PipelineSh = "$WslScriptDir/pipeline.sh"
-$MpvBurnPs1 = Join-Path $ScriptDir "mpv-burn.ps1"
+$BurnPs1 = Join-Path $ScriptDir "ffmpeg-burn.ps1"
 
 # ── 构建 WSL 命令 ──────────────────────────────────────────────────────────────
 
@@ -170,7 +170,7 @@ if ($DryRun) {
     Write-Host "  wsl -u root bash -lc `"$WslCmd`"" -ForegroundColor Yellow
     if (-not $SkipBurn) {
         Write-Host "[DRY RUN] Burn CMD:" -ForegroundColor Yellow
-        Write-Host "  .\mpv-burn.ps1 <video> -SubFile <ass> -Ovc $Ovc -Ovcopts $Ovcopts" -ForegroundColor Yellow
+        Write-Host "  .\ffmpeg-burn.ps1 <video> -SubFile <ass> -Ovc $Ovc -Ovcopts $Ovcopts" -ForegroundColor Yellow
     }
     exit 0
 }
@@ -259,20 +259,20 @@ Write-Host ""
 Write-Host ">>> Burning subtitles..." -ForegroundColor Cyan
 
 # 用 hashtable splatting — PowerShell 标准方式, 无 null 歧义
-$MpvParams = @{
-    VideoPath = $VideoPath
-    SubFile   = $AssPath
-    Ovc       = $Ovc
-    Ovcopts   = $Ovcopts
-    Oac       = $Oac
-    MpvPath   = $MpvPath
+$BurnParams = @{
+    VideoPath   = $VideoPath
+    SubFile     = $AssPath
+    Ovc         = $Ovc
+    Ovcopts     = $Ovcopts
+    Oac         = $Oac
+    FfmpegPath  = $FfmpegPath
 }
-if ($Output) { $MpvParams['Output'] = $Output }
+if ($Output) { $BurnParams['Output'] = $Output }
 
 if ($MpvExtraArgs.Count -gt 0) {
-    & $MpvBurnPs1 @MpvParams @MpvExtraArgs
+    & $BurnPs1 @BurnParams @MpvExtraArgs
 } else {
-    & $MpvBurnPs1 @MpvParams
+    & $BurnPs1 @BurnParams
 }
 $BurnExit = $LASTEXITCODE
 
