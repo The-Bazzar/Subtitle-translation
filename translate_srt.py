@@ -136,11 +136,17 @@ Rules:
 - Match the tone of the original: casual stays casual, formal stays formal
 - Keep proper nouns, brand names, and technical terms in their original form if no standard Chinese translation exists
 - Do NOT skip, merge, split, or add any items — exactly N input lines → N output lines
-- Respond ONLY with numbered lines in this exact format:
+
+Netflix Chinese subtitle formatting:
+- Do NOT use any punctuation marks — Chinese subtitles omit 。，！？ etc.
+- The ONLY punctuation allowed is 《》 (book title marks) — keep these if present in the original
+- Use a single space to replace all removed punctuation where natural pauses occur
+
+Respond ONLY with numbered lines in this exact format:
   [1] translation
   [2] translation
   ...
-- No explanations, no preamble, no closing remarks"""
+No explanations, no preamble, no closing remarks"""
 
 
 def load_env(script_dir: str) -> dict[str, str]:
@@ -177,6 +183,7 @@ def translate_batch(
     provider: str,
     model: str,
     api_key: str,
+    system_prompt: str = "",
     quiet: bool = False,
     retries: int = 3,
 ) -> list[str]:
@@ -197,7 +204,7 @@ def translate_batch(
     payload = {
         'model': model,
         'messages': [
-            {'role': 'system', 'content': TRANSLATION_SYSTEM_PROMPT},
+            {'role': 'system', 'content': system_prompt or TRANSLATION_SYSTEM_PROMPT},
             {'role': 'user', 'content': (
                 f"Translate these {len(texts)} subtitle lines to Chinese. "
                 f"Respond with exactly {len(texts)} numbered lines.\n\n{prompt}"
@@ -278,6 +285,7 @@ def translate_subtitles(
     provider: str = 'deepseek',
     model: Optional[str] = None,
     api_key: Optional[str] = None,
+    system_prompt: str = "",
     batch_size: int = 50,
     quiet: bool = False,
 ) -> list[str]:
@@ -311,7 +319,7 @@ def translate_subtitles(
                   file=sys.stderr)
 
         batch_translations = translate_batch(
-            batch_texts, provider, model, api_key, quiet=quiet
+            batch_texts, provider, model, api_key, system_prompt=system_prompt, quiet=quiet
         )
         all_translations.extend(batch_translations)
 
@@ -481,6 +489,8 @@ Examples:
                         help='API key (默认: 从 .env 读取)')
     parser.add_argument('--batch-size', type=int, default=50,
                         help='每批翻译行数 (默认: 50)')
+    parser.add_argument('--system-prompt', metavar='PROMPT',
+                        help='自定义系统提示词 (默认: 内置 Netflix 规范提示词)')
     parser.add_argument('--title',
                         help='视频标题 (默认: 从 SRT 文件名推断)')
     parser.add_argument('-q', '--quiet', action='store_true',
@@ -523,6 +533,9 @@ Examples:
         print(f"  Parsed {len(subtitles)} subtitle entries")
         print(f"  Duration: {subtitles[0]['start_ass']} → {subtitles[-1]['end_ass']}")
 
+    # 系统提示词: CLI > .env > 内置默认
+    system_prompt = args.system_prompt or _env.get('TRANSLATE_SYSTEM_PROMPT', '') or ''
+
     # ── 获取中文翻译 ──────────────────────────────────────────────────────
     # 始终使用 .zh.srt 作为翻译缓存: 已存在则跳过 LLM, 否则翻译后写入
 
@@ -552,6 +565,7 @@ Examples:
             provider=args.provider,
             model=args.model,
             api_key=args.api_key,
+            system_prompt=system_prompt,
             batch_size=args.batch_size,
             quiet=args.quiet,
         )
