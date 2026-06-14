@@ -29,7 +29,7 @@ Subtitle translation/
     ├── <Video Title>.zh.srt  # 中文 SRT 翻译缓存
     ├── <Video Title>.zh.ass  # 仅中文 ASS (style=zh)
     ├── <Video Title>.zh-en.ass  # 双语 ASS (bi-en + bi-zh, 硬压用)
-    ├── <Video Title>.webp    # 封面缩略图
+    ├── <Video Title>.png     # 封面缩略图 (PNG)
     ├── <Video Title>.info.json     # yt-dlp 元数据
     └── <Video Title>.description   # 视频简介文本
 ```

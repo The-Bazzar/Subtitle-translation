@@ -47,7 +47,9 @@ echo "============================================="
 yt-dlp -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
 	--cookies cookies.txt \
 	--embed-metadata \
+	--embed-thumbnail \
 	--write-thumbnail \
+	--convert-thumbnails png \
 	--write-info-json \
 	--write-description \
 	--no-mtime \

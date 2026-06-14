@@ -110,7 +110,7 @@ BURN=0 ./pipeline.sh "url"
 ├── 视频标题.zh.srt         # 中文 SRT 翻译缓存 (二次运行跳过 LLM)
 ├── 视频标题.zh.ass         # 仅中文 ASS (style=zh)
 ├── 视频标题.zh-en.ass      # 双语 ASS (bi-en + bi-zh, 硬压用) ✨
-├── 视频标题.webp           # 封面缩略图
+├── 视频标题.png            # 封面缩略图 (PNG)
 ├── 视频标题.info.json      # yt-dlp 元数据
 └── 视频标题.description    # 视频简介
 ```
