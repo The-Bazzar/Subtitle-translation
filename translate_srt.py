@@ -110,7 +110,7 @@ PROVIDERS = {
     },
     'deepseek': {
         'url': 'https://api.deepseek.com/v1/chat/completions',
-        'default_model': 'deepseek-chat',
+        'default_model': 'deepseek-v4-pro',
         'env_key': 'DEEPSEEK_API_KEY',
         'headers': lambda key: {
             'Authorization': f'Bearer {key}',
@@ -406,6 +406,96 @@ def proofread_subtitles(
 
 # ─── ASS 输出 ──────────────────────────────────────────────────────────────────
 
+DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following YouTube video description from English to Simplified Chinese.
+
+Rules:
+- Preserve all URLs, email addresses, and social media handles exactly as-is
+- Preserve all line breaks and paragraph structure
+- Translate the text naturally while keeping the original tone
+- Do NOT add any explanations, preamble, or closing remarks
+- Output ONLY the translated description text"""
+
+
+def translate_description(
+    desc_path: str,
+    provider: str,
+    model: str,
+    api_key: str,
+    quiet: bool = False,
+) -> str:
+    """Translate a .description file to Chinese, output .zh.description with metadata header."""
+    import json
+    import urllib.request
+    import urllib.error
+
+    srt_dir = os.path.dirname(os.path.abspath(desc_path))
+    desc_base = os.path.splitext(os.path.basename(desc_path))[0]
+    zh_path = os.path.join(srt_dir, f"{desc_base}.zh.description")
+
+    # 从 .info.json 读取视频元数据
+    info_json = os.path.join(srt_dir, f"{desc_base}.info.json")
+    metadata_header = ""
+    if os.path.isfile(info_json):
+        try:
+            with open(info_json, 'r', encoding='utf-8') as f:
+                info = json.load(f)
+            title = info.get('title', '')
+            uploader = info.get('uploader', '') or info.get('channel', '')
+            upload_date = info.get('upload_date', '')  # YYYYMMDD
+            if upload_date and len(upload_date) == 8:
+                upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+            metadata_header = f"原视频：{title}\n原作者：{uploader}\n上传时间：{upload_date}\n\n=====\n\n"
+        except Exception:
+            pass
+
+    with open(desc_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    if not text.strip():
+        with open(zh_path, 'w', encoding='utf-8') as f:
+            f.write(metadata_header)
+        if not quiet:
+            print(f"  .zh.description: {zh_path}")
+        return zh_path
+
+    # 复用字幕翻译的 API key (参数 > .env)
+    if api_key is None:
+        env = load_env(os.path.dirname(os.path.abspath(__file__)))
+        api_key = get_api_key(provider, env)
+
+    cfg = PROVIDERS[provider]
+    payload = {
+        'model': model,
+        'messages': [
+            {'role': 'system', 'content': DESCRIPTION_TRANSLATE_PROMPT},
+            {'role': 'user', 'content': text},
+        ],
+        'temperature': 0.3,
+        'max_tokens': max(2048, len(text) * 3),
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+    headers = cfg['headers'](api_key)
+
+    try:
+        req = urllib.request.Request(cfg['url'], data=data, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode('utf-8'))
+        translated = body['choices'][0]['message']['content']
+    except Exception as e:
+        print(f"  Warning: Description translation failed: {e}", file=sys.stderr)
+        return zh_path
+
+    with open(zh_path, 'w', encoding='utf-8') as f:
+        f.write(metadata_header)
+        f.write(translated)
+
+    if not quiet:
+        print(f"  .zh.description: {zh_path}")
+
+    return zh_path
+
+
 def load_template(template_path: str) -> tuple[str, str]:
     """
     Read template.ass, return (header_part, events_format_line).
@@ -692,8 +782,21 @@ Examples:
     write_ass(zh_ass_path, template_path, title, subtitles, translations, bilingual=False)
     write_ass(output_path, template_path, title, subtitles, translations, bilingual=True)
 
+    # ── 翻译视频简介 (如果存在) ──────────────────────────────────────────
+    desc_path = os.path.join(srt_dir, f"{srt_name}.description")
+    if os.path.isfile(desc_path):
+        if not args.quiet:
+            print()
+        translate_description(
+            desc_path,
+            provider=args.provider,
+            model=args.model,
+            api_key=args.api_key,
+            quiet=args.quiet,
+        )
+
     if not args.quiet:
-        print(f"Output:   {zh_ass_path}")
+        print(f"\nOutput:   {zh_ass_path}")
         print(f"          {output_path}")
         print(f"Lines:    {len(subtitles)}")
         print()
