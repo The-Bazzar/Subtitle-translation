@@ -23,9 +23,6 @@ param(
     [Parameter(HelpMessage = "Output resolution (e.g. 1920x1080, 1280x720)")]
     [string]$Res,
 
-    [Parameter(HelpMessage = "ffmpeg.exe path (default: from env FFMPEG_PATH)")]
-    [string]$FfmpegPath,
-
     [Parameter(HelpMessage = "Print command only, do not execute")]
     [switch]$DryRun,
 
@@ -49,8 +46,8 @@ ffmpeg-burn.ps1 — 字幕硬压 (ffmpeg 滤镜)
   .\ffmpeg-burn.ps1 <视频文件> [选项...] [ffmpeg额外参数...]
 
 说明:
-  使用 ffmpeg 的 ass 滤镜将 ASS 字幕硬压到视频中。
-  相比 mpv-burn: 保留原视频封面图, 无需额外依赖。
+  使用 ffmpeg 的 ass 滤镜将 ASS 字幕硬压到视频中, 保留原视频封面图。
+  ffmpeg 路径从 .env 的 FFMPEG_PATH_WIN 读取, 留空则用系统 ffmpeg。
 
 参数:
   -VideoPath          视频文件路径 (必选, 位置 0)
@@ -60,7 +57,6 @@ ffmpeg-burn.ps1 — 字幕硬压 (ffmpeg 滤镜)
   -Ovcopts            视频编码器参数 (默认: qp=20)
   -Oac                音频编码器 (默认: aac)
   -Res                输出分辨率 (如 1920x1080, 默认: 原视频)
-  -FfmpegPath         ffmpeg.exe 路径 (默认: 系统 PATH)
   -DryRun             仅打印命令, 不执行
   -Help               显示此帮助
 
@@ -109,10 +105,16 @@ if ($SubFile) {
 $OvcKey, $OvcVal = $Ovcopts -split '=', 2
 if (-not $OvcVal) { $OvcVal = $OvcKey; $OvcKey = 'qp' }
 
-# FfmpegPath: CLI > env FFMPEG_PATH_WIN > PATH
-if (-not $FfmpegPath) {
-    $FfmpegPath = if ($env:FFMPEG_PATH_WIN) { $env:FFMPEG_PATH_WIN } else { "ffmpeg" }
+# 从 .env 读取 ffmpeg 路径
+$ScriptDir = Split-Path $PSCommandPath -Parent
+$EnvFile = Join-Path $ScriptDir '.env'
+function Get-EnvValue([string]$Key, [string]$Default) {
+    if (-not (Test-Path $EnvFile)) { return $Default }
+    $m = Select-String -Path $EnvFile -Pattern "^\s*$Key\s*=\s*(.*)" | Select-Object -First 1
+    if ($m) { $v = $m.Matches.Groups[1].Value.Trim(); if ($v) { return $v } }
+    return $Default
 }
+$FfmpegPath = Get-EnvValue 'FFMPEG_PATH_WIN' 'ffmpeg'
 
 # ── 执行 ──────────────────────────────────────────────────────────────────────
 

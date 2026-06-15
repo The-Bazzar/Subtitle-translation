@@ -16,10 +16,6 @@ param(
     [Parameter(HelpMessage = "Translation model override (default: provider built-in)")]
     [string]$TranslateModel,
 
-    [Alias("m")]
-    [Parameter(HelpMessage = "ffmpeg path for burning (default: ffmpeg in PATH)")]
-    [string]$FfmpegPath = "ffmpeg",
-
     [Parameter(HelpMessage = "Video encoder (default: hevc_nvenc)")]
     [string]$Ovc = "hevc_nvenc",
 
@@ -78,14 +74,13 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv (硬字幕)
   2. WhisperX large-v3 生成英文字幕
   3. ffmpeg/ffprobe 场景检测 → 字幕时间码美化 (Netflix 规范)
   4. LLM API 翻译英文 → 双语 .zh-en.ass (bi-en + bi-zh)
-  5. mpv 硬压双语字幕 → burned.mkv
+  5. ffmpeg 硬压双语字幕 → burned.mkv
 
 参数:
   -Url                YouTube 视频链接 (必选, 位置 0)
   -Output             输出视频路径 (默认: 视频目录 burned.mkv)
   -TranslateProvider  翻译后端: openrouter | deepseek | gemini (默认: openrouter)
   -TranslateModel     翻译模型 (默认: provider 内置默认)
-  -FfmpegPath         ffmpeg 路径 (默认: 系统 PATH)
   -Ovc                视频编码器 (默认: hevc_nvenc)
   -Ovcopts            视频编码器参数 (默认: qp=20)
   -Oac                音频编码器 (默认: aac)
@@ -109,7 +104,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv (硬字幕)
 
 前置依赖:
   WSL: yt-dlp, uvx (whisperx), ffmpeg, ffprobe, python3
-  Windows: mpv.com (mpv-lazy)
+  Windows: ffmpeg (系统 PATH 或 .env 中 FFMPEG_PATH_WIN)
   API key: .env 中 OPENROUTER_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY
 "@
     exit 0
@@ -270,7 +265,6 @@ $BurnParams = @{
     Ovc         = $Ovc
     Ovcopts     = $Ovcopts
     Oac         = $Oac
-    FfmpegPath  = $FfmpegPath
 }
 if ($Res)    { $BurnParams['Res'] = $Res }
 if ($Output) { $BurnParams['Output'] = $Output }

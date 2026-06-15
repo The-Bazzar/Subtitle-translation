@@ -6,9 +6,6 @@ param(
     [Parameter(HelpMessage = "Output path (default: burned.mkv in video dir)")]
     [string]$Output,
 
-    [Parameter(HelpMessage = "mpv.com path (default: from env MPV_PATH)")]
-    [string]$MpvPath,
-
     [Alias("s")]
     [Parameter(HelpMessage = "Subtitle file to burn (e.g. .zh-en.ass)")]
     [string]$SubFile,
@@ -50,15 +47,16 @@ mpv-burn.ps1 — 字幕硬压 (mpv 编码模式)
 
 说明:
   使用 mpv 的 --o= 编码模式将 ASS/SRT 字幕硬压到视频中。
+  mpv 路径从 .env 的 MPV_PATH_WIN 读取, 留空则用系统 mpv。
 
 参数:
   -VideoPath          视频文件路径 (必选, 位置 0)
   -Output             输出文件路径 (默认: 视频同目录 burned.mkv)
-  -MpvPath            mpv.com 路径 (默认: C:\Users\oculi\mpv-lazy\mpv.com)
   -SubFile            字幕文件路径 (如 .zh-en.ass 双语字幕)
   -Ovc                视频编码器 (默认: hevc_nvenc)
   -Ovcopts            视频编码器参数 (默认: qp=20)
   -Oac                音频编码器 (默认: aac)
+  -Res                输出分辨率 (如 1920x1080, 默认: 原视频)
   -DryRun             仅打印命令, 不执行
   -Help               显示此帮助
 
@@ -66,7 +64,6 @@ mpv-burn.ps1 — 字幕硬压 (mpv 编码模式)
   .\mpv-burn.ps1 video.webm -SubFile video.zh-en.ass
   .\mpv-burn.ps1 video.webm -SubFile video.zh-en.ass -Output result.mkv
   .\mpv-burn.ps1 video.webm -Ovc libx265 -Ovcopts crf=23
-  .\mpv-burn.ps1 video.webm -MpvPath C:\Apps\mpv.com
   .\mpv-burn.ps1 video.webm -SubFile sub.ass --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
   .\mpv-burn.ps1 video.webm -DryRun
 
@@ -99,10 +96,16 @@ if (-not $Output) {
 }
 $OutputAbs = [System.IO.Path]::GetFullPath($Output)
 
-# MpvPath: CLI > env MPV_PATH_WIN > 系统 mpv
-if (-not $MpvPath) {
-    $MpvPath = if ($env:MPV_PATH_WIN) { $env:MPV_PATH_WIN } else { "mpv" }
+# 从 .env 读取 mpv 路径
+$ScriptDir = Split-Path $PSCommandPath -Parent
+$EnvFile = Join-Path $ScriptDir '.env'
+function Get-EnvValue([string]$Key, [string]$Default) {
+    if (-not (Test-Path $EnvFile)) { return $Default }
+    $m = Select-String -Path $EnvFile -Pattern "^\s*$Key\s*=\s*(.*)" | Select-Object -First 1
+    if ($m) { $v = $m.Matches.Groups[1].Value.Trim(); if ($v) { return $v } }
+    return $Default
 }
+$MpvPath = Get-EnvValue 'MPV_PATH_WIN' 'mpv'
 
 # ── 执行 ──────────────────────────────────────────────────────────────────────
 

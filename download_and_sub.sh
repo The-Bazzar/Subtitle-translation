@@ -6,16 +6,21 @@
 #   ./download_and_sub.sh <YouTube URL>
 #
 # 流程:
-#   1. yt-dlp --get-title → 视频标题 (过滤特殊字符作文件夹名)
-#   2. yt-dlp 下载视频/缩略图/元数据 (SponsorBlock 去广告)
+#   1. $YTDLP --get-title → 视频标题 (过滤特殊字符作文件夹名)
+#   2. $YTDLP 下载视频/缩略图/元数据 (SponsorBlock 去广告)
 #   3. 定位视频文件 → 文件名 = 文件夹名 (可预测)
 #   4. uvx whisperx large-v3 → 生成 .srt 字幕 (已存在则跳过)
 #
 # 输出标记:
 #   OUTPUT_VIDEO=<绝对路径>  (供 pipeline.sh 解析)
 #
-# 依赖: yt-dlp, uvx (whisperx), ffmpeg
+# 依赖: $YTDLP, uvx (whisperx), ffmpeg
 # =============================================================================
+
+# 从 .env 读取 $YTDLP 路径
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
+YTDLP="${YTDLP_PATH_LINUX:-$YTDLP}"
 
 # 1. 检查是否输入了链接
 if [ -z "$1" ]; then
@@ -30,7 +35,7 @@ echo "============================================="
 echo "步骤 1: 抓取视频标题并创建独立文件夹"
 echo "============================================="
 # 获取视频标题（作为文件夹名 + 视频文件名）
-VIDEO_TITLE=$(yt-dlp --get-title "$URL")
+VIDEO_TITLE=$($YTDLP --get-title "$URL")
 # 过滤掉 Linux/Windows 文件名中不合法的特殊字符
 FOLDER_NAME=$(echo "$VIDEO_TITLE" | sed 's/[\\/:*?"<>|]/_/g')
 
@@ -40,11 +45,11 @@ echo "视频下载目录: $FOLDER_NAME"
 echo "视频标题: $VIDEO_TITLE"
 
 echo "============================================="
-echo "步骤 2: 使用 yt-dlp 下载视频、元数据及封面"
+echo "步骤 2: 使用 $YTDLP 下载视频、元数据及封面"
 echo "============================================="
 
-# yt-dlp 文件名 = FOLDER_NAME (确保可预测)
-yt-dlp -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
+# $YTDLP 文件名 = FOLDER_NAME (确保可预测)
+$YTDLP -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
 	--cookies cookies.txt \
 	--embed-metadata \
 	--embed-thumbnail \
@@ -61,7 +66,7 @@ echo "============================================="
 echo "步骤 3: 寻找下载好的视频文件"
 echo "============================================="
 
-# 文件名可预测: $FOLDER_NAME.<ext> (yt-dlp 的 %(ext)s 展开为 mp4/webm/mkv 等)
+# 文件名可预测: $FOLDER_NAME.<ext> ($YTDLP 的 %(ext)s 展开为 mp4/webm/mkv 等)
 VIDEO_FILE=""
 for ext in mp4 mkv webm flv avi; do
 	if [ -f "$FOLDER_NAME/$FOLDER_NAME.$ext" ]; then

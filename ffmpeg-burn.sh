@@ -47,7 +47,6 @@ ffmpeg-burn.sh — WSL 字幕硬压脚本 (ffmpeg 滤镜)
   --ovcopts OPTS          视频编码器参数 (默认: qp=20)
   --oac CODEC             音频编码器 (默认: aac)
   --res WxH               输出分辨率 (如 1920x1080, 默认: 原视频)
-  --ffmpeg-path PATH      ffmpeg 路径 (默认: 系统 PATH)
   --dry-run               仅打印命令, 不执行
   -h, --help              显示帮助
 
@@ -99,10 +98,6 @@ while [ $# -gt 0 ]; do
             ;;
         -o|--output)
             OUTPUT="$2"
-            shift 2
-            ;;
-        --ffmpeg-path)
-            FFMPEG="$2"
             shift 2
             ;;
         --sub-file)

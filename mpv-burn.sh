@@ -9,7 +9,6 @@
 #   ./mpv-burn.sh video.webm
 #   ./mpv-burn.sh video.webm -o result.mkv
 #   ./mpv-burn.sh video.webm --sub-file video.zh-en.ass --ovc libx265 --ovcopts crf=23
-#   ./mpv-burn.sh video.webm --mpv-path /mnt/c/Apps/mpv.com
 #   ./mpv-burn.sh video.webm -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
 #
 # 环境变量:
@@ -46,7 +45,6 @@ mpv-burn.sh — WSL 字幕硬压脚本 (mpv 编码模式)
 
 选项:
   -o, --output PATH       输出文件路径 (默认: 输入同目录 burned.mkv)
-  --mpv-path PATH         mpv.com 路径 (默认: /mnt/c/Users/oculi/mpv-lazy/mpv.com)
   --sub-file PATH         字幕文件路径 (如 .zh-en.ass 双语字幕)
   --ovc CODEC             视频编码器 (默认: hevc_nvenc)
   --ovcopts OPTS          视频编码器参数 (默认: qp=20)
@@ -58,11 +56,10 @@ mpv-burn.sh — WSL 字幕硬压脚本 (mpv 编码模式)
   ./mpv-burn.sh video.webm --sub-file video.zh-en.ass
   ./mpv-burn.sh video.webm --sub-file sub.ass -o burned.mkv
   ./mpv-burn.sh video.webm --ovc libx265 --ovcopts crf=23
-  ./mpv-burn.sh video.webm --mpv-path /mnt/c/Apps/mpv.com
   ./mpv-burn.sh video.webm -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
 
 环境变量:
-  MPV_PATH                mpv.com 路径 (优先级低于 --mpv-path)
+
 
 常用编码器:
   hevc_nvenc              NVIDIA GPU H.265 硬编码 (默认, 速度快)
@@ -108,10 +105,6 @@ while [ $# -gt 0 ]; do
             OUTPUT="$2"
             shift 2
             ;;
-        --mpv-path)
-            MPV="$2"
-            shift 2
-            ;;
         --sub-file)
             SUB_FILE="$2"
             shift 2
@@ -152,7 +145,7 @@ VIDEO_ABS="$(realpath "$VIDEO" 2>/dev/null || readlink -f "$VIDEO")"
 
 if [ ! -f "$MPV" ]; then
     echo "Error: mpv.com not found: $MPV" >&2
-    echo "Specify with --mpv-path or set MPV_PATH environment variable." >&2
+    echo "Set MPV_PATH_LINUX in .env." >&2
     exit 1
 fi
 
