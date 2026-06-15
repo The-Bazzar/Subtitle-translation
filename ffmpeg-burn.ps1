@@ -19,6 +19,10 @@ param(
     [Parameter(HelpMessage = "Audio encoder (default: aac)")]
     [string]$Oac = "aac",
 
+    [Alias("r")]
+    [Parameter(HelpMessage = "Output resolution (e.g. 1920x1080, 1280x720)")]
+    [string]$Res,
+
     [Parameter(HelpMessage = "ffmpeg.exe path (default: ffmpeg in PATH)")]
     [string]$FfmpegPath = "ffmpeg",
 
@@ -55,6 +59,7 @@ ffmpeg-burn.ps1 — 字幕硬压 (ffmpeg 滤镜)
   -Ovc                视频编码器 (默认: hevc_nvenc)
   -Ovcopts            视频编码器参数 (默认: qp=20)
   -Oac                音频编码器 (默认: aac)
+  -Res                输出分辨率 (如 1920x1080, 默认: 原视频)
   -FfmpegPath         ffmpeg.exe 路径 (默认: 系统 PATH)
   -DryRun             仅打印命令, 不执行
   -Help               显示此帮助
@@ -115,15 +120,23 @@ if ($SubFile) {
     Write-Host "字幕:    $SubFileAbs" -ForegroundColor Gray
 }
 Write-Host "视频:    -c:v $Ovc -$OvcKey $OvcVal" -ForegroundColor Gray
+if ($Res) { Write-Host "分辨率:  $Res" -ForegroundColor Gray }
 Write-Host "音频:    -c:a $Oac" -ForegroundColor Gray
 if ($FfmpegExtra.Count -gt 0) {
     Write-Host "额外:    $($FfmpegExtra -join ' ')" -ForegroundColor Gray
 }
 Write-Host "=============================================" -ForegroundColor Cyan
 
+# 构建滤镜链: ass + 可选 scale
+$Vf = "ass='$SubFileFfm'"
+if ($Res) {
+    $resW, $resH = $Res -split 'x', 2
+    if ($resW -and $resH) { $Vf += ",scale=${resW}:${resH}" }
+}
+
 $FfmpegArgs = @(
     '-i', $VideoAbs,
-    '-vf', "ass='$SubFileFfm'",
+    '-vf', $Vf,
     '-c:v', $Ovc,
     "-$OvcKey", $OvcVal,
     '-c:a', $Oac,

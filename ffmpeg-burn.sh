@@ -21,6 +21,7 @@ SUB_FILE=""
 OVC="hevc_nvenc"
 OVCOPTS="qp=20"
 OAC="aac"
+RES=""
 FFMPEG="${FFMPEG_PATH:-ffmpeg}"
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ ffmpeg-burn.sh — WSL 字幕硬压脚本 (ffmpeg 滤镜)
   --ovc CODEC             视频编码器 (默认: hevc_nvenc)
   --ovcopts OPTS          视频编码器参数 (默认: qp=20)
   --oac CODEC             音频编码器 (默认: aac)
+  --res WxH               输出分辨率 (如 1920x1080, 默认: 原视频)
   --ffmpeg-path PATH      ffmpeg 路径 (默认: 系统 PATH)
   --dry-run               仅打印命令, 不执行
   -h, --help              显示帮助
@@ -116,6 +118,10 @@ while [ $# -gt 0 ]; do
             OAC="$2"
             shift 2
             ;;
+        --res)
+            RES="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -171,6 +177,7 @@ echo "输出:    $OUTPUT_ABS"
 if [ -n "$SUB_FILE" ]; then
     echo "字幕:    $SUB_FILE_ABS"
 fi
+[ -n "$RES" ] && echo "分辨率:  $RES"
 echo "视频:    -c:v $OVC -$OVC_KEY $OVC_VAL"
 echo "音频:    -c:a $OAC"
 if [ ${#EXTRA_FFMPEG_ARGS[@]} -gt 0 ]; then
@@ -178,12 +185,17 @@ if [ ${#EXTRA_FFMPEG_ARGS[@]} -gt 0 ]; then
 fi
 echo "============================================="
 
+# 构建滤镜链: ass + 可选 scale
+VF="ass='${SUB_FILE_ABS//:/\\:}'"
+if [ -n "$RES" ]; then
+    VF="${VF},scale=${RES}"
+fi
+
 # 组装 ffmpeg 命令
-# ass 滤镜路径中的冒号需转义为 \:
 FFMPEG_CMD=(
     "$FFMPEG"
     -i "$VIDEO_ABS"
-    -vf "ass='${SUB_FILE_ABS//:/\\:}'"
+    -vf "$VF"
     -c:v "$OVC"
     "-$OVC_KEY" "$OVC_VAL"
     -c:a "$OAC"

@@ -30,7 +30,7 @@
 #   EXISTING_SRT          已有美化后 SRT 路径 (跳过美化步骤, 直接用于翻译)
 #   EXISTING_ASS          已有 .zh-en.ass 路径 (跳过翻译步骤, 直接用于压制)
 #   BURN=0                跳过字幕硬压 (默认启用)
-#   BURN_OVC / BURN_OVCOPTS / BURN_OAC  压制参数
+#   BURN_OVC / BURN_OVCOPTS / BURN_OAC / BURN_RES  压制参数
 # =============================================================================
 
 set -euo pipefail
@@ -69,6 +69,7 @@ TRANSLATE_MODEL="${TRANSLATE_MODEL:-}"
 BURN_OVC="${BURN_OVC:-hevc_nvenc}"
 BURN_OVCOPTS="${BURN_OVCOPTS:-qp=20}"
 BURN_OAC="${BURN_OAC:-aac}"
+BURN_RES="${BURN_RES:-}"
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
@@ -334,7 +335,8 @@ else
             --sub-file "$ASS_PATH" \
             --ovc "$BURN_OVC" \
             --ovcopts "$BURN_OVCOPTS" \
-            --oac "$BURN_OAC"
+            --oac "$BURN_OAC" \
+            ${BURN_RES:+--res "$BURN_RES"}
     fi
 fi
 

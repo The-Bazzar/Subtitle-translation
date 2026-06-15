@@ -29,6 +29,10 @@ param(
     [Parameter(HelpMessage = "Audio encoder (default: aac)")]
     [string]$Oac = "aac",
 
+    [Alias("r")]
+    [Parameter(HelpMessage = "Output resolution (e.g. 1920x1080)")]
+    [string]$Res,
+
     [Parameter(HelpMessage = "Skip download step (use existing video)")]
     [switch]$SkipDownload,
 
@@ -85,6 +89,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv (硬字幕)
   -Ovc                视频编码器 (默认: hevc_nvenc)
   -Ovcopts            视频编码器参数 (默认: qp=20)
   -Oac                音频编码器 (默认: aac)
+  -Res                输出分辨率 (如 1920x1080, 默认: 原视频)
   -SkipDownload       跳过下载 (使用已有视频)
   -SkipBeautify       跳过时间码美化
   -SkipTranslate      跳过翻译
@@ -267,6 +272,7 @@ $BurnParams = @{
     Oac         = $Oac
     FfmpegPath  = $FfmpegPath
 }
+if ($Res)    { $BurnParams['Res'] = $Res }
 if ($Output) { $BurnParams['Output'] = $Output }
 
 if ($MpvExtraArgs.Count -gt 0) {

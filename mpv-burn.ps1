@@ -22,6 +22,10 @@ param(
     [Parameter(HelpMessage = "Audio encoder (default: aac)")]
     [string]$Oac = "aac",
 
+    [Alias("r")]
+    [Parameter(HelpMessage = "Output resolution (e.g. 1920x1080, 1280x720)")]
+    [string]$Res,
+
     [Parameter(HelpMessage = "Print command only, do not execute")]
     [switch]$DryRun,
 
@@ -113,6 +117,7 @@ if ($SubFile) {
     Write-Host "字幕:    --sub-file=$SubFile" -ForegroundColor Gray
 }
 Write-Host "视频:    --ovc=$Ovc --ovcopts=$Ovcopts" -ForegroundColor Gray
+if ($Res) { Write-Host "分辨率:  $Res" -ForegroundColor Gray }
 Write-Host "音频:    --oac=$Oac" -ForegroundColor Gray
 if ($MpvExtraArgs.Count -gt 0) {
     Write-Host "额外:    $($MpvExtraArgs -join ' ')" -ForegroundColor Gray
@@ -126,6 +131,10 @@ $MpvArgs = @(
     "--ovcopts=$Ovcopts",
     "--oac=$Oac"
 )
+if ($Res) {
+    $resW, $resH = $Res -split 'x', 2
+    if ($resW -and $resH) { $MpvArgs += "--vf-add=scale=${resW}:${resH}" }
+}
 if ($SubFile) {
     $MpvArgs += "--sub-file=$SubFile"
 }
