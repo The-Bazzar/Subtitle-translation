@@ -78,6 +78,24 @@ fi
 
 echo "成功定位视频文件: $VIDEO_FILE"
 
+# 从 .info.json 读取视频语言 (默认 en, ISO 639-1)
+VIDEO_LANG="en"
+INFO_JSON="$FOLDER_NAME/$FOLDER_NAME.info.json"
+if [ -f "$INFO_JSON" ]; then
+	LANG=$(python3 -c "
+import json
+with open('$INFO_JSON') as f:
+    info = json.load(f)
+lang = info.get('language') or ''
+if lang:
+    # 'en-US' → 'en', 'zh-CN' → 'zh'
+    lang = lang.split('-')[0].lower()
+print(lang if lang else 'en')
+" 2>/dev/null)
+	[ -n "$LANG" ] && VIDEO_LANG="$LANG"
+fi
+echo "视频语言: $VIDEO_LANG"
+
 echo "============================================="
 echo "步骤 4: 运行 uvx whisperx 生成 SRT 字幕"
 echo "============================================="
@@ -90,7 +108,7 @@ if [ -f "$FOLDER_NAME/$SRT_NAME" ]; then
 else
 	# 在子 shell 中 cd, 不改变外层工作目录 (避免影响后续 realpath)
 	(cd "$FOLDER_NAME" && uvx whisperx "$VIDEO_FILE" \
-		--lang en \
+		--lang "$VIDEO_LANG" \
 		--model large-v3 \
 		--output_dir . \
 		--output_format srt \

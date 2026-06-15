@@ -7,7 +7,7 @@
 ### WSL (必需)
 
 ```bash
-# Python 包管理器 (用于运行 WhisperX)
+# uv — Python 包管理器 (用于运行 WhisperX)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # yt-dlp — 视频下载
@@ -20,6 +20,35 @@ sudo apt update && sudo apt install -y ffmpeg
 # Node.js — yt-dlp YouTube 验证
 sudo apt install -y nodejs
 ```
+
+#### WhisperX 安装
+
+```bash
+# 官方安装 (GPU 加速需先装 CUDA Toolkit 12.x + cuDNN)
+pip install whisperx
+
+# 或直接用 uvx (首次自动安装)
+uvx whisperx
+```
+
+**GPU 加速 (WSL2)**：WSL2 透传 Windows GPU 驱动，在 WSL 内装 CUDA Toolkit 即可：
+
+```bash
+# 1. 安装 CUDA Toolkit (WSL2-Ubuntu 专用, 不含驱动)
+wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-12-8
+
+# 2. 验证
+nvcc --version && nvidia-smi
+```
+
+安装后 `pip install whisperx` 会检测到 CUDA 并自动装 GPU 版 torch。
+
+> **无 GPU / macOS**：跳过 CUDA，`download_and_sub.sh` 已配置 `--device cpu --compute_type int8`。
+
+详见 [WhisperX 官方文档](https://github.com/m-bain/whisperX)。
 
 ### Windows (可选)
 
