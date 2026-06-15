@@ -22,7 +22,10 @@ OVC="hevc_nvenc"
 OVCOPTS="qp=20"
 OAC="aac"
 RES=""
-FFMPEG="${FFMPEG_PATH:-ffmpeg}"
+# 从 .env 读取配置
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
+FFMPEG="${FFMPEG_PATH_LINUX:-ffmpeg}"
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 

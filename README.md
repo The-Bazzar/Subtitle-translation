@@ -63,6 +63,12 @@ nvcc --version && nvidia-smi
 在项目根目录创建 `.env` 文件，所有脚本 (`pipeline.sh`, `pipeline.ps1`, `translate_srt.py`) 均从这里读取配置：
 
 ```ini
+# ── 工具路径 (留空则用系统默认 mpv/ffmpeg) ──
+MPV_PATH_WIN=                     # Windows mpv.com 路径
+MPV_PATH_LINUX=                   # Linux mpv 路径
+FFMPEG_PATH_WIN=                  # Windows ffmpeg 路径
+FFMPEG_PATH_LINUX=                # Linux ffmpeg 路径
+
 # ── 翻译默认配置 ──
 TRANSLATE_PROVIDER=deepseek       # 翻译后端: openrouter | deepseek | gemini
 TRANSLATE_MODEL=deepseek-v4-pro   # 模型名, 留空则使用后端内置默认
@@ -89,6 +95,10 @@ GEMINI_API_KEY=xxx                # https://aistudio.google.com
 | `PROOFREAD_SYSTEM_PROMPT` | 否 | 校对系统提示词，留空使用内置校对提示词 |
 | `PROOFREAD_PROVIDER` | 否 | 校对专用后端，留空与翻译共用（可实现交叉校对） |
 | `PROOFREAD_MODEL` | 否 | 校对专用模型，留空与翻译共用 |
+| `MPV_PATH_WIN` | 否 | Windows mpv.com 路径 |
+| `MPV_PATH_LINUX` | 否 | Linux mpv 路径 (如 /mnt/c/Users/.../mpv.com) |
+| `FFMPEG_PATH_WIN` | 否 | Windows ffmpeg 路径 |
+| `FFMPEG_PATH_LINUX` | 否 | Linux ffmpeg 路径 |
 | `OPENROUTER_API_KEY` | * | OpenRouter API key |
 | `DEEPSEEK_API_KEY` | * | DeepSeek API key |
 | `GEMINI_API_KEY` | * | Gemini API key |

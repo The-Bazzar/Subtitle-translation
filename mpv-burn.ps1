@@ -6,8 +6,8 @@ param(
     [Parameter(HelpMessage = "Output path (default: burned.mkv in video dir)")]
     [string]$Output,
 
-    [Parameter(HelpMessage = "mpv.com path")]
-    [string]$MpvPath = "C:\Users\oculi\mpv-lazy\mpv.com",
+    [Parameter(HelpMessage = "mpv.com path (default: from env MPV_PATH)")]
+    [string]$MpvPath,
 
     [Alias("s")]
     [Parameter(HelpMessage = "Subtitle file to burn (e.g. .zh-en.ass)")]
@@ -99,10 +99,9 @@ if (-not $Output) {
 }
 $OutputAbs = [System.IO.Path]::GetFullPath($Output)
 
-if (-not (Test-Path $MpvPath)) {
-    Write-Host "Error: mpv.com not found: $MpvPath" -ForegroundColor Red
-    Write-Host "Specify with -MpvPath parameter." -ForegroundColor Gray
-    exit 1
+# MpvPath: CLI > env MPV_PATH_WIN > 系统 mpv
+if (-not $MpvPath) {
+    $MpvPath = if ($env:MPV_PATH_WIN) { $env:MPV_PATH_WIN } else { "mpv" }
 }
 
 # ── 执行 ──────────────────────────────────────────────────────────────────────

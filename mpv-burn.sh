@@ -20,8 +20,10 @@ set -euo pipefail
 
 # ── 默认值 ──────────────────────────────────────────────────────────────────────
 
-DEFAULT_MPV="/mnt/c/Users/oculi/mpv-lazy/mpv.com"
-MPV="${MPV_PATH:-$DEFAULT_MPV}"
+# 从 .env 读取配置
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
+MPV="${MPV_PATH_LINUX:-mpv}"
 
 OUTPUT=""
 SUB_FILE=""

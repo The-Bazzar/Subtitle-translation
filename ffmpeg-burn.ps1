@@ -23,8 +23,8 @@ param(
     [Parameter(HelpMessage = "Output resolution (e.g. 1920x1080, 1280x720)")]
     [string]$Res,
 
-    [Parameter(HelpMessage = "ffmpeg.exe path (default: ffmpeg in PATH)")]
-    [string]$FfmpegPath = "ffmpeg",
+    [Parameter(HelpMessage = "ffmpeg.exe path (default: from env FFMPEG_PATH)")]
+    [string]$FfmpegPath,
 
     [Parameter(HelpMessage = "Print command only, do not execute")]
     [switch]$DryRun,
@@ -108,6 +108,11 @@ if ($SubFile) {
 # 编码器参数拆分: "qp=20" → -qp 20, "crf=23" → -crf 23
 $OvcKey, $OvcVal = $Ovcopts -split '=', 2
 if (-not $OvcVal) { $OvcVal = $OvcKey; $OvcKey = 'qp' }
+
+# FfmpegPath: CLI > env FFMPEG_PATH_WIN > PATH
+if (-not $FfmpegPath) {
+    $FfmpegPath = if ($env:FFMPEG_PATH_WIN) { $env:FFMPEG_PATH_WIN } else { "ffmpeg" }
+}
 
 # ── 执行 ──────────────────────────────────────────────────────────────────────
 
