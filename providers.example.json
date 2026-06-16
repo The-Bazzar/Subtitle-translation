@@ -10,8 +10,8 @@
         }
     },
     "deepseek": {
-        "url": "https://api.deepseek.com/v1/chat/completions",
-        "default_model": "deepseek-v4-pro",
+        "url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        "default_model": "deepseek-v3-2-251201",
         "env_key": "DEEPSEEK_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {}

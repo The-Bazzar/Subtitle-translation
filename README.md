@@ -114,9 +114,15 @@ GEMINI_API_KEY=xxx                # https://aistudio.google.com
 
 `.env` 已 gitignored，不要提交。换行符支持 LF / CRLF（脚本自动处理 `\r`）。
 
-### `providers.json` — LLM 提供商配置
+### `providers.example.json` — LLM 提供商配置
 
-定义翻译/校对可用的 LLM 后端。内置 `openrouter`、`deepseek`、`gemini` 三个，可自行添加/修改：
+仓库提供 `providers.example.json` 作为模板。使用时复制为 `providers.json`：
+
+```bash
+cp providers.example.json providers.json
+```
+
+`providers.json` 已 gitignored，可自由修改。定义翻译/校对可用的 LLM 后端：
 
 ```json
 {
@@ -489,6 +495,8 @@ Subtitle translation/
 ├── mpv-burn.ps1              # PowerShell: 字幕硬压 (mpv 编码, 高级)
 ├── template.ass              # ASS 模板 (bi-en / bi-zh / zh 样式定义)
 ├── download.ps1              # PowerShell: 仅下载 (不含字幕)
+├── providers.example.json    # LLM 提供商模板 (复制为 providers.json 使用)
+├── .env.example              # 环境变量模板 (复制为 .env 使用)
 ├── .env                      # API keys + 翻译默认配置 (gitignored)
 ├── cookies.txt               # YouTube 登录凭证 (gitignored)
 └── <Video Title>/             # 每个视频独立的输出目录
