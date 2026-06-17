@@ -45,7 +45,7 @@ VIDEO_LANG="en"
 VIDEO_BASE="${VIDEO_NAME%.*}"
 INFO_JSON="$VIDEO_DIR/$VIDEO_BASE.info.json"
 if [ -f "$INFO_JSON" ]; then
-    LANG=$(python3 -c "
+    LANG=$(python -c "
 import json
 with open('$INFO_JSON') as f:
     info = json.load(f)

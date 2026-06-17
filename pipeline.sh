@@ -2,7 +2,7 @@
 # =============================================================================
 # pipeline.sh — 一键流水线: 下载视频 → 字幕 → 美化 → 翻译 [+ 硬压]
 #
-# 串联 download.sh → whisper.sh → beautify_srt.sh → translate_srt.py → (ffmpeg-burn.sh)
+# 串联 download.sh → whisper.sh → beautify_srt.py → translate_srt.py → (ffmpeg-burn.sh)
 # 从 YouTube 链接直达双语 .zh-en.ass 字幕 / burned.mkv 硬字幕。
 #
 # 成果物链 (每步输出作为下一步输入):
@@ -38,7 +38,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_SCRIPT="$SCRIPT_DIR/download.sh"
 WHISPER_SCRIPT="$SCRIPT_DIR/whisper.sh"
-BEAUTIFY_SCRIPT="$SCRIPT_DIR/beautify_srt.sh"
+BEAUTIFY_SCRIPT="$SCRIPT_DIR/beautify_srt.py"
 TRANSLATE_SCRIPT="$SCRIPT_DIR/translate_srt.py"
 BURN_SCRIPT="$SCRIPT_DIR/ffmpeg-burn.sh"
 
@@ -275,7 +275,7 @@ else
         echo "Found SRT: $SRT_PATH" >&2
     fi
 
-    bash "$BEAUTIFY_SCRIPT" "$VIDEO_PATH" "$SRT_PATH" -o "$BEAUTIFIED_SRT" "${BEAUTIFY_ARGS[@]}"
+    python "$BEAUTIFY_SCRIPT" "$VIDEO_PATH" "$SRT_PATH" -o "$BEAUTIFIED_SRT" "${BEAUTIFY_ARGS[@]}"
     echo ""
 fi
 
@@ -317,7 +317,7 @@ else
     if [ "${PROOFREAD:-1}" = "0" ]; then
         export PROOFREAD=0
     fi
-    python3 "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" -o "$ASS_PATH" "${TRANSLATE_ARGS[@]}"
+    python "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" -o "$ASS_PATH" "${TRANSLATE_ARGS[@]}"
 
     echo ""
 fi
