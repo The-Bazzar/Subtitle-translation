@@ -4,19 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-YouTube 视频下载 + WhisperX AI 字幕生成流水线。项目维护在一个 Windows 主机上，核心脚本在 WSL 中运行。
+YouTube 视频下载 + WhisperX AI 字幕生成流水线。项目维护在一个 Windows 主机上，核心脚本在 Linux 中运行。
 
 ## Architecture
 
 ```
 Subtitle translation/
 ├── pipeline.ps1              # Windows/PowerShell: 超级流水线 (URL → burned.mkv)
-├── pipeline.sh               # WSL/bash: 流水线 (download → beautify → translate)
+├── pipeline.sh               # Linux/bash: 流水线 (download → beautify → translate)
 ├── download_and_sub.sh       # 主流程: 下载视频 → 生成英文字幕
 ├── beautify_srt.sh           # 字幕时间码美化入口 (调用 beautify_srt.py)
 ├── beautify_srt.py           # Python: 场景检测 + 帧率自适应 → 美化 SRT 时间码 (Netflix 规范)
 ├── translate_srt.py          # Python: LLM 翻译 → .zh.srt + .zh.ass + .zh-en.ass (双语硬压)
-├── mpv-burn.sh               # WSL/bash: mpv 字幕硬压 (调用 Windows mpv.com)
+├── mpv-burn.sh               # Linux/bash: mpv 字幕硬压 (调用 Windows mpv.com)
 ├── template.ass              # ASS 字幕模板 (Style: zh 定义中文字幕样式)
 ├── download.ps1              # Windows PowerShell 备用: 仅下载 (不含字幕生成)
 ├── mpv-burn.ps1              # Windows PowerShell: mpv 字幕硬压 (NVENC)
@@ -49,7 +49,7 @@ Subtitle translation/
 .\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
 ```
 
-### 主流程 (WSL 中运行)
+### 主流程 (Linux 中运行)
 
 ```bash
 # 一键流水线: 下载 + 字幕 + 美化 (推荐)
@@ -66,7 +66,7 @@ SKIP_BEAUTIFY=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ./download_and_sub.sh "URL1" && ./download_and_sub.sh "URL2"
 ```
 
-### 从 PowerShell 调用 WSL
+### 从 PowerShell 调用 Linux
 
 ```powershell
 wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=xxxxx"
@@ -85,7 +85,7 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 # 输出: burned.mkv (同目录, hevc_nvenc qp=20, aac音频)
 ```
 
-### 字幕硬压到视频 (WSL)
+### 字幕硬压到视频 (Linux)
 
 ```bash
 # 基础用法 (默认 hevc_nvenc qp=20)
@@ -104,7 +104,7 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 ./mpv-burn.sh video.webm -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
 ```
 
-### 字幕时间码美化 (WSL 中运行)
+### 字幕时间码美化 (Linux 中运行)
 
 ```bash
 # 自动查找同目录 .srt 并输出 .beautified.srt (不覆盖原文件)
@@ -129,7 +129,7 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 ./beautify_srt.sh --help
 ```
 
-### 字幕翻译 (WSL 中运行)
+### 字幕翻译 (Linux 中运行)
 
 ```bash
 # 基础翻译 (从 .env 读取 provider/model)
@@ -165,8 +165,8 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 
 ## Pipeline Steps (pipeline.ps1)
 
-1. **WSL 流水线** — 调用 `wsl bash pipeline.sh <url>` 完成下载+美化+翻译
-2. **路径转换** — `wslpath -w` 将 WSL 路径转为 Windows 路径
+1. **Linux 流水线** — 调用 `Linux bash pipeline.sh <url>` 完成下载+美化+翻译
+2. **路径转换** — `wslpath -w` 将 Linux 路径转为 Windows 路径
 3. **硬压字幕** — 调用 `ffmpeg-burn.ps1` 将 .zh-en.ass 硬压到视频 → burned.mkv (保留封面图)
 
 ## Pipeline Steps (download_and_sub.sh)
@@ -219,7 +219,7 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 - WhisperX 首次运行会自动下载 `large-v3` 模型 (数 GB)，需要保持网络畅通。
 - 无 NVIDIA GPU 时需将 `--compute_type float16` 改为 `int8`，或添加 `--device cpu`。
 - 每个视频目录名即为 `yt-dlp --get-title` 的结果 (特殊字符替换为 `_`)。
-- `beautify_srt.sh` 运行在 WSL 中，会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
+- `beautify_srt.sh` 运行在 Linux 中，会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
 - **美化默认不覆盖原文件** — 输出 `<原名>.beautified.srt`，需显式 `-o same.srt` 才会覆盖。
 - 场景检测对长视频可能耗时较久（~5 分钟/小时视频）。
 - 所有帧数参数 (`--snap-frames`, `--end-offset-frames`, `--min-scene-interval-frames`) 会按实际视频帧率自动换算为秒。

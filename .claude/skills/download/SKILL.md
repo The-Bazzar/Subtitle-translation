@@ -10,7 +10,7 @@ description: 下载 YouTube 视频 + 元数据（不含字幕生成）
 ## 执行方式
 
 ```bash
-# WSL: 下载视频 + 元数据 + 字幕生成 (全流程)
+# Linux: 下载视频 + 元数据 + 字幕生成 (全流程)
 ./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
 
 # PowerShell: 仅下载视频 + 元数据

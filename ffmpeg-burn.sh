@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# ffmpeg-burn.sh — WSL 字幕硬压脚本 (ffmpeg 滤镜)
+# ffmpeg-burn.sh — Linux 字幕硬压脚本 (ffmpeg 滤镜)
 #
 # 用法:
 #   ./ffmpeg-burn.sh <视频文件> [选项...] [-- ffmpeg额外参数...]
@@ -31,7 +31,7 @@ FFMPEG="${FFMPEG_PATH_LINUX:-ffmpeg}"
 
 show_help() {
     cat << 'EOF'
-ffmpeg-burn.sh — WSL 字幕硬压脚本 (ffmpeg 滤镜)
+ffmpeg-burn.sh — Linux 字幕硬压脚本 (ffmpeg 滤镜)
 
 用法:
   ./ffmpeg-burn.sh <视频文件> [选项...] [-- ffmpeg额外参数...]

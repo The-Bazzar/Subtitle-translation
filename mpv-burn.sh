@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# mpv-burn.sh — WSL 字幕硬压脚本 (mpv 编码模式)
+# mpv-burn.sh — Linux 字幕硬压脚本 (mpv 编码模式)
 #
 # 用法:
 #   ./mpv-burn.sh <视频文件> [选项...] [-- mpv额外参数...]
@@ -35,14 +35,14 @@ RES=""
 
 show_help() {
     cat << 'EOF'
-mpv-burn.sh — WSL 字幕硬压脚本 (mpv 编码模式)
+mpv-burn.sh — Linux 字幕硬压脚本 (mpv 编码模式)
 
 用法:
   ./mpv-burn.sh <视频文件> [选项...] [-- mpv额外参数...]
 
 说明:
   使用 mpv 的 --o= 编码模式将字幕硬压到视频中。
-  mpv.com 是 Windows 可执行文件，在 WSL 中通过 /mnt/c/... 路径调用。
+  mpv.com 是 Windows 可执行文件，在 Linux 中通过 /mnt/c/... 路径调用。
 
 选项:
   -o, --output PATH       输出文件路径 (默认: 输入同目录 burned.mkv)
@@ -162,7 +162,7 @@ if [ -z "$OUTPUT" ]; then
 fi
 OUTPUT_ABS="$(realpath "$OUTPUT" 2>/dev/null || echo "$OUTPUT")"
 
-# WSL → Windows 路径转换 (mpv.com 是 Windows 可执行文件, 不识别 /mnt/c/...)
+# Linux → Windows 路径转换 (mpv.com 是 Windows 可执行文件, 不识别 /mnt/c/...)
 if command -v wslpath &>/dev/null; then
     VIDEO_WIN="$(wslpath -w "$VIDEO_ABS")"
     OUTPUT_WIN="$(wslpath -w "$OUTPUT_ABS")"
@@ -172,7 +172,7 @@ else
     OUTPUT_WIN="$(echo "$OUTPUT_ABS" | sed 's|^/mnt/\([a-zA-Z]\)/|\1:\\|; s|/|\\|g')"
 fi
 
-# 字幕文件路径也需 WSL → Windows 转换
+# 字幕文件路径也需 Linux → Windows 转换
 if [ -n "$SUB_FILE" ]; then
     SUB_FILE_ABS="$(realpath "$SUB_FILE" 2>/dev/null || readlink -f "$SUB_FILE")"
     if command -v wslpath &>/dev/null; then
@@ -185,7 +185,7 @@ fi
 # ── 执行 ──────────────────────────────────────────────────────────────────────
 
 echo "============================================="
-echo "mpv-burn — WSL 字幕硬压"
+echo "mpv-burn — Linux 字幕硬压"
 echo "============================================="
 echo "mpv:     $MPV"
 echo "输入:    $VIDEO_ABS"

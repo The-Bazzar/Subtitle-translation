@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-batch.py — 批量字幕流水线 (WSL 并行)
+batch.py — 批量字幕流水线 (Linux 并行)
 
 用法:
   python3 batch.py "URL1" "URL2" "URL3" [选项...]
