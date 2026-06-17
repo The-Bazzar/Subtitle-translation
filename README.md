@@ -73,10 +73,6 @@ FFMPEG_PATH_LINUX=                # Linux ffmpeg 路径
 TRANSLATE_PROVIDER=deepseek       # 翻译后端: openrouter | deepseek | gemini
 TRANSLATE_MODEL=deepseek-v4-pro   # 模型名, 留空则使用后端内置默认
 
-# ── 系统提示词 (留空使用内置 Netflix 规范默认) ──
-TRANSLATE_SYSTEM_PROMPT=
-PROOFREAD_SYSTEM_PROMPT=
-
 # ── 校对专用后端/模型 (留空则与翻译共用, 可实现交叉校对) ──
 PROOFREAD_PROVIDER=
 PROOFREAD_MODEL=
@@ -91,8 +87,6 @@ GEMINI_API_KEY=xxx                # https://aistudio.google.com
 |------|:--:|------|
 | `TRANSLATE_PROVIDER` | 否 | 翻译后端，不设默认 `openrouter`。所有脚本均读取 |
 | `TRANSLATE_MODEL` | 否 | 模型名，不设使用后端内置默认 |
-| `TRANSLATE_SYSTEM_PROMPT` | 否 | 翻译系统提示词，留空使用内置 Netflix 规范提示词 |
-| `PROOFREAD_SYSTEM_PROMPT` | 否 | 校对系统提示词，留空使用内置校对提示词 |
 | `PROOFREAD_PROVIDER` | 否 | 校对专用后端，留空与翻译共用（可实现交叉校对） |
 | `PROOFREAD_MODEL` | 否 | 校对专用模型，留空与翻译共用 |
 | `MPV_PATH_WIN` | 否 | Windows mpv.com 路径 |
@@ -415,10 +409,8 @@ python3 translate_srt.py video.srt \
     --proofread-provider openrouter \
     --proofread-model anthropic/claude-sonnet-4-6
 
-# 自定义提示词
-python3 translate_srt.py video.srt \
-    --system-prompt "你的翻译提示词" \
-    --proofread-prompt "你的校对提示词"
+# 自定义提示词 (编辑 translate_prompt.md / proofread_prompt.md)
+# cp translate_prompt.example.md translate_prompt.md
 
 # 自定义输出
 python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
@@ -432,8 +424,6 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 | `--proofread` | 开启 | 中英校对（`PROOFREAD=0` 关闭） |
 | `--proofread-provider` | 同翻译 | 校对专用后端（交叉校对） |
 | `--proofread-model` | 同翻译 | 校对专用模型 |
-| `--system-prompt` | 内置默认 | 自定义翻译提示词 |
-| `--proofread-prompt` | 内置默认 | 自定义校对提示词 |
 | `--title` | SRT 文件名 | 视频标题 (写入 ASS Title) |
 | `--template` | `./template.ass` | ASS 模板路径 |
 | `-o, --output` | 自动 | 输出 `.zh-en.ass` (`.zh.srt` + `.zh.ass` 同目录) |
@@ -495,6 +485,8 @@ Subtitle translation/
 ├── mpv-burn.ps1              # PowerShell: 字幕硬压 (mpv 编码, 高级)
 ├── template.ass              # ASS 模板 (bi-en / bi-zh / zh 样式定义)
 ├── download.ps1              # PowerShell: 仅下载 (不含字幕)
+├── translate_prompt.example.md # 翻译提示词模板 (复制为 translate_prompt.md)
+├── proofread_prompt.example.md # 校对提示词模板 (复制为 proofread_prompt.md)
 ├── providers.example.json    # LLM 提供商模板 (复制为 providers.json 使用)
 ├── .env.example              # 环境变量模板 (复制为 .env 使用)
 ├── .env                      # API keys + 翻译默认配置 (gitignored)
@@ -575,7 +567,7 @@ TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
 - **美化默认不覆盖**：输出 `.beautified.srt`，不修改原始字幕。流水线检测到已存在的自动跳过。
 - **翻译缓存**：`.zh.srt` 存在时自动跳过 LLM，直接合成 `.zh.ass` + `.zh-en.ass`。校对后缓存覆盖为精校版。
 - **两轮校对**：翻译 (Pass 1) 后默认执行中英校对 (Pass 2)，`PROOFREAD=0` 关闭。校对支持**交叉模型**（如 DeepSeek 翻译 + Claude 校对）。
-- **Netflix 中文规范**：默认翻译提示词去除所有中文标点（仅保留 `《》`），用空格替代停顿。可通过 `.env` 的 `TRANSLATE_SYSTEM_PROMPT` 自定义。
+- **Netflix 中文规范**：翻译/校对提示词从 `translate_prompt.md` / `proofread_prompt.md` 读取（不存在则用内置默认），去除中文标点仅保留 `《》`。
 - **双语字幕**：`.zh-en.ass` 先排英文 (bi-en, 36px)，后排中文 (bi-zh, 72px)，中文自动 `\N` 换行。
 - **硬压默认开启**：`pipeline.sh` 默认 BURN=1，设 `BURN=0` 跳过硬压。`pipeline.ps1` 的 burn 在 Windows 端执行。
 - **帧率自适应**：所有帧数参数按实际视频 fps 换算为秒。

@@ -51,8 +51,6 @@ python3 translate_srt.py video.srt \
 | `--proofread` | 开启 | 中英校对 |
 | `--proofread-provider` | 同翻译 | 校对后端 |
 | `--proofread-model` | 同翻译 | 校对模型 |
-| `--system-prompt` | 内置 | 自定义翻译提示词 |
-| `--proofread-prompt` | 内置 | 自定义校对提示词 |
 | `--title` | SRT 文件名 | 视频标题 |
 | `-o, --output` | 自动 | 输出 `.zh-en.ass` |
 | `-q, --quiet` | — | 静默模式 |
@@ -64,13 +62,27 @@ Pass 1: English → LLM → 中文初译 (.zh.srt)
 Pass 2: (English + 中文初译) → LLM → 中文精校 (.zh.srt 覆盖)
 ```
 
+## 提示词配置
+
+翻译/校对提示词从文件加载，不再硬编码在脚本或 `.env` 中：
+
+```
+translate_prompt.md   (用户自定义, gitignored)
+  ↕ 不存在则回退
+translate_prompt.example.md  (仓库模板)
+
+proofread_prompt.md  (用户自定义, gitignored)
+  ↕
+proofread_prompt.example.md  (仓库模板)
+```
+
+使用方式：`cp translate_prompt.example.md translate_prompt.md` 后自行编辑。
+
 ## .env 配置
 
 ```ini
 TRANSLATE_PROVIDER=deepseek
 TRANSLATE_MODEL=deepseek-v4-pro
-TRANSLATE_SYSTEM_PROMPT=
-PROOFREAD_SYSTEM_PROMPT=
 PROOFREAD_PROVIDER=
 PROOFREAD_MODEL=
 DEEPSEEK_API_KEY=sk-xxx

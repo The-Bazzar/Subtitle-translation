@@ -178,7 +178,8 @@ def load_glossary(glossary_path: str) -> str:
         return ""
 
 
-TRANSLATION_SYSTEM_PROMPT = """You are a professional subtitle translator specializing in English→Simplified Chinese translation.
+# 内置回退提示词 (translate_prompt.md / proofread_prompt.md 缺失时使用)
+_TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator specializing in English→Simplified Chinese translation.
 
 Rules:
 - Translate each numbered line 1:1 to natural, fluent Chinese (Simplified)
@@ -199,7 +200,7 @@ Respond ONLY with numbered lines in this exact format:
   ...
 No explanations, no preamble, no closing remarks"""
 
-PROOFREAD_SYSTEM_PROMPT = """You are a Chinese subtitle proofreader. Review each numbered pair (EN original + ZH draft) against the English source.
+_PROOFREAD_PROMPT_FALLBACK = """You are a Chinese subtitle proofreader. Review each numbered pair (EN original + ZH draft) against the English source.
 
 Tasks:
 - Fix mistranslations, omissions, or added content — the Chinese must match the English meaning 1:1
@@ -214,6 +215,27 @@ Respond ONLY with corrected numbered lines:
   [2] corrected translation
   ...
 No explanations, no preamble, no closing remarks"""
+
+
+def load_prompt(filename: str, fallback: str) -> str:
+    """
+    从文件加载提示词.
+    - 先尝试 <filename>.md (用户自定义, gitignored)
+    - 再尝试 <filename>.example.md (仓库模板)
+    - 都不存在则返回 fallback 字符串
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    for suffix in ('.md', '.example.md'):
+        path = os.path.join(base, filename + suffix)
+        if os.path.isfile(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                if content:
+                    return content
+            except OSError:
+                pass
+    return fallback
 
 
 def load_env(script_dir: str) -> dict[str, str]:
@@ -271,7 +293,7 @@ def translate_batch(
     payload = {
         'model': model,
         'messages': [
-            {'role': 'system', 'content': system_prompt or TRANSLATION_SYSTEM_PROMPT},
+            {'role': 'system', 'content': system_prompt or _TRANSLATE_PROMPT_FALLBACK},
             {'role': 'user', 'content': (
                 f"Translate these {len(texts)} subtitle lines to Chinese. "
                 f"Respond with exactly {len(texts)} numbered lines.\n\n{prompt}"
@@ -780,16 +802,12 @@ Examples:
                         help='API key (默认: 从 .env 读取)')
     parser.add_argument('--batch-size', type=int, default=50,
                         help='每批翻译行数 (默认: 50)')
-    parser.add_argument('--system-prompt', metavar='PROMPT',
-                        help='自定义翻译提示词 (默认: 内置 Netflix 规范提示词)')
     parser.add_argument('--proofread', action='store_true', default=True,
                         help='中英校对 (默认开启)')
     parser.add_argument('--proofread-provider', choices=_provider_keys,
                         help='校对专用后端 (默认: 同翻译后端)')
     parser.add_argument('--proofread-model',
                         help='校对专用模型 (默认: 同翻译模型)')
-    parser.add_argument('--proofread-prompt', metavar='PROMPT',
-                        help='自定义校对提示词 (默认: 内置校对提示词)')
     parser.add_argument('--glossary', metavar='PATH',
                         help='glossary.md 术语知识库路径 (注入校对 prompt)')
     parser.add_argument('--title',
@@ -835,8 +853,9 @@ Examples:
         print(f"  Duration: {subtitles[0]['start_ass']} → {subtitles[-1]['end_ass']}")
 
     # 系统提示词: CLI > .env > 内置默认
-    system_prompt = args.system_prompt or _env.get('TRANSLATE_SYSTEM_PROMPT', '') or ''
-    proofread_prompt = args.proofread_prompt or _env.get('PROOFREAD_SYSTEM_PROMPT', '') or ''
+    # 从文件加载提示词 (translate_prompt.md > translate_prompt.example.md > 内置回退)
+    system_prompt = load_prompt('translate_prompt', _TRANSLATE_PROMPT_FALLBACK)
+    proofread_prompt = load_prompt('proofread_prompt', _PROOFREAD_PROMPT_FALLBACK)
 
     # 自动检测或手动指定 glossary.md
     glossary_path = args.glossary
