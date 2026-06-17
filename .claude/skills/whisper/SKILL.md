@@ -59,6 +59,18 @@ pip install whisperx
 | `--model` | `large-v3` | ASR 模型 |
 | `--compute_type` | `float16` | GPU: float16, CPU: int8 |
 | `--device` | `cuda` | cuda / cpu |
+| `--align_model` | 空 | 对齐模型 (留空则 WhisperX 按语言自动选择) |
+
+### Align 模型选择
+
+WhisperX 的 `--align_model` 用于词级时间戳对齐，留空时根据语言自动匹配默认模型。手动指定可覆盖：
+
+| 值 | 说明 |
+|------|------|
+| 留空 (默认) | WhisperX 按语言自动匹配 |
+| `facebook/mms-1b-fl102` | 手动指定 (通用模型, 主流语言均适用) |
+
+通过环境变量指定：`WHISPER_ALIGN_MODEL=facebook/mms-1b-fl102 ./download_and_sub.sh "url"`
 
 ## 注意事项
 

@@ -112,12 +112,7 @@ if [ -f "$FOLDER_NAME/$SRT_NAME" ]; then
 	echo "字幕已存在, 跳过 WhisperX — $FOLDER_NAME/$SRT_NAME"
 else
 	# 在子 shell 中 cd, 不改变外层工作目录 (避免影响后续 realpath)
-	(cd "$FOLDER_NAME" && uvx whisperx "$VIDEO_FILE" \
-		--lang "$VIDEO_LANG" \
-		--model large-v3-turbo \
-		--output_dir . \
-		--output_format srt \
-		--compute_type float16)
+		(cd "$FOLDER_NAME" && uvx whisperx "$VIDEO_FILE" \n			--model "${WHISPER_MODEL:-large-v3-turbo}" \n			--language "$VIDEO_LANG" \n			--align_model "${WHISPER_ALIGN_MODEL:-}" \n			--output_dir . \n			--output_format srt \n			--compute_type "${WHISPER_COMPUTE:-float16}")
 fi
 
 echo "============================================="

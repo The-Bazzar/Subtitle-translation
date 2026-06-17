@@ -53,6 +53,17 @@ uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
 
 > **无 GPU / macOS**：跳过 CUDA，`download_and_sub.sh` 已配置 `--device cpu --compute_type int8`。
 
+**Align 模型**：WhisperX 的词级时间戳对齐模型，通过环境变量 `WHISPER_ALIGN_MODEL` 指定（留空则按语言自动选择）：
+
+| 值 | 说明 |
+|------|------|
+| 留空 (默认) | WhisperX 按语言自动匹配 |
+| `facebook/mms-1b-fl102` | 手动指定 (通用模型, 主流语言均适用) |
+
+```bash
+WHISPER_ALIGN_MODEL=facebook/mms-1b-fl102 ./download_and_sub.sh "url"
+```
+
 详见 [WhisperX 官方文档](https://github.com/m-bain/whisperX)。
 
 ### Windows (可选)
