@@ -67,13 +67,16 @@ echo "模型:   ${WHISPER_MODEL:-large-v3-turbo}"
 echo "============================================="
 
 cd "$VIDEO_DIR"
-uvx whisperx "$VIDEO_NAME" \
-    --model "${WHISPER_MODEL:-large-v3-turbo}" \
-    --language "$VIDEO_LANG" \
-    --align_model "${WHISPER_ALIGN_MODEL:-}" \
-    --output_dir . \
-    --output_format srt \
+WHISPER_ARGS=(
+    "$VIDEO_NAME"
+    --model "${WHISPER_MODEL:-large-v3-turbo}"
+    --language "$VIDEO_LANG"
+    --output_dir .
+    --output_format srt
     --compute_type "${WHISPER_COMPUTE:-float16}"
+)
+[ -n "${WHISPER_ALIGN_MODEL:-}" ] && WHISPER_ARGS+=(--align_model "$WHISPER_ALIGN_MODEL")
+uvx whisperx "${WHISPER_ARGS[@]}"
 
 echo "============================================="
 echo "whisper — 完成: $VIDEO_DIR/$SRT_NAME"
