@@ -112,4 +112,4 @@ Write-Host "Finish! 所有文件已保存在文件夹: $FolderName" -ForegroundC
 Write-Host "=============================================" -ForegroundColor Green
 
 $VideoAbs = Join-Path (Resolve-Path $FolderName).Path $VideoFile
-Write-Host "OUTPUT_VIDEO=$VideoAbs"
+Write-Output "OUTPUT_VIDEO=$VideoAbs"

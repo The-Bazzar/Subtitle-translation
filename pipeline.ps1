@@ -29,8 +29,11 @@ param(
     [Parameter(HelpMessage = "Output resolution (e.g. 1920x1080)")]
     [string]$Res,
 
-    [Parameter(HelpMessage = "Skip download step (use existing video)")]
+    [Parameter(HelpMessage = "Skip download step")]
     [switch]$SkipDownload,
+
+    [Parameter(HelpMessage = "Skip WhisperX subtitle generation")]
+    [switch]$SkipWhisper,
 
     [Parameter(HelpMessage = "Skip subtitle beautify step")]
     [switch]$SkipBeautify,
@@ -55,65 +58,49 @@ param(
     [string]$ExistingAss,
 
     [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$MpvExtraArgs
+    [string[]]$FfmpegExtra
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
-if ($Help -or ($PSBoundParameters.Count -eq 0 -and -not $Url)) {
+if ($Help -or (-not $Url)) {
     @"
-pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv (硬字幕)
+pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
-用法:
-  .\pipeline.ps1 <YouTube URL> [选项...]
+用法: .\pipeline.ps1 <YouTube URL> [选项...]
 
-流程:
-  1. yt-dlp 下载视频 + SponsorBlock 去广告
-  2. WhisperX large-v3 生成英文字幕
-  3. ffmpeg/ffprobe 场景检测 → 字幕时间码美化 (Netflix 规范)
-  4. LLM API 翻译英文 → 双语 .zh-en.ass (bi-en + bi-zh)
-  5. ffmpeg 硬压双语字幕 → burned.mkv
+流程: 下载 → 语音识别 → 美化 → 翻译 → 硬压 (纯 Windows)
+  1. yt-dlp 下载视频 + 元数据
+  2. WhisperX 生成英文字幕
+  3. 场景检测美化时间码 (Netflix 规范)
+  4. LLM 翻译 + 校对 → 双语 .zh-en.ass
+  5. ffmpeg 硬压 → burned.mkv
 
 参数:
-  -Url                YouTube 视频链接 (必选, 位置 0)
-  -Output             输出视频路径 (默认: 视频目录 burned.mkv)
-  -TranslateProvider  翻译后端: openrouter | deepseek | gemini (默认: openrouter)
-  -TranslateModel     翻译模型 (默认: provider 内置默认)
-  -Ovc                视频编码器 (默认: hevc_nvenc)
-  -Ovcopts            视频编码器参数 (默认: qp=20)
-  -Oac                音频编码器 (默认: aac)
-  -Res                输出分辨率 (如 1920x1080, 默认: 原视频)
-  -SkipDownload       跳过下载 (使用已有视频)
+  -Url                YouTube 视频链接 (必选)
+  -o, -Output         输出视频路径
+  -p, -TranslateProvider  翻译后端
+  -tm, -TranslateModel    翻译模型
+  -Ovc / -Ovcopts / -Oac  视频/音频编码器参数
+  -r, -Res            输出分辨率 (保持宽高比+黑边)
+  -SkipDownload       跳过下载
+  -SkipWhisper        跳过语音识别
   -SkipBeautify       跳过时间码美化
   -SkipTranslate      跳过翻译
-  -NoProofread        关闭校对 (仅翻译, 不审校)
-  -SkipBurn           跳过压制 (输出 .zh.srt + .zh.ass + .zh-en.ass)
-  -ExistingAss        已有 .zh-en.ass 路径 (跳过翻译, 直接压制)
-  -DryRun             仅打印命令, 不执行
-  -Help               显示帮助
+  -NoProofread        关闭校对
+  -SkipBurn           跳过压制
+  -ExistingAss        已有 .zh-en.ass 路径
+  -DryRun             仅打印命令
+  -h, -Help           帮助
 
 示例:
-  .\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
-  .\pipeline.ps1 "https://youtu.be/xxxxx" -TranslateProvider deepseek
-  .\pipeline.ps1 "https://youtu.be/xxxxx" -o result.mkv -Ovc libx265 -Ovcopts crf=23
-  .\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
-  .\pipeline.ps1 "https://youtu.be/xxxxx" -DryRun
-  .\pipeline.ps1 "https://youtu.be/xxxxx" --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
-
-前置依赖:
-  WSL: yt-dlp, uvx (whisperx), ffmpeg, ffprobe, python3
-  Windows: ffmpeg (系统 PATH 或 .env 中 FFMPEG_PATH_WIN)
-  API key: .env 中 OPENROUTER_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY
+  .\pipeline.ps1 "https://youtube.com/watch?v=xxx"
+  .\pipeline.ps1 "url" -p deepseek -SkipBurn
+  .\pipeline.ps1 "url" -r 1920x1080
 "@
     exit 0
-}
-
-if (-not $Url) {
-    Write-Host "Error: URL is required." -ForegroundColor Red
-    Write-Host "Usage: .\pipeline.ps1 <YouTube URL> [-h]" -ForegroundColor Gray
-    exit 1
 }
 
 # ── 从 .env 读取默认配置 ──────────────────────────────────────────────────────
@@ -128,161 +115,182 @@ function Get-EnvValue([string]$Key, [string]$Default) {
     return $Default
 }
 
-# CLI 参数未指定时, 回退到 .env
 if (-not $TranslateProvider) { $TranslateProvider = Get-EnvValue 'TRANSLATE_PROVIDER' 'openrouter' }
 if (-not $TranslateModel)    { $TranslateModel    = Get-EnvValue 'TRANSLATE_MODEL' '' }
 
-# ── 路径 ──────────────────────────────────────────────────────────────────────
+# ── 工具路径 ──────────────────────────────────────────────────────────────────
 
-# WSL 中的脚本目录 (/mnt/c/Users/...)
-$WslScriptDir = ($ScriptDir -replace '\\', '/') -replace '^C:', '/mnt/c'
-$PipelineSh = "$WslScriptDir/pipeline.sh"
-$BurnPs1 = Join-Path $ScriptDir "ffmpeg-burn.ps1"
+$DownloadPs1  = Join-Path $ScriptDir "download.ps1"
+$WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
+$BeautifyPy   = Join-Path $ScriptDir "beautify_srt.py"
+$TranslatePy  = Join-Path $ScriptDir "translate_srt.py"
+$BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
 
-# ── 构建 WSL 命令 ──────────────────────────────────────────────────────────────
-
-$WslEnv = "BURN=0 "  # pipeline.ps1 handles burn on Windows, don't double-burn in WSL
-if ($SkipDownload)   { $WslEnv += "SKIP_DOWNLOAD=1 " }
-if ($SkipBeautify)   { $WslEnv += "SKIP_BEAUTIFY=1 " }
-if ($SkipTranslate)  { $WslEnv += "SKIP_TRANSLATE=1 " }
-if ($NoProofread)    { $WslEnv += "PROOFREAD=0 " }
-if ($ExistingAss)    { $WslEnv += "EXISTING_ASS=$(WinToWsl $ExistingAss) " }
-
-$WslCmd = "cd '$WslScriptDir' && ${WslEnv}TRANSLATE_PROVIDER=$TranslateProvider"
-if ($TranslateModel) { $WslCmd += " TRANSLATE_MODEL=$TranslateModel" }
-$WslCmd += " bash '$PipelineSh' '$Url'"
+# ── 启动信息 ──────────────────────────────────────────────────────────────────
 
 Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "pipeline — Super Pipeline" -ForegroundColor Cyan
+Write-Host "pipeline — Super Pipeline (纯 Windows)" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "URL:              $Url" -ForegroundColor Gray
-Write-Host "Translator:       $TranslateProvider" -ForegroundColor Gray
-if ($ExistingAss)         { Write-Host "Translate:      Using existing ASS: $ExistingAss" -ForegroundColor Gray }
-if (-not $SkipDownload)   { Write-Host "Step 1: Download + Subtitles" -ForegroundColor Gray }
-if (-not $SkipBeautify)   { Write-Host "Step 2: Beautify Timecodes → .beautified.srt" -ForegroundColor Gray }
-if (-not $SkipTranslate)  { Write-Host "Step 3: Translate (LLM) → .zh.srt + .zh.ass + .zh-en.ass" -ForegroundColor Gray }
-if (-not $SkipBurn)       { Write-Host "Step 4: Burn Subtitles → burned.mkv" -ForegroundColor Gray }
+Write-Host "URL:       $Url" -ForegroundColor Gray
+Write-Host "Provider:  $TranslateProvider" -ForegroundColor Gray
+if ($TranslateModel) { Write-Host "Model:     $TranslateModel" -ForegroundColor Gray }
+if ($ExistingAss)    { Write-Host "Existing:  $ExistingAss" -ForegroundColor Gray }
+$steps = @()
+if (-not $SkipDownload)  { $steps += "Download" }
+if (-not $SkipWhisper)   { $steps += "Whisper" }
+if (-not $SkipBeautify)  { $steps += "Beautify" }
+if (-not $SkipTranslate) { $steps += "Translate" }
+if (-not $SkipBurn)      { $steps += "Burn" }
+Write-Host "Steps:     $($steps -join ' → ')" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Cyan
 
 if ($DryRun) {
-    Write-Host ""
-    Write-Host "[DRY RUN] WSL CMD:" -ForegroundColor Yellow
-    Write-Host "  wsl -u root bash -lc `"$WslCmd`"" -ForegroundColor Yellow
-    if (-not $SkipBurn) {
-        Write-Host "[DRY RUN] Burn CMD:" -ForegroundColor Yellow
-        Write-Host "  .\ffmpeg-burn.ps1 <video> -SubFile <ass> -Ovc $Ovc -Ovcopts $Ovcopts" -ForegroundColor Yellow
-    }
+    if (-not $SkipDownload) { Write-Host "[DRY RUN] .\download.ps1 `"$Url`"" -ForegroundColor Yellow }
     exit 0
 }
 
-# ── Step 1-3: WSL pipeline (download + beautify + translate) ─────────────────
+# ── 步骤 1: 下载 ─────────────────────────────────────────────────────────────
 
-Write-Host ""
-Write-Host ">>> Starting WSL pipeline..." -ForegroundColor Cyan
-Write-Host ""
-
-# Stream WSL output line-by-line in real-time, while capturing for later parsing
-$WslLines = [System.Collections.ArrayList]::new()
-& wsl -u root bash -lc $WslCmd 2>&1 | ForEach-Object {
-    $line = $_
-    Write-Host $line          # real-time display
-    [void]$WslLines.Add($line) # capture for parsing
-}
-$WslExit = $LASTEXITCODE
-$WslOutput = $WslLines -join "`n"
-
-if ($WslExit -ne 0) {
+if ($SkipDownload) {
     Write-Host ""
-    Write-Host "Error: WSL pipeline failed (exit code: $WslExit)" -ForegroundColor Red
-    exit $WslExit
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "SKIP: 下载 (使用已有视频)" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    $VideoPath = Read-Host "视频文件路径"
+    if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
+        Write-Host "Error: Video file not found: $VideoPath" -ForegroundColor Red
+        exit 1
+    }
+} else {
+    Write-Host ""
+    Write-Host ">>> Step 1/5: Download" -ForegroundColor Cyan
+    $DownloadOutput = & $DownloadPs1 $Url 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Error: download.ps1 failed (exit code: $LASTEXITCODE)" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+    Write-Host ($DownloadOutput -join "`n")
+
+    $VideoPath = $null
+    foreach ($line in $DownloadOutput) {
+        if ($line -match '^OUTPUT_VIDEO=(.+)$') {
+            $VideoPath = $Matches[1].Trim()
+        }
+    }
+    if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
+        Write-Host "Error: Failed to locate downloaded video." -ForegroundColor Red
+        exit 1
+    }
 }
 
-# Parse OUTPUT_VIDEO, OUTPUT_SRT, OUTPUT_ASS markers from WSL output
-$VideoPath = $null
-$BeautifiedSrtPath = $null
-$AssPath = $null
+# ── 推导路径 ──────────────────────────────────────────────────────────────────
 
-foreach ($line in ($WslOutput -replace "`r`n", "`n") -split "`n") {
-    if ($line -match '^OUTPUT_VIDEO=(.+)$') {
-        $VideoPath = $Matches[1].Trim()
-    }
-    if ($line -match '^OUTPUT_SRT=(.+)$') {
-        $BeautifiedSrtPath = $Matches[1].Trim()
-    }
-    if ($line -match '^OUTPUT_ASS=(.+)$') {
-        $AssPath = $Matches[1].Trim()
-    }
+$VideoDir  = Split-Path $VideoPath -Parent
+$VideoBase = [System.IO.Path]::GetFileNameWithoutExtension($VideoPath)
+$SrtPath   = Join-Path $VideoDir "$VideoBase.srt"
+$BeautifiedSrt = Join-Path $VideoDir "$VideoBase.beautified.srt"
+$AssPath   = if ($ExistingAss) { $ExistingAss } else { Join-Path $VideoDir "$VideoBase.zh-en.ass" }
+
+# ── 步骤 2: WhisperX 字幕 ─────────────────────────────────────────────────────
+
+if ($SkipWhisper) {
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "SKIP: WhisperX 语音识别" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+} elseif (Test-Path $SrtPath) {
+    Write-Host ""
+    Write-Host "SKIP: WhisperX — $SrtPath 已存在" -ForegroundColor Gray
+} else {
+    Write-Host ""
+    Write-Host ">>> Step 2/5: WhisperX" -ForegroundColor Cyan
+    & $WhisperPs1 $VideoPath
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-# WSL 路径 (/mnt/c/...) → Windows 路径 (C:\...)
-function WslToWin([string]$WslPath) {
-    if ($WslPath -match '^/mnt/([a-zA-Z])/(.+)$') {
-        return $Matches[1].ToUpper() + ":\" + ($Matches[2] -replace '/', '\')
-    }
-    return $WslPath
+# ── 步骤 3: 美化时间码 ────────────────────────────────────────────────────────
+
+if ($SkipBeautify) {
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "SKIP: 时间码美化" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+} elseif (Test-Path $BeautifiedSrt) {
+    Write-Host ""
+    Write-Host "SKIP: 美化 — $BeautifiedSrt 已存在" -ForegroundColor Gray
+} else {
+    Write-Host ""
+    Write-Host ">>> Step 3/5: Beautify" -ForegroundColor Cyan
+    & python $BeautifyPy $VideoPath $SrtPath -o $BeautifiedSrt
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-# Windows 路径 (C:\...) → WSL 路径 (/mnt/c/...)
-function WinToWsl([string]$WinPath) {
-    if ($WinPath -match '^([a-zA-Z]):\\(.+)$') {
-        return "/mnt/" + $Matches[1].ToLower() + "/" + ($Matches[2] -replace '\\', '/')
-    }
-    return $WinPath
+# ── 步骤 4: 翻译 ──────────────────────────────────────────────────────────────
+
+$TranslateSrc = if (Test-Path $BeautifiedSrt) { $BeautifiedSrt } else { $SrtPath }
+
+if ($SkipTranslate) {
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "SKIP: LLM 翻译" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+} elseif (Test-Path $AssPath) {
+    Write-Host ""
+    Write-Host "SKIP: 翻译 — $AssPath 已存在" -ForegroundColor Gray
+} else {
+    Write-Host ""
+    Write-Host ">>> Step 4/5: Translate" -ForegroundColor Cyan
+    if ($NoProofread) { $env:PROOFREAD = "0" }
+    $TranslateArgs = @($TranslateSrc, '-o', $AssPath, '--provider', $TranslateProvider)
+    if ($TranslateModel) { $TranslateArgs += @('--model', $TranslateModel) }
+    & python $TranslatePy @TranslateArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-if ($VideoPath)       { $VideoPath       = WslToWin $VideoPath }
-if ($BeautifiedSrtPath) { $BeautifiedSrtPath = WslToWin $BeautifiedSrtPath }
-if ($AssPath)         { $AssPath         = WslToWin $AssPath }
-
-Write-Host ""
-Write-Host "Video:        $VideoPath" -ForegroundColor Gray
-if ($BeautifiedSrtPath) { Write-Host "Beautif. SRT: $BeautifiedSrtPath" -ForegroundColor Gray }
-Write-Host "zh-en ASS:    $AssPath" -ForegroundColor Gray
-
-if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
-    Write-Host "Error: Could not locate video file." -ForegroundColor Red
-    exit 1
-}
-
-# ── Step 4: Burn subtitles ───────────────────────────────────────────────────
+# ── 步骤 5: 硬压 ──────────────────────────────────────────────────────────────
 
 if ($SkipBurn) {
     Write-Host ""
     Write-Host "=============================================" -ForegroundColor Green
     Write-Host "Done! (burn skipped)" -ForegroundColor Green
-    Write-Host "zh-en ASS: $AssPath" -ForegroundColor Green
+    Write-Host "Video:   $VideoPath" -ForegroundColor Gray
+    Write-Host "SRT:     $BeautifiedSrt" -ForegroundColor Gray
+    Write-Host "ASS:     $AssPath" -ForegroundColor Gray
     Write-Host "=============================================" -ForegroundColor Green
     exit 0
 }
 
-Write-Host ""
-Write-Host ">>> Burning subtitles..." -ForegroundColor Cyan
+if (-not (Test-Path $AssPath)) {
+    Write-Host "Error: ASS not found, cannot burn: $AssPath" -ForegroundColor Red
+    exit 1
+}
 
-# 用 hashtable splatting — PowerShell 标准方式, 无 null 歧义
+Write-Host ""
+Write-Host ">>> Step 5/5: Burn" -ForegroundColor Cyan
+
 $BurnParams = @{
-    VideoPath   = $VideoPath
-    SubFile     = $AssPath
-    Ovc         = $Ovc
-    Ovcopts     = $Ovcopts
-    Oac         = $Oac
+    VideoPath = $VideoPath
+    SubFile   = $AssPath
+    Ovc       = $Ovc
+    Ovcopts   = $Ovcopts
+    Oac       = $Oac
 }
 if ($Res)    { $BurnParams['Res'] = $Res }
 if ($Output) { $BurnParams['Output'] = $Output }
 
-if ($MpvExtraArgs.Count -gt 0) {
-    & $BurnPs1 @BurnParams @MpvExtraArgs
+if ($FfmpegExtra.Count -gt 0) {
+    & $BurnPs1 @BurnParams @FfmpegExtra
 } else {
     & $BurnPs1 @BurnParams
 }
-$BurnExit = $LASTEXITCODE
-
-if ($BurnExit -ne 0) {
-    Write-Host ""
-    Write-Host "Error: mpv burning failed (exit code: $BurnExit)" -ForegroundColor Red
-    exit $BurnExit
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Error: Burn failed" -ForegroundColor Red
+    exit $LASTEXITCODE
 }
 
 Write-Host ""
 Write-Host "=============================================" -ForegroundColor Green
 Write-Host "Pipeline complete!" -ForegroundColor Green
+Write-Host "Video:   $VideoPath" -ForegroundColor Gray
+Write-Host "ASS:     $AssPath" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Green
