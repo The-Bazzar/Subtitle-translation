@@ -27,8 +27,6 @@ whisper.ps1 — WhisperX 语音识别生成英文字幕 (.srt)
 
 输出:
   同目录输出 <文件名>.srt
-
-通过 WSL 调用 whisper.sh。
 "@
     exit 0
 }
@@ -39,31 +37,59 @@ if (-not (Test-Path $VideoPath -PathType Leaf)) {
 }
 
 $VideoAbs = (Get-Item $VideoPath).FullName
+$VideoDir = Split-Path $VideoAbs -Parent
+$VideoName = [System.IO.Path]::GetFileNameWithoutExtension($VideoAbs)
 
-# 转 WSL 路径: C:\path\to\video → /mnt/c/path/to/video
-$WslPath = ($VideoAbs -replace '\\', '/') -replace '^([a-zA-Z]):', '/mnt/$1'.ToLower()
+# 已存在则跳过
+$SrtPath = Join-Path $VideoDir "$VideoName.srt"
+if (Test-Path $SrtPath) {
+    Write-Host "字幕已存在, 跳过: $SrtPath"
+    exit 0
+}
 
-$ScriptDir = Split-Path $PSCommandPath -Parent
-$WslScriptDir = ($ScriptDir -replace '\\', '/') -replace '^([a-zA-Z]):', '/mnt/$1'.ToLower()
-
-$EnvVars = "WHISPER_MODEL=$Model"
-if ($AlignModel) { $EnvVars += " WHISPER_ALIGN_MODEL=$AlignModel" }
-$EnvVars += " WHISPER_COMPUTE=$ComputeType"
+# 从 .info.json 读取视频语言
+$VideoLang = "en"
+$InfoJson = Join-Path $VideoDir "$VideoName.info.json"
+if (Test-Path $InfoJson) {
+    try {
+        $Info = Get-Content $InfoJson -Raw | ConvertFrom-Json
+        $Lang = if ($Info.language) { $Info.language } else { "" }
+        if ($Lang) {
+            $VideoLang = ($Lang -split '-')[0].ToLower()
+        }
+    } catch {}
+}
 
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "whisper — 语音识别 → .srt" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "视频: $VideoAbs" -ForegroundColor Gray
+Write-Host "语言: $VideoLang" -ForegroundColor Gray
 Write-Host "模型: $Model" -ForegroundColor Gray
 if ($AlignModel) { Write-Host "对齐: $AlignModel" -ForegroundColor Gray }
 Write-Host "=============================================" -ForegroundColor Cyan
 
-$WslCmd = "cd '$WslScriptDir' && $EnvVars bash whisper.sh '$WslPath'"
+$WhisperArgs = @(
+    $VideoAbs,
+    '--model', $Model,
+    '--language', $VideoLang,
+    '--output_dir', $VideoDir,
+    '--output_format', 'srt',
+    '--compute_type', $ComputeType
+)
+if ($AlignModel) {
+    $WhisperArgs += '--align_model'
+    $WhisperArgs += $AlignModel
+}
 
-& wsl -u root bash -lc $WslCmd
+& uvx whisperx @WhisperArgs
 $ExitCode = $LASTEXITCODE
 
-if ($ExitCode -ne 0) {
-    Write-Host "Error: whisper.sh failed (exit code: $ExitCode)" -ForegroundColor Red
+if ($ExitCode -eq 0) {
+    Write-Host "=============================================" -ForegroundColor Green
+    Write-Host "whisper — 完成: $VideoName.srt" -ForegroundColor Green
+    Write-Host "=============================================" -ForegroundColor Green
+} else {
+    Write-Host "Error: whisperx failed (exit code: $ExitCode)" -ForegroundColor Red
     exit $ExitCode
 }
