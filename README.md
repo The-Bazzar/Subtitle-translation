@@ -228,6 +228,7 @@ BURN=0 ./pipeline.sh "url"
 | `-Ovc` | `hevc_nvenc` | 视频编码器 |
 | `-Ovcopts` | `qp=20` | 编码器参数 |
 | `-Oac` | `aac` | 音频编码器 |
+| `-r, -Res` | 原视频 | 输出分辨率 (如 1920x1080, 保持宽高比+黑边) |
 | `-SkipDownload` | — | 跳过下载 |
 | `-SkipBeautify` | — | 跳过美化 |
 | `-SkipTranslate` | — | 跳过翻译 |

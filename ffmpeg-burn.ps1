@@ -138,7 +138,8 @@ Write-Host "=============================================" -ForegroundColor Cyan
 $Vf = "ass='$SubFileFfm'"
 if ($Res) {
     $resW, $resH = $Res -split 'x', 2
-    if ($resW -and $resH) { $Vf += ",scale=${resW}:${resH}" }
+    # 保持宽高比 + 黑边填充, 不拉伸变形
+    if ($resW -and $resH) { $Vf += ",scale=${resW}:${resH}:force_original_aspect_ratio=decrease,pad=${resW}:${resH}:(ow-iw)/2:(oh-ih)/2" }
 }
 
 $FfmpegArgs = @(

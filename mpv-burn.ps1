@@ -135,7 +135,10 @@ $MpvArgs = @(
 )
 if ($Res) {
     $resW, $resH = $Res -split 'x', 2
-    if ($resW -and $resH) { $MpvArgs += "--vf-add=scale=${resW}:${resH}" }
+    if ($resW -and $resH) {
+        # 保持宽高比 + 黑边填充, 不拉伸变形
+        $MpvArgs += "--vf-add=lavfi=[scale=${resW}:${resH}:force_original_aspect_ratio=decrease,pad=${resW}:${resH}:(ow-iw)/2:(oh-ih)/2]"
+    }
 }
 if ($SubFile) {
     $MpvArgs += "--sub-file=$SubFile"

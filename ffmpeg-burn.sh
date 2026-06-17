@@ -186,7 +186,7 @@ echo "============================================="
 # 构建滤镜链: ass + 可选 scale
 VF="ass='${SUB_FILE_ABS//:/\\:}'"
 if [ -n "$RES" ]; then
-    VF="${VF},scale=${RES}"
+    VF="${VF},scale=${RES}:force_original_aspect_ratio=decrease,pad=${RES}:(ow-iw)/2:(oh-ih)/2"
 fi
 
 # 组装 ffmpeg 命令

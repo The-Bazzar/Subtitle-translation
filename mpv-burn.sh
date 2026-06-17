@@ -29,6 +29,7 @@ SUB_FILE=""
 OVC="hevc_nvenc"
 OVCOPTS="qp=20"
 OAC="aac"
+RES=""
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ mpv-burn.sh — WSL 字幕硬压脚本 (mpv 编码模式)
   --sub-file PATH         字幕文件路径 (如 .zh-en.ass 双语字幕)
   --ovc CODEC             视频编码器 (默认: hevc_nvenc)
   --ovcopts OPTS          视频编码器参数 (默认: qp=20)
+  --res WxH               输出分辨率 (如 1920x1080, 保持宽高比加黑边)
   --oac CODEC             音频编码器 (默认: aac)
   --dry-run               仅打印命令, 不执行
   -h, --help              显示帮助
@@ -121,6 +123,10 @@ while [ $# -gt 0 ]; do
             OAC="$2"
             shift 2
             ;;
+        --res)
+            RES="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -190,6 +196,7 @@ if [ -n "$SUB_FILE" ]; then
     echo "字幕:    --sub-file=$SUB_FILE_ABS"
     echo "       → $SUB_FILE_WIN"
 fi
+[ -n "$RES" ] && echo "分辨率:  $RES (保持宽高比+黑边)"
 echo "视频:    --ovc=$OVC --ovcopts=$OVCOPTS"
 echo "音频:    --oac=$OAC"
 if [ ${#EXTRA_MPV_ARGS[@]} -gt 0 ]; then
@@ -207,6 +214,11 @@ MPV_CMD=(
     "--oac=$OAC"
     "${EXTRA_MPV_ARGS[@]}"
 )
+
+# 分辨率缩放: 保持宽高比 + 黑边填充
+if [ -n "$RES" ]; then
+    MPV_CMD+=("--vf-add=lavfi=[scale=$RES:force_original_aspect_ratio=decrease,pad=$RES:(ow-iw)/2:(oh-ih)/2]")
+fi
 
 # 仅当指定字幕文件时添加 --sub-file
 if [ -n "$SUB_FILE" ]; then
