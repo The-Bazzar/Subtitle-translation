@@ -46,6 +46,11 @@ nvcc --version && nvidia-smi
 
 安装后 `pip install whisperx` 会检测到 CUDA 并自动装 GPU 版 torch。
 
+```bash
+# 验证 CUDA + torch 是否可用
+uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
+```
+
 > **无 GPU / macOS**：跳过 CUDA，`download_and_sub.sh` 已配置 `--device cpu --compute_type int8`。
 
 详见 [WhisperX 官方文档](https://github.com/m-bain/whisperX)。

@@ -45,6 +45,8 @@ sudo apt update && sudo apt install -y cuda-toolkit-12-8
 
 # 安装 WhisperX
 pip install whisperx
+    # 验证 CUDA + torch 是否可用
+    uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 > `uvx whisperx` 检测到 CUDA 后自动装 GPU 版 torch。
