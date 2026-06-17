@@ -6,6 +6,8 @@ Similar to Subtitle Edit's "Beautify timecodes" feature (Netflix 规范).
 算法 (Netflix Timed Text Style Guide):
   0. 检测视频帧率, 所有帧数参数按实际 fps 换算为秒
   1. 用 ffmpeg 检测视频场景切换点 (最小间隔 7 帧)
+     - 默认: ffprobe 读取精确 pts_time (6 位小数, 微秒级)
+     - 回退: ffmpeg showinfo (浮点精度较低)
   2. 字幕入点吸附到前一个场景切换点 (7 帧以内)
   3. 字幕出点吸附到下一个场景切换点前 2 帧 (7 帧以内)
   4. 修复连续字幕之间的重叠和间隙问题 (>500ms 合并)
@@ -36,10 +38,10 @@ class Subtitle:
 
 @dataclass
 class BeautifyOptions:
-    scene_threshold: float = 0.15       # 场景检测灵敏度 (0-1)
+    scene_threshold: float = 0.15       # 场景检测灵敏度 (0-1), 越低越多切换点
     snap_frames: int = 7                # 吸附到场景切换的最大帧数
     end_offset_frames: int = 2          # 出点对齐到场景前 N 帧
-    min_scene_interval_frames: int = 7  # 场景切换最小帧间隔
+    min_scene_interval_frames: int = 2  # 场景切换最小帧间隔 (Netflix: 7, Subtitle Edit: 0-2)
     use_keyframes: bool = False         # 默认不用关键帧 (各视频帧率不同)
     keyframe_snap_frames: int = 2       # 关键帧吸附最大帧数 (仅 --use-keyframes)
     min_duration: float = 1.0           # 最短字幕时长 (秒) — Netflix: 1000ms
@@ -48,6 +50,7 @@ class BeautifyOptions:
     max_gap_merge: float = 0.5          # 小于此值的间隙合并 (秒) — Netflix: 500ms
     extend_to_scene: bool = False       # 延伸到场景切换 (Netflix 不启用)
     no_scene_snap: bool = False         # 完全跳过场景吸附
+    aggressive: bool = False            # 激进模式: 更低阈值 + 更宽吸附窗口
     preview: bool = False
     quiet: bool = False
     fps: float = 24.0                   # 视频帧率 (运行时由 ffprobe 检测)
@@ -170,15 +173,128 @@ def get_frame_rate(video_path: str) -> float:
     return 24.0
 
 
+def get_scene_changes_ffprobe(video_path: str, threshold: float = 0.25,
+                               min_interval_sec: float = 0.3,
+                               quiet: bool = False) -> list[float]:
+    """
+    用 ffprobe 精确获取场景切换时间码 (优先方法).
+
+    先用 ffmpeg select 过滤场景切换帧, 输出到临时文件,
+    再用 ffprobe 读取每一帧的精确 pts_time.
+
+    相比 showinfo, ffprobe 的浮点精度更高 (保留 6 位小数).
+    """
+    import tempfile
+
+    if not quiet:
+        print(f"  Running ffprobe scene detection (threshold={threshold:.2f})...",
+              file=sys.stderr)
+
+    # 第一步: ffmpeg 检测场景切换, 输出 null (只为触发 scene 滤镜)
+    # 同时用 setpts 重置时间戳, 方便后续 ffprobe 读取
+    with tempfile.NamedTemporaryFile(suffix='.mkv', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # 方法: ffmpeg scene filter → 输出极低质量视频 (只保留切换帧) → ffprobe 读取精确 pts_time
+        cmd_filter = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-vf', f"select='gt(scene,{threshold})',setpts=N/FRAME_RATE/TB",
+            '-vsync', 'vfr',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '51',  # 极低质量 (只需时间码)
+            '-an',  # 无音频
+            '-f', 'matroska',
+            tmp_path,
+        ]
+
+        result_filter = subprocess.run(
+            cmd_filter,
+            capture_output=True, text=True,
+            timeout=600,
+        )
+
+        if result_filter.returncode != 0:
+            stderr_tail = '\n'.join(result_filter.stderr.strip().split('\n')[-5:])
+            print(f"Warning: ffmpeg scene filter failed (exit {result_filter.returncode}).",
+                  file=sys.stderr)
+            print(f"  ffmpeg stderr: {stderr_tail}", file=sys.stderr)
+            return []
+
+        # 第二步: ffprobe 读取过滤后视频的每一帧 pts_time (精确到微秒)
+        cmd_probe = [
+            'ffprobe', '-v', 'quiet',
+            '-select_streams', 'v:0',
+            '-show_entries', 'frame=pts_time',
+            '-of', 'csv=p=0',
+            tmp_path,
+        ]
+
+        result_probe = subprocess.run(
+            cmd_probe,
+            capture_output=True, text=True,
+            timeout=120,
+        )
+
+        if result_probe.returncode != 0:
+            print("Warning: ffprobe failed to read scene timestamps.", file=sys.stderr)
+            return []
+
+        times: list[float] = []
+        for line in result_probe.stdout.strip().split('\n'):
+            line = line.strip()
+            if line:
+                try:
+                    times.append(float(line))
+                except ValueError:
+                    pass
+
+    except subprocess.TimeoutExpired:
+        print("Warning: Scene detection timed out. Skipping.", file=sys.stderr)
+        return []
+    except FileNotFoundError:
+        print("Error: ffmpeg or ffprobe not found.", file=sys.stderr)
+        return []
+    finally:
+        # 清理临时文件
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # 去重排序, 合并太近的切换点
+    times = sorted(set(times))
+    if not quiet and times:
+        print(f"  Raw detections: {len(times)} scene changes", file=sys.stderr)
+
+    merged: list[float] = []
+    for t in times:
+        if not merged or t - merged[-1] >= min_interval_sec:
+            merged.append(t)
+
+    if not quiet and times and len(merged) < len(times):
+        filtered_count = len(times) - len(merged)
+        print(f"  Filtered out: {filtered_count} (< {min_interval_sec*1000:.0f}ms interval)",
+              file=sys.stderr)
+
+    return merged
+
+
 def get_scene_changes(video_path: str, threshold: float = 0.25,
                       min_interval_sec: float = 0.3,
-                      quiet: bool = False) -> list[float]:
+                      quiet: bool = False,
+                      use_ffprobe: bool = True) -> list[float]:
     """
     用 ffmpeg 的 select + showinfo 滤镜检测场景切换.
     返回场景切换点的时间戳列表 (秒).
 
     min_interval_sec: 合并间距小于此值的相邻场景切换 (Netflix: 7帧)
+    use_ffprobe: 优先用 ffprobe 获取精确时间码 (避免 showinfo 的浮点精度问题)
     """
+    if use_ffprobe:
+        return get_scene_changes_ffprobe(video_path, threshold, min_interval_sec, quiet)
+
+    # Fallback: 原 ffmpeg showinfo 方法
     cmd = [
         'ffmpeg',
         '-i', video_path,
@@ -205,6 +321,17 @@ def get_scene_changes(video_path: str, threshold: float = 0.25,
         print("Error: ffmpeg not found. Is it installed?", file=sys.stderr)
         return []
 
+    # 检查 ffmpeg 是否执行成功
+    if result.returncode != 0:
+        # 提取最后几行 stderr 用于诊断
+        stderr_tail = '\n'.join(result.stderr.strip().split('\n')[-5:])
+        print(f"Warning: ffmpeg scene detection failed (exit {result.returncode}).",
+              file=sys.stderr)
+        print(f"  ffmpeg stderr: {stderr_tail}", file=sys.stderr)
+        print(f"  Hint: try --scene-threshold 0.1 or check ffmpeg version (needs 'scene' in select filter, ffmpeg ≥4.4)",
+              file=sys.stderr)
+        return []
+
     times: list[float] = []
     pts_re = re.compile(r'pts_time:([0-9]+\.?[0-9]*)')
 
@@ -218,10 +345,19 @@ def get_scene_changes(video_path: str, threshold: float = 0.25,
 
     # 去重排序, 合并太近的切换点
     times = sorted(set(times))
+    if not quiet and times:
+        print(f"  Raw detections: {len(times)} scene changes", file=sys.stderr)
+
     merged: list[float] = []
     for t in times:
         if not merged or t - merged[-1] >= min_interval_sec:
             merged.append(t)
+
+    if not quiet and times and len(merged) < len(times):
+        filtered_count = len(times) - len(merged)
+        print(f"  Filtered out: {filtered_count} (< {min_interval_sec*1000:.0f}ms interval)",
+              file=sys.stderr)
+
     return merged
 
 
@@ -550,7 +686,8 @@ Examples:
   %(prog)s video.mp4 subtitle.srt         # 指定字幕 → .beautified.srt
   %(prog)s video.mp4 -o result.srt        # 输出到指定文件
   %(prog)s video.mp4 -o video.srt         # 覆盖原文件 (需显式指定 -o)
-  %(prog)s video.mp4 --scene-threshold 0.2 --snap-frames 5
+  %(prog)s video.mp4 --scene-threshold 0.1 --snap-frames 10
+  %(prog)s video.mp4 --aggressive         # 激进: threshold=0.08 snap=12 end-offset=0
   %(prog)s video.mp4 --preview            # 预览变化 (不写入)
   %(prog)s video.mp4 --backup             # 覆盖前备份原文件 (仅 -o 同文件时有效)
         """,
@@ -562,16 +699,16 @@ Examples:
                         help='输出 SRT 路径 (默认: <原名>.beautified.srt, 不覆盖原文件)')
 
     # 场景检测
-    parser.add_argument('--scene-threshold', type=float, default=0.25,
-                        help='场景检测灵敏度 (0.1-0.5, 默认: 0.25)')
+    parser.add_argument('--scene-threshold', type=float, default=0.15,
+                        help='场景检测灵敏度 (0.05-0.5, 默认: 0.15, 越低越多切换点)')
 
     # 帧数参数 (按实际 fps 换算为秒)
     parser.add_argument('--snap-frames', type=int, default=7,
                         help='吸附到场景切换的最大帧数 (默认: 7)')
     parser.add_argument('--end-offset-frames', type=int, default=2,
                         help='出点对齐到场景切换前 N 帧 (默认: 2)')
-    parser.add_argument('--min-scene-interval-frames', type=int, default=7,
-                        help='场景切换最小帧间隔 (默认: 7)')
+    parser.add_argument('--min-scene-interval-frames', type=int, default=2,
+                        help='场景切换最小帧间隔 (默认: 2, Subtitle Edit 兼容)')
 
     # 关键帧 (默认关闭)
     parser.add_argument('--use-keyframes', action='store_true',
@@ -592,6 +729,10 @@ Examples:
     # 行为开关
     parser.add_argument('--extend', action='store_true',
                         help='延伸字幕填充到场景切换前的间隙 (Netflix 默认不启用)')
+    parser.add_argument('--aggressive', action='store_true',
+                        help='激进模式: scene-threshold=0.08 snap-frames=12 end-offset=0 min-interval=1 (短视频/剪辑密集)')
+    parser.add_argument('--use-showinfo', action='store_true',
+                        help='用 ffmpeg showinfo 而非 ffprobe (回退方法, 精度较低)')
     parser.add_argument('--no-scene-snap', action='store_true',
                         help='完全跳过场景切换吸附')
     parser.add_argument('--preview', action='store_true',
@@ -643,12 +784,25 @@ Examples:
         print(f"  Found {len(subs)} subtitles [{format_srt_time(subs[0].start)} → "
               f"{format_srt_time(subs[-1].end)}]")
 
-    # 组装选项
+    # 组装选项 (aggressive 模式覆盖对应参数)
+    if args.aggressive:
+        scene_threshold = 0.08
+        snap_frames = 12
+        end_offset_frames = 0
+        min_scene_interval_frames = 1  # 激进模式: 几乎不过滤
+        if not args.quiet:
+            print("\n  ⚡ Aggressive mode: threshold=0.08 snap=12 frames end-offset=0 min-interval=1")
+    else:
+        scene_threshold = args.scene_threshold
+        snap_frames = args.snap_frames
+        end_offset_frames = args.end_offset_frames
+        min_scene_interval_frames = args.min_scene_interval_frames
+
     opts = BeautifyOptions(
-        scene_threshold=args.scene_threshold,
-        snap_frames=args.snap_frames,
-        end_offset_frames=args.end_offset_frames,
-        min_scene_interval_frames=args.min_scene_interval_frames,
+        scene_threshold=scene_threshold,
+        snap_frames=snap_frames,
+        end_offset_frames=end_offset_frames,
+        min_scene_interval_frames=min_scene_interval_frames,
         use_keyframes=args.use_keyframes,
         keyframe_snap_frames=args.keyframe_snap_frames,
         min_duration=args.min_duration,
@@ -656,6 +810,7 @@ Examples:
         min_gap=args.min_gap,
         max_gap_merge=args.max_gap_merge,
         extend_to_scene=args.extend,
+        aggressive=args.aggressive,
         no_scene_snap=args.no_scene_snap,
         preview=args.preview,
         quiet=args.quiet,
@@ -667,7 +822,8 @@ Examples:
         snap_sec = opts.snap_frames / fps
         end_off_sec = opts.end_offset_frames / fps
         min_int_sec = opts.min_scene_interval_frames / fps
-        print(f"\n  Netflix parameters @ {fps:.2f} fps:")
+        mode_label = "Aggressive" if opts.aggressive else "Netflix"
+        print(f"\n  {mode_label} parameters @ {fps:.2f} fps:")
         print(f"    snap distance:        {opts.snap_frames} frames = {snap_sec*1000:.0f} ms")
         print(f"    end offset:           {opts.end_offset_frames} frames = {end_off_sec*1000:.0f} ms")
         print(f"    min scene interval:   {opts.min_scene_interval_frames} frames = {min_int_sec*1000:.0f} ms")
@@ -676,14 +832,17 @@ Examples:
     scene_changes: list[float] = []
     if not opts.no_scene_snap:
         min_interval_sec = opts.min_scene_interval_frames / fps
+        use_ffprobe_method = not args.use_showinfo
         if not args.quiet:
-            print(f"\nDetecting scene changes "
+            method_label = "ffprobe (precise)" if use_ffprobe_method else "showinfo"
+            print(f"\nDetecting scene changes [{method_label}] "
                   f"(threshold={opts.scene_threshold}, "
                   f"min interval={opts.min_scene_interval_frames} frames)...")
         scene_changes = get_scene_changes(
             args.video, opts.scene_threshold,
             min_interval_sec=min_interval_sec,
             quiet=args.quiet,
+            use_ffprobe=use_ffprobe_method,
         )
         if not args.quiet:
             print(f"  Found {len(scene_changes)} scene changes")
@@ -691,6 +850,11 @@ Examples:
                 duration = scene_changes[-1] - scene_changes[0] if len(scene_changes) > 1 else 0
                 if duration > 0:
                     print(f"  Avg interval: {duration/len(scene_changes):.1f}s")
+            # 场景切换太少 → 提示用户降低 threshold
+            video_duration = subs[-1].end if subs else 0
+            if video_duration > 120 and len(scene_changes) < video_duration / 60:
+                print(f"  ⚠ Warning: Only {len(scene_changes)} scene changes in {video_duration/60:.0f} min video.")
+                print(f"     Try --scene-threshold 0.1 or --aggressive for more scene snap points.")
 
     # ── 关键帧提取 (仅 --use-keyframes) ──────────────────────────────────
     keyframes: list[float] = []

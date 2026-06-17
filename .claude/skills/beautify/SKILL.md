@@ -17,6 +17,7 @@ python beautify_srt.py video.webm
 python beautify_srt.py video.webm subtitle.srt
 python beautify_srt.py video.webm -o result.srt
 python beautify_srt.py video.webm --preview
+python beautify_srt.py video.webm --aggressive   # 激进: 更多场景切换点 + 更宽吸附
 ```
 
 ## 输出
@@ -27,9 +28,11 @@ python beautify_srt.py video.webm --preview
 ## 算法
 
 ```
-帧率检测 → 场景检测 (7帧间隔)
-→ 入点吸附到场景 → 出点吸附到场景前2帧
+帧率检测 → 场景检测 (ffmpeg select filter, 7帧最小间隔)
+→ ffprobe 读取精确 pts_time (微秒级, 6 位小数)
+→ 入点吸附到前一个场景切换 → 出点吸附到下一个场景切换前2帧
 → 重叠/间隙修复 → 时长约束 (1s~8s)
+→ 场景切换太少时警告并建议 --aggressive
 ```
 
 ## 主要参数
@@ -37,6 +40,22 @@ python beautify_srt.py video.webm --preview
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
 | `-o, --output` | `.beautified.srt` | 输出路径 |
-| `--scene-threshold` | `0.25` | 场景灵敏度 |
-| `--snap-frames` | `7` | 吸附帧数 |
-| `--preview` | — | 仅预览 |
+| `--scene-threshold` | `0.15` | 场景检测灵敏度 (0.05~0.5, 越低越多切换点) |
+| `--snap-frames` | `7` | 吸附最大帧数 |
+| `--min-scene-interval-frames` | `2` | 最小场景间隔 (Subtitle Edit 兼容, Netflix: 7) |
+| `--aggressive` | — | 激进模式: threshold=0.08 snap=12 min-interval=1 |
+| `--use-showinfo` | — | 回退到 ffmpeg showinfo (精度较低, 默认用 ffprobe) |
+| `--extend` | — | 延伸字幕填充到场景切换前的间隙 |
+| `--preview` | — | 仅预览变化, 不写入 |
+
+## 调试输出
+
+脚本会显示原始检测数和过滤后结果：
+
+```
+Raw detections: 31 scene changes
+Filtered out: 26 (< 83ms interval)
+Found 5 scene changes
+```
+
+如果过滤太多，降低 `--min-scene-interval-frames`。
