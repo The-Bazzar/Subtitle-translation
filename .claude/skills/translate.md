@@ -51,16 +51,24 @@ python3 translate_srt.py video.srt \
 | `--proofread` | 开启 | 中英校对 |
 | `--proofread-provider` | 同翻译 | 校对后端 |
 | `--proofread-model` | 同翻译 | 校对模型 |
+| `--glossary` | 自动检测 | glossary.md 路径 (术语知识库) |
 | `--title` | SRT 文件名 | 视频标题 |
 | `-o, --output` | 自动 | 输出 `.zh-en.ass` |
 | `-q, --quiet` | — | 静默模式 |
 
-## 两轮校对
+## 两轮校对 (+ 可选第三轮术语校对)
 
 ```
 Pass 1: English → LLM → 中文初译 (.zh.srt)
 Pass 2: (English + 中文初译) → LLM → 中文精校 (.zh.srt 覆盖)
+Pass 3: (English + 中文精校 + glossary.md) → LLM → 术语一致性校对
 ```
+
+Pass 3 需要先在视频目录下建立 `glossary.md` 术语知识库。可通过 Claude Code 的 `knowledge` skill 让 Agent 浏览字幕自动生成，也可手动编写。
+
+`translate_srt.py` 会自动检测 SRT 同目录下的 `glossary.md`，存在则将其内容注入校对 prompt 中进行第三次术语一致性校对。也可用 `--glossary` 手动指定路径。
+
+> **注意**：glossary 的质量取决于建立它的 Agent 能力。越强的模型抽取的术语越准确。
 
 ## 提示词配置
 
