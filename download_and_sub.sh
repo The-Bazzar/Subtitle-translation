@@ -114,7 +114,7 @@ else
 	# 在子 shell 中 cd, 不改变外层工作目录 (避免影响后续 realpath)
 	(cd "$FOLDER_NAME" && uvx whisperx "$VIDEO_FILE" \
 		--lang "$VIDEO_LANG" \
-		--model large-v3 \
+		--model large-v3-turbo \
 		--output_dir . \
 		--output_format srt \
 		--compute_type float16)
