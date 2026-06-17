@@ -157,6 +157,31 @@ def make_headers(provider_cfg: dict, api_key: str) -> dict[str, str]:
 PROVIDER_KEYS = list(_BUILTIN_PROVIDERS.keys())
 
 
+def load_description(desc_path: str) -> str:
+    """
+    Read .description file and format as context for the translation prompt.
+    Returns empty string if file doesn't exist or is empty.
+    """
+    if not desc_path or not os.path.isfile(desc_path):
+        return ""
+    try:
+        with open(desc_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        if not content:
+            return ""
+        # Truncate if too long
+        if len(content) > 2000:
+            content = content[:2000].rsplit('\n', 1)[0]
+        return (
+            "\n\nThe following is the description of the video being translated. "
+            "Use this context to understand domain-specific vocabulary, "
+            "proper names, and the overall topic of the video:\n\n"
+            + content
+        )
+    except OSError:
+        return ""
+
+
 def load_glossary(glossary_path: str) -> str:
     """
     读取 glossary.md 术语知识库, 转化为可注入 prompt 的文本.
@@ -856,6 +881,15 @@ Examples:
     # 从文件加载提示词 (translate_prompt.md > translate_prompt.example.md > 内置回退)
     system_prompt = load_prompt('translate_prompt', _TRANSLATE_PROMPT_FALLBACK)
     proofread_prompt = load_prompt('proofread_prompt', _PROOFREAD_PROMPT_FALLBACK)
+
+    # 自动检测 .description, 注入到翻译和校对提示词中
+    desc_path = os.path.join(srt_dir, f"{srt_name}.description")
+    desc_context = load_description(desc_path)
+    if desc_context:
+        system_prompt += desc_context
+        proofread_prompt += desc_context
+        if not args.quiet:
+            print(f"Description: .description 已注入到翻译/校对提示词 ({desc_path})")
 
     # 自动检测或手动指定 glossary.md
     glossary_path = args.glossary
