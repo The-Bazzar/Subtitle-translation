@@ -207,10 +207,10 @@ else
     echo "============================================="
     echo ""
 
-    bash "$WHISPER_SCRIPT" "$VIDEO_PATH" || {
+    if ! bash "$WHISPER_SCRIPT" "$VIDEO_PATH"; then
         echo "Error: whisper.sh failed." >&2
         exit 1
-    }
+    fi
 
     echo ""
 fi
