@@ -397,6 +397,7 @@ PROOFREAD=0 ./pipeline.sh "url"
 - `.zh.srt` — 中文翻译缓存（同目录已存在则跳过 LLM，校对后覆盖为精校版）
 - `.zh.ass` — 仅中文 ASS（style=zh）
 - `.zh-en.ass` — 双语 ASS（bi-en + bi-zh，硬压用）
+- `.description` — 视频简介，如存在则自动注入翻译/校对提示词作为上下文
 - 中文按 Netflix 规范自动去除标点（仅保留 `《》`），自动插入 `\N` 软换行
 
 ```bash
@@ -572,6 +573,7 @@ TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
 - **场景检测耗时**：长视频可能较慢（~5 分钟/小时视频）。
 - **美化默认不覆盖**：输出 `.beautified.srt`，不修改原始字幕。流水线检测到已存在的自动跳过。
 - **翻译缓存**：`.zh.srt` 存在时自动跳过 LLM，直接合成 `.zh.ass` + `.zh-en.ass`。校对后缓存覆盖为精校版。
+- **视频简介注入**：翻译时自动检测 `.description` 文件（yt-dlp 下载），将其内容注入翻译和校对提示词，帮助 LLM 理解视频主题和领域词汇。
 - **两轮校对**：翻译 (Pass 1) 后默认执行中英校对 (Pass 2)，`PROOFREAD=0` 关闭。校对支持**交叉模型**（如 DeepSeek 翻译 + Claude 校对）。
 - **Netflix 中文规范**：翻译/校对提示词从 `translate_prompt.md` / `proofread_prompt.md` 读取（不存在则用内置默认），去除中文标点仅保留 `《》`。
 - **双语字幕**：`.zh-en.ass` 先排英文 (bi-en, 36px)，后排中文 (bi-zh, 72px)，中文自动 `\N` 换行。
