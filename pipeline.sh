@@ -2,7 +2,7 @@
 # =============================================================================
 # pipeline.sh — 一键流水线: 下载视频 → 字幕 → 美化 → 翻译 [+ 硬压]
 #
-# 串联 download_and_sub.sh → beautify_srt.sh → translate_srt.py → (mpv-burn.sh)
+# 串联 download.sh → whisper.sh → beautify_srt.sh → translate_srt.py → (ffmpeg-burn.sh)
 # 从 YouTube 链接直达双语 .zh-en.ass 字幕 / burned.mkv 硬字幕。
 #
 # 成果物链 (每步输出作为下一步输入):
@@ -36,7 +36,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DOWNLOAD_SCRIPT="$SCRIPT_DIR/download_and_sub.sh"
+DOWNLOAD_SCRIPT="$SCRIPT_DIR/download.sh"
+WHISPER_SCRIPT="$SCRIPT_DIR/whisper.sh"
 BEAUTIFY_SCRIPT="$SCRIPT_DIR/beautify_srt.sh"
 TRANSLATE_SCRIPT="$SCRIPT_DIR/translate_srt.py"
 BURN_SCRIPT="$SCRIPT_DIR/ffmpeg-burn.sh"
@@ -180,14 +181,14 @@ if [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then
     read -r VIDEO_PATH
 else
     echo "============================================="
-    echo "pipeline — 步骤 1/4: 下载视频 + 生成字幕"
+    echo "pipeline — 步骤 1/5: 下载视频"
     echo "============================================="
     echo ""
 
     DOWNLOAD_OUTPUT=$(bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1) || {
         echo "$DOWNLOAD_OUTPUT"
         echo ""
-        echo "Error: download_and_sub.sh failed." >&2
+        echo "Error: download.sh failed." >&2
         exit 1
     }
     echo "$DOWNLOAD_OUTPUT"
@@ -197,9 +198,19 @@ else
     if [ -z "$VIDEO_PATH" ] || [ ! -f "$VIDEO_PATH" ]; then
         echo ""
         echo "Error: Failed to locate downloaded video file." >&2
-        echo "Output line: $(echo "$DOWNLOAD_OUTPUT" | grep '^OUTPUT_VIDEO=' || echo '(none)')" >&2
         exit 1
     fi
+
+    echo ""
+    echo "============================================="
+    echo "pipeline — 步骤 2/5: WhisperX 生成字幕"
+    echo "============================================="
+    echo ""
+
+    bash "$WHISPER_SCRIPT" "$VIDEO_PATH" || {
+        echo "Error: whisper.sh failed." >&2
+        exit 1
+    }
 
     echo ""
 fi
@@ -241,7 +252,7 @@ elif [ -f "$BEAUTIFIED_SRT" ]; then
     echo "============================================="
 else
     echo "============================================="
-    echo "pipeline — 步骤 2/4: 字幕时间码美化 → .beautified.srt"
+    echo "pipeline — 步骤 3/5: 字幕时间码美化 → .beautified.srt"
     echo "============================================="
     echo ""
 
@@ -288,7 +299,7 @@ elif [ -f "$ASS_PATH" ]; then
     echo "============================================="
 else
     echo "============================================="
-    echo "pipeline — 步骤 3/4: LLM 翻译 (英→中) → .zh-en.ass"
+    echo "pipeline — 步骤 4/5: LLM 翻译 (英→中) → .zh-en.ass"
     echo "============================================="
     echo ""
 
@@ -324,7 +335,7 @@ elif [ "${SKIP_BURN:-0}" = "1" ]; then
     echo "============================================="
 else
     echo "============================================="
-    echo "pipeline — 步骤 4/4: 字幕硬压 (mpv) → burned.mkv"
+    echo "pipeline — 步骤 5/5: 字幕硬压 (mpv) → burned.mkv"
     echo "============================================="
     echo ""
 
