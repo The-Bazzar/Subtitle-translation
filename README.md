@@ -51,7 +51,7 @@ nvcc --version && nvidia-smi
 uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-> **无 GPU / macOS**：跳过 CUDA，`download_and_sub.sh` 已配置 `--device cpu --compute_type int8`。
+> **无 GPU / macOS**：跳过 CUDA，`whisper.sh` 已配置 `--device cpu --compute_type int8`。
 
 **Align 模型**：WhisperX 的词级时间戳对齐模型，通过环境变量 `WHISPER_ALIGN_MODEL` 指定（留空则按语言自动选择）：
 
@@ -61,7 +61,7 @@ uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
 | `facebook/mms-1b-fl102` | 手动指定 (通用模型, 主流语言均适用) |
 
 ```bash
-WHISPER_ALIGN_MODEL=facebook/mms-1b-fl102 ./download_and_sub.sh "url"
+WHISPER_ALIGN_MODEL=facebook/mms-1b-fl102 ./whisper.sh "url"
 ```
 
 详见 [WhisperX 官方文档](https://github.com/m-bain/whisperX)。
@@ -357,28 +357,35 @@ PROOFREAD=0 ./pipeline.sh "url"
 | `BURN_OVCOPTS` | qp=20 | 编码器参数 |
 | `BURN_OAC` | aac | 音频编码器 |
 
-### `download_and_sub.sh` — 下载 + WhisperX 字幕
+### `download.sh` — 下载视频
 
 ```bash
-./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
-# 输出: OUTPUT_VIDEO=<绝对路径>  (供 pipeline.sh 解析)
+./download.sh "https://www.youtube.com/watch?v=xxxxx"
+# 输出: OUTPUT_VIDEO=<路径>
 ```
 
-### `beautify_srt.sh` — 字幕时间码美化
+### `whisper.sh` — 语音识别
+
+```bash
+./whisper.sh "/path/to/video.webm"
+# 输出: 同目录 <视频名>.srt
+```
+
+### `beautify_srt.py` — 字幕时间码美化
 
 ```bash
 # 自动查找同目录 .srt → .beautified.srt (不覆盖原文件)
-./beautify_srt.sh video.webm
+python beautify_srt.py video.webm
 
 # 指定字幕 + 输出
-./beautify_srt.sh video.webm subtitle.srt
-./beautify_srt.sh video.webm -o result.srt
+python beautify_srt.py video.webm subtitle.srt
+python beautify_srt.py video.webm -o result.srt
 
 # 覆盖原文件 (显式指定)
-./beautify_srt.sh video.webm -o video.srt --backup
+python beautify_srt.py video.webm -o video.srt --backup
 
 # 仅预览变化
-./beautify_srt.sh video.webm --preview
+python beautify_srt.py video.webm --preview
 ```
 
 **算法流程**：帧率检测 → 场景检测 (≥7帧间隔) → 入点吸附到场景 → 出点吸附到场景前2帧 → 重叠/间隙修复 → 时长约束
@@ -493,8 +500,9 @@ Subtitle translation/
 ├── batch.py                  # 批量并行 (Python/Linux): 多URL并行
 ├── pipeline.ps1              # 超级流水线 (PowerShell): URL → burned.mkv
 ├── pipeline.sh               # Linux 流水线 (下载 → 美化 → 翻译 → 硬压)
-├── download_and_sub.sh       # 下载视频 + 生成英文字幕
-├── beautify_srt.sh           # 字幕时间码美化入口
+├── download.sh               # 下载视频 + 元数据
+├── whisper.sh                # WhisperX 语音识别 → .srt
+├── beautify_srt.py           # 字幕时间码美化
 ├── beautify_srt.py           # 美化核心算法 (场景检测 + Netflix 帧对齐)
 ├── translate_srt.py          # 字幕翻译: LLM 英→中 → .zh.srt + .zh.ass + .zh-en.ass
 ├── ffmpeg-burn.sh            # Linux: 字幕硬压 (ffmpeg ass 滤镜, 默认)
@@ -544,12 +552,13 @@ YouTube URL
 └─────────────────────────────────────────────────────┘
 ```
 
-### 方案 B: Linux 分步
+### 方案 B: Linux 分步 (手动)
 
 ```bash
-./download_and_sub.sh "https://www.youtube.com/watch?v=xxxxx"
-./beautify_srt.sh "视频标题/视频标题.webm"
-python3 translate_srt.py "视频标题/视频标题.srt" --provider openrouter
+./download.sh "https://www.youtube.com/watch?v=xxxxx"
+./whisper.sh "视频标题/视频标题.webm"
+python beautify_srt.py "视频标题/视频标题.webm"
+python translate_srt.py "视频标题/视频标题.srt" --provider openrouter
 ./ffmpeg-burn.sh "视频标题/视频标题.webm" --sub-file "视频标题/视频标题.zh-en.ass"
 ```
 
