@@ -79,10 +79,21 @@ def format_srt_time(seconds: float) -> str:
 
 # ─── SRT 解析 / 写入 ───────────────────────────────────────────────────────────
 
+def _read_text_file(filepath: str) -> str:
+    """读取文本文件，自动检测编码 (utf-8-sig → utf-8 → gbk → latin-1)."""
+    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'latin-1'):
+        try:
+            with open(filepath, 'r', encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
 def parse_srt(filepath: str) -> list[Subtitle]:
     """解析 SRT 文件，返回 Subtitle 列表."""
-    with open(filepath, 'r', encoding='utf-8-sig') as f:
-        content = f.read()
+    content = _read_text_file(filepath)
 
     # 按空行分割字幕块
     blocks = re.split(r'\n\s*\n', content.strip())
@@ -485,10 +496,9 @@ def summarize_changes(subs: list[Subtitle], fps: float) -> str:
 def is_valid_srt(filepath: str) -> bool:
     """快速检查文件是否为真正的 SRT 格式 (而非 ASS/VTT 伪装的 .srt)."""
     try:
-        with open(filepath, 'r', encoding='utf-8-sig') as f:
-            head = f.read(256).lstrip()
+        head = _read_text_file(filepath)[:256].lstrip()
         return bool(re.match(r'\d+\s*\n', head))
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return False
 
 

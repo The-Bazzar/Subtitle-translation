@@ -50,13 +50,25 @@ def ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+def _read_text_file(filepath: str) -> str:
+    """读取文本文件，自动检测编码 (utf-8-sig → utf-8 → gbk → latin-1)."""
+    for enc in ('utf-8-sig', 'utf-8', 'gbk', 'latin-1'):
+        try:
+            with open(filepath, 'r', encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # last resort
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
 def parse_srt(filepath: str) -> list[dict]:
     """
     解析 SRT 文件，返回 [{index, start, end, start_ass, end_ass, text}, ...].
     start/end 是秒 (float)，start_ass/end_ass 是 ASS 格式字符串.
     """
-    with open(filepath, 'r', encoding='utf-8-sig') as f:
-        content = f.read()
+    content = _read_text_file(filepath)
 
     blocks = re.split(r'\n\s*\n', content.strip())
     subtitles = []
