@@ -36,7 +36,7 @@ class Subtitle:
 
 @dataclass
 class BeautifyOptions:
-    scene_threshold: float = 0.25       # 场景检测灵敏度 (0-1)
+    scene_threshold: float = 0.15       # 场景检测灵敏度 (0-1)
     snap_frames: int = 7                # 吸附到场景切换的最大帧数
     end_offset_frames: int = 2          # 出点对齐到场景前 N 帧
     min_scene_interval_frames: int = 7  # 场景切换最小帧间隔
