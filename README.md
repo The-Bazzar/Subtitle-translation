@@ -572,3 +572,43 @@ TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
 - **硬压默认开启**：`pipeline.sh` 默认 BURN=1，设 `BURN=0` 跳过硬压。`pipeline.ps1` 的 burn 在 Windows 端执行。
 - **帧率自适应**：所有帧数参数按实际视频 fps 换算为秒。
 - **关键帧吸附**：默认关闭 (`--use-keyframes` 启用)，支持 H.264/H.265/VP9。
+
+---
+
+## 🧠 术语知识库 + 第三次校对 (knowledge skill)
+
+翻译完成后，可通过 Claude Code 的 `knowledge` skill 对中文翻译进行**基于术语知识库的第三次校对**。
+
+### 工作原理
+
+```
+英文 .srt + 中文 .zh.srt
+     │
+     ▼
+用户提供的 Agent 通读全文 → 抽取术语/态度/观点 → glossary.md
+     │
+     ▼
+translate_srt.py 检测 glossary.md → 注入校对 prompt
+     │
+     ▼
+.zh.srt (精校版) → .zh.ass + .zh-en.ass
+```
+
+### 使用方式
+
+```bash
+# 1. 用 Claude Code 的 knowledge skill 建立知识库
+#    在对话中直接说: "knowledge" 或 "建立知识库"
+#    Agent 会浏览 .srt + .zh.srt, 生成 glossary.md
+
+# 2. 翻译脚本自动检测并注入
+python3 translate_srt.py video.beautified.srt
+# → 如 glossary.md 存在, 自动注入校对 prompt 进行第三次校对
+```
+
+### 重要说明
+
+- **用户需自行提供 Agent**：知识库由你自己运行的 AI Agent（如 Claude Code、ChatGPT、或其他 LLM 客户端）来建立，不是项目脚本自动生成的。项目的 `knowledge` skill 定义了 Agent 的执行规范（读什么、抽什么、输出什么格式）
+- **效果取决于 Agent 性能**：术语抽取的准确性、语境理解的深度、有没有自相矛盾，完全由你使用的 Agent 模型决定。越强的模型（如 Opus 4.5、GPT-5）抽出的知识库越可靠
+- **人工复核推荐**：Agent 生成的 `glossary.md` 建议人工过一遍，补充遗漏或修正误判，后续校对才会生效
+- **仅对该视频生效**：glossary.md 存放在视频文件夹下，一个视频一个知识库，互不干扰
