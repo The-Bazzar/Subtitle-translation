@@ -156,6 +156,28 @@ def make_headers(provider_cfg: dict, api_key: str) -> dict[str, str]:
 
 PROVIDER_KEYS = list(_BUILTIN_PROVIDERS.keys())
 
+
+def load_glossary(glossary_path: str) -> str:
+    """
+    读取 glossary.md 术语知识库, 转化为可注入 prompt 的文本.
+    文件不存在或为空则返回空字符串.
+    """
+    if not glossary_path or not os.path.isfile(glossary_path):
+        return ""
+    try:
+        with open(glossary_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        if not content:
+            return ""
+        return (
+            "\n\n以下是本视频的术语知识库, "
+            "请严格遵循其中的翻译规范和术语一致性要求:\n\n"
+            + content
+        )
+    except OSError:
+        return ""
+
+
 TRANSLATION_SYSTEM_PROMPT = """You are a professional subtitle translator specializing in English→Simplified Chinese translation.
 
 Rules:
@@ -768,6 +790,8 @@ Examples:
                         help='校对专用模型 (默认: 同翻译模型)')
     parser.add_argument('--proofread-prompt', metavar='PROMPT',
                         help='自定义校对提示词 (默认: 内置校对提示词)')
+    parser.add_argument('--glossary', metavar='PATH',
+                        help='glossary.md 术语知识库路径 (注入校对 prompt)')
     parser.add_argument('--title',
                         help='视频标题 (默认: 从 SRT 文件名推断)')
     parser.add_argument('-q', '--quiet', action='store_true',
@@ -813,6 +837,17 @@ Examples:
     # 系统提示词: CLI > .env > 内置默认
     system_prompt = args.system_prompt or _env.get('TRANSLATE_SYSTEM_PROMPT', '') or ''
     proofread_prompt = args.proofread_prompt or _env.get('PROOFREAD_SYSTEM_PROMPT', '') or ''
+
+    # 自动检测或手动指定 glossary.md
+    glossary_path = args.glossary
+    if not glossary_path:
+        # 尝试 SRT 同目录下的 glossary.md
+        candidate = os.path.join(srt_dir, 'glossary.md')
+        if os.path.isfile(candidate):
+            glossary_path = candidate
+    glossary_text = load_glossary(glossary_path)
+    if glossary_text and not args.quiet:
+        print(f"\nGlossary: glossary.md 已加载, 将注入校对提示词")
 
     # ── 获取中文翻译 ──────────────────────────────────────────────────────
     # 始终使用 .zh.srt 作为翻译缓存: 已存在则跳过 LLM, 否则翻译后写入
@@ -865,7 +900,7 @@ Examples:
             provider=pr_provider,
             model=pr_model,
             api_key=args.api_key,
-            system_prompt=proofread_prompt,
+            system_prompt=proofread_prompt + glossary_text,
             batch_size=args.batch_size,
             quiet=args.quiet,
         )
