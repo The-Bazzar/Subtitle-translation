@@ -42,22 +42,16 @@ sudo apt update && sudo apt install -y cuda-toolkit-12-8
 
 ```powershell
 # Windows PowerShell
-uv tool install whisperx==3.8.6 `
+uv tool install git+https://github.com/m-bain/whisperx.git `
   --with "torch==2.8.0+cu128" `
-  --with "torchaudio==2.8.0+cu128" `
-  --with "nvidia-cublas-cu12" `
-  --with "nvidia-cudnn-cu12" `
-  --python 3.13.12
+  --with "torchaudio==2.8.0+cu128"
 ```
 
 ```bash
 # Linux / WSL
-uv tool install whisperx==3.8.6 \
+uv tool install git+https://github.com/m-bain/whisperx.git \
   --with "torch==2.8.0+cu128" \
-  --with "torchaudio==2.8.0+cu128" \
-  --with "nvidia-cublas-cu12" \
-  --with "nvidia-cudnn-cu12" \
-  --python 3.13.12
+  --with "torchaudio==2.8.0+cu128"
 ```
 
 运行时需设置环境变量：
