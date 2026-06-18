@@ -174,7 +174,7 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 1. **获取标题** — `yt-dlp --get-title` 获取视频标题，过滤文件名非法字符后创建目录
 2. **下载** — `yt-dlp` 下载视频/缩略图/元数据/简介，自动移除 sponsor 和 selfpromo 片段 (SponsorBlock)
 3. **定位视频文件** — 在目录中查找 `.mp4/.mkv/.webm/.flv/.avi` 文件
-4. **生成字幕** — `uvx whisperx` 使用 `large-v3` 模型 + `float16` 计算生成英文 SRT 字幕
+4. **生成字幕** — `whisperx` (全局工具) 使用 `large-v3-turbo` 模型生成英文 SRT 字幕
 5. **输出路径** — 打印 `OUTPUT_VIDEO=<绝对路径>` 供下游脚本解析
 
 ## Dependencies
@@ -182,8 +182,8 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 | Tool | Purpose |
 |------|---------|
 | `yt-dlp` | YouTube 视频下载 |
-| `uvx` (uv) | 运行 WhisperX，无需手动配置 Python 环境 |
-| `whisperx` (large-v3) | AI 语音识别生成英文字幕 |
+| `uv` (uvx) | 安装 WhisperX 为全局工具 |
+| `whisperx` (large-v3-turbo) | AI 语音识别生成英文字幕 |
 | `ffmpeg` | 音视频处理底层依赖 |
 | `ffprobe` | 场景切换检测 + 关键帧提取 (beautify_srt) |
 | `python3` | beautify_srt.py / translate_srt.py 运行环境 |
@@ -217,7 +217,7 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
   - `.env` 已 gitignored，不要提交。
 - `cookies.txt` 包含 YouTube 登录凭证，已 gitignored。过期后需要重新导出。
 - WhisperX 首次运行会自动下载 `large-v3-turbo` 模型 (~1.5GB)，需要保持网络畅通。
-- WhisperX 自动检测 `compute_type`（GPU: float16, CPU: int8），无需手动配置。
+- WhisperX 需先用 `uv tool install whisperx==3.8.6 --with "torch==2.8.0+cu128" --with "torchaudio==2.8.0+cu128" --with "nvidia-cublas-cu12" --with "nvidia-cudnn-cu12" --python 3.13.12` 安装为全局工具。然后：① CPU 用 `whisperx --device cpu`；② CUDA 用 `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx --device cuda`。`compute_type` 自动检测。
 - 每个视频目录名即为 `yt-dlp --get-title` 的结果 (特殊字符替换为 `_`)。
 - `beautify_srt.sh` 运行在 Linux 中，会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
 - **美化默认不覆盖原文件** — 输出 `<原名>.beautified.srt`，需显式 `-o same.srt` 才会覆盖。

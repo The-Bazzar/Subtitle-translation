@@ -70,12 +70,45 @@ WHISPER_CHUNK_SIZE=10 WHISPER_MAX_LINE_WIDTH=36 ./whisper.sh "video.webm"
 └── 视频标题.srt            # 英文 SRT 字幕 ✨
 ```
 
-## GPU 加速
+## 安装与运行
 
-需安装 CUDA Toolkit。首次运行需下载 `large-v3-turbo` 模型 (~1.5GB)。
+两种方式，选其一：
+
+### 方式 1：CPU（无需 CUDA）
+
+```powershell
+# 直接运行，WhisperX 自动用 CPU
+whisperx audio.mp3 --device cpu
+```
+
+### 方式 2：CUDA 12.8 加速（推荐）
+
+**首次安装**：
+
+```powershell
+uv tool install whisperx==3.8.6 `
+  --with "torch==2.8.0+cu128" `
+  --with "torchaudio==2.8.0+cu128" `
+  --with "nvidia-cublas-cu12" `
+  --with "nvidia-cudnn-cu12" `
+  --python 3.13.12
+```
+
+**每次运行**（PowerShell）：
+```powershell
+& { $env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1"; whisperx audio.mp3 --device cuda }
+```
+
+**每次运行**（Linux）：
+```bash
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx audio.mp3 --device cuda
+```
+
+> **注意**：本地 CUDA 版本必须 ≥ 12.8，否则用方式 1。`compute_type` 由 WhisperX 自动检测。
 
 ## 注意事项
 
 - `.srt` 已存在时自动跳过
 - 语言自动从 `.info.json` 读取，fallback `en`
 - `--max_line_width/--max_line_count` 需要 alignment (--no_align 时无效)
+- CUDA 版本不匹配时用 `WHISPER_DEVICE=cpu` 回退

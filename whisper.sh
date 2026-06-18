@@ -106,7 +106,7 @@ WHISPER_ARGS=(
 [ -n "$MAX_LINE_WIDTH" ] && WHISPER_ARGS+=(--max_line_width "$MAX_LINE_WIDTH")
 [ -n "$MAX_LINE_COUNT" ] && WHISPER_ARGS+=(--max_line_count "$MAX_LINE_COUNT")
 [ -n "${WHISPER_ALIGN_MODEL:-}" ] && WHISPER_ARGS+=(--align_model "$WHISPER_ALIGN_MODEL")
-uvx whisperx "${WHISPER_ARGS[@]}"
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx "${WHISPER_ARGS[@]}"
 
 echo "============================================="
 echo "whisper — 完成: $VIDEO_DIR/$SRT_NAME"

@@ -23,35 +23,46 @@ sudo apt install -y nodejs
 
 #### WhisperX 安装
 
-```bash
-# 官方安装 (GPU 加速需先装 CUDA Toolkit 12.x + cuDNN)
-pip install whisperx
+**方式 1：CPU（无需 CUDA）**
 
-# 或直接用 uvx (首次自动安装)
-uvx whisperx
+```bash
+whisperx audio.mp3 --device cpu
 ```
 
-**GPU 加速 (WSL2)**：WSL2 透传 Windows GPU 驱动，在 Linux 内装 CUDA Toolkit 即可：
+**方式 2：CUDA 12.8 加速（推荐）** — 需先安装 CUDA Toolkit 12.8：
 
 ```bash
-# 1. 安装 CUDA Toolkit (WSL2-Ubuntu 专用, 不含驱动)
+# WSL2-Ubuntu 安装 CUDA Toolkit (不含驱动，驱动由 Windows 提供)
 wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install -y cuda-toolkit-12-8
-
-# 2. 验证
-nvcc --version && nvidia-smi
+sudo apt update && sudo apt install -y cuda-toolkit-12-8
 ```
 
-安装后 `pip install whisperx` 会检测到 CUDA 并自动装 GPU 版 torch。
+安装 whisperx 到 uv 工具链：
+
+```powershell
+# PowerShell
+uv tool install whisperx==3.8.6 `
+  --with "torch==2.8.0+cu128" `
+  --with "torchaudio==2.8.0+cu128" `
+  --with "nvidia-cublas-cu12" `
+  --with "nvidia-cudnn-cu12" `
+  --python 3.13.12
+```
+
+运行时需设置环境变量：
+
+```powershell
+# PowerShell
+& { $env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1"; whisperx audio.mp3 --device cuda }
+```
 
 ```bash
-# 验证 CUDA + torch 是否可用
-uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
+# Linux
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx audio.mp3 --device cuda
 ```
 
-> **无 GPU / macOS**：WhisperX 自动检测 compute_type，无需手动配置。
+> `compute_type` 由 WhisperX 自动检测，无需手动配置。
 
 **Align 模型**：WhisperX 的词级时间戳对齐模型，通过环境变量 `WHISPER_ALIGN_MODEL` 指定（留空则按语言自动选择）：
 
@@ -588,7 +599,7 @@ TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
 ## 💡 注意事项
 
 - **WhisperX 首次运行**：自动下载 `large-v3` 模型（数 GB），保持网络畅通。
-- **GPU 加速**：WhisperX 自动检测 compute_type（GPU: float16, CPU: int8），无需手动配置。
+- **GPU 加速**：WhisperX 需 CUDA 12.8，版本不匹配用 `WHISPER_DEVICE=cpu`。`compute_type` 自动检测。
 - **cookies.txt**：YouTube 登录凭证，过期后需重新导出。已 gitignored。
 - **场景检测耗时**：长视频可能较慢（~5 分钟/小时视频）。
 - **美化默认不覆盖**：输出 `.beautified.srt`，不修改原始字幕。流水线检测到已存在的自动跳过。

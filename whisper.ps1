@@ -149,7 +149,8 @@ if ($AlignModel) {
     $WhisperArgs += $AlignModel
 }
 
-& uvx whisperx @WhisperArgs
+$env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
+& whisperx @WhisperArgs
 $ExitCode = $LASTEXITCODE
 
 if ($ExitCode -eq 0) {
