@@ -51,7 +51,7 @@ nvcc --version && nvidia-smi
 uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-> **无 GPU / macOS**：跳过 CUDA，`whisper.sh` 已配置 `--device cpu --compute_type int8`。
+> **无 GPU / macOS**：WhisperX 自动检测 compute_type，无需手动配置。
 
 **Align 模型**：WhisperX 的词级时间戳对齐模型，通过环境变量 `WHISPER_ALIGN_MODEL` 指定（留空则按语言自动选择）：
 
@@ -588,7 +588,7 @@ TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
 ## 💡 注意事项
 
 - **WhisperX 首次运行**：自动下载 `large-v3` 模型（数 GB），保持网络畅通。
-- **GPU 加速**：WhisperX 默认 float16 + GPU。无 NVIDIA 显卡需 `--compute_type int8` 或 `--device cpu`。
+- **GPU 加速**：WhisperX 自动检测 compute_type（GPU: float16, CPU: int8），无需手动配置。
 - **cookies.txt**：YouTube 登录凭证，过期后需重新导出。已 gitignored。
 - **场景检测耗时**：长视频可能较慢（~5 分钟/小时视频）。
 - **美化默认不覆盖**：输出 `.beautified.srt`，不修改原始字幕。流水线检测到已存在的自动跳过。

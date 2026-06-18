@@ -11,7 +11,6 @@
 # 环境变量:
 #   WHISPER_MODEL                  ASR 模型 (默认: large-v3-turbo)
 #   WHISPER_ALIGN_MODEL            对齐模型 (默认: 空, 按语言自动匹配)
-#   WHISPER_COMPUTE                计算精度 (默认: float16)
 #   WHISPER_SEGMENT_RESOLUTION     分割粒度: sentence | chunk (默认: sentence)
 #   WHISPER_MAX_LINE_WIDTH         每行最大字符数 (默认: 42, 需要 alignment)
 #   WHISPER_MAX_LINE_COUNT         每段最大行数 (默认: 2, 需要 alignment)
@@ -93,7 +92,6 @@ WHISPER_ARGS=(
     --language "$VIDEO_LANG"
     --output_dir .
     --output_format srt
-    --compute_type "${WHISPER_COMPUTE:-float16}"
     --segment_resolution "$SEGMENT_RESOLUTION"
     --chunk_size "$CHUNK_SIZE"
     --vad_onset "$VAD_ONSET"

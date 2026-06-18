@@ -216,8 +216,8 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
   - `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY`: 至少配一个对应 provider 的 key
   - `.env` 已 gitignored，不要提交。
 - `cookies.txt` 包含 YouTube 登录凭证，已 gitignored。过期后需要重新导出。
-- WhisperX 首次运行会自动下载 `large-v3` 模型 (数 GB)，需要保持网络畅通。
-- 无 NVIDIA GPU 时需将 `--compute_type float16` 改为 `int8`，或添加 `--device cpu`。
+- WhisperX 首次运行会自动下载 `large-v3-turbo` 模型 (~1.5GB)，需要保持网络畅通。
+- WhisperX 自动检测 `compute_type`（GPU: float16, CPU: int8），无需手动配置。
 - 每个视频目录名即为 `yt-dlp --get-title` 的结果 (特殊字符替换为 `_`)。
 - `beautify_srt.sh` 运行在 Linux 中，会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
 - **美化默认不覆盖原文件** — 输出 `<原名>.beautified.srt`，需显式 `-o same.srt` 才会覆盖。

@@ -46,7 +46,6 @@ WHISPER_CHUNK_SIZE=10 WHISPER_MAX_LINE_WIDTH=36 ./whisper.sh "video.webm"
 |------|--------|------|
 | `WHISPER_MODEL` | `large-v3-turbo` | ASR 模型 |
 | `WHISPER_ALIGN_MODEL` | 空 | 对齐模型 (空=按语言自动匹配) |
-| `WHISPER_COMPUTE` | `float16` | GPU: float16, CPU: int8 |
 | `WHISPER_SEGMENT_RESOLUTION` | `sentence` | 分割粒度 |
 | `WHISPER_MAX_LINE_WIDTH` | `42` | 每行最大字符数 |
 | `WHISPER_MAX_LINE_COUNT` | `2` | 每段最大行数 |

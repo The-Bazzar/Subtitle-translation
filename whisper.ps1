@@ -8,9 +8,6 @@ param(
     [Parameter(HelpMessage = "Align model (default: empty = auto)")]
     [string]$AlignModel,
 
-    [Parameter(HelpMessage = "Compute type (default: float16)")]
-    [string]$ComputeType,
-
     [Parameter(HelpMessage = "Segmentation: sentence | chunk (default: sentence)")]
     [string]$SegmentResolution,
 
@@ -48,7 +45,7 @@ param(
 . "$PSScriptRoot\.env.ps1"
 $Model                   = Merge-EnvDefault 'WHISPER_MODEL'                    $Model                   'large-v3-turbo'
 $AlignModel              = Merge-EnvDefault 'WHISPER_ALIGN_MODEL'              $AlignModel              ''
-$ComputeType             = Merge-EnvDefault 'WHISPER_COMPUTE'                  $ComputeType             'float16'
+
 $SegmentResolution       = Merge-EnvDefault 'WHISPER_SEGMENT_RESOLUTION'       $SegmentResolution       'sentence'
 $MaxLineWidth            = Merge-EnvDefault 'WHISPER_MAX_LINE_WIDTH'           $MaxLineWidth            '42'
 $MaxLineCount            = Merge-EnvDefault 'WHISPER_MAX_LINE_COUNT'           $MaxLineCount            '2'
@@ -133,7 +130,6 @@ $WhisperArgs = @(
     '--language', $VideoLang,
     '--output_dir', $VideoDir,
     '--output_format', 'srt',
-    '--compute_type', $ComputeType,
     '--segment_resolution', $SegmentResolution,
     '--chunk_size', $ChunkSize,
     '--vad_onset', $VadOnset,
