@@ -6,6 +6,7 @@
 #   ./whisper.sh <视频文件路径>
 #
 # 输出:
+#   先提取音频 .wav → whisperx 识别 → 自动清理 .wav
 #   同目录输出 <视频文件名>.srt + .json (词级时间码) + .txt/.tsv/.vtt
 #
 # 环境变量:
@@ -59,6 +60,8 @@ fi
 
 DEVICE="${WHISPER_DEVICE:-cuda}"
 
+# 提取音频为 WAV (避免长视频时间码漂移)
+WAV_NAME="${VIDEO_NAME%.*}.wav"
 echo "============================================="
 echo "whisper — 语音识别 → .srt"
 echo "============================================="
@@ -70,8 +73,11 @@ echo "设备:      $DEVICE"
 echo "============================================="
 
 cd "$VIDEO_DIR"
+echo "提取音频..."
+ffmpeg -i "$VIDEO_NAME" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$WAV_NAME" -y -loglevel error
+
 WHISPER_ARGS=(
-    "$VIDEO_NAME"
+    "$WAV_NAME"
     --model "${WHISPER_MODEL:-large-v3-turbo}"
     --language "$VIDEO_LANG"
     --output_dir .
@@ -80,6 +86,7 @@ WHISPER_ARGS=(
 )
 [ -n "${WHISPER_ALIGN_MODEL:-}" ] && WHISPER_ARGS+=(--align_model "$WHISPER_ALIGN_MODEL")
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx "${WHISPER_ARGS[@]}"
+rm -f "$WAV_NAME"
 
 echo "============================================="
 echo "whisper — 完成: $VIDEO_DIR/$SRT_NAME"

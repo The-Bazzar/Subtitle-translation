@@ -1133,31 +1133,38 @@ Examples:
 
     # ── 长句拆分 (LLM 自然语言边界, 优先 JSON 词级时间码) ───────────────
     if not args.no_split:
-        subtitles = split_subtitles(
-            subtitles,
-            provider=args.provider,
-            model=args.model,
-            api_key=args.api_key,
-            srt_path=srt_path,
-            max_chars=args.split_max_chars,
-            max_duration=args.split_max_duration,
-            quiet=args.quiet,
-        )
-        # 补 ASS 格式时间码 (split_subtitles 只生成了 float 秒)
-        for sub in subtitles:
-            if 'start_ass' not in sub:
-                sub['start_ass'] = ass_time(sub['start'])
-            if 'end_ass' not in sub:
-                sub['end_ass'] = ass_time(sub['end'])
-
-        # 保存拆分中间成果 (.split.srt)
+        # 检查 .split.srt 缓存
         srt_base2 = os.path.splitext(os.path.basename(srt_path))[0]
         if srt_base2.endswith('.beautified'):
             srt_base2 = srt_base2[:-len('.beautified')]
-        split_out = os.path.join(srt_dir, f"{srt_base2}.split.srt")
-        write_srt_generic(split_out, subtitles)
-        if not args.quiet:
-            print(f"  .split.srt: {split_out}")
+        split_cache = os.path.join(srt_dir, f"{srt_base2}.split.srt")
+
+        if os.path.isfile(split_cache):
+            subtitles = parse_srt(split_cache)
+            if not args.quiet:
+                print(f"\n  .split.srt 缓存已存在, 跳过 LLM 分句: {split_cache}")
+        else:
+            subtitles = split_subtitles(
+                subtitles,
+                provider=args.provider,
+                model=args.model,
+                api_key=args.api_key,
+                srt_path=srt_path,
+                max_chars=args.split_max_chars,
+                max_duration=args.split_max_duration,
+                quiet=args.quiet,
+            )
+            # 补 ASS 格式时间码 (split_subtitles 只生成了 float 秒)
+            for sub in subtitles:
+                if 'start_ass' not in sub:
+                    sub['start_ass'] = ass_time(sub['start'])
+                if 'end_ass' not in sub:
+                    sub['end_ass'] = ass_time(sub['end'])
+
+            # 保存拆分中间成果 (.split.srt)
+            write_srt_generic(split_cache, subtitles)
+            if not args.quiet:
+                print(f"  .split.srt: {split_cache}")
 
         if not args.quiet:
             print(f"  Duration: {subtitles[0]['start_ass']} → {subtitles[-1]['end_ass']}")

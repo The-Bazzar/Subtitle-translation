@@ -83,8 +83,13 @@ Write-Host "设备:        $Device" -ForegroundColor Gray
 if ($AlignModel) { Write-Host "对齐:        $AlignModel" -ForegroundColor Gray }
 Write-Host "=============================================" -ForegroundColor Cyan
 
+# 提取音频为 WAV (避免长视频时间码漂移)
+$WavPath = Join-Path $VideoDir "$VideoName.wav"
+Write-Host "提取音频..." -ForegroundColor Gray
+& ffmpeg -i $VideoAbs -vn -acodec pcm_s16le -ar 16000 -ac 1 $WavPath -y -loglevel error
+
 $WhisperArgs = @(
-    $VideoAbs,
+    $WavPath,
     '--model', $Model,
     '--language', $VideoLang,
     '--output_dir', $VideoDir,
@@ -98,6 +103,7 @@ if ($AlignModel) {
 
 $env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
 & whisperx @WhisperArgs
+Remove-Item $WavPath -Force
 $ExitCode = $LASTEXITCODE
 
 if ($ExitCode -eq 0) {
