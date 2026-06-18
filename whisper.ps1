@@ -8,6 +8,9 @@ param(
     [Parameter(HelpMessage = "Align model (default: empty = auto)")]
     [string]$AlignModel,
 
+    [Parameter(HelpMessage = "Device: cuda | cpu (default: cuda)")]
+    [string]$Device,
+
     [Parameter(HelpMessage = "Segmentation: sentence | chunk (default: sentence)")]
     [string]$SegmentResolution,
 
@@ -32,7 +35,8 @@ param(
     [float]$VadOffset,
 
     [Parameter(HelpMessage = "Condition on previous text (default: false, shorter segments)")]
-    [bool]$ConditionOnPreviousText,
+    [ValidateSet("True", "False")]
+    [string]$ConditionOnPreviousText,
 
     [Alias("h")]
     [Parameter(HelpMessage = "Show help")]
@@ -45,14 +49,14 @@ param(
 . "$PSScriptRoot\.env.ps1"
 $Model                   = Merge-EnvDefault 'WHISPER_MODEL'                    $Model                   'large-v3-turbo'
 $AlignModel              = Merge-EnvDefault 'WHISPER_ALIGN_MODEL'              $AlignModel              ''
-
+$Device                  = Merge-EnvDefault 'WHISPER_DEVICE'                   $Device                  'cuda'
 $SegmentResolution       = Merge-EnvDefault 'WHISPER_SEGMENT_RESOLUTION'       $SegmentResolution       'sentence'
 $MaxLineWidth            = Merge-EnvDefault 'WHISPER_MAX_LINE_WIDTH'           $MaxLineWidth            '42'
 $MaxLineCount            = Merge-EnvDefault 'WHISPER_MAX_LINE_COUNT'           $MaxLineCount            '2'
 $ChunkSize               = Merge-EnvDefault 'WHISPER_CHUNK_SIZE'               $ChunkSize               '15'
 $VadOnset                = Merge-EnvDefault 'WHISPER_VAD_ONSET'                $VadOnset                '0.5'
 $VadOffset               = Merge-EnvDefault 'WHISPER_VAD_OFFSET'               $VadOffset               '0.363'
-$ConditionOnPreviousText = Merge-EnvDefault 'WHISPER_CONDITION_ON_PREVIOUS'    $ConditionOnPreviousText 'false'
+$ConditionOnPreviousText = Merge-EnvDefault 'WHISPER_CONDITION_ON_PREVIOUS'    $ConditionOnPreviousText 'False'
 
 if ($Help -or (-not $VideoPath)) {
     @"
@@ -118,6 +122,7 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "视频:        $VideoAbs" -ForegroundColor Gray
 Write-Host "语言:        $VideoLang" -ForegroundColor Gray
 Write-Host "模型:        $Model" -ForegroundColor Gray
+Write-Host "设备:        $Device" -ForegroundColor Gray
 Write-Host "分割粒度:    $SegmentResolution" -ForegroundColor Gray
 Write-Host "行宽/行数:   $MaxLineWidth 字符/行, $MaxLineCount 行/段" -ForegroundColor Gray
 Write-Host "块大小:      ${ChunkSize}s" -ForegroundColor Gray
@@ -130,6 +135,7 @@ $WhisperArgs = @(
     '--language', $VideoLang,
     '--output_dir', $VideoDir,
     '--output_format', 'srt',
+    '--device', $Device,
     '--segment_resolution', $SegmentResolution,
     '--chunk_size', $ChunkSize,
     '--vad_onset', $VadOnset,

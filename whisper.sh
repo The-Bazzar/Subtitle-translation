@@ -11,13 +11,14 @@
 # 环境变量:
 #   WHISPER_MODEL                  ASR 模型 (默认: large-v3-turbo)
 #   WHISPER_ALIGN_MODEL            对齐模型 (默认: 空, 按语言自动匹配)
+#   WHISPER_DEVICE                 推理设备: cuda | cpu (默认: cuda, 自动检测)
 #   WHISPER_SEGMENT_RESOLUTION     分割粒度: sentence | chunk (默认: sentence)
 #   WHISPER_MAX_LINE_WIDTH         每行最大字符数 (默认: 42, 需要 alignment)
 #   WHISPER_MAX_LINE_COUNT         每段最大行数 (默认: 2, 需要 alignment)
 #   WHISPER_CHUNK_SIZE             处理块大小秒 (默认: 15, 原始: 30)
 #   WHISPER_VAD_ONSET              VAD 语音起始阈值 (默认: 0.5)
 #   WHISPER_VAD_OFFSET             VAD 语音结束阈值 (默认: 0.363)
-#   WHISPER_CONDITION_ON_PREVIOUS  是否用前文做 prompt (默认: false)
+#   WHISPER_CONDITION_ON_PREVIOUS  是否用前文做 prompt (默认: False)
 # =============================================================================
 
 set -uo pipefail
@@ -64,13 +65,14 @@ print(lang if lang else 'en')
 fi
 
 # 分割参数默认值
+DEVICE="${WHISPER_DEVICE:-cuda}"
 SEGMENT_RESOLUTION="${WHISPER_SEGMENT_RESOLUTION:-sentence}"
 MAX_LINE_WIDTH="${WHISPER_MAX_LINE_WIDTH:-42}"
 MAX_LINE_COUNT="${WHISPER_MAX_LINE_COUNT:-2}"
 CHUNK_SIZE="${WHISPER_CHUNK_SIZE:-15}"
 VAD_ONSET="${WHISPER_VAD_ONSET:-0.5}"
 VAD_OFFSET="${WHISPER_VAD_OFFSET:-0.363}"
-CONDITION_ON_PREVIOUS="${WHISPER_CONDITION_ON_PREVIOUS:-false}"
+CONDITION_ON_PREVIOUS="${WHISPER_CONDITION_ON_PREVIOUS:-False}"
 
 echo "============================================="
 echo "whisper — 语音识别 → .srt"
@@ -78,6 +80,7 @@ echo "============================================="
 echo "视频:      $VIDEO_PATH"
 echo "语言:      $VIDEO_LANG"
 echo "模型:      ${WHISPER_MODEL:-large-v3-turbo}"
+echo "设备:      $DEVICE"
 echo "分割粒度:  $SEGMENT_RESOLUTION"
 echo "行宽限制:  $MAX_LINE_WIDTH 字符/行"
 echo "行数限制:  $MAX_LINE_COUNT 行/段"
@@ -92,6 +95,7 @@ WHISPER_ARGS=(
     --language "$VIDEO_LANG"
     --output_dir .
     --output_format srt
+    --device "$DEVICE"
     --segment_resolution "$SEGMENT_RESOLUTION"
     --chunk_size "$CHUNK_SIZE"
     --vad_onset "$VAD_ONSET"

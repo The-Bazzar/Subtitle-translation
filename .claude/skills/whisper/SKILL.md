@@ -36,7 +36,7 @@ WHISPER_CHUNK_SIZE=10 WHISPER_MAX_LINE_WIDTH=36 ./whisper.sh "video.webm"
 | `--chunk_size` | `15` | 处理块大小秒 (WhisperX 原始: 30, 越小段越短) |
 | `--max_line_width` | `42` | 每行最大字符数 (字幕标准, 需 alignment) |
 | `--max_line_count` | `2` | 每段最大行数 (需 alignment) |
-| `--condition_on_previous_text` | `false` | 关掉让每段独立 (不会连成长句) |
+| `--condition_on_previous_text` | `False` | 关掉让每段独立 (不会连成长句) |
 | `--vad_onset` | `0.5` | VAD 语音起始阈值 (通常不改) |
 | `--vad_offset` | `0.363` | VAD 语音结束阈值 (通常不改) |
 
@@ -46,11 +46,12 @@ WHISPER_CHUNK_SIZE=10 WHISPER_MAX_LINE_WIDTH=36 ./whisper.sh "video.webm"
 |------|--------|------|
 | `WHISPER_MODEL` | `large-v3-turbo` | ASR 模型 |
 | `WHISPER_ALIGN_MODEL` | 空 | 对齐模型 (空=按语言自动匹配) |
+| `WHISPER_DEVICE` | `cuda` | 推理设备: cuda / cpu |
 | `WHISPER_SEGMENT_RESOLUTION` | `sentence` | 分割粒度 |
 | `WHISPER_MAX_LINE_WIDTH` | `42` | 每行最大字符数 |
 | `WHISPER_MAX_LINE_COUNT` | `2` | 每段最大行数 |
 | `WHISPER_CHUNK_SIZE` | `15` | 处理块大小秒 |
-| `WHISPER_CONDITION_ON_PREVIOUS` | `false` | 前文 prompt 开关 |
+| `WHISPER_CONDITION_ON_PREVIOUS` | `False` | 前文 prompt 开关 |
 
 ## 调参指南
 
@@ -60,7 +61,7 @@ WHISPER_CHUNK_SIZE=10 WHISPER_MAX_LINE_WIDTH=36 ./whisper.sh "video.webm"
 | **句子太碎/太短** | `--segment_resolution chunk --chunk_size 30` |
 | **字幕行溢出屏幕** | `--max_line_width 36` |
 | **单字行太多** | `--max_line_width 50 --max_line_count 3` |
-| **段落粘连** | `--condition_on_previous_text false` |
+| **段落粘连** | `--condition_on_previous_text False` |
 
 ## 输出
 
