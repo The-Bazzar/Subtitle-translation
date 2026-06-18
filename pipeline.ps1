@@ -106,14 +106,8 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 # ── 从 .env 读取默认配置 ──────────────────────────────────────────────────────
 
 $ScriptDir = Split-Path $PSCommandPath -Parent
-$EnvFile = Join-Path $ScriptDir '.env'
 
-function Get-EnvValue([string]$Key, [string]$Default) {
-    if (-not (Test-Path $EnvFile)) { return $Default }
-    $m = Select-String -Path $EnvFile -Pattern "^\s*$Key\s*=\s*(.*)" | Select-Object -First 1
-    if ($m) { $v = $m.Matches.Groups[1].Value.Trim(); if ($v) { return $v } }
-    return $Default
-}
+. "$PSScriptRoot\.env.ps1"
 
 if (-not $TranslateProvider) { $TranslateProvider = Get-EnvValue 'TRANSLATE_PROVIDER' 'openrouter' }
 if (-not $TranslateModel)    { $TranslateModel    = Get-EnvValue 'TRANSLATE_MODEL' '' }

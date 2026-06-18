@@ -97,14 +97,7 @@ if (-not $Output) {
 $OutputAbs = [System.IO.Path]::GetFullPath($Output)
 
 # 从 .env 读取 mpv 路径
-$ScriptDir = Split-Path $PSCommandPath -Parent
-$EnvFile = Join-Path $ScriptDir '.env'
-function Get-EnvValue([string]$Key, [string]$Default) {
-    if (-not (Test-Path $EnvFile)) { return $Default }
-    $m = Select-String -Path $EnvFile -Pattern "^\s*$Key\s*=\s*(.*)" | Select-Object -First 1
-    if ($m) { $v = $m.Matches.Groups[1].Value.Trim(); if ($v) { return $v } }
-    return $Default
-}
+. "$PSScriptRoot\.env.ps1"
 $MpvPath = Get-EnvValue 'MPV_PATH_WIN' 'mpv'
 
 # ── 执行 ──────────────────────────────────────────────────────────────────────

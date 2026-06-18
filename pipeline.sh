@@ -56,8 +56,12 @@ if [ -f "$ENV_FILE" ]; then
         [ -z "$key" ] && continue
         # 仅在环境变量未设置时从 .env 取值
         case "$key" in
-            TRANSLATE_PROVIDER) TRANSLATE_PROVIDER="${TRANSLATE_PROVIDER:-$value}" ;;
-            TRANSLATE_MODEL)    TRANSLATE_MODEL="${TRANSLATE_MODEL:-$value}" ;;
+            TRANSLATE_PROVIDER)       TRANSLATE_PROVIDER="${TRANSLATE_PROVIDER:-$value}" ;;
+            TRANSLATE_MODEL)          TRANSLATE_MODEL="${TRANSLATE_MODEL:-$value}" ;;
+            PIPELINE_SKIP_DOWNLOAD)   PIPELINE_SKIP_DOWNLOAD="${PIPELINE_SKIP_DOWNLOAD:-$value}" ;;
+            PIPELINE_SKIP_BEAUTIFY)   PIPELINE_SKIP_BEAUTIFY="${PIPELINE_SKIP_BEAUTIFY:-$value}" ;;
+            PIPELINE_SKIP_TRANSLATE)  PIPELINE_SKIP_TRANSLATE="${PIPELINE_SKIP_TRANSLATE:-$value}" ;;
+            PIPELINE_SKIP_BURN)       PIPELINE_SKIP_BURN="${PIPELINE_SKIP_BURN:-$value}" ;;
         esac
     done < "$ENV_FILE"
 fi
@@ -65,6 +69,12 @@ fi
 # 硬编码兜底 (环境变量 > .env > 此处默认值)
 TRANSLATE_PROVIDER="${TRANSLATE_PROVIDER:-openrouter}"
 TRANSLATE_MODEL="${TRANSLATE_MODEL:-}"
+
+# 阶段跳过: 运行时 SKIP_* > .env PIPELINE_SKIP_* > 默认 0
+SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-${PIPELINE_SKIP_DOWNLOAD:-0}}"
+SKIP_BEAUTIFY="${SKIP_BEAUTIFY:-${PIPELINE_SKIP_BEAUTIFY:-0}}"
+SKIP_TRANSLATE="${SKIP_TRANSLATE:-${PIPELINE_SKIP_TRANSLATE:-0}}"
+SKIP_BURN="${SKIP_BURN:-${PIPELINE_SKIP_BURN:-0}}"
 
 # 压制参数
 BURN_OVC="${BURN_OVC:-hevc_nvenc}"
@@ -116,10 +126,11 @@ beautify 选项 (在 -- 之后, 默认值遵循 Subtitle Edit 兼容):
   --preview                     仅预览, 不写入
   --backup                      覆盖前备份原文件
 
-环境变量:
-  SKIP_DOWNLOAD=1         跳过下载 (仅处理已有视频)
-  SKIP_BEAUTIFY=1         跳过美化
-  SKIP_TRANSLATE=1        跳过 LLM 翻译
+环境变量 (优先级: 运行时 > .env > 默认值):
+  SKIP_DOWNLOAD=1 / PIPELINE_SKIP_DOWNLOAD=1     跳过下载 (仅处理已有视频)
+  SKIP_BEAUTIFY=1 / PIPELINE_SKIP_BEAUTIFY=1     跳过美化
+  SKIP_TRANSLATE=1 / PIPELINE_SKIP_TRANSLATE=1   跳过 LLM 翻译
+  SKIP_BURN=1 / PIPELINE_SKIP_BURN=1             跳过字幕硬压
   EXISTING_SRT            已有美化后 SRT 路径 (跳过美化步骤)
   EXISTING_ASS            已有 .zh-en.ass 路径 (跳过翻译步骤)
   TRANSLATE_PROVIDER      翻译后端: openrouter | deepseek | gemini (默认: openrouter)
@@ -127,10 +138,10 @@ beautify 选项 (在 -- 之后, 默认值遵循 Subtitle Edit 兼容):
   PROOFREAD=0              关闭中英校对 (默认开启)
   PROOFREAD_PROVIDER       校对专用后端 (默认: 同翻译)
   PROOFREAD_MODEL          校对专用模型 (默认: 同翻译)
-  BURN=0                  跳过字幕硬压 (默认启用)
   BURN_OVC                视频编码器 (默认: hevc_nvenc)
   BURN_OVCOPTS            编码器参数 (默认: qp=20)
   BURN_OAC                音频编码器 (默认: aac)
+  BURN_RES                输出分辨率 (默认: 原始)
 EOF
     exit 0
 }

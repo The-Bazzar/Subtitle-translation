@@ -24,16 +24,8 @@ download.ps1 — 下载 YouTube 视频 + 元数据 (不含字幕生成)
     exit 0
 }
 
-# ── 从 .env 读取 yt-dlp 路径 ─────────────────────────────────────────────────
-
-$ScriptDir = Split-Path $PSCommandPath -Parent
-$EnvFile = Join-Path $ScriptDir '.env'
-function Get-EnvValue([string]$Key, [string]$Default) {
-    if (-not (Test-Path $EnvFile)) { return $Default }
-    $m = Select-String -Path $EnvFile -Pattern "^\s*$Key\s*=\s*(.*)" | Select-Object -First 1
-    if ($m) { $v = $m.Matches.Groups[1].Value.Trim(); if ($v) { return $v } }
-    return $Default
-}
+# ── 从 .env 读取配置 ─────────────────────────────────────────────────────────
+. "$PSScriptRoot\.env.ps1"
 $Ytdlp = Get-EnvValue 'YTDLP_PATH_WIN' 'yt-dlp'
 
 # ── 步骤 1: 获取视频标题并创建文件夹 ──────────────────────────────────────────

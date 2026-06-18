@@ -106,14 +106,7 @@ $OvcKey, $OvcVal = $Ovcopts -split '=', 2
 if (-not $OvcVal) { $OvcVal = $OvcKey; $OvcKey = 'qp' }
 
 # 从 .env 读取 ffmpeg 路径
-$ScriptDir = Split-Path $PSCommandPath -Parent
-$EnvFile = Join-Path $ScriptDir '.env'
-function Get-EnvValue([string]$Key, [string]$Default) {
-    if (-not (Test-Path $EnvFile)) { return $Default }
-    $m = Select-String -Path $EnvFile -Pattern "^\s*$Key\s*=\s*(.*)" | Select-Object -First 1
-    if ($m) { $v = $m.Matches.Groups[1].Value.Trim(); if ($v) { return $v } }
-    return $Default
-}
+. "$PSScriptRoot\.env.ps1"
 $FfmpegPath = Get-EnvValue 'FFMPEG_PATH_WIN' 'ffmpeg'
 
 # ── 执行 ──────────────────────────────────────────────────────────────────────
