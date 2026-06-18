@@ -37,9 +37,9 @@ whisper.ps1 — WhisperX 语音识别生成英文字幕 (.srt)
   -Device      cuda|cpu (默认: cuda)
 
 输出:
-  同目录输出 <文件名>.srt + .json (词级时间码，供 split_srt.py 使用)
+  同目录输出 <文件名>.srt + .json (词级时间码)
 
-句子拆分: 另用 split_srt.py (LLM 辅助自然语言边界分句)
+句子拆分已集成到 translate_srt.py，翻译时自动 LLM 分句 + JSON 对轴
 "@
     exit 0
 }
@@ -102,7 +102,7 @@ $ExitCode = $LASTEXITCODE
 
 if ($ExitCode -eq 0) {
     Write-Host "=============================================" -ForegroundColor Green
-    Write-Host "whisper — 完成: $VideoName.srt" -ForegroundColor Green
+    Write-Host "whisper — 完成: $VideoName.srt + .json + .txt/.tsv/.vtt" -ForegroundColor Green
     Write-Host "=============================================" -ForegroundColor Green
 } else {
     Write-Host "Error: whisperx failed (exit code: $ExitCode)" -ForegroundColor Red

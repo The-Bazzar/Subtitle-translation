@@ -6,7 +6,7 @@
 #   ./whisper.sh <视频文件路径>
 #
 # 输出:
-#   同目录输出 <视频文件名>.srt
+#   同目录输出 <视频文件名>.srt + .json (词级时间码) + .txt/.tsv/.vtt
 #
 # 环境变量:
 #   WHISPER_MODEL                  ASR 模型 (默认: large-v3-turbo)
