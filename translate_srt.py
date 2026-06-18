@@ -216,42 +216,36 @@ def load_glossary(glossary_path: str) -> str:
 
 
 # 内置回退提示词 (translate_prompt.md / proofread_prompt.md 缺失时使用)
-_TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator specializing in English→Simplified Chinese translation.
+_TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator specializing in English to Simplified Chinese.
 
 Rules:
-- Translate each numbered line 1:1 to natural, fluent Chinese (Simplified)
-- Preserve \\\\N line breaks exactly — this is a subtitle soft-return marker, keep it in the SAME position
+- Translate each numbered line 1:1 to natural, fluent Chinese
 - Match the tone of the original: casual stays casual, formal stays formal
-- Keep proper nouns, brand names, and technical terms in their original form if no standard Chinese translation exists
-- Do NOT skip, merge, split, or add any items — exactly N input lines → N output lines
+- Keep proper nouns, brand names, and technical terms in original form unless a standard Chinese translation exists
+- Do not skip, merge, split, or add items — exactly N input lines -> N output lines
+- Each input is already a short, self-contained segment; translate it as-is
 
-Netflix Chinese subtitle formatting:
-- Do NOT use 。，！？ (period, comma, exclamation, question) — Chinese subtitles omit these
-- Keep 、(enumeration comma) as a separator between list items
-- Keep 《》 (book title marks) if present in the original
-- Use a single space to replace other removed punctuation where natural pauses occur
+Netflix Chinese formatting: omit all punctuation marks (。，！？；：) except 、and 《》.
+Use a single space for natural pauses where punctuation was removed.
 
-Respond ONLY with numbered lines in this exact format:
+Respond with numbered lines only:
   [1] translation
   [2] translation
-  ...
-No explanations, no preamble, no closing remarks"""
+  ..."""
 
-_PROOFREAD_PROMPT_FALLBACK = """You are a Chinese subtitle proofreader. Review each numbered pair (EN original + ZH draft) against the English source.
+_PROOFREAD_PROMPT_FALLBACK = """You are a Chinese subtitle proofreader. Review each EN+ZH pair against the English source.
 
 Tasks:
-- Fix mistranslations, omissions, or added content — the Chinese must match the English meaning 1:1
-- Improve awkward or unnatural phrasing — the Chinese should read fluently as spoken subtitles
-- Fix tone mismatches — casual/formal/informal register must match the original
-- Ensure Netflix formatting: no 。，！？, keep 、and 《》, spaces for natural pauses
-- Preserve \\\\N line breaks exactly in their original positions
-- Do NOT merge, split, or reorder items — exactly N input pairs → N output lines
+- Fix mistranslations, omissions, or added content — match English meaning 1:1
+- Improve awkward phrasing — Chinese must read fluently as spoken subtitles
+- Fix tone mismatches — register must match the original
+- Netflix formatting: no 。，！？；：, keep 、and 《》, use spaces for pauses
+- Do not merge, split, or reorder items — exactly N input pairs -> N output lines
 
-Respond ONLY with corrected numbered lines:
+Respond with corrected numbered lines only:
   [1] corrected translation
   [2] corrected translation
-  ...
-No explanations, no preamble, no closing remarks"""
+  ..."""
 
 
 def load_prompt(filename: str, fallback: str) -> str:
