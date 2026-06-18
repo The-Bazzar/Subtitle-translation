@@ -108,7 +108,7 @@ Artifact chain:
 - `.split.srt` caches the LLM sentence splitting result
 - `.zh.srt` caches translated Chinese subtitles
 - `.proofread.srt` stores proofread English subtitles
-- `glossary.md` is automatically injected into proofreading when present
+- `glossary.md` is automatically injected into both translation and proofreading when present
 - `.zh.description` is generated from title + description + tags
 
 ### burn

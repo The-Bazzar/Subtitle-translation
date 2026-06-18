@@ -277,7 +277,7 @@ def load_glossary(glossary_path: str) -> str:
             return ""
         return (
             "\n\n以下是本视频的术语知识库, "
-            "请严格遵循其中的翻译规范和术语一致性要求:\n\n"
+            "请在翻译和校对时严格遵循其中的术语理解、推荐译法、语气判断和一致性要求:\n\n"
             + content
         )
     except OSError:
@@ -1009,7 +1009,7 @@ Examples:
     parser.add_argument('--proofread', action='store_true', default=True,
                         help='中英校对 (默认开启)')
     parser.add_argument('--glossary', metavar='PATH',
-                        help='glossary.md 术语知识库路径 (注入校对 prompt)')
+                        help='glossary.md 术语知识库路径 (注入翻译和校对 prompt)')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='静默模式')
 
@@ -1063,7 +1063,9 @@ Examples:
     glossary_path = args.glossary or (ctx.glossary if os.path.isfile(ctx.glossary) else None)
     glossary_text = load_glossary(glossary_path)
     if glossary_text and not args.quiet:
-        print(f"\nGlossary: glossary.md 已加载, 将注入校对提示词")
+        print(f"\nGlossary: glossary.md 已加载, 将注入翻译和校对提示词")
+        system_prompt += glossary_text
+        proofread_prompt += glossary_text
 
     # ── 长句拆分 ──────────────────────────────────────────────────────────
     if split.enabled:
@@ -1110,8 +1112,9 @@ Examples:
     if args.proofread and _env.get('PROOFREAD', '1') != '0':
         if not args.quiet:
             print()
-        corrected_en, translations = proofread_subtitles(subtitles, translations, llm,
-                                                           proofread_prompt + glossary_text, args.quiet)
+        corrected_en, translations = proofread_subtitles(
+            subtitles, translations, llm, proofread_prompt, args.quiet
+        )
         write_zh_srt(ctx.zh_srt, subtitles, translations)
         if not args.quiet:
             print(f"  .zh.srt:  {ctx.zh_srt} (updated with proofread)")

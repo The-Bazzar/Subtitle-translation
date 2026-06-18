@@ -58,5 +58,5 @@ platform: Agent + Script
 ## 重要约束
 
 - 不要把“离线生成”“联网生成”之类元信息写进 glossary
-- glossary 是给后续翻译/校对 prompt 直接注入的
+- glossary 是给后续翻译和校对 prompt 直接注入的
 - 不确定的术语宁可少写，也不要硬猜一堆

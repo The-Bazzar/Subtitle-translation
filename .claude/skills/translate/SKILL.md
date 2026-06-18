@@ -6,7 +6,7 @@ platform: Win + Linux
 
 # 翻译与校对
 
-目标：把英文字幕转换成双语成果物，并把术语知识库注入到校对阶段。
+目标：把英文字幕转换成双语成果物，并把术语知识库注入到翻译和校对阶段。
 
 ## 输入
 
@@ -39,7 +39,7 @@ platform: Win + Linux
 4. 若存在 `.zh.srt`，跳过初译
 5. 否则执行翻译
 6. 默认执行中英双语校对
-7. 若存在 `glossary.md`，自动注入校对提示词
+7. 若存在 `glossary.md`，自动注入翻译和校对提示词
 8. 输出 `.proofread.srt`、`.zh.ass`、`.zh-en.ass`
 9. 若存在 `.description`，同时生成 `.zh.description`
 

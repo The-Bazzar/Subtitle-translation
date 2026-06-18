@@ -379,7 +379,7 @@ TAVILY_MAX_RESULTS=10
 4. 如果存在 `.zh.srt`，跳过初译
 5. 否则执行翻译
 6. 默认执行双语校对，输出校对后的英文 `.proofread.srt`
-7. 自动检测 `glossary.md` 并注入校对提示词
+7. 自动检测 `glossary.md` 并注入翻译与校对提示词
 8. 输出 `.zh.ass` 和 `.zh-en.ass`
 9. 如果存在 `.description`，顺带翻译为 `.zh.description`
 
@@ -463,7 +463,7 @@ TAVILY_MAX_RESULTS=10
 
 `beautify → knowledge/glossary → translate`
 
-原因是这样只需要一轮正式校对，就能把术语一致性纳入翻译链。
+原因是这样 glossary 能从翻译初稿开始就参与约束，后续校对只需要在此基础上做收口。
 
 ## 批处理
 
