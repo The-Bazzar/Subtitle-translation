@@ -5,7 +5,7 @@ Step 1 — Check English for common ASR errors:
 - Garbled proper names, brand names, or technical terms
 - Missing or extra negation (not, never, don't)
 - Obvious grammar breaks that distort meaning
-Fix any errors found; mark EN as-is if correct.
+Fix any errors found.
 
 Step 2 — Check Chinese against the (corrected) English:
 - Fix mistranslations, omissions, or added content
