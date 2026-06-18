@@ -1,80 +1,62 @@
 ---
 name: knowledge
-description: 美化后/翻译前建立术语知识库，配合双语校对实现一轮审校
-platform: Agent (跨平台)
+description: 在美化后、翻译前建立 glossary.md，提升术语一致性和校对准确度
+platform: Agent + Script
 ---
 
-# 术语知识库 + 双语校对
+# 术语知识库
 
-由 **用户提供的 AI Agent** 浏览美化/分句后的英文字幕，建立术语知识库 `glossary.md`，然后 `translate_srt.py` 自动注入实现**一轮双语审校**（英文 ASR 纠错 + 中文校对 + 术语一致性）。
+当前项目有两种建立 glossary 的方式：
+
+1. 自动脚本：[`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py)
+2. 外部 agent：由用户自己提供更强模型，人工审阅后落地 `glossary.md`
 
 ## 推荐时机
 
-```
-beautify/split → knowledge (glossary.md) → translate (翻译 + 双语校对)
-```
+`beautify -> glossary -> translate`
 
-在翻译之前建立知识库，glossary 可同时注入翻译和校对两轮 prompt。
+这样 glossary 能同时参与翻译后的校对阶段，通常一轮正式校对就够。
 
-## Agent 工作流程
+## 自动脚本行为
 
-### 步骤 0：收集上下文
+输入：
 
-先读取视频目录下所有可用文件：
+- 优先 `.beautified.srt`
+- 回退 `.srt`
 
-| 文件 | 用途 |
-|------|------|
-| `<video>.srt` / `.beautified.srt` / `.split.srt` | 英文字幕（优先美化/分句后的） |
-| `<video>.zh.srt` | 中文翻译（如有），检查已有译法 |
-| `<video>.description` | 视频简介，理解主题和语境 |
-| `<video>.tags.txt` | 视频标签，搜索关键词直接来源 |
-| `<video>.info.json` | yt-dlp 元数据（标题、频道、上传日期） |
+附加上下文：
 
-### 步骤 1：联网搜索（优先）
+- `.description`
+- `.tags.txt`
+- `.info.json`
 
-**必须优先尝试联网搜索**，提高术语准确度：
+联网搜索：
 
-1. 从 `.tags.txt` 提取标签，结合标题/频道名，用 `WebSearch` 或 MCP 搜索术语的标准译法和视频主题背景
-2. 如有 `WebFetch`，抓取搜索结果中的权威页面（维基百科、官方文档）验证术语含义
-3. **如果 WebSearch / MCP 均不可用**，静默回退到离线模式，用模型自身知识 + 字幕上下文推断
+- 如果配置了 `TAVILY_API_KEY`，优先联网搜索
+- `TAVILY_MAX_RESULTS` 控制每次搜索结果上限，默认 10
+- 如果没有 web search 能力，则回退离线总结
 
-### 步骤 2：生成 glossary.md
+输出：
 
-综合字幕分析 + 搜索结果，输出 `glossary.md` 到视频目录：
+- `glossary.md`
 
-```markdown
-# 术语知识库 — <视频标题>
+## 外部 agent 工作要求
 
-## 背景
-<.tags.txt + .description + 搜索结果，2-3 句概括视频主题>
+1. 先读字幕主线内容，理解视频主题
+2. 再结合 `.description`、`.tags.txt`、`.info.json`
+3. 如果可联网，优先搜索术语标准译法、背景概念、作者涉及的领域知识
+4. 如果当前没有 web_search / MCP，则离线总结，不要因此中断
+5. 只保留对当前视频真正重要的术语、概念、态度和核心论点
 
-## 核心术语
-| 英文 | 推荐译法 | 说明 |
-|------|---------|------|
-| transformer | Transformer 架构 | 深度学习模型，不译"变压器" |
+## glossary 内容建议
 
-## 态度基调
-- 作者对 <X> 持批判/支持/中立态度
+- 背景
+- 核心术语
+- 态度基调
+- 关键论点
 
-## 关键论点
-- （全文反复出现的核心观点）
-```
+## 重要约束
 
-> **重要**：`glossary.md` 直接注入校对 prompt，**不要**在其中添加"离线生成""联网搜索"等元信息。
-
-### 步骤 3：翻译脚本自动注入
-
-```bash
-python translate_srt.py video.beautified.srt
-# 自动检测同目录 glossary.md → 注入翻译 + 校对 prompt → 双语审校
-```
-
-校对 prompt 会先检查英文 ASR 错误，再检查中文翻译质量，一轮完成。
-
-## 注意事项
-
-- **Agent 由用户提供**，项目脚本不自动生成 glossary
-- 每个视频独立的知识库，不跨视频复用
-- `glossary.md` 内容越精准越好，不确定的术语宁可省略
-- 建议在美化/分句后、翻译前建立知识库
-- 建议人工复核后重新运行校对
+- 不要把“离线生成”“联网生成”之类元信息写进 glossary
+- glossary 是给后续翻译/校对 prompt 直接注入的
+- 不确定的术语宁可少写，也不要硬猜一堆

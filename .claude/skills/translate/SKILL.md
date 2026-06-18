@@ -1,65 +1,69 @@
 ---
 name: translate
-description: LLM 翻译英文字幕为中文 — 输出双语 .zh-en.ass
+description: LLM 翻译英文字幕为中文，输出 .zh.srt / .proofread.srt / .zh.ass / .zh-en.ass
 platform: Win + Linux
 ---
 
-# 字幕翻译 (Win + Linux)
+# 翻译与校对
 
-将英文 SRT 通过 LLM API 翻译为中文，输出双语 `.zh-en.ass`。内置 LLM 长句拆分 + 两轮校对 + 术语注入。**Python 脚本，跨平台**。
+目标：把英文字幕转换成双语成果物，并把术语知识库注入到校对阶段。
 
-输入：WhisperX 生成的 `.srt`（或已美化的 `.beautified.srt`）。
+## 输入
 
-## 执行
-
-```bash
-python translate_srt.py video.srt
-python translate_srt.py video.srt --no-split          # 禁用长句拆分
-python translate_srt.py video.srt --split-max-chars 50 # 更激进拆分
-```
+- 优先：`.beautified.srt`
+- 回退：原始 `.srt`
+- 可选上下文：
+  - `.json`
+  - `.description`
+  - `.tags.txt`
+  - `glossary.md`
 
 ## 输出
 
-```
-视频目录/
-├── 视频标题.split.srt      # LLM 分句中间成果 ✨
-├── 视频标题.zh.srt         # 中文翻译缓存
-├── 视频标题.zh.ass         # 仅中文 ASS
-├── 视频标题.zh-en.ass      # 双语 ASS ✨
-└── 视频标题.zh.description # 中文简介
-```
+- `.split.srt`
+- `.zh.srt`
+- `.proofread.srt`
+- `.zh.ass`
+- `.zh-en.ass`
+- `.zh.description`
+
+## 当前实现
+
+- 核心脚本：[`translate_srt.py`](/G:/Subtitle%20translation/translate_srt.py)
 
 ## 流程
 
-```
-Step 0: LLM 分句 — 长句 (>60 chars 或 >3s) → 自然语言边界拆分
-        优先用 WhisperX JSON 词级时间码精确对轴 → .split.srt
+1. 读取英文 SRT
+2. 若存在 `.split.srt`，跳过分句
+3. 否则用 LLM 做长句自然拆分，并尽量用 WhisperX `.json` 词级时间码精确对轴
+4. 若存在 `.zh.srt`，跳过初译
+5. 否则执行翻译
+6. 默认执行中英双语校对
+7. 若存在 `glossary.md`，自动注入校对提示词
+8. 输出 `.proofread.srt`、`.zh.ass`、`.zh-en.ass`
+9. 若存在 `.description`，同时生成 `.zh.description`
 
-Step 1: Pass 1 翻译 — English → LLM → 中文初译
-Step 2: Pass 2 校对 — (English + 初译) → LLM → 中文精校
-Step 3: Pass 3 术语 — (English + 精校 + glossary.md) → 术语一致性校对
-```
+## 配置来源
 
-## 关键参数
+当前脚本依赖 `.env`：
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--no-split` | — | 禁用长句拆分 |
-| `--split-max-chars` | `60` | 拆分触发字符数 |
-| `--split-max-duration` | `3.0` | 拆分触发时长 (秒) |
-| `--no-proofread` | — | 禁用校对 |
-| `--glossary` | 自动检测 | glossary.md 路径 |
-| `--batch-size` | `50` | 每批翻译条数 |
+- `TRANSLATE_PROVIDER`
+- `TRANSLATE_MODEL`
+- `PROOFREAD`
+- `PROOFREAD_PROVIDER`
+- `PROOFREAD_MODEL`
 
-## 提示词
+如果没有配置 `TRANSLATE_PROVIDER`，脚本会直接报错。
 
-翻译/校对提示词从文件加载：
-- `translate_prompt.md` → `translate_prompt.example.md` → 内置回退
-- `proofread_prompt.md` → `proofread_prompt.example.md` → 内置回退
+## Prompt 来源
 
-## 自定义 LLM 后端
+- `translate_prompt.md` 或 `translate_prompt.example.md`
+- `proofread_prompt.md` 或 `proofread_prompt.example.md`
 
-编辑 `providers.json`：
-```json
-{"my_api": {"url": "...", "default_model": "...", "env_key": "MY_KEY", "auth_header": "Bearer {api_key}"}}
-```
+代码本身还会强制要求编号格式，避免用户自定义 prompt 时把输出结构搞乱。
+
+## 关键点
+
+- `.proofread.srt` 保存校对后的英文
+- `.zh-en.ass` 使用校对后的英文，而不是原始 ASR 英文
+- glossary 推荐在翻译前建立，这样一轮正式校对就够用

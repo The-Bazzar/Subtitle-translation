@@ -29,6 +29,9 @@ param(
     [Parameter(HelpMessage = "Skip subtitle beautify step")]
     [switch]$SkipBeautify,
 
+    [Parameter(HelpMessage = "Skip glossary knowledge base generation")]
+    [switch]$SkipKnowledge,
+
     [Parameter(HelpMessage = "Skip translation step")]
     [switch]$SkipTranslate,
 
@@ -54,6 +57,46 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+$ScriptDir = Split-Path $PSCommandPath -Parent
+. "$PSScriptRoot\.env.ps1"
+
+# ── 从 .env 读取阶段默认值 (CLI 显式传参优先) ───────────────────────────────
+
+if (-not $PSBoundParameters.ContainsKey('SkipDownload') -and (Get-EnvFlag 'PIPELINE_SKIP_DOWNLOAD' $false)) {
+    $SkipDownload = $true
+}
+if (-not $PSBoundParameters.ContainsKey('SkipWhisper') -and (Get-EnvFlag 'PIPELINE_SKIP_WHISPER' $false)) {
+    $SkipWhisper = $true
+}
+if (-not $PSBoundParameters.ContainsKey('SkipBeautify') -and (Get-EnvFlag 'PIPELINE_SKIP_BEAUTIFY' $false)) {
+    $SkipBeautify = $true
+}
+if (-not $PSBoundParameters.ContainsKey('SkipKnowledge') -and (Get-EnvFlag 'PIPELINE_SKIP_KNOWLEDGE' $false)) {
+    $SkipKnowledge = $true
+}
+if (-not $PSBoundParameters.ContainsKey('SkipTranslate') -and (Get-EnvFlag 'PIPELINE_SKIP_TRANSLATE' $false)) {
+    $SkipTranslate = $true
+}
+if (-not $PSBoundParameters.ContainsKey('SkipBurn') -and (Get-EnvFlag 'PIPELINE_SKIP_BURN' $false)) {
+    $SkipBurn = $true
+}
+if (-not $PSBoundParameters.ContainsKey('NoProofread') -and -not (Get-EnvFlag 'PROOFREAD' $true)) {
+    $NoProofread = $true
+}
+
+if (-not $PSBoundParameters.ContainsKey('Ovc')) {
+    $Ovc = Merge-EnvDefault 'BURN_OVC' '' 'hevc_nvenc'
+}
+if (-not $PSBoundParameters.ContainsKey('Ovcopts')) {
+    $Ovcopts = Merge-EnvDefault 'BURN_OVCOPTS' '' 'qp=20'
+}
+if (-not $PSBoundParameters.ContainsKey('Oac')) {
+    $Oac = Merge-EnvDefault 'BURN_OAC' '' 'aac'
+}
+if (-not $PSBoundParameters.ContainsKey('Res')) {
+    $Res = Merge-EnvDefault 'BURN_RES' '' ''
+}
+
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
 if ($Help -or (-not $Url)) {
@@ -62,12 +105,13 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
 用法: .\pipeline.ps1 <YouTube URL> [选项...]
 
-流程: 下载 → 语音识别 → 美化 → 翻译 → 硬压 (纯 Windows)
+流程: 下载 → 语音识别 → 美化 → 术语库 → 翻译 → 硬压 (纯 Windows)
   1. yt-dlp 下载视频 + 元数据
   2. WhisperX 生成英文字幕
   3. 场景检测美化时间码 (Netflix 规范)
-  4. LLM 翻译 + 校对 → 双语 .zh-en.ass
-  5. ffmpeg 硬压 → burned.mkv
+  4. glossary_builder.py 可选联网搜索 + LLM 生成术语知识库 (glossary.md)
+  5. LLM 长句拆分 + 翻译 + 双语校对 → .zh-en.ass
+  6. ffmpeg 硬压 → burned.mkv
 
 参数:
   -Url                YouTube 视频链接 (必选)
@@ -77,6 +121,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
   -SkipDownload       跳过下载
   -SkipWhisper        跳过语音识别
   -SkipBeautify       跳过时间码美化
+  -SkipKnowledge      跳过术语知识库
   -SkipTranslate      跳过翻译
   -NoProofread        关闭校对
   -SkipBurn           跳过压制
@@ -91,18 +136,12 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 "@
     exit 0
 }
-
-# ── 从 .env 读取默认配置 ──────────────────────────────────────────────────────
-
-$ScriptDir = Split-Path $PSCommandPath -Parent
-
-. "$PSScriptRoot\.env.ps1"
-
 # ── 工具路径 ──────────────────────────────────────────────────────────────────
 
 $DownloadPs1  = Join-Path $ScriptDir "download.ps1"
 $WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
 $BeautifyPy   = Join-Path $ScriptDir "beautify_srt.py"
+$KnowledgePy  = Join-Path $ScriptDir "glossary_builder.py"
 $TranslatePy  = Join-Path $ScriptDir "translate_srt.py"
 $BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
 
@@ -117,6 +156,7 @@ $steps = @()
 if (-not $SkipDownload)  { $steps += "Download" }
 if (-not $SkipWhisper)   { $steps += "Whisper" }
 if (-not $SkipBeautify)  { $steps += "Beautify" }
+if (-not $SkipKnowledge) { $steps += "Knowledge" }
 if (-not $SkipTranslate) { $steps += "Translate" }
 if (-not $SkipBurn)      { $steps += "Burn" }
 Write-Host "Steps:     $($steps -join ' → ')" -ForegroundColor Gray
@@ -141,7 +181,7 @@ if ($SkipDownload) {
     }
 } else {
     Write-Host ""
-    Write-Host ">>> Step 1/5: Download" -ForegroundColor Cyan
+    Write-Host ">>> Step 1/6: Download" -ForegroundColor Cyan
     $DownloadOutput = & $DownloadPs1 $Url 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Error: download.ps1 failed (exit code: $LASTEXITCODE)" -ForegroundColor Red
@@ -161,13 +201,15 @@ if ($SkipDownload) {
     }
 }
 
-# ── 推导路径 ──────────────────────────────────────────────────────────────────
+# ── 推导成果物路径链 ──────────────────────────────────────────────────────────
 
 $VideoDir  = Split-Path $VideoPath -Parent
 $VideoBase = [System.IO.Path]::GetFileNameWithoutExtension($VideoPath)
 $SrtPath   = Join-Path $VideoDir "$VideoBase.srt"
 $BeautifiedSrt = Join-Path $VideoDir "$VideoBase.beautified.srt"
+$GlossaryPath = Join-Path $VideoDir "glossary.md"
 $AssPath   = if ($ExistingAss) { $ExistingAss } else { Join-Path $VideoDir "$VideoBase.zh-en.ass" }
+$TranslateSrc = if ((Test-Path $BeautifiedSrt) -and -not $SkipBeautify) { $BeautifiedSrt } else { $SrtPath }
 
 # ── 步骤 2: WhisperX 字幕 ─────────────────────────────────────────────────────
 
@@ -181,7 +223,7 @@ if ($SkipWhisper) {
     Write-Host "SKIP: WhisperX — $SrtPath 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host ">>> Step 2/5: WhisperX" -ForegroundColor Cyan
+    Write-Host "Step 2/6: WhisperX" -ForegroundColor Cyan
     & $WhisperPs1 $VideoPath
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
@@ -198,14 +240,31 @@ if ($SkipBeautify) {
     Write-Host "SKIP: 美化 — $BeautifiedSrt 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host ">>> Step 3/5: Beautify" -ForegroundColor Cyan
+    Write-Host "Step 3/6: Beautify" -ForegroundColor Cyan
     & python $BeautifyPy $VideoPath $SrtPath -o $BeautifiedSrt
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-# ── 步骤 4: 翻译 ──────────────────────────────────────────────────────────────
+# ── 步骤 4: 术语知识库 ──────────────────────────────────────────────────────
 
 $TranslateSrc = if (Test-Path $BeautifiedSrt) { $BeautifiedSrt } else { $SrtPath }
+
+if ($SkipKnowledge) {
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "SKIP: 术语知识库" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+} elseif (Test-Path $GlossaryPath) {
+    Write-Host ""
+    Write-Host "SKIP: Knowledge — $GlossaryPath 已存在" -ForegroundColor Gray
+} else {
+    Write-Host ""
+    Write-Host "Step 4/6: Knowledge" -ForegroundColor Cyan
+    & python $KnowledgePy $TranslateSrc
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+# ── 步骤 5: 翻译 ──────────────────────────────────────────────────────────────
 
 if ($SkipTranslate) {
     Write-Host ""
@@ -217,20 +276,21 @@ if ($SkipTranslate) {
     Write-Host "SKIP: 翻译 — $AssPath 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host ">>> Step 4/5: Translate" -ForegroundColor Cyan
+    Write-Host "Step 5/6: Translate" -ForegroundColor Cyan
     if ($NoProofread) { $env:PROOFREAD = "0" }
     & python $TranslatePy $TranslateSrc -o $AssPath
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-# ── 步骤 5: 硬压 ──────────────────────────────────────────────────────────────
+# ── 步骤 6: 硬压 ──────────────────────────────────────────────────────────────
 
 if ($SkipBurn) {
+    $FinalSrtPath = if (Test-Path $BeautifiedSrt) { $BeautifiedSrt } else { $SrtPath }
     Write-Host ""
     Write-Host "=============================================" -ForegroundColor Green
     Write-Host "Done! (burn skipped)" -ForegroundColor Green
     Write-Host "Video:   $VideoPath" -ForegroundColor Gray
-    Write-Host "SRT:     $BeautifiedSrt" -ForegroundColor Gray
+    Write-Host "SRT:     $FinalSrtPath" -ForegroundColor Gray
     Write-Host "ASS:     $AssPath" -ForegroundColor Gray
     Write-Host "=============================================" -ForegroundColor Green
     exit 0
@@ -242,7 +302,7 @@ if (-not (Test-Path $AssPath)) {
 }
 
 Write-Host ""
-Write-Host ">>> Step 5/5: Burn" -ForegroundColor Cyan
+Write-Host "Step 6/6: Burn" -ForegroundColor Cyan
 
 $BurnParams = @{
     VideoPath = $VideoPath

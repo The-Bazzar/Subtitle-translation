@@ -17,6 +17,23 @@ function Get-EnvValue([string]$Key, [string]$Default) {
     return $Default
 }
 
+function Get-EnvFlag([string]$Key, [bool]$Default = $false) {
+    $raw = Get-EnvValue $Key ''
+    if (-not $raw) { return $Default }
+
+    switch ($raw.Trim().ToLowerInvariant()) {
+        '1'     { return $true }
+        'true'  { return $true }
+        'yes'   { return $true }
+        'on'    { return $true }
+        '0'     { return $false }
+        'false' { return $false }
+        'no'    { return $false }
+        'off'   { return $false }
+        default { return $Default }
+    }
+}
+
 # ── 批量覆盖未由 CLI 显式传参的变量 ──────────────────────────────────────────
 # 用法:
 #   Invoke-EnvDefaults -ParamRef ([ref]$Model) -EnvKey 'WHISPER_MODEL' -Default 'large-v3-turbo'

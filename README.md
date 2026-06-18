@@ -1,642 +1,503 @@
-# YouTube 视频下载 + AI 字幕生成 + 时间码美化 + 翻译 + 硬压
+# YouTube 字幕流水线
 
-一键流水线：从 YouTube 链接直达 burned.mkv 硬字幕视频。
+从 YouTube 链接出发，完成：
 
-## 🛠 前置依赖
+`下载视频 → WhisperX 英文字幕 → 时间码美化 → glossary 术语知识库 → LLM 翻译/校对 → 双语 ASS → ffmpeg 硬字幕 burned.mkv`
 
-### 一键安装
+项目同时提供：
 
-```bash
-# Linux / WSL
-./setup.sh
+- Windows / PowerShell 超级流水线：[`pipeline.ps1`](/G:/Subtitle%20translation/pipeline.ps1)
+- Linux / WSL bash 流水线：[`pipeline.sh`](/G:/Subtitle%20translation/pipeline.sh)
+- 分步脚本：下载、WhisperX、美化、翻译、知识库、硬压
 
-# Windows PowerShell
-.\setup.ps1
+## 项目结构
+
+```text
+Subtitle translation/
+├── pipeline.ps1
+├── pipeline.sh
+├── download.ps1
+├── download.sh
+├── whisper.ps1
+├── whisper.sh
+├── beautify_srt.py
+├── glossary_builder.py
+├── translate_srt.py
+├── ffmpeg-burn.ps1
+├── ffmpeg-burn.sh
+├── mpv-burn.ps1
+├── mpv-burn.sh
+├── template.ass
+├── .env.example
+├── providers.example.json
+├── translate_prompt.example.md
+├── proofread_prompt.example.md
+└── <Video Title>/
+    ├── <Video Title>.<ext>
+    ├── <Video Title>.srt
+    ├── <Video Title>.json
+    ├── <Video Title>.beautified.srt
+    ├── <Video Title>.split.srt
+    ├── <Video Title>.proofread.srt
+    ├── <Video Title>.zh.srt
+    ├── <Video Title>.zh.ass
+    ├── <Video Title>.zh-en.ass
+    ├── <Video Title>.zh.description
+    ├── <Video Title>.png
+    ├── <Video Title>.info.json
+    ├── <Video Title>.description
+    ├── <Video Title>.tags.txt
+    └── glossary.md
 ```
 
-安装内容：`uv`、`yt-dlp`、`ffmpeg`、`Node.js`、`openai`、`whisperx` (CUDA 12.8)。
+## 流程总览
 
-手动安装 WhisperX 参考：
+### PowerShell 超级流水线
 
-**方式 1：CPU（无需 CUDA）**
+[`pipeline.ps1`](/G:/Subtitle%20translation/pipeline.ps1) 目前是纯 Windows 流程，不再绕回 WSL：
+
+1. [`download.ps1`](/G:/Subtitle%20translation/download.ps1) 下载视频、简介、标签、封面、元数据
+2. [`whisper.ps1`](/G:/Subtitle%20translation/whisper.ps1) 提取 WAV，再调用 WhisperX 输出 `.srt + .json`
+3. [`beautify_srt.py`](/G:/Subtitle%20translation/beautify_srt.py) 场景吸附时间码，输出 `.beautified.srt`
+4. [`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py) 读取字幕/简介/标签，结合 Tavily 联网搜索生成 `glossary.md`
+5. [`translate_srt.py`](/G:/Subtitle%20translation/translate_srt.py) 分句、翻译、中英校对、术语注入，输出 `.zh-en.ass`
+6. [`ffmpeg-burn.ps1`](/G:/Subtitle%20translation/ffmpeg-burn.ps1) 保留封面图并压制硬字幕
+
+成果物链：
+
+`VIDEO_PATH → SRT_PATH → BEAUTIFIED_SRT → glossary.md → zh-en.ass → burned.mkv`
+
+### Linux / WSL 流水线
+
+[`pipeline.sh`](/G:/Subtitle%20translation/pipeline.sh) 走同一条成果物链：
+
+1. [`download.sh`](/G:/Subtitle%20translation/download.sh)
+2. [`whisper.sh`](/G:/Subtitle%20translation/whisper.sh)
+3. [`beautify_srt.py`](/G:/Subtitle%20translation/beautify_srt.py)
+4. [`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py)
+5. [`translate_srt.py`](/G:/Subtitle%20translation/translate_srt.py)
+6. [`ffmpeg-burn.sh`](/G:/Subtitle%20translation/ffmpeg-burn.sh)
+
+## 快速开始
+
+### Windows / PowerShell
+
+```powershell
+.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
+```
+
+只生成字幕，不压制：
+
+```powershell
+.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx" -SkipBurn
+```
+
+跳过知识库步骤：
+
+```powershell
+.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx" -SkipKnowledge
+```
+
+### Linux / WSL
+
+```bash
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+```
+
+跳过硬压：
+
+```bash
+SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+```
+
+给 beautify 透传参数：
+
+```bash
+./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --scene-threshold 0.12 --snap-frames 10
+```
+
+## 环境要求
+
+### 通用依赖
+
+| 工具 | 用途 |
+|---|---|
+| `yt-dlp` | 下载视频、标签、简介、元数据 |
+| `ffmpeg` / `ffprobe` | 音频提取、场景检测、硬字幕压制 |
+| `python3` | `beautify_srt.py` / `glossary_builder.py` / `translate_srt.py` |
+| `openai` Python 包 | LLM 调用 |
+| `whisperx` | 英文字幕和词级时间码 |
+
+### WhisperX 运行方式
+
+#### CPU
+
+Windows / PowerShell：
+
+```powershell
+whisperx audio.mp3 --device cpu
+```
+
+Linux / WSL：
 
 ```bash
 whisperx audio.mp3 --device cpu
 ```
 
-**方式 2：CUDA 12.8 加速（推荐）** — 需先安装 CUDA Toolkit 12.8：
+#### CUDA 12.8
 
-```bash
-# WSL2-Ubuntu 安装 CUDA Toolkit (不含驱动，驱动由 Windows 提供)
-wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update && sudo apt install -y cuda-toolkit-12-8
-```
+WhisperX 这套配置要求你本地 CUDA 运行时和 `torch` 版本对齐。
 
-安装 whisperx 到 uv 工具链：
+安装：
+
+Windows / PowerShell：
 
 ```powershell
-# Windows PowerShell
 uv tool install git+https://github.com/m-bain/whisperx.git `
   --with "torch==2.8.0+cu128" `
   --with "torchaudio==2.8.0+cu128"
 ```
 
+Linux / WSL：
+
 ```bash
-# Linux / WSL
 uv tool install git+https://github.com/m-bain/whisperx.git \
   --with "torch==2.8.0+cu128" \
   --with "torchaudio==2.8.0+cu128"
 ```
 
-运行时需设置环境变量：
+运行：
+
+Windows / PowerShell：
 
 ```powershell
-# Windows PowerShell
 & { $env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1"; whisperx audio.mp3 --device cuda }
 ```
 
+Linux / WSL：
+
 ```bash
-# Linux / WSL
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx audio.mp3 --device cuda
 ```
 
-> `compute_type` 由 WhisperX 自动检测，无需手动配置。
+检测 CUDA 是否可用：
 
-**Align 模型**：WhisperX 的词级时间戳对齐模型，通过环境变量 `WHISPER_ALIGN_MODEL` 指定（留空则按语言自动选择）：
-
-| 值 | 说明 |
-|------|------|
-| 留空 (默认) | WhisperX 按语言自动匹配 |
-| `facebook/mms-1b-fl102` | 手动指定 (通用模型, 主流语言均适用) |
-
-```bash
-WHISPER_ALIGN_MODEL=facebook/mms-1b-fl102 ./whisper.sh "url"
+```powershell
+uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-详见 [WhisperX 官方文档](https://github.com/m-bain/whisperX)。
+```bash
+uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
+```
 
-### Windows (可选)
+### WhisperX 对齐模型
 
-| 工具 | 用途 |
-|------|------|
-| `yt-dlp` | `download.ps1` 仅下载 |
+通过 `WHISPER_ALIGN_MODEL` 控制：
 
----
+| 值 | 说明 |
+|---|---|
+| 留空 | WhisperX 按语言自动选择 |
+| `facebook/wav2vec2-large-960h-lv60-self` | 英文顶级对齐模型 |
+| `facebook/wav2vec2-base-960h` | 英文次选 |
+| `facebook/wav2vec2-large-xlsr-53` | 多语言通用 |
+| `facebook/mms-1b-fl102` | 更通用的自动对齐模型 |
 
-## ⚙️ 配置文件 .env
+## 配置文件
 
-在项目根目录创建 `.env` 文件，所有脚本 (`pipeline.sh`, `pipeline.ps1`, `translate_srt.py`) 均从这里读取配置：
+### `.env`
+
+复制 [` .env.example`](/G:/Subtitle%20translation/.env.example) 为 `.env`。
+
+当前脚本会读取这些关键变量：
 
 ```ini
-# ── 工具路径 (留空则用系统默认 mpv/ffmpeg) ──
-MPV_PATH_WIN=                     # Windows mpv.com 路径
-MPV_PATH_LINUX=                   # Linux mpv 路径
-FFMPEG_PATH_WIN=                  # Windows ffmpeg 路径
-FFMPEG_PATH_LINUX=                # Linux ffmpeg 路径
+MPV_PATH_WIN=
+MPV_PATH_LINUX=
+FFMPEG_PATH_WIN=
+FFMPEG_PATH_LINUX=
+YTDLP_PATH_WIN=
+YTDLP_PATH_LINUX=
 
-# ── 翻译默认配置 ──
-TRANSLATE_PROVIDER=deepseek       # 翻译后端: openrouter | deepseek | gemini
-TRANSLATE_MODEL=deepseek-v4-pro   # 模型名, 留空则使用后端内置默认
+WHISPER_MODEL=large-v3-turbo
+WHISPER_ALIGN_MODEL=facebook/mms-1b-fl102
+WHISPER_DEVICE=cuda
 
-# ── 校对专用后端/模型 (留空则与翻译共用, 可实现交叉校对) ──
+TRANSLATE_PROVIDER=deepseek
+TRANSLATE_MODEL=deepseek-v4-pro
+PROOFREAD=1
 PROOFREAD_PROVIDER=
 PROOFREAD_MODEL=
 
-# ── API keys (至少配置一个对应 TRANSLATE_PROVIDER 的 key) ──
-OPENROUTER_API_KEY=sk-or-v1-xxx   # https://openrouter.ai/keys
-DEEPSEEK_API_KEY=sk-xxx           # https://platform.deepseek.com
-GEMINI_API_KEY=xxx                # https://aistudio.google.com
+PIPELINE_SKIP_DOWNLOAD=0
+PIPELINE_SKIP_WHISPER=0
+PIPELINE_SKIP_BEAUTIFY=0
+PIPELINE_SKIP_KNOWLEDGE=0
+PIPELINE_SKIP_TRANSLATE=0
+PIPELINE_SKIP_BURN=0
+
+BURN_OVC=hevc_nvenc
+BURN_OVCOPTS=qp=20
+BURN_OAC=aac
+BURN_RES=
+
+OPENROUTER_API_KEY=
+DEEPSEEK_API_KEY=
+GEMINI_API_KEY=
+TAVILY_API_KEY=
+TAVILY_MAX_RESULTS=10
 ```
 
-| 变量 | 必填 | 说明 |
-|------|:--:|------|
-| `TRANSLATE_PROVIDER` | 否 | 翻译后端，不设默认 `openrouter`。所有脚本均读取 |
-| `TRANSLATE_MODEL` | 否 | 模型名，不设使用后端内置默认 |
-| `PROOFREAD_PROVIDER` | 否 | 校对专用后端，留空与翻译共用（可实现交叉校对） |
-| `PROOFREAD_MODEL` | 否 | 校对专用模型，留空与翻译共用 |
-| `MPV_PATH_WIN` | 否 | Windows mpv.com 路径 |
-| `MPV_PATH_LINUX` | 否 | Linux mpv 路径 (如 /mnt/c/Users/.../mpv.com) |
-| `FFMPEG_PATH_WIN` | 否 | Windows ffmpeg 路径 |
-| `FFMPEG_PATH_LINUX` | 否 | Linux ffmpeg 路径 |
-| `OPENROUTER_API_KEY` | * | OpenRouter API key |
-| `DEEPSEEK_API_KEY` | * | DeepSeek API key |
-| `GEMINI_API_KEY` | * | Gemini API key |
+说明：
 
-> \* 至少配置一个与你选择的 `TRANSLATE_PROVIDER` 对应的 key
+| 变量 | 说明 |
+|---|---|
+| `TRANSLATE_PROVIDER` | 必填。不再默认回退到 `openrouter` |
+| `TRANSLATE_MODEL` | 翻译模型，留空走 provider 默认值 |
+| `PROOFREAD` | `1/0`，控制双语校对 |
+| `PROOFREAD_PROVIDER` | 校对专用 provider，留空则复用翻译 provider |
+| `PROOFREAD_MODEL` | 校对专用模型，留空则复用翻译模型 |
+| `TAVILY_API_KEY` | glossary 联网搜索所需 |
+| `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限，默认 10 |
+| `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
+| `WHISPER_DEVICE` | `cuda` 或 `cpu` |
 
-**读取优先级**：
-| 脚本 | 优先级 (高→低) |
-|------|---------------|
-| `pipeline.ps1` | CLI 参数 → `.env` → 默认值 |
-| `pipeline.sh` | 环境变量 → `.env` → 默认值 |
-| `translate_srt.py` | CLI 参数 → `.env` → 默认值 |
+### `providers.json`
 
-`.env` 已 gitignored，不要提交。换行符支持 LF / CRLF（脚本自动处理 `\r`）。
+复制 [`providers.example.json`](/G:/Subtitle%20translation/providers.example.json) 为 `providers.json`。
 
-### `providers.example.json` — LLM 提供商配置
-
-仓库提供 `providers.example.json` 作为模板。使用时复制为 `providers.json`：
-
-```bash
-cp providers.example.json providers.json
-```
-
-`providers.json` 已 gitignored，可自由修改。定义翻译/校对可用的 LLM 后端：
+格式：
 
 ```json
 {
-    "my_provider": {
-        "url": "https://api.example.com/v1/chat/completions",
-        "default_model": "my-model",
-        "env_key": "MY_API_KEY",
-        "auth_header": "Bearer {api_key}",
-        "extra_headers": {}
-    }
+  "my_provider": {
+    "url": "https://api.example.com/v1",
+    "default_model": "my-model",
+    "env_key": "MY_API_KEY",
+    "auth_header": "Bearer {api_key}",
+    "extra_headers": {}
+  }
 }
 ```
 
-| 字段 | 说明 |
-|------|------|
-| `url` | API 端点 (OpenAI 兼容) |
-| `default_model` | 默认模型名 |
-| `env_key` | `.env` 中对应的 API key 变量名 |
-| `auth_header` | 认证头模板，`{api_key}` 替换为实际 key |
-| `extra_headers` | 额外请求头 (如 HTTP-Referer) |
+注意：这里的 `url` 需要是 OpenAI SDK 的 `base_url`，不要再写到 `/chat/completions` 这一层。
 
-`translate_srt.py` 从 `.env` 读取翻译后端和模型，不再通过 CLI 传参。
+## 各脚本说明
 
----
+### `download.ps1` / `download.sh`
 
-## 🚀 快速开始
+下载：
 
-### 超级流水线 (PowerShell, 推荐)
+- 视频本体
+- `.png` 封面
+- `.info.json`
+- `.description`
+- `.tags.txt`
+
+视频文件名固定为：
+
+`<文件夹名>/<文件夹名>.<ext>`
+
+这样后续脚本能可靠推导成果物路径。
+
+### `whisper.ps1` / `whisper.sh`
+
+当前逻辑：
+
+1. 如果 `.srt` 已存在则跳过
+2. 从视频提取 `16kHz mono wav`
+3. 调 `whisperx --output_format all`
+4. 输出 `.srt + .json + .txt/.tsv/.vtt`
+5. 删除临时 `.wav`
+
+`.json` 里的词级时间码会被 `translate_srt.py` 用于长句自然分句后的重新对轴。
+
+### `beautify_srt.py`
+
+当前默认行为：
+
+- 不覆盖原始 `.srt`
+- 输出 `<name>.beautified.srt`
+
+主要规则：
+
+- `scene_threshold=0.15`
+- `snap_frames=7`
+- `end_offset_frames=2`
+- `min_scene_interval_frames=2`
+- `min_duration=1.0`
+- `max_duration=8.0`
+- `min_gap=0.083`
+- `max_gap_merge=0.5`
+
+流程：
+
+1. `ffprobe` 取 fps
+2. `ffmpeg` / `ffprobe` 找场景切换
+3. 入点吸附到场景变化点
+4. 出点吸附到下一场景前 2 帧
+5. 修复重叠和小间隙
+6. 限制最短/最长时长
+
+### `glossary_builder.py`
+
+这一步现在已经集成到两条流水线里，位置固定在：
+
+`beautify 之后 → translate 之前`
+
+输入会优先选：
+
+1. `.beautified.srt`
+2. 不存在时回退 `.srt`
+
+它会读取：
+
+- 字幕
+- `.description`
+- `.tags.txt`
+- `.info.json`
+
+如果配置了 `TAVILY_API_KEY`，会额外联网搜索，再调用翻译模型生成 `glossary.md`。
+
+如果没有 `TAVILY_API_KEY`，则离线生成 glossary。
+
+### `translate_srt.py`
+
+当前输出：
+
+- `.split.srt`
+- `.zh.srt`
+- `.proofread.srt`
+- `.zh.ass`
+- `.zh-en.ass`
+- `.zh.description`
+
+流程：
+
+1. 读取原始或美化后的英文 SRT
+2. 如果存在 `.split.srt`，跳过分句
+3. 否则用 LLM 做长句拆分，并尽量用 WhisperX `.json` 精确对轴
+4. 如果存在 `.zh.srt`，跳过初译
+5. 否则执行翻译
+6. 默认执行双语校对，输出校对后的英文 `.proofread.srt`
+7. 自动检测 `glossary.md` 并注入校对提示词
+8. 输出 `.zh.ass` 和 `.zh-en.ass`
+9. 如果存在 `.description`，顺带翻译为 `.zh.description`
+
+双语 ASS 使用：
+
+- 英文：`bi-en`
+- 中文：`bi-zh`
+
+仅中文 ASS 使用：
+
+- `zh`
+
+### `ffmpeg-burn.ps1` / `ffmpeg-burn.sh`
+
+流水线默认烧录脚本。
+
+特点：
+
+- 用 `ass` 滤镜硬压双语字幕
+- 默认保留原视频封面图
+- 可指定输出分辨率
+- 指定分辨率时保持宽高比并自动补黑边，不拉伸
+
+## 阶段跳过和缓存规则
+
+### PowerShell
+
+[`pipeline.ps1`](/G:/Subtitle%20translation/pipeline.ps1) 支持：
+
+- `-SkipDownload`
+- `-SkipWhisper`
+- `-SkipBeautify`
+- `-SkipKnowledge`
+- `-SkipTranslate`
+- `-SkipBurn`
+
+同时也会读取 `.env` 中的：
+
+- `PIPELINE_SKIP_DOWNLOAD`
+- `PIPELINE_SKIP_WHISPER`
+- `PIPELINE_SKIP_BEAUTIFY`
+- `PIPELINE_SKIP_KNOWLEDGE`
+- `PIPELINE_SKIP_TRANSLATE`
+- `PIPELINE_SKIP_BURN`
+
+### Bash
+
+[`pipeline.sh`](/G:/Subtitle%20translation/pipeline.sh) 支持同名环境变量：
+
+- `SKIP_DOWNLOAD`
+- `SKIP_WHISPER`
+- `SKIP_BEAUTIFY`
+- `SKIP_KNOWLEDGE`
+- `SKIP_TRANSLATE`
+- `SKIP_BURN`
+
+并从 `.env` 继承：
+
+- `PIPELINE_SKIP_DOWNLOAD`
+- `PIPELINE_SKIP_WHISPER`
+- `PIPELINE_SKIP_BEAUTIFY`
+- `PIPELINE_SKIP_KNOWLEDGE`
+- `PIPELINE_SKIP_TRANSLATE`
+- `PIPELINE_SKIP_BURN`
+
+自动跳过规则：
+
+- `.srt` 存在：跳过 Whisper
+- `.beautified.srt` 存在：跳过美化
+- `glossary.md` 存在：跳过术语知识库
+- `.zh-en.ass` 存在：跳过翻译
+
+## 术语知识库
+
+项目内的 `knowledge` skill 和 [`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py) 是两种不同角色：
+
+- `glossary_builder.py`：项目内可直接运行的自动生成脚本
+- `knowledge` skill：给外部 AI agent 用的工作说明，适合你手动让更强模型建立知识库
+
+推荐顺序：
+
+`beautify → knowledge/glossary → translate`
+
+原因是这样只需要一轮正式校对，就能把术语一致性纳入翻译链。
+
+## 批处理
+
+### Windows
 
 ```powershell
-# 一键: YouTube URL → burned.mkv
-.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
-
-# 仅翻译不压制
-.\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
-```
-
-### Linux 流水线
-
-```bash
-# 一键: 下载 → 字幕 → 美化 → 翻译 → 硬压
-./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
-
-# 跳过硬压
-BURN=0 ./pipeline.sh "url"
-```
-
-执行后在视频目录生成：
-
-```
-视频标题/
-├── 视频标题.webm           # 视频文件
-├── 视频标题.srt            # 原始英文字幕 (WhisperX)
-├── 视频标题.beautified.srt # 美化后的英文字幕 (Netflix 规范)
-├── 视频标题.zh.srt         # 中文 SRT 翻译缓存 (二次运行跳过 LLM)
-├── 视频标题.zh.ass         # 仅中文 ASS (style=zh)
-├── 视频标题.zh-en.ass      # 双语 ASS (bi-en + bi-zh, 硬压用) ✨
-├── 视频标题.png            # 封面缩略图 (PNG)
-├── 视频标题.info.json      # yt-dlp 元数据
-└── 视频标题.description    # 视频简介
-```
-
----
-
-## 📖 命令参考
-
-### `pipeline.ps1` — 超级流水线 (PowerShell)
-
-从 YouTube URL 到硬字幕 burned.mkv。自动调用 Linux 完成下载/字幕/美化/翻译，再调用 ffmpeg 硬压（保留封面图）。
-
-```powershell
-# 基础用法
-.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
-
-# 选择翻译后端和模型
-.\pipeline.ps1 "https://youtu.be/xxxxx" -TranslateProvider deepseek -TranslateModel deepseek-v4-pro
-
-# 自定义编码 + 输出
-.\pipeline.ps1 "https://youtu.be/xxxxx" -o result.mkv -Ovc libx265 -Ovcopts crf=23
-
-# 仅翻译不压制
-.\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
-
-# 仅翻译不校对
-.\pipeline.ps1 "https://youtu.be/xxxxx" -NoProofread
-
-# 使用已有双语 ASS
-.\pipeline.ps1 "https://youtu.be/xxxxx" -ExistingAss path/to/existing.zh-en.ass
-
-# 预览命令
-.\pipeline.ps1 "https://youtu.be/xxxxx" -DryRun
-
-# 透传 ffmpeg 额外参数
-.\pipeline.ps1 "https://youtu.be/xxxxx" -- -preset fast
-```
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-Url` | (必选) | YouTube 视频链接 |
-| `-o, -Output` | `burned.mkv` | 输出路径 |
-| `-p, -TranslateProvider` | openrouter | 翻译后端 |
-| `-tm, -TranslateModel` | 后端默认 | 翻译模型 |
-| `-m, -MpvPath` | mpv-lazy | mpv.com 路径 |
-| `-Ovc` | `hevc_nvenc` | 视频编码器 |
-| `-Ovcopts` | `qp=20` | 编码器参数 |
-| `-Oac` | `aac` | 音频编码器 |
-| `-r, -Res` | 原视频 | 输出分辨率 (如 1920x1080, 保持宽高比+黑边) |
-| `-SkipDownload` | — | 跳过下载 |
-| `-SkipBeautify` | — | 跳过美化 |
-| `-SkipTranslate` | — | 跳过翻译 |
-| `-NoProofread` | — | 关闭校对 |
-| `-SkipBurn` | — | 跳过压制 |
-| `-ExistingAss` | — | 已有 .zh-en.ass 路径 |
-| `-DryRun` | — | 仅打印命令 |
-
-### `batch.ps1` — 批量并行流水线
-
-多个 YouTube 链接并行执行 `pipeline.ps1`，最大化利用 CPU/GPU/网络资源。
-
-```powershell
-# 并行处理多个视频
 .\batch.ps1 "URL1" "URL2" "URL3"
-
-# 限制并行数 + 指定翻译后端
-.\batch.ps1 -j 4 -p deepseek url1 url2 url3 url4 url5
-
-# 仅出字幕不压制
-.\batch.ps1 url1 url2 url3 -SkipBurn
-
-# 预览命令
-.\batch.ps1 url1 url2 -DryRun
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-Urls` | (必选) | YouTube 链接列表 |
-| `-j, -MaxJobs` | CPU 核心数 | 最大并行数 |
-| `-p, -TranslateProvider` | .env | 翻译后端 |
-| `-tm, -TranslateModel` | .env | 翻译模型 |
-| `-SkipBurn` | — | 跳过硬压 |
-| `-DryRun` | — | 仅打印命令 |
-
-### `batch.py` — 批量并行流水线 (Linux)
-
-在 Linux 中用 Python 并行执行多个 `pipeline.sh`。
+### Linux / WSL
 
 ```bash
-# 并行处理
-python3 batch.py "url1" "url2" "url3"
-
-# 限制并行数
-python3 batch.py -j 4 url1 url2 url3 url4 url5
-
-# 指定翻译后端 + 跳过硬压
-python3 batch.py -p deepseek -B 0 url1 url2
-
-# 预演
-python3 batch.py -n url1 url2
+python3 batch.py "URL1" "URL2" "URL3"
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-j, --jobs` | CPU 核心数 | 最大并行数 |
-| `-B, --burn` | 1 | 0=跳过硬压 |
-| `-r, --report` | batch-result.txt | 报告路径 |
-| `-n, --dry-run` | — | 仅打印命令 |
+## Skills
 
-### `pipeline.sh` — Linux 流水线
+当前仓库内可用的 skill 在：
 
-串联下载 → 字幕 → 美化 → 翻译 → 硬压（默认全开）。
+- [` .claude/skills/download/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/download/SKILL.md)
+- [` .claude/skills/whisper/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/whisper/SKILL.md)
+- [` .claude/skills/beautify/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/beautify/SKILL.md)
+- [` .claude/skills/knowledge/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/knowledge/SKILL.md)
+- [` .claude/skills/translate/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/translate/SKILL.md)
 
-```bash
-# 基础用法
-./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+格式已经统一为：
 
-# 传递美化选项 (-- 之后)
-./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --preview
-./pipeline.sh "url" -- --backup --scene-threshold 0.2
+`<skill-dir>/SKILL.md`
 
-# 跳过某些步骤
-SKIP_DOWNLOAD=1 ./pipeline.sh "url"
-SKIP_BEAUTIFY=1 ./pipeline.sh "url"
-SKIP_TRANSLATE=1 ./pipeline.sh "url"
-BURN=0 ./pipeline.sh "url"
+## 注意事项
 
-# 使用已有产物
-EXISTING_SRT=/path/to/beautified.srt ./pipeline.sh "url"
-EXISTING_ASS=/path/to/existing.zh-en.ass ./pipeline.sh "url"
-
-# 选择翻译后端
-TRANSLATE_PROVIDER=deepseek TRANSLATE_MODEL=deepseek-v4-pro ./pipeline.sh "url"
-
-# 交叉校对
-PROOFREAD_PROVIDER=openrouter PROOFREAD_MODEL=anthropic/claude-sonnet-4-6 ./pipeline.sh "url"
-
-# 仅翻译不校对
-PROOFREAD=0 ./pipeline.sh "url"
-```
-
-**流程**：yt-dlp 下载 → WhisperX 字幕 → 场景检测美化 → LLM 翻译 → ffmpeg 硬压
-
-**成果物链**：`VIDEO_PATH` → `BEAUTIFIED_SRT` → `.split.srt` → `ASS_PATH` → `burned.mkv`
-- 每步输出作为下一步输入，已存在的中间产物自动跳过
-- translate_srt.py 内置 LLM 长句拆分 (逗号/从句/连词处自然断开)
-- WhisperX JSON 词级时间码精确对轴
-- `.zh.srt` 翻译缓存存在时自动跳过 LLM
-
-| 环境变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SKIP_DOWNLOAD` | 0 | 跳过下载 |
-| `SKIP_BEAUTIFY` | 0 | 跳过美化 |
-| `SKIP_TRANSLATE` | 0 | 跳过翻译 |
-| `EXISTING_SRT` | — | 已有美化 SRT 路径 |
-| `EXISTING_ASS` | — | 已有 .zh-en.ass 路径 |
-| `TRANSLATE_PROVIDER` | openrouter | 翻译后端 |
-| `TRANSLATE_MODEL` | 后端默认 | 翻译模型 |
-| `PROOFREAD` | 1 | 0=关闭校对 |
-| `PROOFREAD_PROVIDER` | 同翻译 | 校对后端 |
-| `PROOFREAD_MODEL` | 同翻译 | 校对模型 |
-| `BURN` | 1 | 0=跳过硬压 |
-| `BURN_OVC` | hevc_nvenc | 视频编码器 |
-| `BURN_OVCOPTS` | qp=20 | 编码器参数 |
-| `BURN_OAC` | aac | 音频编码器 |
-
-### `download.sh` — 下载视频
-
-```bash
-./download.sh "https://www.youtube.com/watch?v=xxxxx"
-# 输出: OUTPUT_VIDEO=<路径>
-```
-
-### `whisper.sh` — 语音识别
-
-```bash
-./whisper.sh "/path/to/video.webm"
-# 输出: 同目录 <视频名>.srt + <视频名>.json (词级时间码)
-# 不再传分割参数, 断句交 translate_srt.py 内置 LLM 分句
-```
-
-### `beautify_srt.py` — 字幕时间码美化
-
-```bash
-# 自动查找同目录 .srt → .beautified.srt (不覆盖原文件)
-python beautify_srt.py video.webm
-
-# 指定字幕 + 输出
-python beautify_srt.py video.webm subtitle.srt
-python beautify_srt.py video.webm -o result.srt
-
-# 覆盖原文件 (显式指定)
-python beautify_srt.py video.webm -o video.srt --backup
-
-# 仅预览变化
-python beautify_srt.py video.webm --preview
-```
-
-**算法流程**：帧率检测 → 场景检测 (≥7帧间隔) → 入点吸附到场景 → 出点吸附到场景前2帧 → 重叠/间隙修复 → 时长约束
-
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `-o, --output` | `<原名>.beautified.srt` | 输出路径 (默认不覆盖原文件) |
-| `--scene-threshold` | `0.25` | 场景检测灵敏度 |
-| `--snap-frames` | `7` | 吸附到场景切换的最大帧数 |
-| `--end-offset-frames` | `2` | 出点对齐到场景前 N 帧 |
-| `--min-scene-interval-frames` | `7` | 场景切换最小帧间隔 |
-| `--min-duration` | `1.0` | 最短字幕时长 (秒) |
-| `--max-duration` | `8.0` | 最长字幕时长 (秒) |
-| `--min-gap` | `0.083` | 字幕最小间距 (秒) |
-| `--max-gap-merge` | `0.5` | 间隙合并阈值 (秒) |
-| `--use-keyframes` | 关闭 | 启用关键帧吸附 |
-| `--extend` | 关闭 | 延伸字幕填充间隙 |
-| `--no-scene-snap` | — | 跳过场景吸附 |
-| `--preview` | — | 仅预览, 不写入 |
-| `--backup` | — | 覆盖前备份 |
-
-### `translate_srt.py` — 字幕翻译 + 分句
-
-内置 LLM 长句拆分 + 两轮校对 + 术语注入：
-
-```
-Step 0: LLM 分句 (逗号/从句/连词处自然断开, JSON 词级对轴) → .split.srt
-Step 1: 翻译 English → 中文初译
-Step 2: 校对 (English + 初译) → 精校
-Step 3: 术语校对 (+ glossary.md)
-```
-
-输出：
-- `.split.srt` — LLM 分句中间成果
-- `.zh.srt` — 中文翻译缓存
-- `.zh.ass` / `.zh-en.ass` — 双语字幕
-- `.zh.description` — 中文简介
-- 中文按 Netflix 规范自动去除标点，自动 `\N` 换行
-
-```bash
-python3 translate_srt.py video.srt                    # 默认: 分句 + 翻译 + 校对
-python3 translate_srt.py video.srt --no-split         # 禁用分句
-python3 translate_srt.py video.srt --split-max-chars 50
-# 交叉校对
-python3 translate_srt.py video.srt
-```
-
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `--no-split` | — | 禁用长句拆分 |
-| `--split-max-chars` | `60` | 拆分触发字符数 |
-| `--split-max-duration` | `3.0` | 拆分触发时长秒 |
-| `--proofread` | 开启 | 中英校对 |
-| `--glossary` | 自动检测 | glossary.md 路径 |
-| `--batch-size` | `50` | 每批翻译行数 |
-
-### `ffmpeg-burn.sh` — 字幕硬压 (Linux, 默认)
-
-使用 ffmpeg 的 `ass` 滤镜硬压双语字幕，**保留原视频封面图**。流水线默认使用此脚本。
-
-```bash
-# 基础用法
-./ffmpeg-burn.sh path/to/video.webm --sub-file video.zh-en.ass
-
-# 自定义编码器
-./ffmpeg-burn.sh video.webm --sub-file sub.ass -o result.mkv --ovc libx265 --ovcopts crf=23
-```
-
-| 选项 | 默认值 | 说明 |
-|------|--------|------|
-| `-o, --output` | `burned.mkv` | 输出路径 |
-| `--sub-file` | — | 字幕文件路径 |
-| `--ovc` | `hevc_nvenc` | 视频编码器 |
-| `--ovcopts` | `qp=20` | 编码器参数 |
-| `--oac` | `aac` | 音频编码器 |
-| `--ffmpeg-path` | `ffmpeg` | ffmpeg 路径 |
-| `--dry-run` | — | 仅打印命令 |
-
-### `ffmpeg-burn.ps1` — 字幕硬压 (PowerShell, 默认)
-
-```powershell
-.\ffmpeg-burn.ps1 "C:\path\to\video.webm" -SubFile video.zh-en.ass
-# 输出: burned.mkv (同目录, 保留封面图)
-```
-
-### `mpv-burn.sh` / `mpv-burn.ps1` — 字幕硬压 (高级)
-
-mpv 编码模式，支持补帧滤镜等高级功能。仅手动使用，流水线默认用 ffmpeg-burn。
-
-```bash
-./mpv-burn.sh video.webm --sub-file sub.ass -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
-```
-
----
-
-## 📂 项目结构
-
-```
-Subtitle translation/
-├── batch.ps1                 # 批量并行 (PowerShell): 多URL并行
-├── batch.py                  # 批量并行 (Python/Linux): 多URL并行
-├── pipeline.ps1              # 超级流水线 (PowerShell): URL → burned.mkv
-├── pipeline.sh               # Linux 流水线 (下载 → 美化 → 翻译 → 硬压)
-├── download.sh               # 下载视频 + 元数据
-├── whisper.sh                # WhisperX 语音识别 → .srt
-├── beautify_srt.py           # 字幕时间码美化
-├── beautify_srt.py           # 美化核心算法 (场景检测 + Netflix 帧对齐)
-├── translate_srt.py          # 字幕翻译: LLM 英→中 → .zh.srt + .zh.ass + .zh-en.ass
-├── ffmpeg-burn.sh            # Linux: 字幕硬压 (ffmpeg ass 滤镜, 默认)
-├── ffmpeg-burn.ps1           # PowerShell: 字幕硬压 (ffmpeg, 默认)
-├── mpv-burn.sh               # Linux: 字幕硬压 (mpv 编码, 高级)
-├── mpv-burn.ps1              # PowerShell: 字幕硬压 (mpv 编码, 高级)
-├── template.ass              # ASS 模板 (bi-en / bi-zh / zh 样式定义)
-├── download.ps1              # PowerShell: 仅下载 (不含字幕)
-├── translate_prompt.example.md # 翻译提示词模板 (复制为 translate_prompt.md)
-├── proofread_prompt.example.md # 校对提示词模板 (复制为 proofread_prompt.md)
-├── providers.example.json    # LLM 提供商模板 (复制为 providers.json 使用)
-├── .env.example              # 环境变量模板 (复制为 .env 使用)
-├── .env                      # API keys + 翻译默认配置 (gitignored)
-├── cookies.txt               # YouTube 登录凭证 (gitignored)
-└── <Video Title>/             # 每个视频独立的输出目录
-    ├── <Video Title>.<ext>   # 视频文件 (webm/mp4/mkv)
-    ├── <Video Title>.srt     # 原始英文字幕 (WhisperX)
-    ├── <Video Title>.beautified.srt  # 美化后英文字幕
-    ├── <Video Title>.zh.srt  # 中文 SRT 翻译缓存
-    ├── <Video Title>.zh.ass  # 仅中文 ASS
-    ├── <Video Title>.zh-en.ass  # 双语 ASS (硬压用)
-    ├── <Video Title>.webp    # 封面缩略图
-    ├── <Video Title>.info.json     # yt-dlp 元数据
-    └── <Video Title>.description   # 视频简介
-```
-
----
-
-## 🎬 完整用例
-
-### 方案 A: 超级流水线 (一条命令)
-
-```powershell
-.\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
-```
-
-```
-YouTube URL
-  │  pipeline.ps1
-  ▼
-┌─────────────────────────────────────────────────────┐
-│ 1. yt-dlp 下载视频 + SponsorBlock 去广告             │  Linux
-│ 2. WhisperX large-v3 生成英文字幕 (.srt)             │  Linux
-│ 3. ffmpeg 场景检测 → 时间码美化 → .beautified.srt    │  Linux
-│ 4. LLM 翻译 + 校对 (双轮) → .zh.srt + .zh.ass + .zh-en.ass │  Linux
-│ 5. ffmpeg 硬压双语字幕 → burned.mkv (保留封面图)      │  Windows
-└─────────────────────────────────────────────────────┘
-```
-
-### 方案 B: Linux 分步 (手动)
-
-```bash
-./download.sh "https://www.youtube.com/watch?v=xxxxx"
-./whisper.sh "视频标题/视频标题.webm"
-python beautify_srt.py "视频标题/视频标题.webm"
-python translate_srt.py "视频标题/视频标题.srt"
-./ffmpeg-burn.sh "视频标题/视频标题.webm" --sub-file "视频标题/视频标题.zh-en.ass"
-```
-
-### 方案 C: 分离翻译 + 压制
-
-```bash
-# Linux 中完成所有字幕工作
-TRANSLATE_PROVIDER=deepseek ./pipeline.sh "url"
-# 输出: OUTPUT_VIDEO=... OUTPUT_ASS=...
-```
-```powershell
-# Windows 端单独压制
-.\ffmpeg-burn.ps1 "C:\...\video.webm" -SubFile video.zh-en.ass
-```
-
-### 环境要求
-
-| 阶段 | 环境 | 依赖 |
-|------|------|------|
-| 下载 + 字幕 | Linux | `yt-dlp`, `uvx` (whisperx + large-v3) |
-| 时间码美化 | Linux | `ffmpeg`, `ffprobe`, `python3` |
-| LLM 翻译 | Linux | `.env` 中 API key |
-| 硬压字幕 | Linux / Windows | `ffmpeg` |
-
----
-
-## 💡 注意事项
-
-- **WhisperX 首次运行**：自动下载 `large-v3` 模型（数 GB），保持网络畅通。
-- **GPU 加速**：WhisperX 需 CUDA 12.8，版本不匹配用 `WHISPER_DEVICE=cpu`。`compute_type` 自动检测。
-- **cookies.txt**：YouTube 登录凭证，过期后需重新导出。已 gitignored。
-- **场景检测耗时**：长视频可能较慢（~5 分钟/小时视频）。
-- **美化默认不覆盖**：输出 `.beautified.srt`，不修改原始字幕。流水线检测到已存在的自动跳过。
-- **翻译缓存**：`.zh.srt` 存在时自动跳过 LLM，直接合成 `.zh.ass` + `.zh-en.ass`。校对后缓存覆盖为精校版。
-- **视频简介注入**：翻译时自动检测 `.description` 文件（yt-dlp 下载），将其内容注入翻译和校对提示词，帮助 LLM 理解视频主题和领域词汇。
-- **两轮校对**：翻译 (Pass 1) 后默认执行中英校对 (Pass 2)，`PROOFREAD=0` 关闭。校对支持**交叉模型**（如 DeepSeek 翻译 + Claude 校对）。
-- **Netflix 中文规范**：翻译/校对提示词从 `translate_prompt.md` / `proofread_prompt.md` 读取（不存在则用内置默认），去除中文标点仅保留 `《》`。
-- **双语字幕**：`.zh-en.ass` 先排英文 (bi-en, 36px)，后排中文 (bi-zh, 72px)，中文自动 `\N` 换行。
-- **硬压默认开启**：`pipeline.sh` 默认 BURN=1，设 `BURN=0` 跳过硬压。`pipeline.ps1` 的 burn 在 Windows 端执行。
-- **帧率自适应**：所有帧数参数按实际视频 fps 换算为秒。
-- **关键帧吸附**：默认关闭 (`--use-keyframes` 启用)，支持 H.264/H.265/VP9。
-
----
-
-## 🧠 术语知识库 + 第三次校对 (knowledge skill)
-
-翻译完成后，可通过 Claude Code 的 `knowledge` skill 对中文翻译进行**基于术语知识库的第三次校对**。
-
-### 工作原理
-
-```
-英文 .srt + 中文 .zh.srt
-     │
-     ▼
-用户提供的 Agent 通读全文 → 抽取术语/态度/观点 → glossary.md
-     │
-     ▼
-translate_srt.py 检测 glossary.md → 注入校对 prompt
-     │
-     ▼
-.zh.srt (精校版) → .zh.ass + .zh-en.ass
-```
-
-### 使用方式
-
-```bash
-# 1. 用 Claude Code 的 knowledge skill 建立知识库
-#    在对话中直接说: "knowledge" 或 "建立知识库"
-#    Agent 会浏览 .srt + .zh.srt, 生成 glossary.md
-
-# 2. 翻译脚本自动检测并注入
-python3 translate_srt.py video.beautified.srt
-# → 如 glossary.md 存在, 自动注入校对 prompt 进行第三次校对
-```
-
-### 重要说明
-
-- **用户需自行提供 Agent**：知识库由你自己运行的 AI Agent（如 Claude Code、ChatGPT、或其他 LLM 客户端）来建立，不是项目脚本自动生成的。项目的 `knowledge` skill 定义了 Agent 的执行规范（读什么、抽什么、输出什么格式）
-- **效果取决于 Agent 性能**：术语抽取的准确性、语境理解的深度、有没有自相矛盾，完全由你使用的 Agent 模型决定。越强的模型（如 Opus 4.5、GPT-5）抽出的知识库越可靠
-- **人工复核推荐**：Agent 生成的 `glossary.md` 建议人工过一遍，补充遗漏或修正误判，后续校对才会生效
-- **仅对该视频生效**：glossary.md 存放在视频文件夹下，一个视频一个知识库，互不干扰
+- `TRANSLATE_PROVIDER` 现在必须配置，否则翻译和 glossary 都会直接报错
+- `.env` 和 `providers.json` 建议保持本地私有版本，仓库里只提交 example 模板
+- `cookies.txt` 已 gitignored
+- `whisperx` 首次运行会下载模型
+- 长视频使用“先提 WAV 再 WhisperX”是为了减轻后续时间漂移
+- 如果你自己用更强的外部 agent 来写 `glossary.md`，通常会比自动生成脚本更稳
