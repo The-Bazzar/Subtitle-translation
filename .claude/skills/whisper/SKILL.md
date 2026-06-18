@@ -28,18 +28,6 @@ platform: Win + Linux
 WHISPER_CHUNK_SIZE=10 WHISPER_MAX_LINE_WIDTH=36 ./whisper.sh "video.webm"
 ```
 
-## 核心参数 (句子分割)
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--segment_resolution` | `sentence` | **sentence**=句子级(推荐) / chunk=原始长段 |
-| `--chunk_size` | `15` | 处理块大小秒 (WhisperX 原始: 30, 越小段越短) |
-| `--max_line_width` | `42` | 每行最大字符数 (字幕标准, 需 alignment) |
-| `--max_line_count` | `2` | 每段最大行数 (需 alignment) |
-| `--condition_on_previous_text` | `False` | 关掉让每段独立 (不会连成长句) |
-| `--vad_onset` | `0.5` | VAD 语音起始阈值 (通常不改) |
-| `--vad_offset` | `0.363` | VAD 语音结束阈值 (通常不改) |
-
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -47,28 +35,26 @@ WHISPER_CHUNK_SIZE=10 WHISPER_MAX_LINE_WIDTH=36 ./whisper.sh "video.webm"
 | `WHISPER_MODEL` | `large-v3-turbo` | ASR 模型 |
 | `WHISPER_ALIGN_MODEL` | 空 | 对齐模型 (空=按语言自动匹配) |
 | `WHISPER_DEVICE` | `cuda` | 推理设备: cuda / cpu |
-| `WHISPER_SEGMENT_RESOLUTION` | `sentence` | 分割粒度 |
-| `WHISPER_MAX_LINE_WIDTH` | `42` | 每行最大字符数 |
-| `WHISPER_MAX_LINE_COUNT` | `2` | 每段最大行数 |
-| `WHISPER_CHUNK_SIZE` | `15` | 处理块大小秒 |
-| `WHISPER_CONDITION_ON_PREVIOUS` | `False` | 前文 prompt 开关 |
-
-## 调参指南
-
-| 问题 | 解决方案 |
-|------|---------|
-| **句子太长** (最常⻅) | `--segment_resolution sentence --chunk_size 10` |
-| **句子太碎/太短** | `--segment_resolution chunk --chunk_size 30` |
-| **字幕行溢出屏幕** | `--max_line_width 36` |
-| **单字行太多** | `--max_line_width 50 --max_line_count 3` |
-| **段落粘连** | `--condition_on_previous_text False` |
 
 ## 输出
 
 ```
 视频目录/
-└── 视频标题.srt            # 英文 SRT 字幕 ✨
+├── 视频标题.srt            # 英文 SRT 字幕 ✨
+└── 视频标题.json           # 词级时间码 (供 split_srt.py 分句用)
 ```
+
+## 句子拆分
+
+WhisperX 原生的 `--segment_resolution` 是机械切分，不认语法边界。改用 `split_srt.py` 后处理：
+
+```bash
+# LLM 辅助自然语言分句 (需要 API key)
+python split_srt.py video.srt
+# 输出: video.split.srt (36 条 → 96 条, 在逗号/从句/连词处拆分)
+```
+
+时间码来自 `.json` 词级时间戳，精确到微秒；无 JSON 时自动回退字符比例。
 
 ## 安装与运行
 

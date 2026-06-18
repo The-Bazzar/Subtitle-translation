@@ -25,6 +25,8 @@ Subtitle translation/
 └── <Video Title>/            # 每个视频独立的输出目录
     ├── <Video Title>.<ext>   # 视频文件 (webm/mp4/mkv)
     ├── <Video Title>.srt     # 原始英文字幕 (WhisperX 生成)
+    ├── <Video Title>.json    # 词级时间码 (WhisperX 输出, 供分句对轴)
+    ├── <Video Title>.split.srt       # LLM 分句中间成果
     ├── <Video Title>.beautified.srt  # 美化后的英文字幕 (beautify_srt 输出)
     ├── <Video Title>.zh.srt  # 中文 SRT 翻译缓存
     ├── <Video Title>.zh.ass  # 仅中文 ASS (style=zh)
@@ -169,44 +171,44 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
 2. **路径转换** — `wslpath -w` 将 Linux 路径转为 Windows 路径
 3. **硬压字幕** — 调用 `ffmpeg-burn.ps1` 将 .zh-en.ass 硬压到视频 → burned.mkv (保留封面图)
 
-## Pipeline Steps (download_and_sub.sh)
+## Pipeline Steps (download.sh + whisper.sh)
 
-1. **获取标题** — `yt-dlp --get-title` 获取视频标题，过滤文件名非法字符后创建目录
-2. **下载** — `yt-dlp` 下载视频/缩略图/元数据/简介，自动移除 sponsor 和 selfpromo 片段 (SponsorBlock)
-3. **定位视频文件** — 在目录中查找 `.mp4/.mkv/.webm/.flv/.avi` 文件
-4. **生成字幕** — `whisperx` (全局工具) 使用 `large-v3-turbo` 模型生成英文 SRT 字幕
-5. **输出路径** — 打印 `OUTPUT_VIDEO=<绝对路径>` 供下游脚本解析
+1. **download.sh** — `yt-dlp` 下载视频/缩略图/元数据/简介/标签，SponsorBlock 去广告
+2. **whisper.sh** — `whisperx` (全局工具) 用 `large-v3-turbo` + `--output_format all` 生成 SRT + JSON (词级时间码)。无分割参数，`compute_type` 和断句交给下游。输出 `OUTPUT_VIDEO`
+3. **beautify_srt.py** — ffprobe 精确时间码场景吸附，输出 `.beautified.srt`
+4. **translate_srt.py** — LLM 分句 (.split.srt) → 翻译 → 校对 → glossary 术语一致性校对，输出 `.zh-en.ass`
+5. **ffmpeg-burn.sh** — 字幕硬压 → `burned.mkv`
 
 ## Dependencies
 
 | Tool | Purpose |
 |------|---------|
 | `yt-dlp` | YouTube 视频下载 |
-| `uv` (uvx) | 安装 WhisperX 为全局工具 |
-| `whisperx` (large-v3-turbo) | AI 语音识别生成英文字幕 |
-| `ffmpeg` | 音视频处理底层依赖 |
-| `ffprobe` | 场景切换检测 + 关键帧提取 (beautify_srt) |
-| `python3` | beautify_srt.py / translate_srt.py 运行环境 |
+| `uv` | 安装 WhisperX 为全局工具 |
+| `whisperx` (large-v3-turbo) | AI 语音识别 + 词级对齐 → SRT + JSON |
+| `ffmpeg` / `ffprobe` | 场景检测 + 字幕硬压 |
+| `python3` | beautify_srt.py / translate_srt.py |
+| `DeepSeek` / `OpenRouter` / `Gemini` | LLM: 分句 + 翻译 + 校对 |
 | `OpenRouter` / `DeepSeek` / `Gemini` | LLM API 翻译后端 (translate_srt.py) |
 | `ffmpeg` | 字幕硬压 (ffmpeg-burn) — 流水线默认 |
 
-## Pipeline Steps (beautify_srt.sh)
+## Pipeline Steps (beautify_srt.py)
 
-1. **帧率检测** — `ffprobe` 检测视频帧率, 所有帧数参数按实际 fps 换算为秒
-2. **场景检测** — `ffmpeg -vf "select='gt(scene,0.25)',showinfo"` 检测硬切场景切换 (Netflix: 7帧最小间隔)
-3. **入点吸附** — 字幕起始时间吸附到前一个场景切换 (7帧以内)
-4. **出点吸附** — 字幕结束时间吸附到下一个场景切换前 2 帧 (7帧以内, Netflix 规范)
-5. **重叠修复** — 检测并修复字幕重叠, 间距 <500ms 自动合并
-6. **时长约束** — 强制最短 1000ms / 最长 8000ms 字幕时长
-7. **(可选) 关键帧微调** — `--use-keyframes` 启用, ffprobe 3 级回退提取 I-frame
+1. **帧率检测** — `ffprobe` 检测视频帧率
+2. **场景检测** — ffmpeg select filter + ffprobe 精确 pts_time → 场景切换点列表
+3. **入点吸附** — 字幕起始时间吸附到前一个场景切换 (7帧内)
+4. **出点吸附** — 字幕结束时间吸附到下一个场景切换前 2 帧 (Netflix 规范)
+5. **重叠/间隙修复** — <500ms 间隙自动合并
+6. **时长约束** — 最短 1s / 最长 8s
+7. `--aggressive` 激进模式, `--use-showinfo` 回退旧方法
 
 ## Pipeline Steps (translate_srt.py)
 
-1. **解析 SRT** — 提取字幕文本, 忽略时间码 (节省 LLM token)
-2. **分批翻译** — 每批 50 条发送给 LLM, 系统提示词约束 1:1 翻译
-3. **保留标记** — 翻译中保留 `\N` 软换行标记
-4. **加载模板** — 读取 `template.ass` 的 `[Script Info]` + `[V4+ Styles]`
-5. **写入 ASS** — 填充 Title, 组合原始时间码 + 中文译文, Style=zh
+1. **LLM 分句** — 长句 (>60 chars 或 >3s) 发送 LLM 按自然语言边界拆分，用 WhisperX JSON 词级时间码精确对轴，输出 `.split.srt`
+2. **分批翻译** — 每批 50 条, 1:1 翻译, 保留 `\N` 软换行
+3. **中英校对** — Pass 2 精校, 可交叉模型 (如 DeepSeek 翻译 → Claude 校对)
+4. **术语校对** — 自动检测 `glossary.md` 注入 Pass 3
+5. **写入 ASS** — 双语 `.zh-en.ass` (bi-en + bi-zh), 中文自动 `\N` 换行
 
 ## Important Notes
 
@@ -217,7 +219,8 @@ python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
   - `.env` 已 gitignored，不要提交。
 - `cookies.txt` 包含 YouTube 登录凭证，已 gitignored。过期后需要重新导出。
 - WhisperX 首次运行会自动下载 `large-v3-turbo` 模型 (~1.5GB)，需要保持网络畅通。
-- WhisperX 需先用 `uv tool install git+https://github.com/m-bain/whisperx.git --with "torch==2.8.0+cu128" --with "torchaudio==2.8.0+cu128"` 安装为全局工具。然后：① CPU 用 `whisperx --device cpu`；② CUDA 用 `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx --device cuda`。`compute_type` 自动检测。
+- WhisperX 安装：`uv tool install git+https://github.com/m-bain/whisperx.git --with "torch==2.8.0+cu128" --with "torchaudio==2.8.0+cu128"`。CPU: `whisperx --device cpu`；CUDA 12.8: `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx --device cuda`。输出 `--output_format all` (SRT + JSON)。不再传分割参数。
+- translate_srt.py 内置 LLM 长句拆分，输出 `.split.srt` 中间成果。用 `--no-split` 禁用。
 - 每个视频目录名即为 `yt-dlp --get-title` 的结果 (特殊字符替换为 `_`)。
 - `beautify_srt.sh` 运行在 Linux 中，会自动识别真正的 SRT 文件（排除 ASS/SSA 格式伪装的 `.srt`）。
 - **美化默认不覆盖原文件** — 输出 `<原名>.beautified.srt`，需显式 `-o same.srt` 才会覆盖。

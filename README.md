@@ -351,8 +351,10 @@ PROOFREAD=0 ./pipeline.sh "url"
 
 **流程**：yt-dlp 下载 → WhisperX 字幕 → 场景检测美化 → LLM 翻译 → ffmpeg 硬压
 
-**成果物链**：`VIDEO_PATH` → `BEAUTIFIED_SRT` → `ASS_PATH` → `burned.mkv`
+**成果物链**：`VIDEO_PATH` → `BEAUTIFIED_SRT` → `.split.srt` → `ASS_PATH` → `burned.mkv`
 - 每步输出作为下一步输入，已存在的中间产物自动跳过
+- translate_srt.py 内置 LLM 长句拆分 (逗号/从句/连词处自然断开)
+- WhisperX JSON 词级时间码精确对轴
 - `.zh.srt` 翻译缓存存在时自动跳过 LLM
 
 | 环境变量 | 默认值 | 说明 |
@@ -383,7 +385,8 @@ PROOFREAD=0 ./pipeline.sh "url"
 
 ```bash
 ./whisper.sh "/path/to/video.webm"
-# 输出: 同目录 <视频名>.srt
+# 输出: 同目录 <视频名>.srt + <视频名>.json (词级时间码)
+# 不再传分割参数, 断句交 translate_srt.py 内置 LLM 分句
 ```
 
 ### `beautify_srt.py` — 字幕时间码美化
@@ -422,51 +425,43 @@ python beautify_srt.py video.webm --preview
 | `--preview` | — | 仅预览, 不写入 |
 | `--backup` | — | 覆盖前备份 |
 
-### `translate_srt.py` — 字幕翻译
+### `translate_srt.py` — 字幕翻译 + 分句
 
-两轮 LLM 翻译流程：翻译 (Pass 1) → 校对 (Pass 2, 默认开启)。
+内置 LLM 长句拆分 + 两轮校对 + 术语注入：
 
-输出三类文件：
-- `.zh.srt` — 中文翻译缓存（同目录已存在则跳过 LLM，校对后覆盖为精校版）
-- `.zh.ass` — 仅中文 ASS（style=zh）
-- `.zh-en.ass` — 双语 ASS（bi-en + bi-zh，硬压用）
-- `.description` — 视频简介，如存在则自动注入翻译/校对提示词作为上下文
-- 中文按 Netflix 规范自动去除标点（仅保留 `《》`），自动插入 `\N` 软换行
+```
+Step 0: LLM 分句 (逗号/从句/连词处自然断开, JSON 词级对轴) → .split.srt
+Step 1: 翻译 English → 中文初译
+Step 2: 校对 (English + 初译) → 精校
+Step 3: 术语校对 (+ glossary.md)
+```
+
+输出：
+- `.split.srt` — LLM 分句中间成果
+- `.zh.srt` — 中文翻译缓存
+- `.zh.ass` / `.zh-en.ass` — 双语字幕
+- `.zh.description` — 中文简介
+- 中文按 Netflix 规范自动去除标点，自动 `\N` 换行
 
 ```bash
-# 基础翻译 + 校对 (默认开启)
-python3 translate_srt.py video.srt
-
-# 指定后端
-python3 translate_srt.py video.srt --provider deepseek --model deepseek-v4-pro
-
-# 仅翻译不校对
-PROOFREAD=0 python3 translate_srt.py video.srt
-
-# 交叉校对: DeepSeek 翻译 → Claude 校对
-python3 translate_srt.py video.srt \
-    --provider deepseek \
-    --proofread-provider openrouter \
-    --proofread-model anthropic/claude-sonnet-4-6
-
-# 自定义提示词 (编辑 translate_prompt.md / proofread_prompt.md)
-# cp translate_prompt.example.md translate_prompt.md
-
-# 自定义输出
-python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
+python3 translate_srt.py video.srt                    # 默认: 分句 + 翻译 + 校对
+python3 translate_srt.py video.srt --no-split         # 禁用分句
+python3 translate_srt.py video.srt --split-max-chars 50
+# 交叉校对
+python3 translate_srt.py video.srt --provider deepseek --proofread-provider openrouter
 ```
 
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
-| `--provider` | openrouter | 翻译后端 |
-| `--model` | 后端默认 | 翻译模型 |
+| `--provider` | deepseek | 翻译后端 |
+| `--no-split` | — | 禁用长句拆分 |
+| `--split-max-chars` | `60` | 拆分触发字符数 |
+| `--split-max-duration` | `3.0` | 拆分触发时长秒 |
+| `--proofread` | 开启 | 中英校对 |
+| `--proofread-provider` | 同翻译 | 校对后端 (交叉校对) |
+| `--proofread-model` | 同翻译 | 校对模型 |
+| `--glossary` | 自动检测 | glossary.md 路径 |
 | `--batch-size` | `50` | 每批翻译行数 |
-| `--proofread` | 开启 | 中英校对（`PROOFREAD=0` 关闭） |
-| `--proofread-provider` | 同翻译 | 校对专用后端（交叉校对） |
-| `--proofread-model` | 同翻译 | 校对专用模型 |
-| `--title` | SRT 文件名 | 视频标题 (写入 ASS Title) |
-| `--template` | `./template.ass` | ASS 模板路径 |
-| `-o, --output` | 自动 | 输出 `.zh-en.ass` (`.zh.srt` + `.zh.ass` 同目录) |
 
 ### `ffmpeg-burn.sh` — 字幕硬压 (Linux, 默认)
 

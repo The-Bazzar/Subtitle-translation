@@ -406,6 +406,213 @@ def _parse_numbered_response(content: str, expected_count: int) -> list[str]:
     return [result.get(i, '') for i in range(1, expected_count + 1)]
 
 
+# ─── 长句拆分 ────────────────────────────────────────────────────────────────
+
+_SPLIT_PROMPT = r"""You are a subtitle splitter. Split long subtitle lines into shorter segments at natural pause points.
+
+Rules:
+- Split at: commas, clause boundaries, conjunctions (but, and, because, which, that, when, if, while...)
+- Each segment MUST use words from the original — do NOT rephrase or change any words
+- Each segment: 15-55 characters, keep meaning self-contained
+- Preserve ALL original words across segments
+- Return segments joined with `\N` (capital N, backslash N)
+
+Example:
+Input:  "As I film and compose more soundtracks, I've begun to view the two art forms as analogous."
+Output: "As I film and compose more soundtracks,\NI've begun to view the two art forms as analogous."
+
+Return ONLY one line per input, prefixed with the original index:
+1: split text with \N separators
+2: split text with \N separators"""
+
+
+def _load_word_json(json_path: str) -> dict[tuple[float, float], list[dict]]:
+    """加载 WhisperX word-level JSON → {(start, end): [words...]}."""
+    import json as _json
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = _json.load(f)
+    result = {}
+    for seg in data.get('segments', []):
+        words = seg.get('words', [])
+        if words:
+            result[(round(seg['start'], 2), round(seg['end'], 2))] = words
+    return result
+
+
+def _find_words_time(words: list[dict], seg_text: str, offset: int = 0) -> Optional[tuple[float, float]]:
+    """在词列表中匹配 seg_text, 返回 (start, end)."""
+    seg_words = seg_text.strip().split()
+    if not seg_words:
+        return None
+    n = len(seg_words)
+    first_w = seg_words[0].lower().strip(',.!?;:')
+    for i in range(offset, len(words) - n + 1):
+        if words[i]['word'].lower().strip(',.!?;:') != first_w:
+            continue
+        match = True
+        for j in range(1, n):
+            wj = words[i + j]['word'].lower().strip(',.!?;:')
+            sj = seg_words[j].lower().strip(',.!?;:')
+            if wj != sj:
+                match = False
+                break
+        if match:
+            return (words[i]['start'], words[i + n - 1]['end'])
+    return None
+
+
+def split_subtitles(
+    subtitles: list[dict],
+    provider: str,
+    model: str,
+    api_key: str,
+    srt_path: str = '',
+    max_chars: int = 60,
+    max_duration: float = 3.0,
+    quiet: bool = False,
+) -> list[dict]:
+    """
+    LLM 辅助拆分过长字幕。
+    优先用 WhisperX 词级 JSON 分配精确时间码, 不可用时回退字符比例。
+    """
+    # 自动加载词级 JSON
+    word_data: dict = {}
+    if srt_path:
+        json_path = os.path.splitext(srt_path)[0] + '.json'
+        if os.path.isfile(json_path):
+            word_data = _load_word_json(json_path)
+            if not quiet:
+                print(f"  Word timestamps: {len(word_data)} segments from JSON",
+                      file=sys.stderr)
+
+    # 筛选需要拆分的
+    long_indices = []
+    long_texts = []
+    for i, sub in enumerate(subtitles):
+        text = sub['text']
+        duration = sub['end'] - sub['start']
+        if len(text) > max_chars or duration > max_duration:
+            long_indices.append(i)
+            long_texts.append(text)
+
+    if not long_texts:
+        return subtitles
+
+    if not quiet:
+        print(f"  Splitting {len(long_texts)} long subtitle(s) ({provider})...",
+              file=sys.stderr)
+
+    # 用已有 LLM 基础设施发送拆分请求
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    if api_key is None:
+        api_key = get_api_key(provider, load_env(os.path.dirname(os.path.abspath(__file__))))
+
+    cfg = load_providers()[provider]
+    cfg_model = model or cfg.get('default_model', '')
+    headers = make_headers(cfg, api_key)
+
+    prompt_lines = [f"{i + 1}: {t}" for i, t in enumerate(long_texts)]
+    prompt = "Split each long subtitle at natural pause points:\n\n" + "\n".join(prompt_lines)
+
+    payload = {
+        'model': cfg_model,
+        'messages': [
+            {'role': 'system', 'content': _SPLIT_PROMPT},
+            {'role': 'user', 'content': prompt},
+        ],
+        'temperature': 0.1,
+    }
+
+    data = _json.dumps(payload).encode('utf-8')
+    content = ''
+    try:
+        req = urllib.request.Request(cfg['url'], data=data, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = _json.loads(resp.read().decode('utf-8'))
+        content = body['choices'][0]['message']['content']
+    except Exception as e:
+        if not quiet:
+            print(f"  Warning: split LLM call failed: {e}, keeping original",
+                  file=sys.stderr)
+        return subtitles
+
+    # 解析 LLM 返回
+    splits: dict[int, list[str]] = {}
+    for line in content.strip().split('\n'):
+        line = line.strip()
+        if not line or r'\N' not in line:
+            continue
+        m = re.match(r'^(\d+):\s*(.+)$', line)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if idx < 0 or idx >= len(long_indices):
+            continue
+        segs = [s.strip() for s in m.group(2).split(r'\N') if s.strip()]
+        if len(segs) >= 2:
+            orig_i = long_indices[idx]
+            splits[orig_i] = segs
+
+    # 生成新字幕列表（优先词级 JSON，回退字符比例）
+    new_subs = []
+    for i, sub in enumerate(subtitles):
+        if i not in splits:
+            new_subs.append(sub)
+            continue
+
+        segments = splits[i]
+        words = None
+        if word_data:
+            key = (round(sub['start'], 2), round(sub['end'], 2))
+            words = word_data.get(key)
+            if words is None:
+                for k in word_data:
+                    if abs(k[0] - sub['start']) < 0.5 and abs(k[1] - sub['end']) < 0.5:
+                        words = word_data[k]
+                        break
+
+        if words:
+            word_offset = 0
+            for seg in segments:
+                tr = _find_words_time(words, seg, word_offset)
+                if tr:
+                    new_subs.append({'start': tr[0], 'end': tr[1], 'text': seg})
+                    word_offset += len(seg.strip().split())
+                else:
+                    # 回退
+                    dur = sub['end'] - sub['start']
+                    new_subs.append({
+                        'start': sub['start'] + dur * word_offset / max(len(sub['text']), 1),
+                        'end': sub['end'],
+                        'text': seg,
+                    })
+        else:
+            orig_len = max(len(sub['text']), 1)
+            duration = sub['end'] - sub['start']
+            char_pos = 0
+            for seg in segments:
+                seg_len = len(seg)
+                r1 = char_pos / orig_len
+                r2 = (char_pos + seg_len) / orig_len
+                char_pos += seg_len
+                new_subs.append({
+                    'start': sub['start'] + duration * r1,
+                    'end': sub['start'] + duration * r2,
+                    'text': seg,
+                })
+
+    if not quiet:
+        added = len(new_subs) - len(subtitles)
+        print(f"  Split {len(splits)} subtitle(s), "
+              f"{len(subtitles)} → {len(new_subs)} (+{added})",
+              file=sys.stderr)
+
+    return new_subs
+
+
 def translate_subtitles(
     subtitles: list[dict],
     provider: str = 'deepseek',
@@ -555,6 +762,7 @@ def translate_description(
     # 从 .info.json 读取视频元数据
     info_json = os.path.join(srt_dir, f"{desc_base}.info.json")
     metadata_header = ""
+    title = ""
     if os.path.isfile(info_json):
         try:
             with open(info_json, 'r', encoding='utf-8') as f:
@@ -711,16 +919,19 @@ def format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def write_zh_srt(output_path: str, subtitles: list[dict], translations: list[str]):
-    """
-    写入 .zh.srt 文件 (中文翻译, 保留原始时间码).
-    用作翻译缓存 — 存在时可跳过 LLM 直接合成双语 ASS。
-    """
+def write_srt_generic(output_path: str, subtitles: list[dict], texts: Optional[list[str]] = None):
+    """写入 SRT 文件. texts=None 时取 sub['text'] (英文), 否则用 texts (中文翻译)."""
     with open(output_path, 'w', encoding='utf-8') as f:
-        for i, (sub, trans) in enumerate(zip(subtitles, translations), 1):
+        for i, sub in enumerate(subtitles, 1):
+            text = texts[i - 1] if texts else sub['text']
             f.write(f"{i}\n")
             f.write(f"{format_srt_time(sub['start'])} --> {format_srt_time(sub['end'])}\n")
-            f.write(f"{trans}\n\n")
+            f.write(f"{text}\n\n")
+
+
+def write_zh_srt(output_path: str, subtitles: list[dict], translations: list[str]):
+    """写入 .zh.srt 中文翻译缓存."""
+    write_srt_generic(output_path, subtitles, translations)
 
 
 def wrap_cjk(text: str, max_chars: int = 25) -> str:
@@ -839,6 +1050,12 @@ Examples:
                         help='API key (默认: 从 .env 读取)')
     parser.add_argument('--batch-size', type=int, default=50,
                         help='每批翻译行数 (默认: 50)')
+    parser.add_argument('--no-split', action='store_true',
+                        help='禁用长句拆分 (默认: 自动拆分 >60字符 或 >3秒的句子)')
+    parser.add_argument('--split-max-chars', type=int, default=60,
+                        help='触发拆分的最大字符数 (默认: 60)')
+    parser.add_argument('--split-max-duration', type=float, default=3.0,
+                        help='触发拆分的最大时长秒 (默认: 3.0)')
     parser.add_argument('--proofread', action='store_true', default=True,
                         help='中英校对 (默认开启)')
     parser.add_argument('--proofread-provider', choices=_provider_keys,
@@ -887,7 +1104,7 @@ Examples:
         sys.exit(1)
     if not args.quiet:
         print(f"  Parsed {len(subtitles)} subtitle entries")
-        print(f"  Duration: {subtitles[0]['start_ass']} → {subtitles[-1]['end_ass']}")
+        # duration printed after possible split below
 
     # 系统提示词: CLI > .env > 内置默认
     # 从文件加载提示词 (translate_prompt.md > translate_prompt.example.md > 内置回退)
@@ -913,6 +1130,37 @@ Examples:
     glossary_text = load_glossary(glossary_path)
     if glossary_text and not args.quiet:
         print(f"\nGlossary: glossary.md 已加载, 将注入校对提示词")
+
+    # ── 长句拆分 (LLM 自然语言边界, 优先 JSON 词级时间码) ───────────────
+    if not args.no_split:
+        subtitles = split_subtitles(
+            subtitles,
+            provider=args.provider,
+            model=args.model,
+            api_key=args.api_key,
+            srt_path=srt_path,
+            max_chars=args.split_max_chars,
+            max_duration=args.split_max_duration,
+            quiet=args.quiet,
+        )
+        # 补 ASS 格式时间码 (split_subtitles 只生成了 float 秒)
+        for sub in subtitles:
+            if 'start_ass' not in sub:
+                sub['start_ass'] = ass_time(sub['start'])
+            if 'end_ass' not in sub:
+                sub['end_ass'] = ass_time(sub['end'])
+
+        # 保存拆分中间成果 (.split.srt)
+        srt_base2 = os.path.splitext(os.path.basename(srt_path))[0]
+        if srt_base2.endswith('.beautified'):
+            srt_base2 = srt_base2[:-len('.beautified')]
+        split_out = os.path.join(srt_dir, f"{srt_base2}.split.srt")
+        write_srt_generic(split_out, subtitles)
+        if not args.quiet:
+            print(f"  .split.srt: {split_out}")
+
+        if not args.quiet:
+            print(f"  Duration: {subtitles[0]['start_ass']} → {subtitles[-1]['end_ass']}")
 
     # ── 获取中文翻译 ──────────────────────────────────────────────────────
     # 始终使用 .zh.srt 作为翻译缓存: 已存在则跳过 LLM, 否则翻译后写入
