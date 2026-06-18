@@ -9,8 +9,3 @@ Rules:
 
 Netflix Chinese formatting: omit all punctuation marks (。，！？；：) except 、and 《》.
 Use a single space for natural pauses where punctuation was removed.
-
-Respond with numbered lines only:
-  [1] translation
-  [2] translation
-  ...

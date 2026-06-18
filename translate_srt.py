@@ -295,25 +295,24 @@ Rules:
 - Each input is already a short, self-contained segment; translate it as-is
 
 Netflix Chinese formatting: omit all punctuation marks (。，！？；：) except 、and 《》.
-Use a single space for natural pauses where punctuation was removed.
+Use a single space for natural pauses where punctuation was removed."""
 
-Respond with numbered lines only:
-  [1] translation
-  [2] translation
-  ..."""
+_PROOFREAD_PROMPT_FALLBACK = """You are a bilingual (EN+ZH) subtitle proofreader. Review each pair and fix both languages.
 
-_PROOFREAD_PROMPT_FALLBACK = """You are a Chinese subtitle proofreader. Review each EN+ZH pair against the English source.
+Step 1 — Check English for common ASR errors:
+- Homophone confusion (their/there, its/it's, to/too, your/you're)
+- Garbled proper names, brand names, or technical terms
+- Missing or extra negation (not, never, don't)
+- Obvious grammar breaks that distort meaning
+Fix any errors found; mark EN as-is if correct.
 
-Tasks:
-- Fix mistranslations, omissions, or added content — match English meaning 1:1
-- Improve awkward phrasing — Chinese must read fluently as spoken subtitles
+Step 2 — Check Chinese against the (corrected) English:
+- Fix mistranslations, omissions, or added content
+- Improve awkward phrasing — read fluently as spoken subtitles
 - Fix tone mismatches — register must match the original
 - Netflix formatting: no 。，！？；：, keep 、and 《》, use spaces for pauses
-- Do not merge, split, or reorder items — exactly N input pairs -> N output lines
 
-Respond with corrected numbered lines only:
-  [1] corrected translation
-  [2] corrected translation
+Do not merge, split, or reorder — exactly N input pairs -> N output lines.
   ..."""
 
 
@@ -649,8 +648,12 @@ def translate_subtitles(
             print(f"  Batch {batch_idx + 1}/{total_batches}: "
                   f"translating lines {start_idx + 1}-{end_idx}...", file=sys.stderr)
         all_translations.extend(translate_batch(
-            texts[start_idx:end_idx], llm, system_prompt=system_prompt, quiet=quiet))
+            texts[start_idx:end_idx], llm, system_prompt=system_prompt + _TRANSLATE_FORMAT, quiet=quiet))
     return all_translations
+
+
+_TRANSLATE_FORMAT = "\n\nRespond with numbered lines only:\n  [1] translation\n  [2] translation\n  ..."
+_PROOFREAD_FORMAT = "\n\nReturn each line as: [N] corrected english ||| 修正后的中文\nKeep original English if no ASR errors. Do not merge, split, or reorder."
 
 
 def proofread_subtitles(
@@ -659,10 +662,9 @@ def proofread_subtitles(
     llm: LLMConfig,
     system_prompt: str = "",
     quiet: bool = False,
-) -> list[str]:
-    """中英校对: EN+ZH 成对送入 LLM 审校, 返回校对后中文."""
+) -> tuple[list[str], list[str]]:
+    """双语校对: 返回 (corrected_en, corrected_zh)."""
     en_texts = [s['text'] for s in subtitles]
-    # 校对模型: 可能有独立的 proofread provider/model
     pr_llm = LLMConfig(
         provider=llm.pr_provider(), model=llm.pr_model(),
         api_key=llm.api_key, batch_size=max(15, llm.batch_size // 2),
@@ -672,7 +674,7 @@ def proofread_subtitles(
         print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}")
         print(f"Total lines: {len(en_texts)}\n")
 
-    all_corrected = []
+    corrected_en, corrected_zh = [], []
     total_batches = (len(en_texts) + pr_llm.batch_size - 1) // pr_llm.batch_size
     for batch_idx in range(total_batches):
         start_idx = batch_idx * pr_llm.batch_size
@@ -681,8 +683,19 @@ def proofread_subtitles(
         if not quiet:
             print(f"  Batch {batch_idx + 1}/{total_batches}: "
                   f"proofreading lines {start_idx + 1}-{end_idx}...", file=sys.stderr)
-        all_corrected.extend(translate_batch(pairs, pr_llm, system_prompt=system_prompt, quiet=quiet))
-    return all_corrected[:len(en_texts)]
+        results = translate_batch(pairs, pr_llm, system_prompt=system_prompt + _PROOFREAD_FORMAT, quiet=quiet)
+        for r in results:
+            if '|||' in r:
+                en, zh = r.split('|||', 1)
+                corrected_en.append(en.strip())
+                corrected_zh.append(zh.strip())
+            else:
+                # LLM 没按格式返回，保留原文
+                idx = len(corrected_en)
+                corrected_en.append(en_texts[start_idx + idx] if idx < len(en_texts) else '')
+                corrected_zh.append(r.strip())
+    n = len(en_texts)
+    return corrected_en[:n], corrected_zh[:n]
 
 
 # ─── ASS 输出 ──────────────────────────────────────────────────────────────────
@@ -1097,11 +1110,19 @@ Examples:
     if args.proofread and _env.get('PROOFREAD', '1') != '0':
         if not args.quiet:
             print()
-        translations = proofread_subtitles(subtitles, translations, llm,
-                                            proofread_prompt + glossary_text, args.quiet)
+        corrected_en, translations = proofread_subtitles(subtitles, translations, llm,
+                                                           proofread_prompt + glossary_text, args.quiet)
         write_zh_srt(ctx.zh_srt, subtitles, translations)
         if not args.quiet:
             print(f"  .zh.srt:  {ctx.zh_srt} (updated with proofread)")
+        # 用校对后的英文更新 subtitle text, 保存 .proofread.srt
+        for i, sub in enumerate(subtitles):
+            if i < len(corrected_en):
+                sub['text'] = corrected_en[i]
+        proofread_srt = os.path.join(ctx.dir, f'{ctx.name}.proofread.srt')
+        write_srt_generic(proofread_srt, subtitles)
+        if not args.quiet:
+            print(f"  .proofread.srt: {proofread_srt}")
 
     # ── Write ASS ──────────────────────────────────────────────────────────
     if not args.quiet:
