@@ -26,15 +26,12 @@ def main():
 Examples:
   %(prog)s "url1" "url2" "url3"
   %(prog)s -j 4 url1 url2 url3 url4 url5
-  %(prog)s -p deepseek url1 url2 -B 0
+  %(prog)s url1 url2 -B 0
         """,
     )
     parser.add_argument('urls', nargs='+', help='YouTube 链接列表')
     parser.add_argument('-j', '--jobs', type=int, default=os.cpu_count() or 4,
                         help=f'最大并行数 (默认: CPU 核心数 {os.cpu_count() or 4})')
-    parser.add_argument('-p', '--provider', choices=['openrouter', 'deepseek', 'gemini'],
-                        help='翻译后端 (默认: 从 .env 读取)')
-    parser.add_argument('-m', '--model', help='翻译模型')
     parser.add_argument('-B', '--burn', type=int, default=1,
                         help='硬压开关: 1=启用, 0=跳过 (默认: 1)')
     parser.add_argument('-r', '--report', default=None,
@@ -57,10 +54,6 @@ Examples:
     print("=" * 60)
     print(f"Start:    {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Pipeline: {pipeline_sh}")
-    if args.provider:
-        print(f"Provider: {args.provider}")
-    if args.model:
-        print(f"Model:    {args.model}")
     print(f"Burn:     {'yes' if args.burn else 'no'}")
     print("=" * 60)
 
@@ -69,10 +62,6 @@ Examples:
             cmd = f"bash {pipeline_sh} '{url}'"
             if not args.burn:
                 cmd = f"BURN=0 {cmd}"
-            if args.provider:
-                cmd = f"TRANSLATE_PROVIDER={args.provider} {cmd}"
-            if args.model:
-                cmd = f"TRANSLATE_MODEL={args.model} {cmd}"
             print(f"[DRY RUN] {cmd}")
         return
 
@@ -88,10 +77,6 @@ Examples:
         env = os.environ.copy()
         if not args.burn:
             env['BURN'] = '0'
-        if args.provider:
-            env['TRANSLATE_PROVIDER'] = args.provider
-        if args.model:
-            env['TRANSLATE_MODEL'] = args.model
 
         cmd = ['bash', pipeline_sh, url]
         try:

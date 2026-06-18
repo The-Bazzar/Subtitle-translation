@@ -7,15 +7,6 @@ param(
     [Parameter(HelpMessage = "Output burned video path (default: burned.mkv in video dir)")]
     [string]$Output,
 
-    [Alias("p")]
-    [Parameter(HelpMessage = "Translation provider: openrouter | deepseek | gemini (default: from .env)")]
-    [ValidateSet("openrouter", "deepseek", "gemini")]
-    [string]$TranslateProvider,
-
-    [Alias("tm")]
-    [Parameter(HelpMessage = "Translation model override (default: provider built-in)")]
-    [string]$TranslateModel,
-
     [Parameter(HelpMessage = "Video encoder (default: hevc_nvenc)")]
     [string]$Ovc = "hevc_nvenc",
 
@@ -81,8 +72,6 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 参数:
   -Url                YouTube 视频链接 (必选)
   -o, -Output         输出视频路径
-  -p, -TranslateProvider  翻译后端
-  -tm, -TranslateModel    翻译模型
   -Ovc / -Ovcopts / -Oac  视频/音频编码器参数
   -r, -Res            输出分辨率 (保持宽高比+黑边)
   -SkipDownload       跳过下载
@@ -97,7 +86,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
 示例:
   .\pipeline.ps1 "https://youtube.com/watch?v=xxx"
-  .\pipeline.ps1 "url" -p deepseek -SkipBurn
+  .\pipeline.ps1 "url" -SkipBurn
   .\pipeline.ps1 "url" -r 1920x1080
 "@
     exit 0
@@ -108,9 +97,6 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 $ScriptDir = Split-Path $PSCommandPath -Parent
 
 . "$PSScriptRoot\.env.ps1"
-
-if (-not $TranslateProvider) { $TranslateProvider = Get-EnvValue 'TRANSLATE_PROVIDER' 'openrouter' }
-if (-not $TranslateModel)    { $TranslateModel    = Get-EnvValue 'TRANSLATE_MODEL' '' }
 
 # ── 工具路径 ──────────────────────────────────────────────────────────────────
 
@@ -126,8 +112,6 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "pipeline — Super Pipeline (纯 Windows)" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "URL:       $Url" -ForegroundColor Gray
-Write-Host "Provider:  $TranslateProvider" -ForegroundColor Gray
-if ($TranslateModel) { Write-Host "Model:     $TranslateModel" -ForegroundColor Gray }
 if ($ExistingAss)    { Write-Host "Existing:  $ExistingAss" -ForegroundColor Gray }
 $steps = @()
 if (-not $SkipDownload)  { $steps += "Download" }
@@ -235,9 +219,7 @@ if ($SkipTranslate) {
     Write-Host ""
     Write-Host ">>> Step 4/5: Translate" -ForegroundColor Cyan
     if ($NoProofread) { $env:PROOFREAD = "0" }
-    $TranslateArgs = @($TranslateSrc, '-o', $AssPath, '--provider', $TranslateProvider)
-    if ($TranslateModel) { $TranslateArgs += @('--model', $TranslateModel) }
-    & python $TranslatePy @TranslateArgs
+    & python $TranslatePy $TranslateSrc -o $AssPath
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 

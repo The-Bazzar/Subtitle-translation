@@ -140,14 +140,11 @@ python3 translate_srt.py "视频目录/视频.srt"
 # 输出: .zh.srt (缓存) + .zh.ass (仅中文) + .zh-en.ass (双语)
 # .zh.srt 已存在时自动跳过 LLM, 直接合成 ASS
 
-# 使用 DeepSeek (性价比高)
-python3 translate_srt.py video.srt --provider deepseek
+# 翻译 (后端/模型从 .env 读取)
+python3 translate_srt.py video.srt
 
-# 使用 Gemini (免费额度大)
-python3 translate_srt.py video.srt --provider gemini
-
-# 自定义标题和输出
-python3 translate_srt.py video.srt --title "My Video" -o custom.zh-en.ass
+# 自定义输出
+python3 translate_srt.py video.srt -o custom.zh-en.ass
 ```
 
 ## Pipeline Steps (pipeline.sh)

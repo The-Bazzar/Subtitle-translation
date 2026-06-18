@@ -23,7 +23,89 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from typing import Optional
+
+
+@dataclass
+class LLMConfig:
+    """LLM 调用配置 — 翻译/校对模型可独立设置, 校对回退翻译."""
+    provider: str
+    model: str = ''
+    proofread_provider: str = ''
+    proofread_model: str = ''
+    api_key: Optional[str] = None
+    batch_size: int = 50
+
+    def pr_provider(self) -> str:
+        return self.proofread_provider or self.provider
+
+    def pr_model(self) -> str:
+        return self.proofread_model or self.model
+
+    def resolve_key(self) -> str:
+        if self.api_key is None:
+            self.api_key = get_api_key(self.provider, load_env(os.path.dirname(os.path.abspath(__file__))))
+        return self.api_key
+
+    def cfg(self) -> dict:
+        return load_providers()[self.provider]
+
+    def model_name(self) -> str:
+        return self.model or self.cfg().get('default_model', '')
+
+    def _client(self):
+        """懒加载 OpenAI 兼容客户端."""
+        from openai import OpenAI
+        provider_cfg = self.cfg()
+        return OpenAI(
+            base_url=provider_cfg['url'],
+            api_key=self.resolve_key(),
+            default_headers=provider_cfg.get('extra_headers', {}),
+        )
+
+
+@dataclass
+class SplitConfig:
+    """长句拆分配置."""
+    enabled: bool = True
+    max_chars: int = 60
+    max_duration: float = 3.0
+
+
+@dataclass
+class SRTContext:
+    """SRT 文件上下文 — 一个路径进来, 所有派生路径出来."""
+    path: str
+    dir: str
+    name: str
+    json: str
+    zh_srt: str
+    split_srt: str
+    zh_en_ass: str
+    zh_ass: str
+    desc: str
+    zh_desc: str
+    glossary: str
+
+    @staticmethod
+    def from_path(srt_path: str, output_ass: str = '') -> 'SRTContext':
+        srt_dir = os.path.dirname(os.path.abspath(srt_path))
+        srt_name = (os.path.basename(srt_path)).split(".")[0]
+        json_path = os.path.join(srt_dir, f'{srt_name}.json')
+        return SRTContext(
+            path=srt_path,
+            dir=srt_dir,
+            name=srt_name,
+            json=json_path,
+            zh_srt=os.path.join(srt_dir, f'{srt_name}.zh.srt'),
+            split_srt=os.path.join(srt_dir, f'{srt_name}.split.srt'),
+            zh_en_ass=output_ass or os.path.join(srt_dir, f'{srt_name}.zh-en.ass'),
+            zh_ass=os.path.join(srt_dir, f'{srt_name}.zh.ass'),
+            desc=os.path.join(srt_dir, f'{srt_name}.description'),
+            zh_desc=os.path.join(srt_dir, f'{srt_name}.zh.description'),
+            glossary=os.path.join(srt_dir, 'glossary.md'),
+        )
 
 
 # ─── SRT 解析 ──────────────────────────────────────────────────────────────────
@@ -110,7 +192,7 @@ def parse_srt(filepath: str) -> list[dict]:
 # 内置默认提供商 (providers.json 缺失时的回退)
 _BUILTIN_PROVIDERS = {
     'openrouter': {
-        'url': 'https://openrouter.ai/api/v1/chat/completions',
+        'url': 'https://openrouter.ai/api/v1',
         'default_model': 'anthropic/claude-sonnet-4-6',
         'env_key': 'OPENROUTER_API_KEY',
         'auth_header': 'Bearer {api_key}',
@@ -120,14 +202,14 @@ _BUILTIN_PROVIDERS = {
         },
     },
     'deepseek': {
-        'url': 'https://api.deepseek.com/v1/chat/completions',
+        'url': 'https://api.deepseek.com/v1',
         'default_model': 'deepseek-v4-pro',
         'env_key': 'DEEPSEEK_API_KEY',
         'auth_header': 'Bearer {api_key}',
         'extra_headers': {},
     },
     'gemini': {
-        'url': 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+        'url': 'https://generativelanguage.googleapis.com/v1beta/openai',
         'default_model': 'gemini-2.5-pro',
         'env_key': 'GEMINI_API_KEY',
         'auth_header': 'Bearer {api_key}',
@@ -154,19 +236,6 @@ def load_providers() -> dict:
             pass
     _providers_cache = dict(_BUILTIN_PROVIDERS)
     return _providers_cache
-
-
-def make_headers(provider_cfg: dict, api_key: str) -> dict[str, str]:
-    """根据 provider 配置构造请求头."""
-    auth = provider_cfg.get('auth_header', 'Bearer {api_key}')
-    headers = {'Content-Type': 'application/json'}
-    headers['Authorization'] = auth.replace('{api_key}', api_key)
-    for k, v in provider_cfg.get('extra_headers', {}).items():
-        headers[k] = v
-    return headers
-
-
-PROVIDER_KEYS = list(_BUILTIN_PROVIDERS.keys())
 
 
 def load_description(desc_path: str) -> str:
@@ -300,9 +369,7 @@ def get_api_key(provider: str, env: dict[str, str]) -> str:
 
 def translate_batch(
     texts: list[str],
-    provider: str,
-    model: str,
-    api_key: str,
+    llm: LLMConfig,
     system_prompt: str = "",
     quiet: bool = False,
     retries: int = 3,
@@ -311,45 +378,27 @@ def translate_batch(
     Send a batch of numbered texts to the LLM for 1:1 translation.
     Returns translated texts in the same order.
     """
-    import json
-    import urllib.request
-    import urllib.error
-
-    cfg = load_providers()[provider]
-
-    # Build numbered prompt
     prompt_lines = [f"[{i}] {t}" for i, t in enumerate(texts, 1)]
     prompt = "\n".join(prompt_lines)
-
-    payload = {
-        'model': model,
-        'messages': [
-            {'role': 'system', 'content': system_prompt or _TRANSLATE_PROMPT_FALLBACK},
-            {'role': 'user', 'content': (
-                f"Translate these {len(texts)} subtitle lines to Chinese. "
-                f"Respond with exactly {len(texts)} numbered lines.\n\n{prompt}"
-            )},
-        ],
-        'temperature': 0.3,
-        'max_tokens': max(4096, len(texts) * 200),
-    }
-
-    data = json.dumps(payload).encode('utf-8')
-    headers = make_headers(cfg, api_key)
 
     last_error = None
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(cfg['url'], data=data, headers=headers, method='POST')
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = json.loads(resp.read().decode('utf-8'))
-            content = body['choices'][0]['message']['content']
-            return _parse_numbered_response(content, len(texts))
+            resp = llm._client().chat.completions.create(
+                model=llm.model_name(),
+                messages=[
+                    {'role': 'system',
+                     'content': system_prompt or _TRANSLATE_PROMPT_FALLBACK},
+                    {'role': 'user', 'content': (
+                        f"Translate these {len(texts)} subtitle lines to Chinese. "
+                        f"Respond with exactly {len(texts)} numbered lines.\n\n{prompt}"
+                    )},
+                ],
+                temperature=0.3,
+                max_tokens=max(4096, len(texts) * 200),
+            )
+            return _parse_numbered_response(resp.choices[0].message.content, len(texts))
 
-        except urllib.error.HTTPError as e:
-            last_error = f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:500]}"
-        except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError) as e:
-            last_error = str(e)
         except Exception as e:
             last_error = str(e)
 
@@ -457,76 +506,46 @@ def _find_words_time(words: list[dict], seg_text: str, offset: int = 0) -> Optio
 
 def split_subtitles(
     subtitles: list[dict],
-    provider: str,
-    model: str,
-    api_key: str,
-    srt_path: str = '',
-    max_chars: int = 60,
-    max_duration: float = 3.0,
+    ctx: SRTContext,
+    llm: LLMConfig,
+    split: SplitConfig,
     quiet: bool = False,
 ) -> list[dict]:
-    """
-    LLM 辅助拆分过长字幕。
-    优先用 WhisperX 词级 JSON 分配精确时间码, 不可用时回退字符比例。
-    """
-    # 自动加载词级 JSON
+    """LLM 辅助拆分过长字幕。优先词级 JSON 对轴, 不可用时字符比例回退."""
     word_data: dict = {}
-    if srt_path:
-        json_path = os.path.splitext(srt_path)[0] + '.json'
-        if os.path.isfile(json_path):
-            word_data = _load_word_json(json_path)
-            if not quiet:
-                print(f"  Word timestamps: {len(word_data)} segments from JSON",
-                      file=sys.stderr)
+    if os.path.isfile(ctx.json):
+        word_data = _load_word_json(ctx.json)
+        if not quiet:
+            print(f"  Word timestamps: {len(word_data)} segments from JSON",
+                  file=sys.stderr)
 
-    # 筛选需要拆分的
-    long_indices = []
-    long_texts = []
+    long_indices, long_texts = [], []
     for i, sub in enumerate(subtitles):
-        text = sub['text']
-        duration = sub['end'] - sub['start']
-        if len(text) > max_chars or duration > max_duration:
+        if len(sub['text']) > split.max_chars or (sub['end'] - sub['start']) > split.max_duration:
             long_indices.append(i)
-            long_texts.append(text)
+            long_texts.append(sub['text'])
 
     if not long_texts:
         return subtitles
 
     if not quiet:
-        print(f"  Splitting {len(long_texts)} long subtitle(s) ({provider})...",
+        print(f"  Splitting {len(long_texts)} long subtitle(s) ({llm.provider})...",
               file=sys.stderr)
-
-    # 用已有 LLM 基础设施发送拆分请求
-    import json as _json
-    import urllib.request
-    import urllib.error
-
-    if api_key is None:
-        api_key = get_api_key(provider, load_env(os.path.dirname(os.path.abspath(__file__))))
-
-    cfg = load_providers()[provider]
-    cfg_model = model or cfg.get('default_model', '')
-    headers = make_headers(cfg, api_key)
 
     prompt_lines = [f"{i + 1}: {t}" for i, t in enumerate(long_texts)]
     prompt = "Split each long subtitle at natural pause points:\n\n" + "\n".join(prompt_lines)
 
-    payload = {
-        'model': cfg_model,
-        'messages': [
-            {'role': 'system', 'content': _SPLIT_PROMPT},
-            {'role': 'user', 'content': prompt},
-        ],
-        'temperature': 0.1,
-    }
-
-    data = _json.dumps(payload).encode('utf-8')
     content = ''
     try:
-        req = urllib.request.Request(cfg['url'], data=data, headers=headers, method='POST')
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = _json.loads(resp.read().decode('utf-8'))
-        content = body['choices'][0]['message']['content']
+        resp = llm._client().chat.completions.create(
+            model=llm.model_name(),
+            messages=[
+                {'role': 'system', 'content': _SPLIT_PROMPT},
+                {'role': 'user', 'content': prompt},
+            ],
+            temperature=0.1,
+        )
+        content = resp.choices[0].message.content
     except Exception as e:
         if not quiet:
             print(f"  Warning: split LLM call failed: {e}, keeping original",
@@ -609,108 +628,60 @@ def split_subtitles(
 
 def translate_subtitles(
     subtitles: list[dict],
-    provider: str = 'deepseek',
-    model: Optional[str] = None,
-    api_key: Optional[str] = None,
+    llm: LLMConfig,
     system_prompt: str = "",
-    batch_size: int = 50,
     quiet: bool = False,
 ) -> list[str]:
-    """Translate all subtitle texts in batches. Returns translations in order."""
+    """Translate all subtitle texts in batches."""
     texts = [s['text'] for s in subtitles]
-
-    if model is None:
-        model = load_providers()[provider].get('default_model', '')
-
-    # Load API key
-    env = load_env(os.path.dirname(os.path.abspath(__file__)))
-    if api_key is None:
-        api_key = get_api_key(provider, env)
+    _ = llm.resolve_key()
 
     if not quiet:
-        print(f"Translator: {provider} / {model}")
-        print(f"Total lines: {len(texts)}")
-        print()
+        print(f"Translator: {llm.provider} / {llm.model_name()}")
+        print(f"Total lines: {len(texts)}\n")
 
     all_translations = []
-    total_batches = (len(texts) + batch_size - 1) // batch_size
-
+    total_batches = (len(texts) + llm.batch_size - 1) // llm.batch_size
     for batch_idx in range(total_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(texts))
-        batch_texts = texts[start_idx:end_idx]
-
+        start_idx = batch_idx * llm.batch_size
+        end_idx = min(start_idx + llm.batch_size, len(texts))
         if not quiet:
             print(f"  Batch {batch_idx + 1}/{total_batches}: "
-                  f"translating lines {start_idx + 1}-{end_idx}...",
-                  file=sys.stderr)
-
-        batch_translations = translate_batch(
-            batch_texts, provider, model, api_key, system_prompt=system_prompt, quiet=quiet
-        )
-        all_translations.extend(batch_translations)
-
+                  f"translating lines {start_idx + 1}-{end_idx}...", file=sys.stderr)
+        all_translations.extend(translate_batch(
+            texts[start_idx:end_idx], llm, system_prompt=system_prompt, quiet=quiet))
     return all_translations
 
 
 def proofread_subtitles(
     subtitles: list[dict],
     translations: list[str],
-    provider: str = 'deepseek',
-    model: Optional[str] = None,
-    api_key: Optional[str] = None,
+    llm: LLMConfig,
     system_prompt: str = "",
-    batch_size: int = 30,
     quiet: bool = False,
 ) -> list[str]:
-    """
-    中英校对: 将英文原文 + 中文初译成对送入 LLM 审校.
-    返回校对后的中文翻译列表.
-    """
+    """中英校对: EN+ZH 成对送入 LLM 审校, 返回校对后中文."""
     en_texts = [s['text'] for s in subtitles]
-
-    if model is None:
-        model = load_providers()[provider].get('default_model', '')
-
-    env = load_env(os.path.dirname(os.path.abspath(__file__)))
-    if api_key is None:
-        api_key = get_api_key(provider, env)
+    # 校对模型: 可能有独立的 proofread provider/model
+    pr_llm = LLMConfig(
+        provider=llm.pr_provider(), model=llm.pr_model(),
+        api_key=llm.api_key, batch_size=max(15, llm.batch_size // 2),
+    )
 
     if not quiet:
-        print(f"Proofreader: {provider} / {model}")
-        print(f"Total lines: {len(en_texts)}")
-        print()
+        print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}")
+        print(f"Total lines: {len(en_texts)}\n")
 
     all_corrected = []
-    # 校对批次减半: 每个 item 包含 EN+ZH 双份文本
-    proof_batch_size = max(15, batch_size // 2)
-    total_batches = (len(en_texts) + proof_batch_size - 1) // proof_batch_size
-
+    total_batches = (len(en_texts) + pr_llm.batch_size - 1) // pr_llm.batch_size
     for batch_idx in range(total_batches):
-        start_idx = batch_idx * proof_batch_size
-        end_idx = min(start_idx + proof_batch_size, len(en_texts))
-
-        # 每对 EN+ZH 作为 translate_batch 的一个 item
-        # translate_batch 会编号为 [1], [2], ...
-        pairs = []
-        for i in range(start_idx, end_idx):
-            pairs.append(
-                f"EN: {en_texts[i]}\n"
-                f"ZH: {translations[i]}"
-            )
-
+        start_idx = batch_idx * pr_llm.batch_size
+        end_idx = min(start_idx + pr_llm.batch_size, len(en_texts))
+        pairs = [f"EN: {en_texts[i]}\nZH: {translations[i]}" for i in range(start_idx, end_idx)]
         if not quiet:
             print(f"  Batch {batch_idx + 1}/{total_batches}: "
-                  f"proofreading lines {start_idx + 1}-{end_idx}...",
-                  file=sys.stderr)
-
-        corrected = translate_batch(
-            pairs, provider, model, api_key,
-            system_prompt=system_prompt,
-            quiet=quiet,
-        )
-        all_corrected.extend(corrected)
-
+                  f"proofreading lines {start_idx + 1}-{end_idx}...", file=sys.stderr)
+        all_corrected.extend(translate_batch(pairs, pr_llm, system_prompt=system_prompt, quiet=quiet))
     return all_corrected[:len(en_texts)]
 
 
@@ -738,23 +709,15 @@ Rules:
 
 
 def translate_description(
-    desc_path: str,
-    provider: str,
-    model: str,
-    api_key: str,
+    ctx: SRTContext,
+    llm: LLMConfig,
     quiet: bool = False,
 ) -> str:
-    """Translate a .description file to Chinese, output .zh.description with metadata header."""
+    """Translate .description to Chinese, output .zh.description."""
     import json
-    import urllib.request
-    import urllib.error
-
-    srt_dir = os.path.dirname(os.path.abspath(desc_path))
-    desc_base = os.path.splitext(os.path.basename(desc_path))[0]
-    zh_path = os.path.join(srt_dir, f"{desc_base}.zh.description")
 
     # 从 .info.json 读取视频元数据
-    info_json = os.path.join(srt_dir, f"{desc_base}.info.json")
+    info_json = os.path.join(ctx.dir, f'{ctx.name}.info.json')
     metadata_header = ""
     title = ""
     if os.path.isfile(info_json):
@@ -787,12 +750,14 @@ def translate_description(
         except Exception:
             pass
 
-    with open(desc_path, 'r', encoding='utf-8') as f:
-        desc_text = f.read()
+    if os.path.isfile(ctx.desc):
+        with open(ctx.desc, 'r', encoding='utf-8') as f:
+            desc_text = f.read()
+    else:
+        desc_text = ""
 
-    # 读取视频标签 (.tags.txt, yt-dlp Python list 格式)
     tags_text = ""
-    tags_path = os.path.join(srt_dir, f"{desc_base}.tags.txt")
+    tags_path = os.path.join(ctx.dir, f'{ctx.name}.tags.txt')
     if os.path.isfile(tags_path):
         try:
             with open(tags_path, 'r', encoding='utf-8') as f:
@@ -818,61 +783,47 @@ def translate_description(
         except Exception:
             pass
 
-    # 组合标题 + 简介 + 标签, 一次 API 调用完成翻译
     prompt = f"Title: {title}\n\nDescription:\n{desc_text}"
     if tags_text:
         prompt += f"\n\nTags:\n{tags_text}"
 
     if not desc_text.strip() and not title:
-        with open(zh_path, 'w', encoding='utf-8') as f:
+        with open(ctx.zh_desc, 'w', encoding='utf-8') as f:
             f.write(metadata_header)
         if not quiet:
-            print(f"  .zh.description: {zh_path}")
-        return zh_path
-
-    # 复用字幕翻译的 API key (参数 > .env)
-    if api_key is None:
-        env = load_env(os.path.dirname(os.path.abspath(__file__)))
-        api_key = get_api_key(provider, env)
-
-    cfg = load_providers()[provider]
-    payload = {
-        'model': model,
-        'messages': [
-            {'role': 'system', 'content': DESCRIPTION_TRANSLATE_PROMPT},
-            {'role': 'user', 'content': prompt},
-        ],
-        'temperature': 0.3,
-        'max_tokens': max(2048, (len(prompt) * 2)),
-    }
-
-    data = json.dumps(payload).encode('utf-8')
-    headers = make_headers(cfg, api_key)
+            print(f"  .zh.description: {ctx.zh_desc}")
+        return ctx.zh_desc
 
     try:
-        req = urllib.request.Request(cfg['url'], data=data, headers=headers, method='POST')
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode('utf-8'))
-        response = body['choices'][0]['message']['content']
+        resp = llm._client().chat.completions.create(
+            model=llm.model_name(),
+            messages=[
+                {'role': 'system', 'content': DESCRIPTION_TRANSLATE_PROMPT},
+                {'role': 'user', 'content': prompt},
+            ],
+            temperature=0.3,
+            max_tokens=max(2048, (len(prompt) * 2)),
+        )
+        response = resp.choices[0].message.content
     except Exception as e:
         print(f"  Warning: Description translation failed: {e}", file=sys.stderr)
-        return zh_path
+        return ctx.zh_desc
 
     # 解析: 第一行=中文标题, 空行后=翻译简介
     lines = response.strip().split('\n', 1)
     zh_title = lines[0].strip() if lines else ''
     zh_desc = lines[1].strip() if len(lines) > 1 else ''
 
-    with open(zh_path, 'w', encoding='utf-8') as f:
+    with open(ctx.zh_desc, 'w', encoding='utf-8') as f:
         if zh_title:
             f.write(f"{zh_title}\n\n")
         f.write(metadata_header)
         f.write(zh_desc)
 
     if not quiet:
-        print(f"  .zh.description: {zh_path}")
+        print(f"  .zh.description: {ctx.zh_desc}")
 
-    return zh_path
+    return ctx.zh_desc
 
 
 def load_template(template_path: str) -> tuple[str, str]:
@@ -1008,10 +959,11 @@ def main():
     _env = load_env(_script_dir)
     _providers = load_providers()
     _provider_keys = list(_providers.keys())
-    if _provider_keys:
-        _env_provider = _env.get('TRANSLATE_PROVIDER', _provider_keys[0])
-    else:
-        _env_provider = 'openrouter'
+    _env_provider = _env.get('TRANSLATE_PROVIDER', '')
+    if not _env_provider:
+        print(f"Error: TRANSLATE_PROVIDER not set in .env. "
+              f"Available: {', '.join(_provider_keys)}", file=sys.stderr)
+        sys.exit(1)
     _env_model = _env.get('TRANSLATE_MODEL', '') or None
 
     parser = argparse.ArgumentParser(
@@ -1022,11 +974,9 @@ Examples:
   %(prog)s video.srt                          # 输出 .zh-en.ass 双语字幕
   %(prog)s video.srt -t my_template.ass       # 指定模板
   %(prog)s video.srt -o output.zh-en.ass      # 指定输出路径
-  %(prog)s video.srt --provider deepseek      # 使用 DeepSeek
-  %(prog)s video.srt --model openai/gpt-4.1   # 通过 OpenRouter 指定模型
   %(prog)s video.srt --batch-size 30          # 每批 30 条 (默认 50)
 
-默认翻译后端从 .env 读取 (TRANSLATE_PROVIDER, TRANSLATE_MODEL), 当前: {_env_provider}
+翻译后端/模型从 .env 读取 (TRANSLATE_PROVIDER, TRANSLATE_MODEL)
         """,
     )
 
@@ -1035,13 +985,6 @@ Examples:
                         help='template.ass 模板路径 (默认: 脚本同目录)')
     parser.add_argument('-o', '--output',
                         help='输出 .zh-en.ass 路径 (默认: SRT 同目录, 同名 .zh-en.ass)')
-    parser.add_argument('--provider', choices=_provider_keys,
-                        default=_env_provider,
-                        help=f'LLM 后端 (默认: {_env_provider}, 来自 .env)')
-    parser.add_argument('--model', default=_env_model,
-                        help='模型名称 (默认: provider 内置默认模型)')
-    parser.add_argument('--api-key',
-                        help='API key (默认: 从 .env 读取)')
     parser.add_argument('--batch-size', type=int, default=50,
                         help='每批翻译行数 (默认: 50)')
     parser.add_argument('--no-split', action='store_true',
@@ -1052,31 +995,19 @@ Examples:
                         help='触发拆分的最大时长秒 (默认: 3.0)')
     parser.add_argument('--proofread', action='store_true', default=True,
                         help='中英校对 (默认开启)')
-    parser.add_argument('--proofread-provider', choices=_provider_keys,
-                        help='校对专用后端 (默认: 同翻译后端)')
-    parser.add_argument('--proofread-model',
-                        help='校对专用模型 (默认: 同翻译模型)')
     parser.add_argument('--glossary', metavar='PATH',
                         help='glossary.md 术语知识库路径 (注入校对 prompt)')
-    parser.add_argument('--title',
-                        help='视频标题 (默认: 从 SRT 文件名推断)')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='静默模式')
 
     args = parser.parse_args()
 
-    # Validate SRT
     if not os.path.isfile(args.srt):
         print(f"Error: SRT file not found: {args.srt}", file=sys.stderr)
         sys.exit(1)
 
-    # Determine paths
     srt_path = os.path.abspath(args.srt)
-    srt_dir = os.path.dirname(srt_path)
-    srt_name = os.path.splitext(os.path.basename(srt_path))[0]
-    # 如果输入是 .beautified.srt, 去掉 .beautified 后缀
-    if srt_name.endswith('.beautified'):
-        srt_name = srt_name[:-len('.beautified')]
+    ctx = SRTContext.from_path(srt_path, args.output or '')
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     template_path = args.template or os.path.join(script_dir, 'template.ass')
@@ -1084,10 +1015,17 @@ Examples:
         print(f"Error: template.ass not found: {template_path}", file=sys.stderr)
         sys.exit(1)
 
-    output_path = args.output or os.path.join(srt_dir, f"{srt_name}.zh-en.ass")
-
-    # Infer title
-    title = args.title or srt_name
+    llm = LLMConfig(
+        provider=_env_provider,
+        model=_env_model,
+        proofread_provider=_env.get('PROOFREAD_PROVIDER', ''),
+        proofread_model=_env.get('PROOFREAD_MODEL', ''),
+        batch_size=args.batch_size,
+    )
+    split = SplitConfig(
+        enabled=not args.no_split,
+        max_chars=args.split_max_chars, max_duration=args.split_max_duration,
+    )
 
     # ── Parse SRT ──────────────────────────────────────────────────────────
     if not args.quiet:
@@ -1098,83 +1036,47 @@ Examples:
         sys.exit(1)
     if not args.quiet:
         print(f"  Parsed {len(subtitles)} subtitle entries")
-        # duration printed after possible split below
 
-    # 系统提示词: CLI > .env > 内置默认
-    # 从文件加载提示词 (translate_prompt.md > translate_prompt.example.md > 内置回退)
     system_prompt = load_prompt('translate_prompt', _TRANSLATE_PROMPT_FALLBACK)
     proofread_prompt = load_prompt('proofread_prompt', _PROOFREAD_PROMPT_FALLBACK)
 
-    # 自动检测 .description, 注入到翻译和校对提示词中
-    desc_path = os.path.join(srt_dir, f"{srt_name}.description")
-    desc_context = load_description(desc_path)
+    desc_context = load_description(ctx.desc)
     if desc_context:
         system_prompt += desc_context
         proofread_prompt += desc_context
         if not args.quiet:
-            print(f"Description: .description 已注入到翻译/校对提示词 ({desc_path})")
+            print(f"Description: .description 已注入到翻译/校对提示词 ({ctx.desc})")
 
-    # 自动检测或手动指定 glossary.md
-    glossary_path = args.glossary
-    if not glossary_path:
-        # 尝试 SRT 同目录下的 glossary.md
-        candidate = os.path.join(srt_dir, 'glossary.md')
-        if os.path.isfile(candidate):
-            glossary_path = candidate
+    glossary_path = args.glossary or (ctx.glossary if os.path.isfile(ctx.glossary) else None)
     glossary_text = load_glossary(glossary_path)
     if glossary_text and not args.quiet:
         print(f"\nGlossary: glossary.md 已加载, 将注入校对提示词")
 
-    # ── 长句拆分 (LLM 自然语言边界, 优先 JSON 词级时间码) ───────────────
-    if not args.no_split:
-        # 检查 .split.srt 缓存
-        srt_base2 = os.path.splitext(os.path.basename(srt_path))[0]
-        if srt_base2.endswith('.beautified'):
-            srt_base2 = srt_base2[:-len('.beautified')]
-        split_cache = os.path.join(srt_dir, f"{srt_base2}.split.srt")
-
-        if os.path.isfile(split_cache):
-            subtitles = parse_srt(split_cache)
+    # ── 长句拆分 ──────────────────────────────────────────────────────────
+    if split.enabled:
+        if os.path.isfile(ctx.split_srt):
+            subtitles = parse_srt(ctx.split_srt)
             if not args.quiet:
-                print(f"\n  .split.srt 缓存已存在, 跳过 LLM 分句: {split_cache}")
+                print(f"\n  .split.srt 缓存已存在, 跳过 LLM 分句: {ctx.split_srt}")
         else:
-            subtitles = split_subtitles(
-                subtitles,
-                provider=args.provider,
-                model=args.model,
-                api_key=args.api_key,
-                srt_path=srt_path,
-                max_chars=args.split_max_chars,
-                max_duration=args.split_max_duration,
-                quiet=args.quiet,
-            )
-            # 补 ASS 格式时间码 (split_subtitles 只生成了 float 秒)
+            subtitles = split_subtitles(subtitles, ctx, llm, split, args.quiet)
             for sub in subtitles:
                 if 'start_ass' not in sub:
                     sub['start_ass'] = ass_time(sub['start'])
                 if 'end_ass' not in sub:
                     sub['end_ass'] = ass_time(sub['end'])
-
-            # 保存拆分中间成果 (.split.srt)
-            write_srt_generic(split_cache, subtitles)
+            write_srt_generic(ctx.split_srt, subtitles)
             if not args.quiet:
-                print(f"  .split.srt: {split_cache}")
+                print(f"  .split.srt: {ctx.split_srt}")
 
         if not args.quiet:
             print(f"  Duration: {subtitles[0]['start_ass']} → {subtitles[-1]['end_ass']}")
 
     # ── 获取中文翻译 ──────────────────────────────────────────────────────
-    # 始终使用 .zh.srt 作为翻译缓存: 已存在则跳过 LLM, 否则翻译后写入
-
-    zh_srt_path = os.path.join(srt_dir, f"{srt_name}.zh.srt")
-    zh_ass_path = os.path.join(srt_dir, f"{srt_name}.zh.ass")
-
-    if os.path.isfile(zh_srt_path):
-        # 已有 .zh.srt → 直接读取, 跳过 LLM
+    if os.path.isfile(ctx.zh_srt):
         if not args.quiet:
-            print(f"\nCache:    已有 .zh.srt, 跳过 LLM 翻译")
-            print(f"  {zh_srt_path}")
-        zh_subs = parse_srt(zh_srt_path)
+            print(f"\nCache:    已有 .zh.srt, 跳过 LLM 翻译\n  {ctx.zh_srt}")
+        zh_subs = parse_srt(ctx.zh_srt)
         translations = [s['text'] for s in zh_subs]
         if len(translations) != len(subtitles):
             print(f"Warning: .zh.srt 有 {len(translations)} 条, "
@@ -1186,74 +1088,42 @@ Examples:
                 translations.append('')
             translations = translations[:len(subtitles)]
     else:
-        # 调用 LLM 翻译 + 写入 .zh.srt 缓存
-        translations = translate_subtitles(
-            subtitles,
-            provider=args.provider,
-            model=args.model,
-            api_key=args.api_key,
-            system_prompt=system_prompt,
-            batch_size=args.batch_size,
-            quiet=args.quiet,
-        )
-        write_zh_srt(zh_srt_path, subtitles, translations)
+        translations = translate_subtitles(subtitles, llm, system_prompt, args.quiet)
+        write_zh_srt(ctx.zh_srt, subtitles, translations)
         if not args.quiet:
-            print(f"  .zh.srt:  {zh_srt_path}")
+            print(f"  .zh.srt:  {ctx.zh_srt}")
 
-    # ── 校对 (Pass 2): 英文原文 + 中文初译 → LLM 审校 ────────────────────
-    # 默认开启, PROOFREAD=0 环境变量可关闭
-    # 校对专用后端/模型: CLI > .env > 翻译后端/模型
+    # ── 校对 ──────────────────────────────────────────────────────────────
     if args.proofread and _env.get('PROOFREAD', '1') != '0':
         if not args.quiet:
             print()
-        pr_provider = args.proofread_provider or _env.get('PROOFREAD_PROVIDER', '') or args.provider
-        pr_model   = args.proofread_model   or _env.get('PROOFREAD_MODEL', '')   or args.model
-        translations = proofread_subtitles(
-            subtitles,
-            translations,
-            provider=pr_provider,
-            model=pr_model,
-            api_key=args.api_key,
-            system_prompt=proofread_prompt + glossary_text,
-            batch_size=args.batch_size,
-            quiet=args.quiet,
-        )
-        # 覆盖 .zh.srt 为校对版
-        write_zh_srt(zh_srt_path, subtitles, translations)
+        translations = proofread_subtitles(subtitles, translations, llm,
+                                            proofread_prompt + glossary_text, args.quiet)
+        write_zh_srt(ctx.zh_srt, subtitles, translations)
         if not args.quiet:
-            print(f"  .zh.srt:  {zh_srt_path} (updated with proofread)")
+            print(f"  .zh.srt:  {ctx.zh_srt} (updated with proofread)")
 
     # ── Write ASS ──────────────────────────────────────────────────────────
-    # .zh.ass: 仅中文 (style=zh)
-    # .zh-en.ass: 双语 (bi-en + bi-zh)
     if not args.quiet:
         print(f"\nTemplate: {template_path}")
 
-    write_ass(zh_ass_path, template_path, title, subtitles, translations, bilingual=False)
-    write_ass(output_path, template_path, title, subtitles, translations, bilingual=True)
+    write_ass(ctx.zh_ass, template_path, ctx.name, subtitles, translations, bilingual=False)
+    write_ass(ctx.zh_en_ass, template_path, ctx.name, subtitles, translations, bilingual=True)
 
-    # ── 翻译视频简介 (如果存在) ──────────────────────────────────────────
-    desc_path = os.path.join(srt_dir, f"{srt_name}.description")
-    if os.path.isfile(desc_path):
+    # ── 翻译视频简介 ──────────────────────────────────────────────────────
+    if os.path.isfile(ctx.desc):
         if not args.quiet:
             print()
-        translate_description(
-            desc_path,
-            provider=args.provider,
-            model=args.model,
-            api_key=args.api_key,
-            quiet=args.quiet,
-        )
+        translate_description(ctx, llm, args.quiet)
 
     if not args.quiet:
-        print(f"\nOutput:   {zh_ass_path}")
-        print(f"          {output_path}")
+        print(f"\nOutput:   {ctx.zh_ass}")
+        print(f"          {ctx.zh_en_ass}")
         print(f"Lines:    {len(subtitles)}")
-        print()
-        print("Done! .zh.ass + .zh-en.ass 双语字幕已生成。")
+        print(f"\nDone! .zh.ass + .zh-en.ass 双语字幕已生成。")
     else:
-        print(output_path)
-    print(f"OUTPUT_ASS={os.path.abspath(output_path)}")
+        print(ctx.zh_en_ass)
+    print(f"OUTPUT_ASS={os.path.abspath(ctx.zh_en_ass)}")
 
 
 if __name__ == '__main__':

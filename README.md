@@ -4,24 +4,19 @@
 
 ## 🛠 前置依赖
 
-### Linux (必需)
+### 一键安装
 
 ```bash
-# uv — Python 包管理器 (用于运行 WhisperX)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Linux / WSL
+./setup.sh
 
-# yt-dlp — 视频下载
-sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
-sudo chmod a+rx /usr/local/bin/yt-dlp
-
-# FFmpeg — 音视频处理 + 场景检测
-sudo apt update && sudo apt install -y ffmpeg
-
-# Node.js — yt-dlp YouTube 验证
-sudo apt install -y nodejs
+# Windows PowerShell
+.\setup.ps1
 ```
 
-#### WhisperX 安装
+安装内容：`uv`、`yt-dlp`、`ffmpeg`、`Node.js`、`openai`、`whisperx` (CUDA 12.8)。
+
+手动安装 WhisperX 参考：
 
 **方式 1：CPU（无需 CUDA）**
 
@@ -169,7 +164,7 @@ cp providers.example.json providers.json
 | `auth_header` | 认证头模板，`{api_key}` 替换为实际 key |
 | `extra_headers` | 额外请求头 (如 HTTP-Referer) |
 
-`translate_srt.py` 的 `--provider` 参数从 `providers.json` 的 key 动态生成选项。
+`translate_srt.py` 从 `.env` 读取翻译后端和模型，不再通过 CLI 传参。
 
 ---
 
@@ -311,8 +306,6 @@ python3 batch.py -n url1 url2
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-j, --jobs` | CPU 核心数 | 最大并行数 |
-| `-p, --provider` | .env | 翻译后端 |
-| `-m, --model` | .env | 翻译模型 |
 | `-B, --burn` | 1 | 0=跳过硬压 |
 | `-r, --report` | batch-result.txt | 报告路径 |
 | `-n, --dry-run` | — | 仅打印命令 |
@@ -448,18 +441,15 @@ python3 translate_srt.py video.srt                    # 默认: 分句 + 翻译 
 python3 translate_srt.py video.srt --no-split         # 禁用分句
 python3 translate_srt.py video.srt --split-max-chars 50
 # 交叉校对
-python3 translate_srt.py video.srt --provider deepseek --proofread-provider openrouter
+python3 translate_srt.py video.srt
 ```
 
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
-| `--provider` | deepseek | 翻译后端 |
 | `--no-split` | — | 禁用长句拆分 |
 | `--split-max-chars` | `60` | 拆分触发字符数 |
 | `--split-max-duration` | `3.0` | 拆分触发时长秒 |
 | `--proofread` | 开启 | 中英校对 |
-| `--proofread-provider` | 同翻译 | 校对后端 (交叉校对) |
-| `--proofread-model` | 同翻译 | 校对模型 |
 | `--glossary` | 自动检测 | glossary.md 路径 |
 | `--batch-size` | `50` | 每批翻译行数 |
 
@@ -568,7 +558,7 @@ YouTube URL
 ./download.sh "https://www.youtube.com/watch?v=xxxxx"
 ./whisper.sh "视频标题/视频标题.webm"
 python beautify_srt.py "视频标题/视频标题.webm"
-python translate_srt.py "视频标题/视频标题.srt" --provider openrouter
+python translate_srt.py "视频标题/视频标题.srt"
 ./ffmpeg-burn.sh "视频标题/视频标题.webm" --sub-file "视频标题/视频标题.zh-en.ass"
 ```
 

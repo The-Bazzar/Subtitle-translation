@@ -322,15 +322,11 @@ else
         exit 1
     fi
 
-    TRANSLATE_ARGS=(--provider "$TRANSLATE_PROVIDER")
-    if [ -n "$TRANSLATE_MODEL" ]; then
-        TRANSLATE_ARGS+=(--model "$TRANSLATE_MODEL")
-    fi
     # 校对默认开启, PROOFREAD=0 关闭
     if [ "${PROOFREAD:-1}" = "0" ]; then
         export PROOFREAD=0
     fi
-    python "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" -o "$ASS_PATH" "${TRANSLATE_ARGS[@]}"
+    python "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" -o "$ASS_PATH"
 
     echo ""
 fi
