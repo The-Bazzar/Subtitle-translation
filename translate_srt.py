@@ -450,7 +450,7 @@ def _parse_numbered_response(content: str, expected_count: int) -> list[str]:
 
 # ─── 长句拆分 ────────────────────────────────────────────────────────────────
 
-_SPLIT_PROMPT = r"""You are a subtitle splitter. Split long subtitle lines into shorter segments at natural pause points.
+_SPLIT_PROMPT_FALLBACK = r"""You are a subtitle splitter. Split long subtitle lines into shorter segments at natural pause points.
 
 Rules:
 - Split at: commas, clause boundaries, conjunctions (but, and, because, which, that, when, if, while...)
@@ -539,7 +539,7 @@ def split_subtitles(
         resp = llm._client().chat.completions.create(
             model=llm.model_name(),
             messages=[
-                {'role': 'system', 'content': _SPLIT_PROMPT},
+                {'role': 'system', 'content': load_prompt('split_prompt', _SPLIT_PROMPT_FALLBACK)},
                 {'role': 'user', 'content': prompt},
             ],
             temperature=0.1,
@@ -1152,4 +1152,5 @@ Examples:
 
 if __name__ == '__main__':
     main()
+
 
