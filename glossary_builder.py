@@ -84,6 +84,12 @@ def build_glossary(
     3. LLM 综合分析 → glossary.md
     """
     # ── Step 1: 收集所有上下文 ──────────────────────────────────────────
+    # 如果 glossary 已存在且非空, 跳过
+    if os.path.isfile(ctx.glossary) and os.path.getsize(ctx.glossary) > 0:
+        if not quiet:
+            print(f">>> Skipped: {ctx.glossary} already exists", file=sys.stderr)
+        return _read_text_file(ctx.glossary)
+
     if not quiet:
         print(">>> Step 1: Gathering context...", file=sys.stderr)
 
@@ -249,3 +255,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
