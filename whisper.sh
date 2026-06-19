@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# whisper.sh — WhisperX 语音识别生成英文字幕 (.srt)
+# whisper.sh — WhisperX 语音识别生成词级 JSON
 #
 # 用法:
 #   ./whisper.sh <视频文件路径>
 #
 # 输出:
 #   先提取音频 .wav → whisperx 识别 → 自动清理 .wav
-#   同目录输出 <视频文件名>.srt + .json (词级时间码) + .txt/.tsv/.vtt
+#   同目录输出 <视频文件名>.json (词级时间码)
 #
 # 环境变量:
 #   WHISPER_MODEL                  ASR 模型 (默认: large-v3-turbo)
@@ -33,11 +33,12 @@ fi
 
 VIDEO_DIR="$(dirname "$VIDEO_PATH")"
 VIDEO_NAME="$(basename "$VIDEO_PATH")"
-SRT_NAME="${VIDEO_NAME%.*}.srt"
+JSON_NAME="${VIDEO_NAME%.*}.json"
 
 # 已存在则跳过
-if [ -f "$VIDEO_DIR/$SRT_NAME" ]; then
-    echo "字幕已存在, 跳过: $VIDEO_DIR/$SRT_NAME"
+if [ -f "$VIDEO_DIR/$JSON_NAME" ]; then
+    echo "JSON 已存在, 跳过: $VIDEO_DIR/$JSON_NAME"
+    echo "OUTPUT_JSON=$VIDEO_DIR/$JSON_NAME"
     exit 0
 fi
 
@@ -63,7 +64,7 @@ DEVICE="${WHISPER_DEVICE:-cuda}"
 # 提取音频为 WAV (避免长视频时间码漂移)
 WAV_NAME="${VIDEO_NAME%.*}.wav"
 echo "============================================="
-echo "whisper — 语音识别 → .srt"
+echo "whisper — 语音识别 → .json"
 echo "============================================="
 echo "视频:      $VIDEO_PATH"
 echo "语言:      $VIDEO_LANG"
@@ -81,7 +82,7 @@ WHISPER_ARGS=(
     --model "${WHISPER_MODEL:-large-v3-turbo}"
     --language "$VIDEO_LANG"
     --output_dir .
-    --output_format all
+    --output_format json
     --device "$DEVICE"
 )
 [ -n "${WHISPER_ALIGN_MODEL:-}" ] && WHISPER_ARGS+=(--align_model "$WHISPER_ALIGN_MODEL")
@@ -89,5 +90,6 @@ TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 whisperx "${WHISPER_ARGS[@]}"
 rm -f "$WAV_NAME"
 
 echo "============================================="
-echo "whisper — 完成: $VIDEO_DIR/$SRT_NAME"
+echo "whisper — 完成: $VIDEO_DIR/$JSON_NAME"
 echo "============================================="
+echo "OUTPUT_JSON=$VIDEO_DIR/$JSON_NAME"

@@ -26,7 +26,7 @@ $Device                  = Merge-EnvDefault 'WHISPER_DEVICE'                   $
 
 if ($Help -or (-not $VideoPath)) {
     @"
-whisper.ps1 — WhisperX 语音识别生成英文字幕 (.srt)
+whisper.ps1 — WhisperX 语音识别生成词级 JSON
 
 用法:
   .\whisper.ps1 <视频文件路径> [选项...]
@@ -37,9 +37,9 @@ whisper.ps1 — WhisperX 语音识别生成英文字幕 (.srt)
   -Device      cuda|cpu (默认: cuda)
 
 输出:
-  同目录输出 <文件名>.srt + .json (词级时间码)
+  同目录输出 <文件名>.json (词级时间码)
 
-句子拆分已集成到 translate_srt.py，翻译时自动 LLM 分句 + JSON 对轴
+translate_srt.py 以 .json 为唯一字幕入口，负责美化、翻译、校对、分割和对轴
 "@
     exit 0
 }
@@ -54,9 +54,9 @@ $VideoDir = Split-Path $VideoAbs -Parent
 $VideoName = [System.IO.Path]::GetFileNameWithoutExtension($VideoAbs)
 
 # 已存在则跳过
-$SrtPath = Join-Path $VideoDir "$VideoName.srt"
-if (Test-Path $SrtPath) {
-    Write-Host "字幕已存在, 跳过: $SrtPath"
+$JsonPath = Join-Path $VideoDir "$VideoName.json"
+if (Test-Path $JsonPath) {
+    Write-Host "JSON 已存在, 跳过: $JsonPath"
     exit 0
 }
 
@@ -74,7 +74,7 @@ if (Test-Path $InfoJson) {
 }
 
 Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "whisper — 语音识别 → .srt" -ForegroundColor Cyan
+Write-Host "whisper — 语音识别 → .json" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "视频:        $VideoAbs" -ForegroundColor Gray
 Write-Host "语言:        $VideoLang" -ForegroundColor Gray
@@ -93,7 +93,7 @@ $WhisperArgs = @(
     '--model', $Model,
     '--language', $VideoLang,
     '--output_dir', $VideoDir,
-    '--output_format', 'all',
+    '--output_format', 'json',
     '--device', $Device
 )
 if ($AlignModel) {
@@ -108,8 +108,9 @@ $ExitCode = $LASTEXITCODE
 
 if ($ExitCode -eq 0) {
     Write-Host "=============================================" -ForegroundColor Green
-    Write-Host "whisper — 完成: $VideoName.srt + .json + .txt/.tsv/.vtt" -ForegroundColor Green
+    Write-Host "whisper — 完成: $VideoName.json" -ForegroundColor Green
     Write-Host "=============================================" -ForegroundColor Green
+    Write-Host "OUTPUT_JSON=$JsonPath"
 } else {
     Write-Host "Error: whisperx failed (exit code: $ExitCode)" -ForegroundColor Red
     exit $ExitCode

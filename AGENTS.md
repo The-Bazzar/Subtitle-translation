@@ -1,193 +1,195 @@
 # AGENTS.md
 
-本文件是项目的唯一权威文档。代码路径、行为、配置以此为准。
+本文件是项目的唯一权威文档。代码路径、行为、配置以当前仓库为准；不要引用历史脚本或本地视频项目路径。
 
 ## Overview
 
-`download -> whisper -> beautify -> glossary -> translate/proofread -> burn`
+`download -> whisper(json) -> beautify(json words) -> glossary -> translate -> split -> proofread -> ass -> burn`
 
-Windows 主机，PowerShell 7 为必需运行环境（旧版 PS 5.x 会导致脚本报错）。升级命令：`winget install Microsoft.PowerShell`。Linux / WSL bash 脚本并行维护。
-项目使用本地工具完成下载/语音识别/硬压，远程 LLM API 完成翻译和校对。
+Windows 主机必须使用 PowerShell 7，旧版 Windows PowerShell 5.x 会导致 `.ps1` 脚本报错。升级命令：
 
-## Architecture
+```powershell
+winget install Microsoft.PowerShell
+```
 
-所有工具脚本位于仓库根目录：
+项目使用本地工具完成下载、语音识别、时间轴处理和硬压，使用远程 LLM API 完成 glossary、翻译、分割和校对。主字幕入口是 WhisperX `.json`，SRT 不再作为输入缓存。
+
+## Repository Layout
+
+所有运行脚本位于仓库根目录：
 
 ```text
-├── pipeline.ps1              # Windows: 超级流水线 (URL → burned.mkv)
-├── pipeline.sh               # Linux/bash: 流水线 (同流程)
-├── download.ps1              # Windows: 仅下载
-├── download.sh               # Linux: 仅下载
-├── download_and_sub.sh       # Linux: 下载 + WhisperX 字幕
-├── whisper.ps1               # Windows: WhisperX 语音识别
-├── whisper.sh                # Linux: WhisperX 语音识别
-├── beautify_srt.py           # Python: 场景检测 + 帧率自适应 → 美化 SRT (Netflix 规范)
-├── glossary_builder.py       # Python: 自动生成 glossary.md (可选 Tavily 搜索)
-├── translate_srt.py          # Python: LLM 分句 + 翻译 + 校对 + ASS 导出
-├── ffmpeg-burn.ps1           # Windows: ffmpeg 字幕硬压 (流水线默认)
-├── ffmpeg-burn.sh            # Linux: ffmpeg 字幕硬压
-├── mpv-burn.ps1              # Windows: mpv 硬压 (备选)
-├── mpv-burn.sh               # Linux: mpv 硬压 (备选)
-├── batch.ps1                 # Windows: 批量处理多个 URL
-├── batch.py                  # Linux: 批量处理多个 URL
-├── setup.ps1                 # Windows: 环境安装
-├── setup.sh                  # Linux: 环境安装
-├── template.ass              # ASS 字幕模板 (Style: zh / bi-en / bi-zh)
-├── .env                      # API keys + 流水线配置 (gitignored)
+├── pipeline.ps1              # Windows: download -> whisper -> translate_srt.py -> ffmpeg-burn
+├── pipeline.sh               # Linux/WSL: 同流程
+├── download.ps1              # Windows: yt-dlp 下载视频和元数据
+├── download.sh               # Linux/WSL: yt-dlp 下载视频和元数据
+├── whisper.ps1               # Windows: WhisperX 生成词级 JSON
+├── whisper.sh                # Linux/WSL: WhisperX 生成词级 JSON
+├── translate_srt.py          # JSON 美化 + glossary + 翻译/分割/校对 + SRT/ASS 导出
+├── ffmpeg-burn.ps1           # Windows: ffmpeg ASS 硬压
+├── ffmpeg-burn.sh            # Linux/WSL: ffmpeg ASS 硬压
+├── mpv-burn.ps1              # Windows: mpv 硬压备选
+├── mpv-burn.sh               # Linux/WSL: mpv 硬压备选
+├── batch.ps1                 # Windows: 多 URL 批处理
+├── batch.py                  # Linux/WSL: 多 URL 批处理
+├── setup.ps1                 # Windows: 安装依赖
+├── setup.sh                  # Linux/WSL: 安装依赖
+├── .env.ps1                  # PowerShell 读取 .env 的共享模块
+├── template.ass              # ASS 模板；保留历史 Style: zh / bi-en / bi-zh
 ├── .env.example              # 环境变量模板
-├── providers.json            # LLM provider 配置 (gitignored)
-├── providers.example.json    # provider 配置模板
-├── translate_prompt.md       # 翻译 prompt (可自定义)
+├── providers.example.json    # LLM provider 配置模板
 ├── translate_prompt.example.md
-├── proofread_prompt.md       # 校对 prompt (可自定义)
 ├── proofread_prompt.example.md
-├── AGENTS.md                 # ← 本文档
-├── README.md                 # 用户向文档
-├── CLAUDE.md                 # 已弃用 (内容合并至此)
-├── .gitignore
-├── .agents/skills/
-│   ├── beautify/SKILL.md
-│   ├── download/SKILL.md
-│   ├── knowledge/SKILL.md
-│   ├── translate/SKILL.md
-│   └── whisper/SKILL.md
-└── cookies.txt               # YouTube cookies (gitignored)
+├── split_prompt.example.md
+├── AGENTS.md
+├── README.md
+└── .agents/skills/
+    ├── beautify/SKILL.md
+    ├── download/SKILL.md
+    ├── knowledge/SKILL.md
+    ├── translate/SKILL.md
+    └── whisper/SKILL.md
 ```
+
+本地文件 `.env`、`providers.json`、`cookies.txt`、`split_prompt.md` 和生成产物均不应提交。
 
 ## Pipeline Flow
 
-### pipeline.sh (Linux)
+### Windows `pipeline.ps1`
 
-1. **download + whisper** — `download_and_sub.sh` 下载视频 + WhisperX 识别 → `.srt` + `.json`
-2. **beautify** — `beautify_srt.py` 场景吸附 → `.beautified.srt`
-3. **glossary** — `glossary_builder.py` 术语知识库 → `glossary.md`
-4. **translate** — `translate_srt.py` 分句 + 翻译 + 校对 → `.zh.srt` + `.zh.ass` + `.zh-en.ass`
-5. **burn** — `ffmpeg-burn.sh` 双语 ASS 硬压 → `burned.mkv`
+1. `download.ps1` 下载视频、封面、`.info.json`、`.description`、`.tags.txt`
+2. `whisper.ps1` 调用 WhisperX，只输出 `<base>.json`
+3. `translate_srt.py --only-beautify` 美化 JSON 中的 word 时间轴，输出 `<base>.beautified.json`
+4. `translate_srt.py --only-glossary` 在翻译前生成或复用 `glossary.md`
+5. `translate_srt.py` 整句翻译、AI 分割、词级对轴、split event 校对，输出最终字幕
+6. `ffmpeg-burn.ps1` 可选硬压双语 ASS 到 `burned.mkv`
 
-成果物链: `video → srt → beautified.srt → glossary.md → zh-en.ass → burned.mkv`
+### Linux/WSL `pipeline.sh`
 
-### pipeline.ps1 (Windows)
+流程与 Windows 对齐，使用 `download.sh`、`whisper.sh`、`translate_srt.py`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
 
-1. 调用 `wsl bash pipeline.sh` 完成下载+美化+翻译（成果物在 WSL 侧）
-2. `wslpath -w` 转换 Linux 路径为 Windows 路径
-3. 调用 `ffmpeg-burn.ps1` 将 `.zh-en.ass` 硬压到视频 → `burned.mkv`
+### Output Chain
 
-### 跳过控制
+```text
+video -> json -> beautified.json -> glossary.md
+      -> split.<source>.srt / split.<target>.srt
+      -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass
+      -> burned.mkv
+```
 
-| 环境变量 | PowerShell 参数 | 效果 |
-|---------|----------------|------|
-| `SKIP_DOWNLOAD` / `PIPELINE_SKIP_DOWNLOAD` | `-SkipDownload` | 跳过下载 |
-| `SKIP_WHISPER` / `PIPELINE_SKIP_WHISPER` | `-SkipWhisper` | 跳过语音识别 |
-| `SKIP_BEAUTIFY` / `PIPELINE_SKIP_BEAUTIFY` | `-SkipBeautify` | 跳过时间码美化 |
-| `SKIP_KNOWLEDGE` / `PIPELINE_SKIP_KNOWLEDGE` | `-SkipKnowledge` | 跳过术语知识库 |
-| `SKIP_TRANSLATE` / `PIPELINE_SKIP_TRANSLATE` | `-SkipTranslate` | 跳过翻译/校对 |
-| `SKIP_BURN` / `PIPELINE_SKIP_BURN` | `-SkipBurn` | 跳过硬压 |
-
-bash 从 `.env` 继承 `PIPELINE_SKIP_*` 变量。
+默认 `.env.example` 设置 `PIPELINE_SKIP_BURN=1`，推荐先人工校对字幕，再决定是否硬压。
 
 ## Step Behavior
 
 ### download
 
-- 视频文件名固定为 `<video_dir>/<video_dir>.<ext>`
-- 同步下载缩略图 `.png`、元数据 `.info.json`、简介 `.description`、标签 `.tags.txt`
-- SponsorBlock 去广告
+- 输出目录名和视频基名相同，视频路径形如 `<video_dir>/<video_dir>.<ext>`
+- 同步保存 `.png` 封面、`.info.json` 元数据、`.description` 简介、`.tags.txt` 标签
+- SponsorBlock 移除 `sponsor,selfpromo`
+- `cookies.txt` 通过相对路径引用，必须在仓库根目录运行脚本
+- Windows 文件夹名会做 Unicode 标点和非法字符清理，避免引号、破折号等导致跨 Windows/WSL 路径乱码
 
 ### whisper
 
-- 已存在 `.srt` 自动跳过
-- 视频先转为 mono 16kHz WAV 再识别
-- WhisperX 输出 `--output_format all`（SRT + JSON + TXT/TSV/VTT）
-- `.json` 包含词级时间码，供 `translate_srt.py` 分句对轴
-- `WHISPER_DEVICE` 控制 `cuda` / `cpu`
+- 已存在 `<base>.json` 时跳过
+- 视频先转为 mono 16kHz WAV，再调用 WhisperX
+- WhisperX 参数固定为 `--output_format json`
+- `.info.json` 中的 `language` 会用于 WhisperX `--language`；缺省回退 `en`
+- 输出 JSON 的 `segments[].words[]` 是后续分割对轴的唯一词源
 
 ### beautify
 
-- 不覆盖原始 `.srt`，默认输出 `.beautified.srt`
-- 场景吸附代替关键帧吸附（默认关闭 `--use-keyframes`）
-- 入点吸附到前一个场景切换 (7帧内)
-- 出点吸附到下一个场景切换前 2 帧 (Netflix 规范)
-- 重叠/间隙修复：<500ms 自动合并
-- 时长约束：最短 1s / 最长 8s
+- 已合并到 `translate_srt.py`
+- 输入 `.json`，输出 `.beautified.json`，不覆盖原始 JSON
+- 对每个 word 做场景吸附和边界修复，再用首尾有效 word 回写 segment 起止时间
+- 入点吸附到前一个场景切换，出点吸附到下一个场景切换前 `end_offset_frames`
+- 只补足最短时长，不再用最大时长截断整句；长句交给 split 阶段
 
 ### glossary
 
+- 已合并到 `translate_srt.py`
 - 位于 beautify 之后、translate 之前
-- 输入优先 `.beautified.srt`，回退 `.srt`
-- 读取 `.description`、`.tags.txt`、`.info.json` 作为上下文
-- 配置 `TAVILY_API_KEY` 时联网搜索术语标准译法
-- 回退离线总结
-- 需要 `TRANSLATE_PROVIDER` 配置（复用 LLM 栈）
+- 如果 `glossary.md` 已存在且非空，直接复用，不重新总结
+- 读取 transcript、`.description`、`.tags.txt`、`.info.json`
+- 配置 `TAVILY_API_KEY` 时联网搜索，未配置时离线总结
+- 需要 `TRANSLATE_PROVIDER` 和对应 API key
 
-### translate
+### translate / split / proofread
 
-- 输出: `.split.srt` / `.zh.srt` / `.proofread.srt` / `.zh.ass` / `.zh-en.ass` / `.zh.description`
-- `.split.srt` 存在时跳过 LLM 分句
-- `.zh.srt` 存在时跳过 LLM 翻译
-- 长句拆分 (>60 chars 或 >3s) 用 LLM 按自然语言边界拆分，WhisperX JSON 精确对轴
-- 分批翻译 (50条/批)，保留 `\N` 软换行
-- 双语校对 (Pass 2)，可交叉模型
-- 自动检测 `glossary.md` 注入 Pass 3 术语校对
-- 双语 ASS 使用 `bi-en` / `bi-zh` 样式，仅中文 ASS 使用 `zh`
+- 输入 `.json` 或 `.beautified.json`
+- `.beautified.json` 是主缓存，会保存 `translation`、`proofread_text`、`split_events`
+- 顺序固定为：整句翻译 -> AI 分割 -> 词级对轴 -> split event 校对
+- 翻译使用整句 segment，避免先分割导致上下文破碎
+- 分割使用未校对源语言文本匹配 WhisperX words，校对发生在 split event 上
+- 分割 AI 必须返回严格 JSON array，代码只接受 legacy keys: `id`, `en`, `zh`
+- legacy key `en` 表示源语言文本，`zh` 表示目标语言文本；这是内部协议名，不代表只能英译中
+- 对轴时只用源语言 split 的首尾 token 匹配 `words[]`；匹配失败则整句回退到 beautified 时间轴，禁止本地强切
+- token normalize 会忽略词内 dash/hyphen，例如 `non-existent` 与 `nonexistent` 可匹配；带空格的 dash 仍作为分隔
+- `--no-split` 只跳过 AI 分割，仍会输出 SRT/ASS
+
+输出命名：
+
+```text
+<base>.split.<source>.srt
+<base>.split.<target>.srt
+<base>.<source>.proofread.ass
+<base>.<target>.ass
+<base>.<source>-<target>.ass
+<base>.<target>.description
+```
+
+`SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名。输出文件后缀通过 `langcodes` 规范为 ISO 639 代码；未显式设置 `SOURCE_LANG` 时使用 WhisperX JSON 的 `language`，`TARGET_LANG` 默认 `zh`。
+
+Prompt 文件支持模板变量：
+
+```text
+${SOURCE_LANG}
+${TARGET_LANG}
+${SOURCE_LANG_CODE}
+${TARGET_LANG_CODE}
+```
+
+`split_prompt.md` 仅允许微调分割风格，输出格式规则由 `translate_srt.py` 内置 `_SPLIT_FORMAT` 强制追加。
 
 ### burn
 
-- ffmpeg ASS 滤镜硬压为流水线默认路径
-- 保留原视频封面图
-- 指定分辨率时保持宽高比，自动补黑边
+- pipeline 默认调用 ffmpeg ASS 滤镜硬压
+- `-SkipBurn` / `SKIP_BURN=1` / `PIPELINE_SKIP_BURN=1` 会跳过硬压
+- `BURN_RES` 指定输出分辨率时保持宽高比并补黑边
+- `ExistingAss` / `EXISTING_ASS` 可指定已有双语 ASS 跳过翻译，直接用于硬压
 
 ## Config
 
-### `.env`
+`.env` 由 `.env.example` 复制而来；PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
 
 | 变量 | 说明 |
 |------|------|
-| `WHISPER_MODEL` | 默认为 `large-v3-turbo` |
-| `WHISPER_ALIGN_MODEL` | 对齐模型，空则自动选择 |
+| `WHISPER_MODEL` | WhisperX ASR 模型，默认 `large-v3-turbo` |
+| `WHISPER_ALIGN_MODEL` | WhisperX 对齐模型，空则自动 |
 | `WHISPER_DEVICE` | `cuda` / `cpu` |
-| `TRANSLATE_PROVIDER` | 翻译后端 (`openrouter` / `deepseek` / `gemini`) |
+| `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
+| `TARGET_LANG` | 目标语言标签，默认 `zh` |
+| `TRANSLATE_PROVIDER` | 翻译后端：`openrouter` / `deepseek` / `gemini` |
 | `TRANSLATE_MODEL` | 翻译模型，空则用 provider 默认 |
-| `PROOFREAD` | `1` / `0` 控制双语校对 |
-| `PROOFREAD_PROVIDER` | 校对专用 provider，空则复用翻译 provider |
-| `PROOFREAD_MODEL` | 校对专用模型 |
-| `BURN_OVC` | 硬压编码器 (默认 `hevc_nvenc`) |
-| `BURN_OVCOPTS` | 编码参数 (默认 `qp=20`) |
-| `BURN_OAC` | 音频编码器 (默认 `aac`) |
-| `BURN_RES` | 输出分辨率 (空=原分辨率) |
+| `PROOFREAD` | `1` / `0` 控制 split event 校对 |
+| `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
+| `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
-| `OPENROUTER_API_KEY` | OpenRouter API key |
-| `DEEPSEEK_API_KEY` | DeepSeek API key |
-| `GEMINI_API_KEY` | Gemini API key |
-| `TAVILY_API_KEY` | Tavily 搜索 API key |
-| `TAVILY_MAX_RESULTS` | 搜索结果上限 (默认 10) |
+| `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
+| `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM API keys |
+| `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` | glossary 联网搜索配置 |
 
-### `providers.json`
-
-格式：
-
-```json
-{
-  "my_provider": {
-    "url": "https://api.example.com/v1",
-    "default_model": "my-model",
-    "env_key": "MY_API_KEY",
-    "auth_header": "Bearer {api_key}",
-    "extra_headers": {}
-  }
-}
-```
-
-`url` 是 OpenAI SDK 的 `base_url`，不包含 `/chat/completions`。
+`providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。
 
 ## Key Commands
 
-### PowerShell (推荐)
+### PowerShell
 
 ```powershell
 .\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
-.\pipeline.ps1 "https://youtu.be/xxxxx" -TranslateProvider deepseek -Ovc libx265 -Ovcopts crf=23
 .\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
-.\pipeline.ps1 "https://youtu.be/xxxxx" -SkipKnowledge
+.\pipeline.ps1 "https://youtu.be/xxxxx" -SourceLang en -TargetLang ja -SkipBurn
+.\pipeline.ps1 "https://youtu.be/xxxxx" -ExistingAss "path\to\video.en-zh.ass"
 .\batch.ps1 "URL1" "URL2"
 ```
 
@@ -195,98 +197,48 @@ bash 从 `.env` 继承 `PIPELINE_SKIP_*` 变量。
 
 ```bash
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
+TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 ./pipeline.sh "URL" -- --scene-threshold 0.12 --snap-frames 10
-SKIP_BEAUTIFY=1 ./pipeline.sh "URL"
-SKIP_BURN=1 ./pipeline.sh "URL"
-./download_and_sub.sh "URL"
 python3 batch.py "URL1" "URL2"
 ```
 
-### 仅下载
+### Manual Steps
 
 ```powershell
 .\download.ps1 "URL"
-```
-
-### 字幕硬压
-
-```powershell
-.\ffmpeg-burn.ps1 "video.webm"
-.\mpv-burn.ps1 "C:\path\to\video.webm"
+.\whisper.ps1 "video.webm"
+python translate_srt.py video.json --video video.webm --only-beautify
+python translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
+python translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang zh
+.\ffmpeg-burn.ps1 "video.webm" -SubFile "video.en-zh.ass"
 ```
 
 ```bash
-./mpv-burn.sh "path/to/video.webm"
-./mpv-burn.sh video.webm -o result.mkv
-./mpv-burn.sh video.webm --ovc libx265 --ovcopts crf=23 --slang=en,zh
+./download.sh "URL"
+./whisper.sh "video.webm"
+python3 translate_srt.py video.json --video video.webm --only-beautify
+python3 translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
+python3 translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang zh
+./ffmpeg-burn.sh "video.webm" --sub-file "video.en-zh.ass"
 ```
-
-### 时间码美化
-
-```bash
-./beautify_srt.sh "path/to/video.webm"
-./beautify_srt.sh video.webm -o video.srt --backup
-./beautify_srt.sh video.webm --scene-threshold 0.2 --snap-frames 10
-./beautify_srt.sh --help
-```
-
-### 翻译
-
-```bash
-python3 translate_srt.py video.srt
-python3 translate_srt.py video.srt -o custom.zh-en.ass
-```
-
-### 从 PowerShell 调用 Linux
-
-```powershell
-wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=xxxxx"
-```
-
-## Skills
-
-项目技能文件在 `.agents/skills/` 目录下，每个技能一个文件夹，格式为 `skill-dir/SKILL.md`：
-
-- `.agents/skills/beautify/SKILL.md`
-- `.agents/skills/download/SKILL.md`
-- `.agents/skills/knowledge/SKILL.md`
-- `.agents/skills/translate/SKILL.md`
-- `.agents/skills/whisper/SKILL.md`
 
 ## Dependencies
 
 | 工具 | 用途 |
 |------|------|
 | `yt-dlp` | YouTube 视频/元数据下载 |
-| `uv` | 安装 WhisperX 为全局工具 |
-| `whisperx` (large-v3-turbo) | AI 语音识别 + 词级对齐 |
-| `ffmpeg` / `ffprobe` | 音频提取、场景检测、字幕硬压 |
-| `python3` | beautify_srt.py / glossary_builder.py / translate_srt.py |
-| `openai` Python 包 | LLM 调用 (分句 / 翻译 / 校对) |
-| `tavily-python` | glossary 联网搜索 (可选) |
-
-## Important Notes
-
-- `.env` 和 `providers.json` 已 gitignored，仓库只提交 example 模板
-- `cookies.txt` 已 gitignored，过期后重新导出。注意：yt-dlp 通过相对路径 `cookies.txt` 引用，请确保在脚本所在目录（仓库根目录）下运行，否则会找不到
-- `TRANSLATE_PROVIDER` 必须配置，否则翻译和 glossary 直接报错
-- WhisperX 首次运行下载 `large-v3-turbo` (~1.5GB)
-- WhisperX 安装: `uv tool install git+https://github.com/m-bain/whisperx.git --with "torch==2.8.0+cu128" --with "torchaudio==2.8.0+cu128"`
-- `translate_srt.py` 内置 LLM 长句拆分，`--no-split` 禁用
-- 美化默认不覆盖原文件，输出 `.beautified.srt`，`-o same.srt` 覆盖
-- 场景检测对长视频较耗时 (~5分/小时视频)
-- 帧数参数按实际帧率自动换算为秒
-- 关键帧吸附默认关闭（`--use-keyframes` 启用），场景吸附已足够
-- 流水线自动跳过已完成的步骤（`.beautified.srt`、`.zh-en.ass` 等存在时跳过对应阶段）
-- 翻译不消耗本地 GPU，全部通过 LLM API
-- 双语 `.zh-en.ass` 使用 `bi-en` / `bi-zh` 样式，仅中文 `.zh.ass` 使用 `zh`
+| `uv` | 安装 WhisperX 和 Python 包 |
+| `whisperx` | ASR + word alignment JSON |
+| `ffmpeg` / `ffprobe` | 音频提取、场景检测、硬压 |
+| `python3` | `translate_srt.py` |
+| `openai` | LLM 调用 |
+| `langcodes[data]` | 语言名/标签规范为 ISO 639 输出后缀 |
+| `tavily-python` | glossary 联网搜索，可选 |
 
 ## Working Notes
 
-- 优先读取 `.env` 而非硬编码工具路径
+- 更新文档时以实际脚本参数和文件名为准，不保留历史 SRT 流程
 - 保持 PowerShell 和 bash 入口行为对齐
-- 更新文档时匹配实际代码路径和参数，而非历史版本
-- 仓库可能包含用户本地的 `.env`、`providers.json`、cookies 和生成产物，不要回退用户数据
-
-
-
+- 不要提交 `.env`、`providers.json`、`cookies.txt`、`split_prompt.md` 或生成产物
+- 不要回退用户本地数据或未请求的工作区改动
+- `README.md` 面向用户快速使用；`AGENTS.md` 面向维护和自动化代理；`.agents/skills/*` 面向分步骤执行

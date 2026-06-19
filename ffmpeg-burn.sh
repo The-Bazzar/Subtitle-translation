@@ -6,7 +6,7 @@
 #   ./ffmpeg-burn.sh <视频文件> [选项...] [-- ffmpeg额外参数...]
 #
 # 示例:
-#   ./ffmpeg-burn.sh video.webm --sub-file video.zh-en.ass
+#   ./ffmpeg-burn.sh video.webm --sub-file video.en-zh.ass
 #   ./ffmpeg-burn.sh video.webm --sub-file sub.ass -o result.mkv --ovc libx265 --ovcopts crf=23
 #
 # 相比 mpv-burn: 保留原视频封面图, 无需 Windows mpv.com
@@ -42,7 +42,7 @@ ffmpeg-burn.sh — Linux 字幕硬压脚本 (ffmpeg 滤镜)
 
 选项:
   -o, --output PATH       输出文件路径 (默认: 输入同目录 burned.mkv)
-  --sub-file PATH         字幕文件路径 (如 .zh-en.ass 双语字幕)
+  --sub-file PATH         字幕文件路径 (如 .en-zh.ass 双语 ASS)
   --ovc CODEC             视频编码器 (默认: hevc_nvenc)
   --ovcopts OPTS          视频编码器参数 (默认: qp=20)
   --oac CODEC             音频编码器 (默认: aac)
@@ -51,7 +51,7 @@ ffmpeg-burn.sh — Linux 字幕硬压脚本 (ffmpeg 滤镜)
   -h, --help              显示帮助
 
 示例:
-  ./ffmpeg-burn.sh video.webm --sub-file video.zh-en.ass
+  ./ffmpeg-burn.sh video.webm --sub-file video.en-zh.ass
   ./ffmpeg-burn.sh video.webm --sub-file sub.ass -o result.mkv
   ./ffmpeg-burn.sh video.webm --ovc libx265 --ovcopts crf=23
   ./ffmpeg-burn.sh video.webm --dry-run

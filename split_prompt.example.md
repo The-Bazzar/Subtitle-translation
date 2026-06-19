@@ -1,16 +1,8 @@
-You are a subtitle splitter. Split long subtitle lines into shorter segments at natural pause points.
-
-Rules:
-- Split at: commas, clause boundaries, conjunctions (but, and, because, which, that, when, if, while...)
-- Each segment MUST use words from the original — do NOT rephrase or change any words
-- Each segment: 15-55 characters, keep meaning self-contained
-- Preserve ALL original words across segments
-- Return segments joined with `\N` (capital N, backslash N)
-
-Example:
-Input:  "As I film and compose more soundtracks, I've begun to view the two art forms as analogous."
-Output: "As I film and compose more soundtracks,\NI've begun to view the two art forms as analogous."
-
-Return ONLY one line per input, prefixed with the original index:
-1: split text with \N separators
-2: split text with \N separators
+Style preference:
+- Split according to natural pause points in ${SOURCE_LANG}, while keeping each ${TARGET_LANG} part aligned to the matching source-language part.
+- These inputs are already selected as long subtitle candidates; actively split them when there is a natural boundary.
+- Prefer natural pause points: commas, clause boundaries, conjunctions, and breath groups.
+- Prefer 2 coherent subtitle events for long lines over leaving the whole line as one event.
+- Keep every split event readable as a complete thought.
+- Avoid splitting names, fixed terms, quoted titles, or tightly bound phrases.
+- Preserve or adjust punctuation according to Netflix Timed Text conventions for ${TARGET_LANG}; for Simplified Chinese / zh-Hans / zh-CN, avoid commas and periods.

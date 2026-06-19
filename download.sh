@@ -30,7 +30,24 @@ echo "download — 步骤 1/3: 抓取视频标题"
 echo "============================================="
 
 VIDEO_TITLE=$($YTDLP --get-title "$URL")
-FOLDER_NAME=$(echo "$VIDEO_TITLE" | sed 's/[\\/:*?"<>|]/_/g')
+FOLDER_NAME=$(python3 - "$VIDEO_TITLE" <<'PY'
+import re
+import sys
+import unicodedata
+
+title = sys.argv[1]
+name = unicodedata.normalize("NFKD", title)
+name = re.sub(r"[\u2018\u2019\u201A\u201B\u2032\u02BC]", "", name)
+name = re.sub(r"[\u201C\u201D\u201E\u201F\u2033]", "", name)
+name = re.sub(r"[\u2010-\u2015]", "-", name)
+name = re.sub(r"[^\w. -]+", "_", name, flags=re.UNICODE)
+name = re.sub(r"[\\/:*?\"<>|]", "_", name)
+name = re.sub(r"\s+", " ", name)
+name = re.sub(r"_+", "_", name)
+name = name.strip(" ._") or "video"
+print(name)
+PY
+)
 mkdir -p "$FOLDER_NAME"
 echo "目录: $FOLDER_NAME"
 

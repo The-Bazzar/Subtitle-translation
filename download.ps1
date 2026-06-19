@@ -19,7 +19,7 @@ download.ps1 — 下载 YouTube 视频 + 元数据 (不含字幕生成)
 
 说明:
   下载视频、缩略图 (PNG)、元数据、简介、标签。
-  功能对齐 download_and_sub.sh 的下载部分, 但不运行 WhisperX。
+  只负责下载，不运行 WhisperX。
 "@
     exit 0
 }
@@ -41,8 +41,19 @@ if ($LASTEXITCODE -ne 0) {
 }
 $VideoTitle = $VideoTitle.Trim()
 
-# 过滤非法文件名字符
-$FolderName = $VideoTitle -replace '[\\/:*?"<>|]', '_'
+# 生成跨 Windows/WSL 稳定的目录名。保留可读单词，移除容易乱码的 Unicode 标点。
+$FolderName = $VideoTitle.Normalize([Text.NormalizationForm]::FormKD)
+$FolderName = $FolderName -replace '[\u2018\u2019\u201A\u201B\u2032\u02BC]', ''
+$FolderName = $FolderName -replace '[\u201C\u201D\u201E\u201F\u2033]', ''
+$FolderName = $FolderName -replace '[\u2010-\u2015]', '-'
+$FolderName = $FolderName -replace '[^\p{L}\p{Nd}._ -]+', '_'
+$FolderName = $FolderName -replace '[\\/:*?"<>|]', '_'
+$FolderName = $FolderName -replace '\s+', ' '
+$FolderName = $FolderName -replace '_+', '_'
+$FolderName = $FolderName.Trim(" ._")
+if (-not $FolderName) {
+    $FolderName = "video"
+}
 Write-Host "视频下载目录: $FolderName" -ForegroundColor Gray
 
 New-Item -ItemType Directory -Force -Path $FolderName | Out-Null

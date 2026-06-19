@@ -41,6 +41,12 @@ param(
     [Parameter(HelpMessage = "Skip burn step (output subtitle files only)")]
     [switch]$SkipBurn,
 
+    [Parameter(HelpMessage = "Source language name/tag for prompts; empty uses WhisperX JSON language")]
+    [string]$SourceLang,
+
+    [Parameter(HelpMessage = "Target language name/tag for prompts and ISO 639 output suffix (default: TARGET_LANG or zh)")]
+    [string]$TargetLang,
+
     [Parameter(HelpMessage = "Print commands only, do not execute")]
     [switch]$DryRun,
 
@@ -48,7 +54,7 @@ param(
     [Parameter(HelpMessage = "Show help")]
     [switch]$Help,
 
-    [Parameter(HelpMessage = "Path to existing .zh-en.ass file (skip translation, use for burn)")]
+    [Parameter(HelpMessage = "Path to existing bilingual .ass file (skip translation, use for burn)")]
     [string]$ExistingAss,
 
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -96,6 +102,12 @@ if (-not $PSBoundParameters.ContainsKey('Oac')) {
 if (-not $PSBoundParameters.ContainsKey('Res')) {
     $Res = Merge-EnvDefault 'BURN_RES' '' ''
 }
+if (-not $PSBoundParameters.ContainsKey('SourceLang')) {
+    $SourceLang = Merge-EnvDefault 'SOURCE_LANG' '' ''
+}
+if (-not $PSBoundParameters.ContainsKey('TargetLang')) {
+    $TargetLang = Merge-EnvDefault 'TARGET_LANG' '' 'zh'
+}
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
@@ -105,12 +117,12 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
 用法: .\pipeline.ps1 <YouTube URL> [选项...]
 
-流程: 下载 → 语音识别 → 美化 → 术语库 → 翻译 → 硬压 (纯 Windows)
+流程: 下载 → JSON 语音识别 → JSON 美化 → 术语库 → 翻译 → 硬压 (纯 Windows)
   1. yt-dlp 下载视频 + 元数据
-  2. WhisperX 生成英文字幕
-  3. 场景检测美化时间码 (Netflix 规范)
-  4. glossary_builder.py 可选联网搜索 + LLM 生成术语知识库 (glossary.md)
-  5. LLM 长句拆分 + 翻译 + 双语校对 → .zh-en.ass
+  2. WhisperX 生成词级 JSON
+  3. 场景检测美化 JSON 时间轴 (Netflix 规范)
+  4. translate_srt.py 可选联网搜索 + LLM 生成术语知识库 (glossary.md)
+  5. 整句翻译 + 校对 + 分割 + 词级对轴 → .<source>-<target>.ass
   6. ffmpeg 硬压 → burned.mkv
 
 参数:
@@ -125,7 +137,9 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
   -SkipTranslate      跳过翻译
   -NoProofread        关闭校对
   -SkipBurn           跳过压制
-  -ExistingAss        已有 .zh-en.ass 路径
+  -SourceLang         源语言提示词标签；空则使用 WhisperX JSON language
+  -TargetLang         目标语言提示词标签；输出后缀会规范为 ISO 639 (默认 TARGET_LANG 或 zh)
+  -ExistingAss        已有双语 .ass 路径
   -DryRun             仅打印命令
   -h, -Help           帮助
 
@@ -140,8 +154,6 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
 $DownloadPs1  = Join-Path $ScriptDir "download.ps1"
 $WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
-$BeautifyPy   = Join-Path $ScriptDir "beautify_srt.py"
-$KnowledgePy  = Join-Path $ScriptDir "glossary_builder.py"
 $TranslatePy  = Join-Path $ScriptDir "translate_srt.py"
 $BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
 
@@ -151,6 +163,8 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "pipeline — Super Pipeline (纯 Windows)" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "URL:       $Url" -ForegroundColor Gray
+$SourceLangDisplay = if ($SourceLang) { $SourceLang } else { '(JSON language)' }
+Write-Host "Language:  $SourceLangDisplay → $TargetLang" -ForegroundColor Gray
 if ($ExistingAss)    { Write-Host "Existing:  $ExistingAss" -ForegroundColor Gray }
 $steps = @()
 if (-not $SkipDownload)  { $steps += "Download" }
@@ -201,11 +215,10 @@ if ($SkipDownload) {
 
 $VideoDir  = Split-Path $VideoPath -Parent
 $VideoBase = [System.IO.Path]::GetFileNameWithoutExtension($VideoPath)
-$SrtPath   = Join-Path $VideoDir "$VideoBase.srt"
-$BeautifiedSrt = Join-Path $VideoDir "$VideoBase.beautified.srt"
+$JsonPath   = Join-Path $VideoDir "$VideoBase.json"
+$BeautifiedJson = Join-Path $VideoDir "$VideoBase.beautified.json"
 $GlossaryPath = Join-Path $VideoDir "glossary.md"
-$AssPath   = if ($ExistingAss) { $ExistingAss } else { Join-Path $VideoDir "$VideoBase.zh-en.ass" }
-$TranslateSrc = if ((Test-Path $BeautifiedSrt) -and -not $SkipBeautify) { $BeautifiedSrt } else { $SrtPath }
+$TranslateSrc = if ((Test-Path $BeautifiedJson) -and -not $SkipBeautify) { $BeautifiedJson } else { $JsonPath }
 
 # ── 步骤 2: WhisperX 字幕 ─────────────────────────────────────────────────────
 
@@ -214,14 +227,25 @@ if ($SkipWhisper) {
     Write-Host "=============================================" -ForegroundColor Cyan
     Write-Host "SKIP: WhisperX 语音识别" -ForegroundColor Cyan
     Write-Host "=============================================" -ForegroundColor Cyan
-} elseif (Test-Path $SrtPath) {
+} elseif (Test-Path $JsonPath) {
     Write-Host ""
-    Write-Host "SKIP: WhisperX — $SrtPath 已存在" -ForegroundColor Gray
+    Write-Host "SKIP: WhisperX — $JsonPath 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
     Write-Host "Step 2/6: WhisperX" -ForegroundColor Cyan
     & $WhisperPs1 $VideoPath
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+if ($ExistingAss) {
+    $AssPath = $ExistingAss
+} else {
+    $LangArgs = @()
+    if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
+    $LangArgs += @('--target-lang', $TargetLang)
+    $AssOutput = & python $TranslatePy $JsonPath @LangArgs --print-output-path
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $AssPath = ($AssOutput | Where-Object { $_ -match '^OUTPUT_ASS=' } | Select-Object -Last 1) -replace '^OUTPUT_ASS=', ''
 }
 
 # ── 步骤 3: 美化时间码 ────────────────────────────────────────────────────────
@@ -231,19 +255,19 @@ if ($SkipBeautify) {
     Write-Host "=============================================" -ForegroundColor Cyan
     Write-Host "SKIP: 时间码美化" -ForegroundColor Cyan
     Write-Host "=============================================" -ForegroundColor Cyan
-} elseif (Test-Path $BeautifiedSrt) {
+} elseif (Test-Path $BeautifiedJson) {
     Write-Host ""
-    Write-Host "SKIP: 美化 — $BeautifiedSrt 已存在" -ForegroundColor Gray
+    Write-Host "SKIP: 美化 — $BeautifiedJson 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host "Step 3/6: Beautify" -ForegroundColor Cyan
-    & python $BeautifyPy $VideoPath $SrtPath -o $BeautifiedSrt
+    Write-Host "Step 3/6: Beautify JSON" -ForegroundColor Cyan
+    & python $TranslatePy $JsonPath --video $VideoPath --only-beautify
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 # ── 步骤 4: 术语知识库 ──────────────────────────────────────────────────────
 
-$TranslateSrc = if (Test-Path $BeautifiedSrt) { $BeautifiedSrt } else { $SrtPath }
+$TranslateSrc = if (Test-Path $BeautifiedJson) { $BeautifiedJson } else { $JsonPath }
 
 if ($SkipKnowledge) {
     Write-Host ""
@@ -256,7 +280,7 @@ if ($SkipKnowledge) {
 } else {
     Write-Host ""
     Write-Host "Step 4/6: Knowledge" -ForegroundColor Cyan
-    & python $KnowledgePy $TranslateSrc
+    & python $TranslatePy $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
@@ -272,21 +296,24 @@ if ($SkipTranslate) {
     Write-Host "SKIP: 翻译 — $AssPath 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host "Step 5/6: Translate" -ForegroundColor Cyan
+    Write-Host "Step 5/6: Translate ($SourceLangDisplay → $TargetLang)" -ForegroundColor Cyan
     if ($NoProofread) { $env:PROOFREAD = "0" }
-    & python $TranslatePy $TranslateSrc -o $AssPath
+    $LangArgs = @()
+    if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
+    $LangArgs += @('--target-lang', $TargetLang)
+    & python $TranslatePy $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 # ── 步骤 6: 硬压 ──────────────────────────────────────────────────────────────
 
 if ($SkipBurn) {
-    $FinalSrtPath = if (Test-Path $BeautifiedSrt) { $BeautifiedSrt } else { $SrtPath }
+    $FinalJsonPath = if (Test-Path $BeautifiedJson) { $BeautifiedJson } else { $JsonPath }
     Write-Host ""
     Write-Host "=============================================" -ForegroundColor Green
     Write-Host "Done! (burn skipped)" -ForegroundColor Green
     Write-Host "Video:   $VideoPath" -ForegroundColor Gray
-    Write-Host "SRT:     $FinalSrtPath" -ForegroundColor Gray
+    Write-Host "JSON:    $FinalJsonPath" -ForegroundColor Gray
     Write-Host "ASS:     $AssPath" -ForegroundColor Gray
     Write-Host "=============================================" -ForegroundColor Green
     exit 0

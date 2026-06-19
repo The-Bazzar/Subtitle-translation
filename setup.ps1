@@ -36,9 +36,9 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     Write-Host "  ffmpeg: $(ffmpeg -version 2>&1 | Select-Object -First 1)" -ForegroundColor Gray
 }
 
-# ── openai ─────────────────────────────────────────────────────────────────
-Write-Host ">>> 安装 openai..." -ForegroundColor Yellow
-uvx pip install openai
+# ── Python packages ────────────────────────────────────────────────────────
+Write-Host ">>> 安装 Python packages..." -ForegroundColor Yellow
+uvx pip install openai "langcodes[data]"
 
 # ── WhisperX (全局工具, CUDA 12.8) ─────────────────────────────────────────
 if (-not (Get-Command whisperx -ErrorAction SilentlyContinue)) {
@@ -56,7 +56,7 @@ Write-Host ""
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "验证安装" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
-python -c "import openai; print('  openai: OK')"
+python -c "import openai, langcodes; print('  openai/langcodes: OK')"
 Write-Host "  yt-dlp $(yt-dlp --version 2>&1 | Select-Object -First 1)" -ForegroundColor Gray
 Write-Host "  ffmpeg $(ffmpeg -version 2>&1 | Select-Object -First 1)" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Cyan

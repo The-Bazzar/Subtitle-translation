@@ -1,28 +1,29 @@
 ---
 name: knowledge
-description: 在美化后、翻译前建立 glossary.md，提升术语一致性和校对准确度
+description: 在 JSON 时间轴美化后、翻译前建立 glossary.md
 platform: Agent + Script
 ---
 
 # 术语知识库
 
-当前项目有两种建立 glossary 的方式：
-
-1. 自动脚本：[`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py)
-2. 外部 agent：由用户自己提供更强模型，人工审阅后落地 `glossary.md`
+目标：在翻译前建立 `glossary.md`，让翻译和校对共享术语、语气和背景判断。
 
 ## 推荐时机
 
-`beautify -> glossary -> translate`
-
-这样 glossary 能同时参与翻译后的校对阶段，通常一轮正式校对就够。
+`json beautify -> glossary -> translate`
 
 ## 自动脚本行为
 
+当前自动 glossary 已集成到 `translate_srt.py`：
+
+```bash
+python translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
+```
+
 输入：
 
-- 优先 `.beautified.srt`
-- 回退 `.srt`
+- 优先 `.beautified.json`
+- 回退 `.json`
 
 附加上下文：
 
@@ -42,7 +43,7 @@ platform: Agent + Script
 
 ## 外部 agent 工作要求
 
-1. 先读字幕主线内容，理解视频主题
+1. 先读 JSON 里的整句 transcript，理解视频主题
 2. 再结合 `.description`、`.tags.txt`、`.info.json`
 3. 如果可联网，优先搜索术语标准译法、背景概念、作者涉及的领域知识
 4. 如果当前没有 web_search / MCP，则离线总结，不要因此中断
@@ -57,6 +58,7 @@ platform: Agent + Script
 
 ## 重要约束
 
+- 已存在且非空的 `glossary.md` 不需要重新总结
 - 不要把“离线生成”“联网生成”之类元信息写进 glossary
 - glossary 是给后续翻译和校对 prompt 直接注入的
 - 不确定的术语宁可少写，也不要硬猜一堆

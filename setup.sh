@@ -43,9 +43,9 @@ else
     echo "  node: $(node --version)"
 fi
 
-# ── openai ─────────────────────────────────────────────────────────────────
-echo ">>> 安装 openai..."
-uvx pip install openai
+# ── Python packages ────────────────────────────────────────────────────────
+echo ">>> 安装 Python packages..."
+uvx pip install openai "langcodes[data]"
 
 # ── WhisperX (全局工具, CUDA 12.8) ─────────────────────────────────────────
 if ! command -v whisperx &>/dev/null; then
@@ -63,7 +63,7 @@ echo ""
 echo "============================================="
 echo "验证安装"
 echo "============================================="
-python -c "import openai; print('  openai: OK')"
+python -c "import openai, langcodes; print('  openai/langcodes: OK')"
 echo "  yt-dlp $(yt-dlp --version 2>&1 | head -1)"
 echo "  ffmpeg $(ffmpeg -version 2>&1 | head -1 | cut -d' ' -f3)"
 echo "  node $(node --version)"

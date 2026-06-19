@@ -7,7 +7,7 @@ param(
     [string]$Output,
 
     [Alias("s")]
-    [Parameter(HelpMessage = "Subtitle file to burn (e.g. .zh-en.ass)")]
+    [Parameter(HelpMessage = "Subtitle file to burn (e.g. .en-zh.ass)")]
     [string]$SubFile,
 
     [Parameter(HelpMessage = "Video encoder (default: hevc_nvenc)")]
@@ -52,7 +52,7 @@ mpv-burn.ps1 — 字幕硬压 (mpv 编码模式)
 参数:
   -VideoPath          视频文件路径 (必选, 位置 0)
   -Output             输出文件路径 (默认: 视频同目录 burned.mkv)
-  -SubFile            字幕文件路径 (如 .zh-en.ass 双语字幕)
+  -SubFile            字幕文件路径 (如 .en-zh.ass 双语 ASS)
   -Ovc                视频编码器 (默认: hevc_nvenc)
   -Ovcopts            视频编码器参数 (默认: qp=20)
   -Oac                音频编码器 (默认: aac)
@@ -61,8 +61,8 @@ mpv-burn.ps1 — 字幕硬压 (mpv 编码模式)
   -Help               显示此帮助
 
 示例:
-  .\mpv-burn.ps1 video.webm -SubFile video.zh-en.ass
-  .\mpv-burn.ps1 video.webm -SubFile video.zh-en.ass -Output result.mkv
+  .\mpv-burn.ps1 video.webm -SubFile video.en-zh.ass
+  .\mpv-burn.ps1 video.webm -SubFile video.en-zh.ass -Output result.mkv
   .\mpv-burn.ps1 video.webm -Ovc libx265 -Ovcopts crf=23
   .\mpv-burn.ps1 video.webm -SubFile sub.ass --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
   .\mpv-burn.ps1 video.webm -DryRun
