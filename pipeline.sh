@@ -211,15 +211,12 @@ else
     echo "============================================="
     echo ""
 
-    DOWNLOAD_OUTPUT=$(bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1) || {
-        echo "$DOWNLOAD_OUTPUT"
-        echo ""
-        echo "Error: download.sh failed." >&2
-        exit 1
-    }
-    echo "$DOWNLOAD_OUTPUT"
-
-    VIDEO_PATH=$(echo "$DOWNLOAD_OUTPUT" | grep '^OUTPUT_VIDEO=' | tail -1 | cut -d= -f2-)
+    VIDEO_PATH=""
+    while IFS= read -r line; do
+        echo "$line"
+        [[ "$line" =~ ^OUTPUT_VIDEO=(.+) ]] && VIDEO_PATH="${BASH_REMATCH[1]}"
+    done < <(bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1)
+    DOWNLOAD_EXIT=$?
 
     if [ -z "$VIDEO_PATH" ] || [ ! -f "$VIDEO_PATH" ]; then
         echo ""
@@ -421,3 +418,6 @@ if [ -n "${ASS_PATH:-}" ] && [ -f "$ASS_PATH" ]; then
     echo "双语 ASS: $ASS_PATH"
 fi
 echo "============================================="
+
+
+

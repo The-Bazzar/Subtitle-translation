@@ -182,18 +182,16 @@ if ($SkipDownload) {
 } else {
     Write-Host ""
     Write-Host ">>> Step 1/6: Download" -ForegroundColor Cyan
-    $DownloadOutput = & $DownloadPs1 $Url 2>&1
+    $VideoPath = $null
+    & $DownloadPs1 $Url 2>&1 | ForEach-Object {
+        $_
+        if ($_ -match '^OUTPUT_VIDEO=(.+)$') {
+            $VideoPath = $Matches[1].Trim()
+        }
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Error: download.ps1 failed (exit code: $LASTEXITCODE)" -ForegroundColor Red
         exit $LASTEXITCODE
-    }
-    Write-Host ($DownloadOutput -join "`n")
-
-    $VideoPath = $null
-    foreach ($line in $DownloadOutput) {
-        if ($line -match '^OUTPUT_VIDEO=(.+)$') {
-            $VideoPath = $Matches[1].Trim()
-        }
     }
     if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
         Write-Host "Error: Failed to locate downloaded video." -ForegroundColor Red
@@ -330,3 +328,4 @@ Write-Host "Pipeline complete!" -ForegroundColor Green
 Write-Host "Video:   $VideoPath" -ForegroundColor Gray
 Write-Host "ASS:     $AssPath" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Green
+
