@@ -1,9 +1,7 @@
 .env
+.idea
+__pycache__
 providers.json
-/*/
-!/.claude/
-/.claude/*
-!/.claude/skills/
 cookies.txt
 batch-result.txt
 proofread_prompt.md
