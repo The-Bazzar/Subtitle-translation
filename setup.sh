@@ -4,6 +4,9 @@
 # =============================================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
+
 echo "============================================="
 echo "setup — 字幕流水线环境安装 (Linux/WSL)"
 echo "============================================="
@@ -43,19 +46,51 @@ else
     echo "  node: $(node --version)"
 fi
 
-# ── Python packages ────────────────────────────────────────────────────────
-echo ">>> 安装 Python packages..."
-uvx pip install openai "langcodes[data]"
+# ── Python venv ────────────────────────────────────────────────────────────
+echo ">>> 创建/复用项目 .venv..."
+cd "$SCRIPT_DIR"
+uv venv .venv --python 3.13.12
 
-# ── WhisperX (全局工具, CUDA 12.8) ─────────────────────────────────────────
-if ! command -v whisperx &>/dev/null; then
-    echo ">>> 安装 WhisperX (CUDA 12.8)..."
-    uv tool install git+https://github.com/m-bain/whisperx.git \
-        --with "torch==2.8.0+cu128" \
-        --with "torchaudio==2.8.0+cu128" \
-        --python 3.13.12
+# ── PyTorch backend ────────────────────────────────────────────────────────
+TORCH_BACKEND="${TORCH_BACKEND:-auto}"
+case "$TORCH_BACKEND" in
+    auto)
+        if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+            TORCH_BACKEND="cuda128"
+            TORCH_REASON="detected NVIDIA GPU"
+        else
+            TORCH_BACKEND="cpu"
+            TORCH_REASON="nvidia-smi not available"
+        fi
+        ;;
+    cuda128)
+        TORCH_REASON="configured"
+        ;;
+    cpu)
+        TORCH_REASON="configured"
+        ;;
+    *)
+        echo "Error: TORCH_BACKEND must be auto, cuda128, or cpu (got: $TORCH_BACKEND)" >&2
+        exit 1
+        ;;
+esac
+
+# ── Python packages ────────────────────────────────────────────────────────
+echo ">>> 同步 pyproject.toml Python packages (asr)..."
+if ! uv sync --inexact --extra asr; then
+    echo "Error: uv sync failed." >&2
+    exit 1
+fi
+
+echo ">>> 安装 PyTorch backend: $TORCH_BACKEND ($TORCH_REASON)"
+if [ "$TORCH_BACKEND" = "cuda128" ]; then
+    uv pip install --python "$SCRIPT_DIR/.venv/bin/python" \
+        torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
+        --index-url https://download.pytorch.org/whl/cu128
 else
-    echo "  whisperx: $(whisperx --version 2>&1 || echo installed)"
+    uv pip install --python "$SCRIPT_DIR/.venv/bin/python" \
+        torch==2.8.0 torchaudio==2.8.0 \
+        --index-url https://download.pytorch.org/whl/cpu
 fi
 
 # ── 验证 ────────────────────────────────────────────────────────────────────
@@ -63,7 +98,8 @@ echo ""
 echo "============================================="
 echo "验证安装"
 echo "============================================="
-python -c "import openai, langcodes; print('  openai/langcodes: OK')"
+"$SCRIPT_DIR/.venv/bin/python" -c "import openai, langcodes; from tavily import TavilyClient; print('  openai/langcodes/tavily: OK')"
+"$SCRIPT_DIR/.venv/bin/whisperx" --version 2>&1 | head -1 | sed 's/^/  whisperx: /' || echo "  whisperx: installed"
 echo "  yt-dlp $(yt-dlp --version 2>&1 | head -1)"
 echo "  ffmpeg $(ffmpeg -version 2>&1 | head -1 | cut -d' ' -f3)"
 echo "  node $(node --version)"

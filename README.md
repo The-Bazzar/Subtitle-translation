@@ -71,11 +71,18 @@ video -> json -> beautified.json -> glossary.md -> <source>.proofread.ass / <tar
 
 入口只接受 WhisperX JSON：
 
+```powershell
+.\.venv\Scripts\python.exe translate_srt.py video.json --video video.webm
+.\.venv\Scripts\python.exe translate_srt.py video.json --video video.webm --only-beautify
+.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang ja
+.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.webm -o custom.en-ja.ass
+```
+
 ```bash
-python3 translate_srt.py video.json --video video.webm
-python3 translate_srt.py video.json --video video.webm --only-beautify
-python3 translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang ja
-python3 translate_srt.py video.beautified.json --video video.webm -o custom.en-ja.ass
+./.venv/bin/python translate_srt.py video.json --video video.webm
+./.venv/bin/python translate_srt.py video.json --video video.webm --only-beautify
+./.venv/bin/python translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang ja
+./.venv/bin/python translate_srt.py video.beautified.json --video video.webm -o custom.en-ja.ass
 ```
 
 输出：
@@ -90,7 +97,7 @@ python3 translate_srt.py video.beautified.json --video video.webm -o custom.en-j
 
 `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名，例如 `en`、`en-US`、`Japanese`、`Chinese Simplified`。输出文件后缀会通过 `langcodes` 规范为 ISO 639 代码，例如 `English -> en`、`Japanese -> ja`。未显式设置 `SOURCE_LANG` 时，脚本使用 WhisperX JSON 中的 `language`；`TARGET_LANG` 默认 `zh`。
 
-翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。分割 AI 必须返回脚本内置协议要求的 JSON 数组；如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。
+翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON array，返回也必须是 JSON array；对象内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。
 
 `translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。
 
@@ -109,7 +116,7 @@ DEEPSEEK_API_KEY=
 |---|---|
 | `WHISPER_MODEL` | WhisperX 模型，默认 `large-v3-turbo` |
 | `WHISPER_ALIGN_MODEL` | 对齐模型，空则自动选择 |
-| `WHISPER_DEVICE` | `cuda` / `cpu` |
+| `WHISPER_DEVICE` | `cuda` / `cpu`；留空则跟随 `TORCH_BACKEND` 自动推导 |
 | `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
 | `TRANSLATE_PROVIDER` | 翻译后端，必填 |
@@ -129,17 +136,21 @@ DEEPSEEK_API_KEY=
 | 工具 | 用途 |
 |---|---|
 | `yt-dlp` | YouTube 视频/元数据下载 |
-| `uv` | 安装 WhisperX |
+| `uv` | 按 `pyproject.toml` 创建 `.venv`，并按 `.env` 安装 PyTorch 后端 |
 | `whisperx` | 语音识别 + 词级对齐 JSON |
 | `ffmpeg` / `ffprobe` | 音频提取、场景检测、字幕硬压 |
-| `python3` | 运行 `translate_srt.py` |
+| `python` | Windows/WSL 下由 setup 创建 `.venv` 运行 `translate_srt.py` |
 | `openai` Python 包 | LLM 调用 |
 | `langcodes[data]` Python 包 | 语言名/标签规范为 ISO 639 输出后缀 |
-| `TAVILY_API_KEY` | glossary 可选联网搜索；脚本直接调用 Tavily HTTP API |
+| `tavily-python` | glossary 可选联网搜索 SDK |
+| `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |
 
 ## 注意事项
 
 - `.env`、`providers.json`、`cookies.txt`、`split_prompt.md` 已 gitignored
+- 不要把 Python 包安装到系统环境；Windows 运行 `.\setup.ps1`，Linux/WSL 运行 `./setup.sh`，它们会创建/更新仓库 `.venv`
+- 运行 pipeline 或任一 `.py` 相关脚本前必须先完成 setup；脚本统一使用项目 `.venv`，不调用全局 `python` / `python3`
+- `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
 - `TRANSLATE_PROVIDER` 必须配置，否则翻译和 glossary 会报错
 - WhisperX 首次运行会下载模型

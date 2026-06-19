@@ -17,7 +17,7 @@ platform: Agent + Script
 当前自动 glossary 已集成到 `translate_srt.py`：
 
 ```bash
-python translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
+./.venv/bin/python translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
 ```
 
 输入：

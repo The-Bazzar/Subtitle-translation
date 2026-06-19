@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 """
 batch.py — 批量字幕流水线 (Linux 并行)
 
 用法:
-  python3 batch.py "URL1" "URL2" "URL3" [选项...]
+  ./.venv/bin/python batch.py "URL1" "URL2" "URL3" [选项...]
 
 说明:
   对多个 YouTube 链接并行执行 pipeline.sh，最大化利用 CPU/GPU/网络资源。

@@ -109,6 +109,11 @@ if (-not $PSBoundParameters.ContainsKey('TargetLang')) {
     $TargetLang = Merge-EnvDefault 'TARGET_LANG' '' 'zh'
 }
 
+$PythonExe = Get-EnvValue 'PYTHON_PATH_WIN' ''
+if (-not $PythonExe) {
+    $PythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+}
+
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
 if ($Help -or (-not $Url)) {
@@ -157,6 +162,11 @@ $WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
 $TranslatePy  = Join-Path $ScriptDir "translate_srt.py"
 $BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
 
+if (-not (Test-Path $PythonExe -PathType Leaf)) {
+    Write-Host "Error: Python venv not found. Run .\setup.ps1 first, or set PYTHON_PATH_WIN." -ForegroundColor Red
+    exit 1
+}
+
 # ── 启动信息 ──────────────────────────────────────────────────────────────────
 
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -196,16 +206,19 @@ if ($SkipDownload) {
 } else {
     Write-Host ""
     Write-Host ">>> Step 1/6: Download" -ForegroundColor Cyan
-    $DownloadOk = $true
     $VideoPath = $null
     & $DownloadPs1 $Url 2>&1 | ForEach-Object {
         $_
         if ($_ -match '^OUTPUT_VIDEO=(.+)$') {
             $VideoPath = $Matches[1].Trim()
         }
-        if ($_ -match '^Error:') { $DownloadOk = $false }
     }
-    if (-not $DownloadOk -or -not $VideoPath -or -not (Test-Path $VideoPath)) {
+    $DownloadExitCode = $LASTEXITCODE
+    if ($DownloadExitCode -ne 0) {
+        Write-Host "Error: Download step failed (exit code $DownloadExitCode)." -ForegroundColor Red
+        exit $DownloadExitCode
+    }
+    if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
         Write-Host "Error: Failed to locate downloaded video." -ForegroundColor Red
         exit 1
     }
@@ -243,7 +256,7 @@ if ($ExistingAss) {
     $LangArgs = @()
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
-    $AssOutput = & python $TranslatePy $JsonPath @LangArgs --print-output-path
+    $AssOutput = & $PythonExe $TranslatePy $JsonPath @LangArgs --print-output-path
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $AssPath = ($AssOutput | Where-Object { $_ -match '^OUTPUT_ASS=' } | Select-Object -Last 1) -replace '^OUTPUT_ASS=', ''
 }
@@ -261,7 +274,7 @@ if ($SkipBeautify) {
 } else {
     Write-Host ""
     Write-Host "Step 3/6: Beautify JSON" -ForegroundColor Cyan
-    & python $TranslatePy $JsonPath --video $VideoPath --only-beautify
+    & $PythonExe $TranslatePy $JsonPath --video $VideoPath --only-beautify
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
@@ -280,7 +293,7 @@ if ($SkipKnowledge) {
 } else {
     Write-Host ""
     Write-Host "Step 4/6: Knowledge" -ForegroundColor Cyan
-    & python $TranslatePy $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
+    & $PythonExe $TranslatePy $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
@@ -301,7 +314,7 @@ if ($SkipTranslate) {
     $LangArgs = @()
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
-    & python $TranslatePy $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
+    & $PythonExe $TranslatePy $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 

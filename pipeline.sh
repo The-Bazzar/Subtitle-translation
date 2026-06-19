@@ -61,6 +61,7 @@ if [ -f "$ENV_FILE" ]; then
             TRANSLATE_MODEL)          TRANSLATE_MODEL="${TRANSLATE_MODEL:-$value}" ;;
             SOURCE_LANG)              SOURCE_LANG="${SOURCE_LANG:-$value}" ;;
             TARGET_LANG)              TARGET_LANG="${TARGET_LANG:-$value}" ;;
+            PYTHON_PATH_LINUX)        PYTHON_PATH_LINUX="${PYTHON_PATH_LINUX:-$value}" ;;
             PIPELINE_SKIP_DOWNLOAD)   PIPELINE_SKIP_DOWNLOAD="${PIPELINE_SKIP_DOWNLOAD:-$value}" ;;
             PIPELINE_SKIP_WHISPER)    PIPELINE_SKIP_WHISPER="${PIPELINE_SKIP_WHISPER:-$value}" ;;
             PIPELINE_SKIP_BEAUTIFY)   PIPELINE_SKIP_BEAUTIFY="${PIPELINE_SKIP_BEAUTIFY:-$value}" ;;
@@ -82,6 +83,15 @@ if [ -n "$SOURCE_LANG" ]; then
 fi
 if [ -z "$TRANSLATE_PROVIDER" ]; then
     echo "Error: TRANSLATE_PROVIDER is not set. Please configure it in .env or environment." >&2
+    exit 1
+fi
+
+if [ -n "${PYTHON_PATH_LINUX:-}" ]; then
+    PYTHON_BIN="$PYTHON_PATH_LINUX"
+elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
+else
+    echo "Error: Python venv not found. Run ./setup.sh first, or set PYTHON_PATH_LINUX." >&2
     exit 1
 fi
 
@@ -215,10 +225,16 @@ else
     echo "============================================="
     echo ""
 
-    while IFS= read -r line; do
-        echo "$line"
-        [[ "$line" =~ ^OUTPUT_VIDEO=(.+) ]] && VIDEO_PATH="${BASH_REMATCH[1]}"
-    done < <(bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1)
+    VIDEO_PATH=""
+    DOWNLOAD_LOG="$(mktemp)"
+    if ! bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1 | tee "$DOWNLOAD_LOG"; then
+        echo ""
+        echo "Error: Download step failed." >&2
+        rm -f "$DOWNLOAD_LOG"
+        exit 1
+    fi
+    VIDEO_PATH="$(awk -F= '/^OUTPUT_VIDEO=/{print substr($0, index($0, "=") + 1)}' "$DOWNLOAD_LOG" | tail -n 1)"
+    rm -f "$DOWNLOAD_LOG"
 
     if [ -z "$VIDEO_PATH" ] || [ ! -f "$VIDEO_PATH" ]; then
         echo ""
@@ -269,7 +285,7 @@ if [ -n "${EXISTING_ASS:-}" ]; then
     ASS_PATH="$EXISTING_ASS"
 else
     ASS_PATH="$(
-        python "$TRANSLATE_SCRIPT" "$JSON_PATH" "${LANG_ARGS[@]}" --print-output-path \
+        "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$JSON_PATH" "${LANG_ARGS[@]}" --print-output-path \
         | awk -F= '/^OUTPUT_ASS=/{print $2}' \
         | tail -n 1
     )"
@@ -297,7 +313,7 @@ else
         exit 1
     fi
 
-    python "$TRANSLATE_SCRIPT" "$JSON_PATH" --video "$VIDEO_PATH" --only-beautify "${BEAUTIFY_ARGS[@]}"
+    "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$JSON_PATH" --video "$VIDEO_PATH" --only-beautify "${BEAUTIFY_ARGS[@]}"
     echo ""
 fi
 
@@ -324,7 +340,7 @@ else
     echo "pipeline — 步骤 4/6: AI Agent 生成术语知识库 → glossary.md"
     echo "============================================="
     echo ""
-    python "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --only-glossary --skip-beautify
+    "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --only-glossary --skip-beautify
     echo ""
 fi
 
@@ -354,7 +370,7 @@ else
     if [ "${PROOFREAD:-1}" = "0" ]; then
         export PROOFREAD=0
     fi
-    python "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --skip-beautify --skip-knowledge \
+    "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --skip-beautify --skip-knowledge \
         "${LANG_ARGS[@]}"
 
     echo ""
@@ -406,7 +422,4 @@ if [ -n "${ASS_PATH:-}" ] && [ -f "$ASS_PATH" ]; then
     echo "双语 ASS: $ASS_PATH"
 fi
 echo "============================================="
-
-
-
 

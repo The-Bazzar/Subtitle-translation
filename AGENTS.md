@@ -121,8 +121,9 @@ video -> json -> beautified.json -> glossary.md
 - 顺序固定为：整句翻译 -> AI 分割 -> 词级对轴 -> split event 校对
 - 翻译使用整句 segment，避免先分割导致上下文破碎
 - 分割使用未校对源语言文本匹配 WhisperX words，校对发生在 split event 上
-- 分割 AI 必须返回严格 JSON array，代码只接受 legacy keys: `id`, `en`, `zh`
-- legacy key `en` 表示源语言文本，`zh` 表示目标语言文本；这是内部协议名，不代表只能英译中
+- 翻译、分割、校对的 user prompt 都是 JSON array；glossary 和 description 的 user prompt 是 JSON object；远端 LLM 必须只返回 JSON
+- 翻译、分割、校对返回严格 JSON array，使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `id`, `en`, `zh`
+- 语言代码 key 由 `${SOURCE_LANG_CODE}` / `${TARGET_LANG_CODE}` 注入；本地解析只匹配这些 ISO code，不匹配完整语言名称或 `source` / `target`
 - 对轴时只用源语言 split 的首尾 token 匹配 `words[]`；匹配失败则整句回退到 beautified 时间轴，禁止本地强切
 - token normalize 会忽略词内 dash/hyphen，例如 `non-existent` 与 `nonexistent` 可匹配；带空格的 dash 仍作为分隔
 - `--no-split` 只跳过 AI 分割，仍会输出 SRT/ASS
@@ -166,7 +167,7 @@ ${TARGET_LANG_CODE}
 |------|------|
 | `WHISPER_MODEL` | WhisperX ASR 模型，默认 `large-v3-turbo` |
 | `WHISPER_ALIGN_MODEL` | WhisperX 对齐模型，空则自动 |
-| `WHISPER_DEVICE` | `cuda` / `cpu` |
+| `WHISPER_DEVICE` | `cuda` / `cpu`；留空则跟随 `TORCH_BACKEND` 自动推导 |
 | `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
 | `TRANSLATE_PROVIDER` | 翻译后端：`openrouter` / `deepseek` / `gemini` |
@@ -199,7 +200,7 @@ ${TARGET_LANG_CODE}
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 ./pipeline.sh "URL" -- --scene-threshold 0.12 --snap-frames 10
-python3 batch.py "URL1" "URL2"
+./.venv/bin/python batch.py "URL1" "URL2"
 ```
 
 ### Manual Steps
@@ -207,18 +208,18 @@ python3 batch.py "URL1" "URL2"
 ```powershell
 .\download.ps1 "URL"
 .\whisper.ps1 "video.webm"
-python translate_srt.py video.json --video video.webm --only-beautify
-python translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
-python translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang zh
+.\.venv\Scripts\python.exe translate_srt.py video.json --video video.webm --only-beautify
+.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
+.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang zh
 .\ffmpeg-burn.ps1 "video.webm" -SubFile "video.en-zh.ass"
 ```
 
 ```bash
 ./download.sh "URL"
 ./whisper.sh "video.webm"
-python3 translate_srt.py video.json --video video.webm --only-beautify
-python3 translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
-python3 translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang zh
+./.venv/bin/python translate_srt.py video.json --video video.webm --only-beautify
+./.venv/bin/python translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
+./.venv/bin/python translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang zh
 ./ffmpeg-burn.sh "video.webm" --sub-file "video.en-zh.ass"
 ```
 
@@ -227,13 +228,14 @@ python3 translate_srt.py video.beautified.json --video video.webm --source-lang 
 | 工具 | 用途 |
 |------|------|
 | `yt-dlp` | YouTube 视频/元数据下载 |
-| `uv` | 安装 WhisperX 和 Python 包 |
+| `uv` | 按 `pyproject.toml` 创建 `.venv`，并按 `.env` 安装 PyTorch 后端 |
 | `whisperx` | ASR + word alignment JSON |
 | `ffmpeg` / `ffprobe` | 音频提取、场景检测、硬压 |
-| `python3` | `translate_srt.py` |
+| `python` | Windows/WSL 下由 setup 创建 `.venv` 运行 `translate_srt.py` |
 | `openai` | LLM 调用 |
 | `langcodes[data]` | 语言名/标签规范为 ISO 639 输出后缀 |
-| `tavily-python` | glossary 联网搜索，可选 |
+| `tavily-python` | glossary 可选联网搜索 SDK |
+| `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |
 
 ## Working Notes
 

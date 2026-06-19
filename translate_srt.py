@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 translate_srt.py - JSON-first subtitle pipeline.
 
@@ -23,6 +22,11 @@ import time
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from typing import Optional
+
+import langcodes
+import language_data  # noqa: F401
+from openai import OpenAI
+from tavily import TavilyClient
 
 
 # --- Data model ---------------------------------------------------------------
@@ -265,15 +269,12 @@ class LLMConfig:
         return self.model or self.cfg().get("default_model", "")
 
     def _client(self):
-        from openai import OpenAI
-
         provider_cfg = self.cfg()
         return OpenAI(
             base_url=provider_cfg["url"],
             api_key=self.resolve_key(),
             default_headers=provider_cfg.get("extra_headers", {}),
         )
-
 
 @dataclass
 class BeautifyOptions:
@@ -310,26 +311,19 @@ def iso_639_suffix(value: str, fallback: str) -> str:
     if not raw:
         return fallback
 
-    try:
-        import langcodes
-
-        for candidate in (raw, raw.replace("_", "-")):
-            try:
-                standardized = langcodes.standardize_tag(candidate)
-                language = langcodes.Language.get(standardized)
-                if language.is_valid() and language.language and language.language != "und":
-                    return safe_lang_suffix(language.language, fallback)
-            except Exception:
-                pass
+    for candidate in (raw, raw.replace("_", "-")):
         try:
-            import language_data  # noqa: F401
-
-            language = langcodes.find(raw)
-            if language.language and language.language != "und":
+            standardized = langcodes.standardize_tag(candidate)
+            language = langcodes.Language.get(standardized)
+            if language.is_valid() and language.language and language.language != "und":
                 return safe_lang_suffix(language.language, fallback)
         except Exception:
             pass
-    except ImportError:
+    try:
+        language = langcodes.find(raw)
+        if language.language and language.language != "und":
+            return safe_lang_suffix(language.language, fallback)
+    except Exception:
         pass
 
     aliases = {
@@ -367,6 +361,61 @@ def iso_639_suffix(value: str, fallback: str) -> str:
     return aliases.get(lowered) or safe_lang_suffix(raw, fallback)
 
 
+def language_prompt_name(value: str, fallback: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return fallback
+
+    aliases = {
+        "en": "English",
+        "eng": "English",
+        "ja": "Japanese",
+        "jpn": "Japanese",
+        "ko": "Korean",
+        "kor": "Korean",
+        "zh": "Chinese",
+        "zh-hans": "Simplified Chinese",
+        "zh-cn": "Simplified Chinese",
+        "zh-hant": "Traditional Chinese",
+        "zh-tw": "Traditional Chinese",
+        "cmn": "Mandarin Chinese",
+        "fr": "French",
+        "fra": "French",
+        "fre": "French",
+        "de": "German",
+        "deu": "German",
+        "ger": "German",
+        "es": "Spanish",
+        "spa": "Spanish",
+        "it": "Italian",
+        "ita": "Italian",
+        "pt": "Portuguese",
+        "por": "Portuguese",
+        "ru": "Russian",
+        "rus": "Russian",
+    }
+    lowered = re.sub(r"\s+", " ", raw.lower().replace("_", "-"))
+    if lowered in aliases:
+        return aliases[lowered]
+
+    for candidate in (raw, raw.replace("_", "-")):
+        try:
+            standardized = langcodes.standardize_tag(candidate)
+            language = langcodes.Language.get(standardized)
+            if language.is_valid() and language.language and language.language != "und":
+                return language.display_name("en")
+        except Exception:
+            pass
+    try:
+        language = langcodes.find(raw)
+        if language.language and language.language != "und":
+            return language.display_name("en")
+    except Exception:
+        pass
+
+    return raw
+
+
 def render_prompt_template(text: str, ctx: TranscriptContext) -> str:
     return render_language_template(
         text,
@@ -385,14 +434,33 @@ def render_language_template(
     target_lang_code: str = "",
 ) -> str:
     replacements = {
-        "${SOURCE_LANG}": source_lang,
-        "${TARGET_LANG}": target_lang,
+        "${SOURCE_LANG}": language_prompt_name(source_lang, "source language"),
+        "${TARGET_LANG}": language_prompt_name(target_lang, "target language"),
         "${SOURCE_LANG_CODE}": source_lang_code or iso_639_suffix(source_lang, "source"),
         "${TARGET_LANG_CODE}": target_lang_code or iso_639_suffix(target_lang, "target"),
     }
     for key, value in replacements.items():
         text = text.replace(key, value)
     return text
+
+
+def normalized_response_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def response_key_candidates(ctx: TranscriptContext, side: str) -> set[str]:
+    if side == "source":
+        values = [ctx.source_lang_code]
+    else:
+        values = [ctx.target_lang_code]
+    return {normalized_response_key(value) for value in values if value}
+
+
+def get_language_keyed_value(item: dict, candidates: set[str]):
+    for key, value in item.items():
+        if normalized_response_key(str(key)) in candidates:
+            return value
+    return None
 
 
 _BUILTIN_PROVIDERS = {
@@ -427,7 +495,8 @@ _providers_cache = None
 _TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
 
 Rules:
-- Translate each numbered transcript segment to natural, fluent ${TARGET_LANG} subtitles.
+- The user message is a JSON array of transcript segment objects.
+- Translate each object to natural, fluent ${TARGET_LANG} subtitles.
 - The input items are complete transcript sentences/segments, not subtitle fragments.
 - Preserve meaning and tone. Do not omit, merge, split, or add items.
 - Keep proper nouns, brand names, and technical terms in original form unless a standard ${TARGET_LANG} translation exists.
@@ -446,41 +515,69 @@ Step 2 - Check the ${TARGET_LANG} translation against the corrected source:
 - Follow the glossary if provided.
 - Follow natural subtitle formatting for ${TARGET_LANG}.
 
-Do not merge, split, reorder, add, or remove events. Timing has already been aligned and must not be changed. Return exactly N pairs."""
+Do not merge, split, reorder, add, or remove events. Timing has already been aligned and must not be changed."""
 
 _SPLIT_PROMPT_FALLBACK = r"""Style preference:
 - Split only at natural pause points such as commas, clause boundaries, conjunctions, and breath groups.
 - Prefer fewer, more coherent subtitle events over many tiny fragments.
 - Keep each split event readable as a complete thought."""
 
-_SPLIT_FORMAT = """MANDATORY OUTPUT FORMAT:
-You must output machine-parseable JSON only. No Markdown. No explanation.
+_JSON_FORMAT = """MANDATORY JSON PROTOCOL:
+The user message is JSON. Your response must be machine-parseable JSON only.
+No Markdown. No explanation. No prose before or after the JSON.
+These rules apply to this entire LLM stage and override any conflicting style preference.
 
 ABSOLUTE JSON RULES:
-1. The first character must be `[` and the last character must be `]`.
-2. Every key and every string value must use double quotes `"`.
-3. Never use single quotes `'` for keys, strings, arrays, or objects.
-4. Apostrophes inside source-language words are ordinary characters: write `"don't"` and `"I've"`, not `'don't'`.
-5. Escape literal double quotes as `\"` and literal backslashes as `\\`.
-6. No trailing commas.
-7. Return one object per input id. Preserve the exact input id. Do not renumber.
-8. Each object must have exactly these legacy keys: "id", "en", "zh".
-9. "en" and "zh" must be arrays with the same length.
-10. Split by adding multiple strings inside "en" and "zh".
-11. Preserve every source-language word in order. Do not rewrite.
+1. Every key and every string value must use double quotes `"`.
+2. Never use single quotes `'` for keys, strings, arrays, or objects.
+3. Apostrophes inside natural-language words are ordinary characters: write `"don't"` and `"I've"`, not `'don't'`.
+4. Escape literal double quotes as `\"` and literal backslashes as `\\`.
+5. No trailing commas.
+6. Process only the JSON in the user message.
 
-BAD, INVALID, WILL BE REJECTED:
-[{'id': 12, 'en': ['wrong quotes'], 'zh': ['错误引号']}]
+Never imitate Python dict syntax. Single-quoted pseudo-JSON will be rejected."""
+
+_JSON_ARRAY_FORMAT = """Return a JSON array.
+The first response character must be `[` and the last response character must be `]`.
+Return one object per input object.
+Preserve each input object's exact `id`. Do not renumber."""
+
+_JSON_OBJECT_FORMAT = """Return a JSON object.
+The first response character must be `{` and the last response character must be `}`."""
+
+_TRANSLATE_FORMAT = """
+TRANSLATION RESPONSE FORMAT:
+Return exactly these keys in each object: "id", "${TARGET_LANG_CODE}".
+"${TARGET_LANG_CODE}" is the ${TARGET_LANG} translation string.
 
 GOOD:
 [
-  {"id": 12, "en": ["Dystopian cyberpunk worlds filled with angels,", "biblical imagery, and esoteric ideas."], "zh": ["反乌托邦赛博朋克世界 充满天使", "圣经意象和秘传思想"]},
-  {"id": 13, "en": ["Short sentence."], "zh": ["短句"]}
-]"""
+  {"id": 1, "${TARGET_LANG_CODE}": "<target translation>"},
+  {"id": 2, "${TARGET_LANG_CODE}": "<target translation>"}
+]
+
+The placeholder values above are format markers only. In your actual response, replace them with translated text."""
+
+_SPLIT_FORMAT = """SPLIT RESPONSE FORMAT:
+Return exactly these keys in each object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}".
+"${SOURCE_LANG_CODE}" is the ${SOURCE_LANG} split text array. "${TARGET_LANG_CODE}" is the ${TARGET_LANG} split text array.
+Split by adding multiple strings inside "${SOURCE_LANG_CODE}" and "${TARGET_LANG_CODE}".
+Preserve every source-language word in order. Do not rewrite.
+
+GOOD:
+[
+  {"id": 1, "${SOURCE_LANG_CODE}": ["<source part 1>", "<source part 2>"], "${TARGET_LANG_CODE}": ["<target part 1>", "<target part 2>"]},
+  {"id": 2, "${SOURCE_LANG_CODE}": ["<source full sentence>"], "${TARGET_LANG_CODE}": ["<target full sentence>"]}
+]
+
+The placeholder values above are format markers only. In your actual response, replace them with split text from the provided segment."""
 
 _KNOWLEDGE_PROMPT = """You are a terminology expert. Analyze the ${SOURCE_LANG} transcript and metadata to build a glossary for ${TARGET_LANG} subtitle translation.
 
-Output format:
+Return a JSON object with exactly this key:
+{"markdown": "<glossary markdown>"}
+
+The markdown value must follow this format:
 # 术语知识库 — <title>
 
 ## 背景
@@ -503,17 +600,16 @@ Rules:
 - If uncertain, mark with (?).
 - Keep under 100 lines."""
 
-_TRANSLATE_FORMAT = "\n\nRespond with numbered lines only:\n[1] translation\n[2] translation"
-_PROOFREAD_FORMAT = """
-
-Return ONLY a valid JSON array. Do not wrap it in Markdown.
-The array length must equal the input count. Each item must have exactly these keys:
+STRUCTURED_MAX_TOKENS = 32768
+_PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
+Return exactly these keys in each object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}".
 [
-  {"id": 1, "en": "corrected source text", "zh": "corrected target translation"},
-  {"id": 2, "en": "corrected source text", "zh": "corrected target translation"}
+  {"id": 1, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>"},
+  {"id": 2, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>"}
 ]
 
-Do not output SRC: or TGT: labels inside values. Do not use separators like |||.
+The placeholder values above are format markers only. In your actual response, replace them with corrected text from the provided subtitle events.
+Do not output Source: or Target: labels inside values. Do not use separators like |||.
 Do not merge, split, or reorder items."""
 
 
@@ -955,25 +1051,9 @@ def read_metadata(ctx: TranscriptContext) -> tuple[str, str, list[str]]:
 
 
 def tavily_search(query: str, api_key: str, max_results: int = 5) -> list[dict]:
-    import urllib.request
-
-    body = json.dumps(
-        {
-            "query": query,
-            "max_results": max_results,
-            "search_depth": "basic",
-            "api_key": api_key,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.tavily.com/search",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        client = TavilyClient(api_key=api_key)
+        data = client.search(query=query, max_results=max_results, search_depth="basic")
         return data.get("results", [])
     except Exception as e:
         print(f"  Warning: Tavily search failed: {e}", file=sys.stderr)
@@ -1016,32 +1096,25 @@ def build_glossary(
             for r in unique[:10]
         )
 
-    prompt = f"""Title: {title}
-
-Transcript excerpt:
-{transcript_text[:8000]}
-
-Description:
-{desc_text[:1000]}
-
-Tags: {', '.join(tags[:20])}
-
-Search results:
-{search_text[:4000] if search_text else '(no web search)'}"""
+    prompt = {
+        "title": title,
+        "transcript_excerpt": transcript_text[:8000],
+        "description": desc_text[:1000],
+        "tags": tags[:20],
+        "search_results": search_text[:4000] if search_text else "",
+    }
 
     if not quiet:
         print(f"Glossary: generating with {llm.provider}", file=sys.stderr)
     try:
-        resp = llm._client().chat.completions.create(
-            model=llm.model_name(),
-            messages=[
-                {"role": "system", "content": render_prompt_template(_KNOWLEDGE_PROMPT, ctx)},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
+        response = llm_json_once(
+            llm,
+            render_prompt_template(_KNOWLEDGE_PROMPT, ctx) + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
+            prompt,
             max_tokens=4096,
+            temperature=0.3,
         )
-        glossary = resp.choices[0].message.content
+        glossary = str(response.get("markdown", "")).strip()
     except Exception as e:
         print(f"Warning: glossary generation failed: {e}", file=sys.stderr)
         return ""
@@ -1069,57 +1142,79 @@ class ChatSession:
 
     def ask(self, content: str, max_tokens: int) -> str:
         self.messages.append({"role": "user", "content": content})
-        resp = self.llm._client().chat.completions.create(
-            model=self.llm.model_name(),
-            messages=self.messages,
-            temperature=self.temperature,
-            max_tokens=max_tokens,
-        )
-        answer = resp.choices[0].message.content
+        kwargs = {
+            "model": self.llm.model_name(),
+            "messages": self.messages,
+            "temperature": self.temperature,
+            "max_tokens": max_tokens,
+        }
+        resp = self.llm._client().chat.completions.create(**kwargs)
+        choice = resp.choices[0]
+        message = choice.message
+        answer = message.content or ""
+        if not answer.strip():
+            reasoning = getattr(message, "reasoning_content", None)
+            usage = getattr(resp, "usage", None)
+            details = [f"finish_reason={getattr(choice, 'finish_reason', 'unknown')}"]
+            if reasoning:
+                details.append(f"reasoning_chars={len(reasoning)}")
+            if usage and getattr(usage, "completion_tokens_details", None):
+                reasoning_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", None)
+                if reasoning_tokens is not None:
+                    details.append(f"reasoning_tokens={reasoning_tokens}")
+            raise RuntimeError(f"LLM returned empty message.content ({', '.join(details)})")
         self.messages.append({"role": "assistant", "content": answer})
         return answer
 
 
-def _parse_numbered_response(content: str, expected_count: int) -> list[str]:
-    pattern = re.compile(r"\[(\d+)\]\s*(.*?)(?=\n\s*\[\d+\]|\Z)", re.DOTALL)
-    matches = pattern.findall(content)
-    if matches:
-        result = {}
-        for num, text in matches:
-            result[int(num)] = text.strip()
-        return [result.get(i, "") for i in range(1, expected_count + 1)]
-
-    lines = [l.strip() for l in content.splitlines() if l.strip()]
-    parsed = []
-    for line in lines:
-        m = re.match(r"^(?:\[?\d+\]?[:.)]?\s*)?(.+)$", line)
-        if m:
-            parsed.append(m.group(1).strip())
-    while len(parsed) < expected_count:
-        parsed.append("")
-    return parsed[:expected_count]
+def llm_json_once(
+    llm: LLMConfig,
+    system_prompt: str,
+    payload: dict,
+    max_tokens: int,
+    temperature: float = 0.3,
+) -> dict:
+    session = ChatSession(llm, system_prompt, temperature=temperature)
+    content = session.ask(json.dumps(payload, ensure_ascii=False, indent=2), max_tokens=max_tokens)
+    parsed = _extract_json_value(content)
+    if isinstance(parsed, dict):
+        return parsed
+    raise ValueError("response is not a JSON object")
 
 
-def _extract_json_array(content: str) -> Optional[list]:
+def _strip_json_fence(content: str) -> str:
     text = content.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _extract_json_value(content: str):
+    text = _strip_json_fence(content)
     try:
-        data = json.loads(text)
-        return data if isinstance(data, list) else None
+        return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    start = text.find("[")
-    end = text.rfind("]")
+    starts = [idx for idx in (text.find("["), text.find("{")) if idx != -1]
+    if not starts:
+        return None
+    start = min(starts)
+    open_char = text[start]
+    close_char = "]" if open_char == "[" else "}"
+    end = text.rfind(close_char)
     if start == -1 or end == -1 or end <= start:
         return None
     try:
-        data = json.loads(text[start : end + 1])
-        return data if isinstance(data, list) else None
+        return json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def _extract_json_array(content: str) -> Optional[list]:
+    data = _extract_json_value(content)
+    return data if isinstance(data, list) else None
 
 
 def _strip_speaker_labels(text: str) -> str:
@@ -1133,62 +1228,53 @@ def _strip_speaker_labels(text: str) -> str:
 
 
 def parse_proofread_response(
-    content: str,
-    expected_count: int,
+    data: list,
+    expected_ids: list[int],
     fallback_pairs: list[tuple[str, str]],
+    ctx: TranscriptContext,
 ) -> list[tuple[str, str]]:
-    data = _extract_json_array(content)
     if data is not None:
+        source_candidates = response_key_candidates(ctx, "source")
+        target_candidates = response_key_candidates(ctx, "target")
         by_id: dict[int, tuple[str, str]] = {}
-        ordered: list[tuple[str, str]] = []
         for pos, item in enumerate(data, 1):
             if not isinstance(item, dict):
                 continue
-            en = _strip_speaker_labels(str(item.get("en", "")))
-            zh = _strip_speaker_labels(str(item.get("zh", "")))
+            source_value = get_language_keyed_value(item, source_candidates)
+            target_value = get_language_keyed_value(item, target_candidates)
+            en = _strip_speaker_labels(str(source_value or ""))
+            zh = _strip_speaker_labels(str(target_value or ""))
+            if not en and not zh:
+                continue
             pair = (en, zh)
             item_id = item.get("id", pos)
             try:
                 by_id[int(item_id)] = pair
             except (TypeError, ValueError):
-                ordered.append(pair)
-        result = []
-        for i in range(1, expected_count + 1):
-            if i in by_id:
-                result.append(by_id[i])
-            elif i - 1 < len(ordered):
-                result.append(ordered[i - 1])
-            else:
-                result.append(fallback_pairs[i - 1])
-        return result
-
-    numbered = _parse_numbered_response(content, expected_count)
-    result = []
-    for i, text in enumerate(numbered):
-        if "|||" in text:
-            en, zh = text.split("|||", 1)
-            result.append((_strip_speaker_labels(en), _strip_speaker_labels(zh)))
-        else:
-            result.append(fallback_pairs[i])
-    return result
+                continue
+        return [by_id.get(item_id, fallback_pairs[idx]) for idx, item_id in enumerate(expected_ids)]
+    return fallback_pairs
 
 
 def llm_numbered_batch(
-    texts: list[str],
+    items: list[dict],
     session: ChatSession,
-    user_intro: str,
     quiet: bool,
     retries: int = 3,
-) -> list[str]:
-    prompt = "\n".join(f"[{i}] {t}" for i, t in enumerate(texts, 1))
+    max_tokens: Optional[int] = None,
+) -> list:
+    prompt = json.dumps(items, ensure_ascii=False, indent=2)
     last_error = ""
     for attempt in range(retries):
         try:
             content = session.ask(
-                f"{user_intro}\n\n{prompt}",
-                max_tokens=max(4096, len(texts) * 220),
+                prompt,
+                max_tokens=max_tokens or max(4096, len(items) * 220),
             )
-            return _parse_numbered_response(content, len(texts))
+            data = _extract_json_array(content)
+            if data is None:
+                raise ValueError("response is not a JSON array")
+            return data
         except Exception as e:
             last_error = str(e)
             if attempt < retries - 1:
@@ -1197,11 +1283,12 @@ def llm_numbered_batch(
                     print(f"  Retry {attempt + 1}/{retries} in {wait}s...", file=sys.stderr)
                 time.sleep(wait)
     print(f"Error: LLM batch failed after {retries} attempts: {last_error}", file=sys.stderr)
-    return ["" for _ in texts]
+    return []
 
 
 def translate_segments(
     transcript: Transcript,
+    ctx: TranscriptContext,
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
@@ -1216,7 +1303,17 @@ def translate_segments(
         print(f"Translator: {llm.provider} / {llm.model_name()}", file=sys.stderr)
         print(f"Total segments: {len(pending)}", file=sys.stderr)
 
-    session = ChatSession(llm, system_prompt + _TRANSLATE_FORMAT, temperature=0.3)
+    session = ChatSession(
+        llm,
+        system_prompt
+        + "\n\n"
+        + _JSON_FORMAT
+        + "\n\n"
+        + _JSON_ARRAY_FORMAT
+        + "\n\n"
+        + render_prompt_template(_TRANSLATE_FORMAT, ctx),
+        temperature=0.3,
+    )
     for start in range(0, len(pending), llm.batch_size):
         batch = pending[start : start + llm.batch_size]
         if not quiet:
@@ -1225,73 +1322,34 @@ def translate_segments(
                 f"translating {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
-        translations = llm_numbered_batch(
-            [s.en_text() for s in batch],
+        items = [{"id": s.index, ctx.source_lang_code: s.en_text()} for s in batch]
+        response_items = llm_numbered_batch(
+            items,
             session,
-            f"Translate these {len(batch)} complete transcript segments to the target language. Respond with exactly {len(batch)} numbered lines.",
             quiet,
         )
+        by_id = {}
+        target_candidates = response_key_candidates(ctx, "target")
+        for item in response_items:
+            if isinstance(item, dict):
+                value = get_language_keyed_value(item, target_candidates)
+                try:
+                    by_id[int(item.get("id"))] = str(value or "").strip()
+                except (TypeError, ValueError):
+                    pass
+        translations = [
+            by_id.get(seg.index, "")
+            for seg in batch
+        ]
         for seg, zh in zip(batch, translations):
             seg.translation = zh.strip()
             seg.split_events = []
     return True
 
 
-def proofread_segments(
-    transcript: Transcript,
-    llm: LLMConfig,
-    system_prompt: str,
-    quiet: bool,
-) -> bool:
-    pending = [s for s in transcript.segments if s.translation and not s.proofread_text]
-    if not pending:
-        if not quiet:
-            print("Proofread: cached", file=sys.stderr)
-        return False
-
-    pr_llm = LLMConfig(
-        provider=llm.pr_provider(),
-        model=llm.pr_model(),
-        api_key=llm.api_key if llm.pr_provider() == llm.provider else None,
-        batch_size=max(15, llm.batch_size // 2),
-    )
-    if not quiet:
-        print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}", file=sys.stderr)
-        print(f"Total segments: {len(pending)}", file=sys.stderr)
-
-    session = ChatSession(pr_llm, system_prompt + _PROOFREAD_FORMAT, temperature=0.2)
-    for start in range(0, len(pending), pr_llm.batch_size):
-        batch = pending[start : start + pr_llm.batch_size]
-        pairs = [f"SRC: {s.en_text()}\nTGT: {s.translation}" for s in batch]
-        if not quiet:
-            print(
-                f"  Batch {start // pr_llm.batch_size + 1}/{math.ceil(len(pending) / pr_llm.batch_size)}: "
-                f"proofreading {start + 1}-{start + len(batch)}",
-                file=sys.stderr,
-            )
-        prompt = "\n\n".join(f"[{i}] {pair}" for i, pair in enumerate(pairs, 1))
-        try:
-            raw_result = session.ask(
-                (
-                    f"Proofread these {len(batch)} bilingual pairs. "
-                    f"Return a JSON array with exactly {len(batch)} objects.\n\n{prompt}"
-                ),
-                max_tokens=max(4096, len(batch) * 260),
-            )
-        except Exception as e:
-            print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
-            raw_result = ""
-
-        fallback_pairs = [(s.en_text(), s.translation) for s in batch]
-        parsed_pairs = parse_proofread_response(raw_result, len(batch), fallback_pairs)
-        for seg, (en, zh) in zip(batch, parsed_pairs):
-            seg.proofread_text = en.strip() or seg.text
-            seg.translation = zh.strip() or seg.translation
-    return True
-
-
 def proofread_split_events(
     transcript: Transcript,
+    ctx: TranscriptContext,
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
@@ -1312,34 +1370,51 @@ def proofread_split_events(
         print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}", file=sys.stderr)
         print(f"Total split events: {len(events)}", file=sys.stderr)
 
-    session = ChatSession(pr_llm, system_prompt + _PROOFREAD_FORMAT, temperature=0.2)
+    source_lang_code = ctx.source_lang_code
+    target_lang_code = ctx.target_lang_code
+    proofread_format = render_prompt_template(_PROOFREAD_FORMAT, ctx)
+    session = ChatSession(
+        pr_llm,
+        system_prompt
+        + "\n\n"
+        + _JSON_FORMAT
+        + "\n\n"
+        + _JSON_ARRAY_FORMAT
+        + "\n\n"
+        + proofread_format,
+        temperature=0.2,
+    )
     changed = False
     for start in range(0, len(events), pr_llm.batch_size):
         batch = events[start : start + pr_llm.batch_size]
-        pairs = [f"SRC: {event.en}\nTGT: {event.zh}" for event in batch]
+        items = [
+            {
+                "id": start + idx + 1,
+                source_lang_code: event.en,
+                target_lang_code: event.zh,
+            }
+            for idx, event in enumerate(batch)
+        ]
         if not quiet:
             print(
                 f"  Batch {start // pr_llm.batch_size + 1}/{math.ceil(len(events) / pr_llm.batch_size)}: "
                 f"proofreading split events {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
-        prompt = "\n\n".join(f"[{i}] {pair}" for i, pair in enumerate(pairs, 1))
-        try:
-            raw_result = session.ask(
-                (
-                    f"Proofread these {len(batch)} bilingual subtitle events. "
-                    f"Return a JSON array with exactly {len(batch)} objects. "
-                    "Do not merge, split, reorder, or change timing.\n\n"
-                    f"{prompt}"
-                ),
-                max_tokens=max(4096, len(batch) * 260),
-            )
-        except Exception as e:
-            print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
-            raw_result = ""
+        response_items = llm_numbered_batch(
+            items,
+            session,
+            quiet,
+            max_tokens=STRUCTURED_MAX_TOKENS,
+        )
 
         fallback_pairs = [(event.en, event.zh) for event in batch]
-        parsed_pairs = parse_proofread_response(raw_result, len(batch), fallback_pairs)
+        parsed_pairs = parse_proofread_response(
+            response_items,
+            [item["id"] for item in items],
+            fallback_pairs,
+            ctx,
+        )
         for event, (en, zh) in zip(batch, parsed_pairs):
             new_en = en.strip() or event.en
             new_zh = zh.strip() or event.zh
@@ -1371,11 +1446,6 @@ def is_token_char(char: str) -> bool:
 
 def is_dash_char(char: str) -> bool:
     return unicodedata.category(char) == "Pd" or char in "\u2212"
-
-
-def normalize_token(text: str) -> str:
-    tokens = text_tokens(text)
-    return tokens[0] if tokens else ""
 
 
 def text_tokens(text: str) -> list[str]:
@@ -1455,40 +1525,6 @@ def timed_token_words(segment: TranscriptSegment) -> list[TranscriptWord]:
     ]
 
 
-def align_split_events_by_position(
-    segment: TranscriptSegment,
-    en_parts: list[str],
-    zh_parts: list[str],
-) -> Optional[list[SplitEvent]]:
-    words = timed_token_words(segment)
-    if len(words) != len(text_tokens(segment.source_text())):
-        return None
-
-    events: list[SplitEvent] = []
-    offset = 0
-    for idx, en in enumerate(en_parts):
-        part_len = len(text_tokens(en))
-        if part_len <= 0:
-            return None
-        span_words = words[offset : offset + part_len]
-        if len(span_words) != part_len:
-            return None
-        zh = zh_parts[idx] if idx < len(zh_parts) else ""
-        events.append(
-            SplitEvent(
-                start=float(span_words[0].start),
-                end=float(span_words[-1].end),
-                en=en,
-                zh=zh,
-            )
-        )
-        offset += part_len
-
-    if offset != len(words):
-        return None
-    return events
-
-
 def align_split_events_by_edge_tokens(
     segment: TranscriptSegment,
     en_parts: list[str],
@@ -1541,13 +1577,13 @@ def clamp_split_events(
 
 def align_split_events(
     segment: TranscriptSegment,
-    en_parts: list[str],
-    zh_parts: list[str],
+    source_parts: list[str],
+    target_parts: list[str],
 ) -> Optional[list[SplitEvent]]:
-    if text_tokens(" ".join(en_parts)) != text_tokens(segment.source_text()):
+    if text_tokens(" ".join(source_parts)) != text_tokens(segment.source_text()):
         return None
 
-    edged = align_split_events_by_edge_tokens(segment, en_parts, zh_parts)
+    edged = align_split_events_by_edge_tokens(segment, source_parts, target_parts)
     if edged:
         return clamp_split_events(segment, edged)
 
@@ -1555,14 +1591,14 @@ def align_split_events(
     timed_words = timed_token_words(segment)
     offset = 0
 
-    for idx, en in enumerate(en_parts):
-        zh = zh_parts[idx] if idx < len(zh_parts) else ""
-        span = find_word_span(timed_words, en, offset) if timed_words else None
+    for idx, source_text in enumerate(source_parts):
+        target_text = target_parts[idx] if idx < len(target_parts) else ""
+        span = find_word_span(timed_words, source_text, offset) if timed_words else None
         if not span:
             return None
         offset = span[1]
         start, end = span[2], span[3]
-        events.append(SplitEvent(start=start, end=end, en=en, zh=zh))
+        events.append(SplitEvent(start=start, end=end, en=source_text, zh=target_text))
 
     if not events:
         return None
@@ -1571,24 +1607,24 @@ def align_split_events(
 
 
 def parse_split_response(
-    content: str,
+    data: list,
     expected_ids: list[int],
+    ctx: TranscriptContext,
 ) -> tuple[dict[int, list[str]], dict[int, list[str]], str]:
-    en: dict[int, list[str]] = {}
-    zh: dict[int, list[str]] = {}
+    source: dict[int, list[str]] = {}
+    target: dict[int, list[str]] = {}
+    source_candidates = response_key_candidates(ctx, "source")
+    target_candidates = response_key_candidates(ctx, "target")
     expected_set = set(expected_ids)
-    data = _extract_json_array(content)
     if data is None:
-        return en, zh, "response is not a JSON array"
+        return source, target, "response is not a JSON array"
     if len(data) != len(expected_ids):
-        return en, zh, f"JSON array length {len(data)} != expected {len(expected_ids)}"
+        return source, target, f"JSON array length {len(data)} != expected {len(expected_ids)}"
 
     seen_ids: set[int] = set()
     for pos, item in enumerate(data, 1):
         if not isinstance(item, dict):
             return {}, {}, f"item {pos} is not an object"
-        if set(item.keys()) != {"id", "en", "zh"}:
-            return {}, {}, f"item {pos} keys {sorted(item.keys())} != ['en', 'id', 'zh']"
         item_id = item.get("id")
         try:
             item_id_int = int(item_id)
@@ -1599,21 +1635,23 @@ def parse_split_response(
         if item_id_int in seen_ids:
             return {}, {}, f"duplicate id {item_id_int}"
         seen_ids.add(item_id_int)
-        en_items = item.get("en", [])
-        zh_items = item.get("zh", [])
-        if not isinstance(en_items, list) or not isinstance(zh_items, list):
-            return {}, {}, f"id {item_id_int} en/zh must both be arrays"
-        en_parts = [str(p).replace("\\N", " ").strip() for p in en_items if str(p).strip()]
-        zh_parts = [str(p).replace("\\N", " ").strip() for p in zh_items if str(p).strip()]
-        if len(en_parts) != len(zh_parts):
-            return {}, {}, f"id {item_id_int} EN parts {len(en_parts)} != ZH parts {len(zh_parts)}"
-        if en_parts:
-            en[item_id_int] = en_parts
-            zh[item_id_int] = zh_parts
+        source_items = get_language_keyed_value(item, source_candidates)
+        target_items = get_language_keyed_value(item, target_candidates)
+        if source_items is None or target_items is None:
+            return {}, {}, f"item {pos} missing expected language-code keys; got {sorted(item.keys())}"
+        if not isinstance(source_items, list) or not isinstance(target_items, list):
+            return {}, {}, f"id {item_id_int} language-code values must both be arrays"
+        source_parts = [str(p).replace("\\N", " ").strip() for p in source_items if str(p).strip()]
+        target_parts = [str(p).replace("\\N", " ").strip() for p in target_items if str(p).strip()]
+        if len(source_parts) != len(target_parts):
+            return {}, {}, f"id {item_id_int} source parts {len(source_parts)} != target parts {len(target_parts)}"
+        if source_parts:
+            source[item_id_int] = source_parts
+            target[item_id_int] = target_parts
     if seen_ids != expected_set:
         missing = sorted(expected_set - seen_ids)
         return {}, {}, f"missing id(s): {missing}"
-    return en, zh, ""
+    return source, target, ""
 
 
 def whole_segment_split_event(segment: TranscriptSegment) -> SplitEvent:
@@ -1622,34 +1660,33 @@ def whole_segment_split_event(segment: TranscriptSegment) -> SplitEvent:
 
 def validated_split_events(
     segment: TranscriptSegment,
-    en_parts: Optional[list[str]],
-    zh_parts: Optional[list[str]],
+    source_parts: Optional[list[str]],
+    target_parts: Optional[list[str]],
 ) -> tuple[Optional[list[SplitEvent]], str]:
-    if not en_parts or not zh_parts:
+    if not source_parts or not target_parts:
         return None, "no usable split parts for this id"
-    if len(en_parts) != len(zh_parts):
-        return None, f"EN parts {len(en_parts)} != ZH parts {len(zh_parts)}"
+    if len(source_parts) != len(target_parts):
+        return None, f"source parts {len(source_parts)} != target parts {len(target_parts)}"
     expected_tokens = text_tokens(segment.source_text())
-    actual_tokens = text_tokens(" ".join(en_parts))
+    actual_tokens = text_tokens(" ".join(source_parts))
     if actual_tokens != expected_tokens:
         return (
             None,
-            f"EN tokens do not reconstruct source ({len(actual_tokens)} != {len(expected_tokens)})",
+            f"source tokens do not reconstruct original ({len(actual_tokens)} != {len(expected_tokens)})",
         )
-    if len(en_parts) == 1:
-        return [SplitEvent(segment.start, segment.end, en_parts[0], zh_parts[0])], ""
-    events = align_split_events(segment, en_parts, zh_parts)
-    if not events or len(events) != len(en_parts):
+    if len(source_parts) == 1:
+        return [SplitEvent(segment.start, segment.end, source_parts[0], target_parts[0])], ""
+    events = align_split_events(segment, source_parts, target_parts)
+    if not events or len(events) != len(source_parts):
         return None, "split edge words could not align to WhisperX words"
     return events, ""
 
 
 def split_segments(
     transcript: Transcript,
+    ctx: TranscriptContext,
     llm: LLMConfig,
     split: SplitConfig,
-    source_lang: str,
-    target_lang: str,
     quiet: bool,
 ) -> bool:
     changed = False
@@ -1687,45 +1724,60 @@ def split_segments(
 
     style_prompt = render_language_template(
         load_prompt("split_prompt", _SPLIT_PROMPT_FALLBACK),
-        source_lang,
-        target_lang,
+        ctx.source_lang,
+        ctx.target_lang,
+        ctx.source_lang_code,
+        ctx.target_lang_code,
     )
+    split_format = render_prompt_template(_SPLIT_FORMAT, ctx)
+    source_lang_code = ctx.source_lang_code
+    target_lang_code = ctx.target_lang_code
     session = ChatSession(
         llm,
-        f"{style_prompt}\n\n{_SPLIT_FORMAT}",
+        f"{style_prompt}\n\n{_JSON_FORMAT}\n\n{_JSON_ARRAY_FORMAT}\n\n{split_format}",
         temperature=0.1,
     )
     for start in range(0, len(pending), max(1, llm.batch_size // 2)):
         batch = pending[start : start + max(1, llm.batch_size // 2)]
-        lines = []
         expected_ids = [seg.index for seg in batch]
-        for seg in batch:
-            lines.append(f"[{seg.index}] SRC: {seg.source_text()}")
-            lines.append(f"[{seg.index}] TGT: {seg.translation}")
-        user_prompt = (
-            f"Split these {len(batch)} complete bilingual transcript segments for subtitle display.\n"
-            f"Return exactly these ids, without renumbering: {expected_ids}.\n"
-            f"SRC is {source_lang}. TGT is {target_lang}. "
-            "These inputs were selected because they are long by duration or character count. "
-            "Actively split when a segment contains a natural clause boundary. "
-            "Keep it unsplit only if splitting would make the subtitle less readable.\n"
-            "Important: JSON with single quotes is invalid and will be rejected; use double quotes only.\n\n"
-            + "\n".join(lines)
-        )
+        items = [
+            {
+                "id": seg.index,
+                source_lang_code: seg.source_text(),
+                target_lang_code: seg.translation,
+            }
+            for seg in batch
+        ]
         try:
-            content = session.ask(user_prompt, max_tokens=max(2048, len(batch) * 350))
+            if not quiet:
+                print("Split AI user prompt:", file=sys.stderr)
+                print(json.dumps(items, ensure_ascii=False, indent=2), file=sys.stderr)
+            response_items = llm_numbered_batch(
+                items,
+                session,
+                quiet,
+                max_tokens=STRUCTURED_MAX_TOKENS,
+            )
             if not quiet:
                 print("Split AI raw response:", file=sys.stderr)
-                print(content.strip(), file=sys.stderr)
-            en_splits, zh_splits, parse_error = parse_split_response(content, expected_ids)
+                print(json.dumps(response_items, ensure_ascii=False, indent=2), file=sys.stderr)
+            source_splits, target_splits, parse_error = parse_split_response(
+                response_items,
+                expected_ids,
+                ctx,
+            )
             if parse_error and not quiet:
                 print(f"Split parse warning: {parse_error}", file=sys.stderr)
         except Exception as e:
             print(f"Warning: split failed: {e}", file=sys.stderr)
-            en_splits, zh_splits, parse_error = {}, {}, str(e)
+            source_splits, target_splits, parse_error = {}, {}, str(e)
 
         for seg in batch:
-            events, reason = validated_split_events(seg, en_splits.get(seg.index), zh_splits.get(seg.index))
+            events, reason = validated_split_events(
+                seg,
+                source_splits.get(seg.index),
+                target_splits.get(seg.index),
+            )
             if events is None:
                 if not quiet:
                     print(
@@ -1734,8 +1786,8 @@ def split_segments(
                         file=sys.stderr,
                     )
                     print(f"  Source text: {seg.source_text()}", file=sys.stderr)
-                    print(f"  AI source parts: {en_splits.get(seg.index)}", file=sys.stderr)
-                    print(f"  AI target parts: {zh_splits.get(seg.index)}", file=sys.stderr)
+                    print(f"  AI source parts: {source_splits.get(seg.index)}", file=sys.stderr)
+                    print(f"  AI target parts: {target_splits.get(seg.index)}", file=sys.stderr)
                 events = [whole_segment_split_event(seg)]
             seg.split_events = events
             changed = True
@@ -1837,9 +1889,10 @@ def write_ass(
 
 DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following video title, description, and tags from ${SOURCE_LANG} to ${TARGET_LANG}.
 
+Return a JSON object with exactly these keys:
+{"title": "<translated title>", "description": "<translated description>"}
+
 Rules:
-- First line: translated title only.
-- Then a blank line, then the translated description.
 - Preserve URLs, email addresses, handles, and paragraph structure.
 - Do not add explanations."""
 
@@ -1849,23 +1902,23 @@ def translate_description(ctx: TranscriptContext, llm: LLMConfig, quiet: bool) -
     desc_text = _read_text_file(ctx.desc) if os.path.isfile(ctx.desc) else ""
     if not desc_text.strip() and not title:
         return ctx.target_desc
-    prompt = f"Title: {title}\nURL: {webpage_url}\n\nDescription:\n{desc_text}"
-    if tags:
-        prompt += f"\n\nTags:\n{', '.join(tags)}"
+    prompt = {
+        "title": title,
+        "url": webpage_url,
+        "description": desc_text,
+        "tags": tags,
+    }
     try:
-        resp = llm._client().chat.completions.create(
-            model=llm.model_name(),
-            messages=[
-                {
-                    "role": "system",
-                    "content": render_prompt_template(DESCRIPTION_TRANSLATE_PROMPT, ctx),
-                },
-                {"role": "user", "content": prompt},
-            ],
+        response_obj = llm_json_once(
+            llm,
+            render_prompt_template(DESCRIPTION_TRANSLATE_PROMPT, ctx) + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
+            prompt,
+            max_tokens=max(2048, len(desc_text) * 2),
             temperature=0.3,
-            max_tokens=max(2048, len(prompt) * 2),
         )
-        response = resp.choices[0].message.content.strip()
+        translated_title = str(response_obj.get("title", "")).strip()
+        translated_desc = str(response_obj.get("description", "")).strip()
+        response = f"{translated_title}\n\n{translated_desc}".strip()
     except Exception as e:
         print(f"Warning: description translation failed: {e}", file=sys.stderr)
         return ctx.target_desc
@@ -1889,10 +1942,6 @@ def infer_video_path(ctx: TranscriptContext) -> str:
     return ""
 
 
-def needs_llm(args) -> bool:
-    return not args.only_beautify
-
-
 def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     env = load_env(script_dir)
@@ -1901,10 +1950,10 @@ def main() -> None:
         description="Translate WhisperX JSON to proofread/target-language/bilingual ASS.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python translate_srt.py video.json --video video.webm
-  python translate_srt.py video.json --source-lang en --target-lang zh
-  python translate_srt.py video.json -o video.en-zh.ass
-  python translate_srt.py video.json --only-beautify --video video.webm
+  .\\.venv\\Scripts\\python.exe translate_srt.py video.json --video video.webm
+  .\\.venv\\Scripts\\python.exe translate_srt.py video.json --source-lang en --target-lang zh
+  .\\.venv\\Scripts\\python.exe translate_srt.py video.json -o video.en-zh.ass
+  .\\.venv\\Scripts\\python.exe translate_srt.py video.json --only-beautify --video video.webm
 """,
     )
     parser.add_argument("json", help="WhisperX .json transcript path")
@@ -2028,21 +2077,26 @@ def main() -> None:
         system_prompt += glossary_text
         proofread_prompt += glossary_text
 
-    changed = translate_segments(transcript, llm, system_prompt, args.quiet)
+    changed = translate_segments(transcript, ctx, llm, system_prompt, args.quiet)
     changed = split_segments(
         transcript,
+        ctx,
         llm,
         SplitConfig(
             enabled=not args.no_split,
             max_chars=args.split_max_chars,
             max_duration=args.split_max_duration,
         ),
-        ctx.source_lang,
-        ctx.target_lang,
         args.quiet,
     ) or changed
     if (args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0"):
-        changed = proofread_split_events(transcript, llm, proofread_prompt, args.quiet) or changed
+        changed = proofread_split_events(
+            transcript,
+            ctx,
+            llm,
+            proofread_prompt,
+            args.quiet,
+        ) or changed
     if changed:
         save_transcript(transcript, ctx.beautified_json)
 

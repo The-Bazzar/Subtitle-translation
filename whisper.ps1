@@ -8,7 +8,7 @@ param(
     [Parameter(HelpMessage = "Align model (default: empty = auto)")]
     [string]$AlignModel,
 
-    [Parameter(HelpMessage = "Device: cuda | cpu (default: cuda)")]
+    [Parameter(HelpMessage = "Device: cuda | cpu (default: follows TORCH_BACKEND)")]
     [string]$Device,
 
     [Alias("h")]
@@ -22,7 +22,24 @@ param(
 . "$PSScriptRoot\.env.ps1"
 $Model                   = Merge-EnvDefault 'WHISPER_MODEL'                    $Model                   'large-v3-turbo'
 $AlignModel              = Merge-EnvDefault 'WHISPER_ALIGN_MODEL'              $AlignModel              ''
-$Device                  = Merge-EnvDefault 'WHISPER_DEVICE'                   $Device                  'cuda'
+$Device                  = Merge-EnvDefault 'WHISPER_DEVICE'                   $Device                  ''
+if (-not $Device) {
+    $TorchBackendForDevice = Get-EnvValue 'TORCH_BACKEND' 'auto'
+    if ($TorchBackendForDevice -eq 'cpu') {
+        $Device = 'cpu'
+    } elseif ($TorchBackendForDevice -eq 'cuda128') {
+        $Device = 'cuda'
+    } elseif (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+        & nvidia-smi *> $null
+        $Device = if ($LASTEXITCODE -eq 0) { 'cuda' } else { 'cpu' }
+    } else {
+        $Device = 'cpu'
+    }
+}
+$WhisperXExe             = Get-EnvValue 'WHISPERX_PATH_WIN' ''
+if (-not $WhisperXExe) {
+    $WhisperXExe = Join-Path $PSScriptRoot ".venv\Scripts\whisperx.exe"
+}
 
 if ($Help -or (-not $VideoPath)) {
     @"
@@ -34,7 +51,7 @@ whisper.ps1 — WhisperX 语音识别生成词级 JSON
 选项:
   -Model       ASR 模型 (默认: large-v3-turbo)
   -AlignModel  对齐模型 (默认: 按语言自动匹配)
-  -Device      cuda|cpu (默认: cuda)
+  -Device      cuda|cpu (默认: 跟随 TORCH_BACKEND)
 
 输出:
   同目录输出 <文件名>.json (词级时间码)
@@ -46,6 +63,10 @@ translate_srt.py 以 .json 为唯一字幕入口，负责美化、翻译、校�
 
 if (-not (Test-Path $VideoPath -PathType Leaf)) {
     Write-Host "Error: Video file not found: $VideoPath" -ForegroundColor Red
+    exit 1
+}
+if (-not (Test-Path $WhisperXExe -PathType Leaf)) {
+    Write-Host "Error: WhisperX venv executable not found. Run .\setup.ps1 first, or set WHISPERX_PATH_WIN." -ForegroundColor Red
     exit 1
 }
 
@@ -102,7 +123,7 @@ if ($AlignModel) {
 }
 
 $env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
-& whisperx @WhisperArgs
+& $WhisperXExe @WhisperArgs
 Remove-Item $WavPath -Force
 $ExitCode = $LASTEXITCODE
 

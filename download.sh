@@ -17,6 +17,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
 YTDLP="${YTDLP_PATH_LINUX:-yt-dlp}"
+PYTHON_BIN="${PYTHON_PATH_LINUX:-$SCRIPT_DIR/.venv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "错误: Python venv not found. Run ./setup.sh first, or set PYTHON_PATH_LINUX." >&2
+    exit 1
+fi
 
 if [ -z "${1:-}" ]; then
     echo "用法: $0 <YouTube URL>" >&2
@@ -30,7 +35,7 @@ echo "download — 步骤 1/3: 抓取视频标题"
 echo "============================================="
 
 VIDEO_TITLE=$($YTDLP --get-title "$URL")
-FOLDER_NAME=$(python3 - "$VIDEO_TITLE" <<'PY'
+FOLDER_NAME=$("$PYTHON_BIN" - "$VIDEO_TITLE" <<'PY'
 import re
 import sys
 import unicodedata
