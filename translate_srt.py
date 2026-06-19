@@ -519,8 +519,10 @@ Do not merge, split, reorder, add, or remove events. Timing has already been ali
 
 _SPLIT_PROMPT_FALLBACK = r"""Style preference:
 - Split only at natural pause points such as commas, clause boundaries, conjunctions, and breath groups.
-- Prefer fewer, more coherent subtitle events over many tiny fragments.
-- Keep each split event readable as a complete thought."""
+- Use as many split parts as the sentence naturally needs. There is no two-part limit; long multi-clause segments may become 3, 4, 5, or more subtitle events.
+- Prefer coherent subtitle events over tiny fragments, but do not keep a long multi-clause segment under-split just to avoid more than two parts.
+- Keep each split event readable as a complete thought.
+- For the source-language array, split by copying exact contiguous spans from the input source text. Do not correct, remove, add, or paraphrase source-language words."""
 
 _JSON_FORMAT = """MANDATORY JSON PROTOCOL:
 The user message is JSON. Your response must be machine-parseable JSON only.
@@ -562,12 +564,25 @@ _SPLIT_FORMAT = """SPLIT RESPONSE FORMAT:
 Return exactly these keys in each object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}".
 "${SOURCE_LANG_CODE}" is the ${SOURCE_LANG} split text array. "${TARGET_LANG_CODE}" is the ${TARGET_LANG} split text array.
 Split by adding multiple strings inside "${SOURCE_LANG_CODE}" and "${TARGET_LANG_CODE}".
-Preserve every source-language word in order. Do not rewrite.
+The arrays may contain 1, 2, 3, 4, 5, or more strings. Choose the count from natural sentence boundaries; do not cap splits at two parts.
+
+SOURCE-LANGUAGE HARD RULES:
+- "${SOURCE_LANG_CODE}" must be made only by inserting split boundaries into the exact input "${SOURCE_LANG_CODE}" string.
+- Preserve every source-language word, repeated word, filler, typo, and ASR artifact in order.
+- Do not correct grammar, deduplicate repeated words, remove fillers, normalize wording, paraphrase, or improve readability in "${SOURCE_LANG_CODE}".
+- If the input says "to to", output "to to"; if it says "how you how you", output "how you how you".
+- When all "${SOURCE_LANG_CODE}" strings are joined with one space, the result must match the input source text token-for-token.
+
+TARGET-LANGUAGE RULES:
+- "${TARGET_LANG_CODE}" must have the same number of strings as "${SOURCE_LANG_CODE}".
+- Each "${TARGET_LANG_CODE}" string translates the matching source split at the same array index.
+- You may make the target-language text natural, but do not merge, omit, or move content across split indexes.
 
 GOOD:
 [
-  {"id": 1, "${SOURCE_LANG_CODE}": ["<source part 1>", "<source part 2>"], "${TARGET_LANG_CODE}": ["<target part 1>", "<target part 2>"]},
-  {"id": 2, "${SOURCE_LANG_CODE}": ["<source full sentence>"], "${TARGET_LANG_CODE}": ["<target full sentence>"]}
+  {"id": 1, "${SOURCE_LANG_CODE}": ["you don't know if you can get to it", "you're learning something about discipline and how you how you push yourself", "and what does motivate you", "and what do you really want out of this life"], "${TARGET_LANG_CODE}": ["<target part 1>", "<target part 2>", "<target part 3>", "<target part 4>"]},
+  {"id": 2, "${SOURCE_LANG_CODE}": ["you're actually being honest and earnest", "in your attempt to to pull something from who you are", "and what you understand"], "${TARGET_LANG_CODE}": ["<target part 1>", "<target part 2>", "<target part 3>"]},
+  {"id": 3, "${SOURCE_LANG_CODE}": ["<source full sentence>"], "${TARGET_LANG_CODE}": ["<target full sentence>"]}
 ]
 
 The placeholder values above are format markers only. In your actual response, replace them with split text from the provided segment."""
