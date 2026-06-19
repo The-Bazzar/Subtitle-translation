@@ -211,12 +211,10 @@ else
     echo "============================================="
     echo ""
 
-    VIDEO_PATH=""
     while IFS= read -r line; do
         echo "$line"
         [[ "$line" =~ ^OUTPUT_VIDEO=(.+) ]] && VIDEO_PATH="${BASH_REMATCH[1]}"
     done < <(bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1)
-    DOWNLOAD_EXIT=$?
 
     if [ -z "$VIDEO_PATH" ] || [ ! -f "$VIDEO_PATH" ]; then
         echo ""
@@ -418,6 +416,7 @@ if [ -n "${ASS_PATH:-}" ] && [ -f "$ASS_PATH" ]; then
     echo "双语 ASS: $ASS_PATH"
 fi
 echo "============================================="
+
 
 
 
