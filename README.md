@@ -6,14 +6,13 @@
 
 项目同时提供：
 
-- Windows / PowerShell 超级流水线：[`pipeline.ps1`](/G:/Subtitle%20translation/pipeline.ps1)
-- Linux / WSL bash 流水线：[`pipeline.sh`](/G:/Subtitle%20translation/pipeline.sh)
+- Windows / PowerShell 超级流水线：[`pipeline.ps1`](pipeline.ps1)
+- Linux / WSL bash 流水线：[`pipeline.sh`](pipeline.sh)
 - 分步脚本：下载、WhisperX、美化、翻译、知识库、硬压
 
 ## 项目结构
 
 ```text
-Subtitle translation/
 ├── pipeline.ps1
 ├── pipeline.sh
 ├── download.ps1
@@ -32,56 +31,6 @@ Subtitle translation/
 ├── providers.example.json
 ├── translate_prompt.example.md
 ├── proofread_prompt.example.md
-└── <Video Title>/
-    ├── <Video Title>.<ext>
-    ├── <Video Title>.srt
-    ├── <Video Title>.json
-    ├── <Video Title>.beautified.srt
-    ├── <Video Title>.split.srt
-    ├── <Video Title>.proofread.srt
-    ├── <Video Title>.zh.srt
-    ├── <Video Title>.zh.ass
-    ├── <Video Title>.zh-en.ass
-    ├── <Video Title>.zh.description
-    ├── <Video Title>.png
-    ├── <Video Title>.info.json
-    ├── <Video Title>.description
-    ├── <Video Title>.tags.txt
-    └── glossary.md
-```
-
-## 流程总览
-
-### PowerShell 超级流水线
-
-[`pipeline.ps1`](/G:/Subtitle%20translation/pipeline.ps1) 目前是纯 Windows 流程，不再绕回 WSL：
-
-1. [`download.ps1`](/G:/Subtitle%20translation/download.ps1) 下载视频、简介、标签、封面、元数据
-2. [`whisper.ps1`](/G:/Subtitle%20translation/whisper.ps1) 提取 WAV，再调用 WhisperX 输出 `.srt + .json`
-3. [`beautify_srt.py`](/G:/Subtitle%20translation/beautify_srt.py) 场景吸附时间码，输出 `.beautified.srt`
-4. [`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py) 读取字幕/简介/标签，结合 Tavily 联网搜索生成 `glossary.md`
-5. [`translate_srt.py`](/G:/Subtitle%20translation/translate_srt.py) 分句、翻译、中英校对、术语注入，输出 `.zh-en.ass`
-6. [`ffmpeg-burn.ps1`](/G:/Subtitle%20translation/ffmpeg-burn.ps1) 保留封面图并压制硬字幕
-
-成果物链：
-
-`VIDEO_PATH → SRT_PATH → BEAUTIFIED_SRT → glossary.md → zh-en.ass → burned.mkv`
-
-### Linux / WSL 流水线
-
-[`pipeline.sh`](/G:/Subtitle%20translation/pipeline.sh) 走同一条成果物链：
-
-1. [`download.sh`](/G:/Subtitle%20translation/download.sh)
-2. [`whisper.sh`](/G:/Subtitle%20translation/whisper.sh)
-3. [`beautify_srt.py`](/G:/Subtitle%20translation/beautify_srt.py)
-4. [`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py)
-5. [`translate_srt.py`](/G:/Subtitle%20translation/translate_srt.py)
-6. [`ffmpeg-burn.sh`](/G:/Subtitle%20translation/ffmpeg-burn.sh)
-
-## 快速开始
-
-### Windows / PowerShell
-
 ```powershell
 .\pipeline.ps1 "https://www.youtube.com/watch?v=xxxxx"
 ```
@@ -206,7 +155,7 @@ uv run --with torch python -c "import torch; print(torch.cuda.is_available())"
 
 ### `.env`
 
-复制 [` .env.example`](/G:/Subtitle%20translation/.env.example) 为 `.env`。
+复制 [` .env.example`](.env.example) 为 `.env`。
 
 当前脚本会读取这些关键变量：
 
@@ -263,7 +212,7 @@ TAVILY_MAX_RESULTS=10
 
 ### `providers.json`
 
-复制 [`providers.example.json`](/G:/Subtitle%20translation/providers.example.json) 为 `providers.json`。
+复制 [`providers.example.json`](providers.example.json) 为 `providers.json`。
 
 格式：
 
@@ -407,7 +356,7 @@ TAVILY_MAX_RESULTS=10
 
 ### PowerShell
 
-[`pipeline.ps1`](/G:/Subtitle%20translation/pipeline.ps1) 支持：
+[`pipeline.ps1`](pipeline.ps1) 支持：
 
 - `-SkipDownload`
 - `-SkipWhisper`
@@ -427,7 +376,7 @@ TAVILY_MAX_RESULTS=10
 
 ### Bash
 
-[`pipeline.sh`](/G:/Subtitle%20translation/pipeline.sh) 支持同名环境变量：
+[`pipeline.sh`](pipeline.sh) 支持同名环境变量：
 
 - `SKIP_DOWNLOAD`
 - `SKIP_WHISPER`
@@ -454,7 +403,7 @@ TAVILY_MAX_RESULTS=10
 
 ## 术语知识库
 
-项目内的 `knowledge` skill 和 [`glossary_builder.py`](/G:/Subtitle%20translation/glossary_builder.py) 是两种不同角色：
+项目内的 `knowledge` skill 和 [`glossary_builder.py`](glossary_builder.py) 是两种不同角色：
 
 - `glossary_builder.py`：项目内可直接运行的自动生成脚本
 - `knowledge` skill：给外部 AI agent 用的工作说明，适合你手动让更强模型建立知识库
@@ -481,13 +430,13 @@ python3 batch.py "URL1" "URL2" "URL3"
 
 ## Skills
 
-当前仓库内可用的 skill 在：
+当前项目技能文件在：
 
-- [` .claude/skills/download/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/download/SKILL.md)
-- [` .claude/skills/whisper/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/whisper/SKILL.md)
-- [` .claude/skills/beautify/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/beautify/SKILL.md)
-- [` .claude/skills/knowledge/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/knowledge/SKILL.md)
-- [` .claude/skills/translate/SKILL.md`](/G:/Subtitle%20translation/.claude/skills/translate/SKILL.md)
+- [` .claude/skills/download/SKILL.md`](.code/.claude/skills/download/SKILL.md)
+- [` .claude/skills/whisper/SKILL.md`](.code/.claude/skills/whisper/SKILL.md)
+- [` .claude/skills/beautify/SKILL.md`](.code/.claude/skills/beautify/SKILL.md)
+- [` .claude/skills/knowledge/SKILL.md`](.code/.claude/skills/knowledge/SKILL.md)
+- [` .claude/skills/translate/SKILL.md`](.code/.claude/skills/translate/SKILL.md)
 
 格式已经统一为：
 

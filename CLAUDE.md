@@ -1,4 +1,4 @@
-# CLAUDE.md
+﻿# CLAUDE.md
 
 This repository is a subtitle pipeline project centered on:
 
@@ -13,7 +13,6 @@ This repository is a subtitle pipeline project centered on:
 ## Current Architecture
 
 ```text
-Subtitle translation/
 ├── pipeline.ps1              # Windows super pipeline
 ├── pipeline.sh               # Linux/WSL pipeline
 ├── download.ps1              # Windows download only
@@ -30,22 +29,6 @@ Subtitle translation/
 ├── template.ass
 ├── .env.example
 ├── providers.example.json
-└── <Video Title>/
-    ├── <Video Title>.<ext>
-    ├── <Video Title>.srt
-    ├── <Video Title>.json
-    ├── <Video Title>.beautified.srt
-    ├── <Video Title>.split.srt
-    ├── <Video Title>.proofread.srt
-    ├── <Video Title>.zh.srt
-    ├── <Video Title>.zh.ass
-    ├── <Video Title>.zh-en.ass
-    ├── <Video Title>.zh.description
-    ├── <Video Title>.png
-    ├── <Video Title>.info.json
-    ├── <Video Title>.description
-    ├── <Video Title>.tags.txt
-    └── glossary.md
 ```
 
 ## Primary Flow
