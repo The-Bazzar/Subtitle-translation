@@ -449,7 +449,8 @@ python3 batch.py "URL1" "URL2" "URL3"
 
 - `TRANSLATE_PROVIDER` 现在必须配置，否则翻译和 glossary 都会直接报错
 - `.env` 和 `providers.json` 建议保持本地私有版本，仓库里只提交 example 模板
-- `cookies.txt` 已 gitignored
+- `cookies.txt` 已 gitignored。yt-dlp 通过相对路径 `cookies.txt` 引用，请确保在脚本所在目录（仓库根目录）下运行
 - `whisperx` 首次运行会下载模型
 - 长视频使用“先提 WAV 再 WhisperX”是为了减轻后续时间漂移
 - 如果你自己用更强的外部 agent 来写 `glossary.md`，通常会比自动生成脚本更稳
+

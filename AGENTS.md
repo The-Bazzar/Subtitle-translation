@@ -268,7 +268,7 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 ## Important Notes
 
 - `.env` 和 `providers.json` 已 gitignored，仓库只提交 example 模板
-- `cookies.txt` 已 gitignored，过期后重新导出
+- `cookies.txt` 已 gitignored，过期后重新导出。注意：yt-dlp 通过相对路径 `cookies.txt` 引用，请确保在脚本所在目录（仓库根目录）下运行，否则会找不到
 - `TRANSLATE_PROVIDER` 必须配置，否则翻译和 glossary 直接报错
 - WhisperX 首次运行下载 `large-v3-turbo` (~1.5GB)
 - WhisperX 安装: `uv tool install git+https://github.com/m-bain/whisperx.git --with "torch==2.8.0+cu128" --with "torchaudio==2.8.0+cu128"`
@@ -287,5 +287,6 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 - 保持 PowerShell 和 bash 入口行为对齐
 - 更新文档时匹配实际代码路径和参数，而非历史版本
 - 仓库可能包含用户本地的 `.env`、`providers.json`、cookies 和生成产物，不要回退用户数据
+
 
 

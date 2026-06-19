@@ -692,7 +692,7 @@ def proofread_subtitles(
             else:
                 # LLM 没按格式返回，保留原文
                 idx = len(corrected_en)
-                corrected_en.append(en_texts[start_idx + idx] if idx < len(en_texts) else '')
+                corrected_en.append(en_texts[idx] if idx < len(en_texts) else '')
                 corrected_zh.append(r.strip())
     n = len(en_texts)
     return corrected_en[:n], corrected_zh[:n]
@@ -1152,3 +1152,4 @@ Examples:
 
 if __name__ == '__main__':
     main()
+
