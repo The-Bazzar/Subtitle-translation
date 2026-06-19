@@ -6,7 +6,7 @@
 
 `download -> whisper -> beautify -> glossary -> translate/proofread -> burn`
 
-Windows 主机，PowerShell 为主要操作面。Linux / WSL bash 脚本并行维护。
+Windows 主机，PowerShell 为主要操作面（推荐升级到 PowerShell 7：`winget install Microsoft.PowerShell`）。Linux / WSL bash 脚本并行维护。
 项目使用本地工具完成下载/语音识别/硬压，远程 LLM API 完成翻译和校对。
 
 ## Architecture
@@ -287,3 +287,4 @@ wsl -u root bash -lc "sh ./download_and_sub.sh https://www.youtube.com/watch?v=x
 - 保持 PowerShell 和 bash 入口行为对齐
 - 更新文档时匹配实际代码路径和参数，而非历史版本
 - 仓库可能包含用户本地的 `.env`、`providers.json`、cookies 和生成产物，不要回退用户数据
+
