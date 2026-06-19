@@ -10,6 +10,7 @@
 - Linux / WSL bash 流水线：[`pipeline.sh`](pipeline.sh)
 - 分步脚本：下载、WhisperX、美化、翻译、知识库、硬压
 
+> 推荐使用 **PowerShell 7**：`winget install Microsoft.PowerShell` 可直接升级。
 ## 项目结构
 
 ```text
