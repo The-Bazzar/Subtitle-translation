@@ -65,6 +65,21 @@ class SplitReason(str, Enum):
             return ""
 
 
+class AssOutputMode(str, Enum):
+    SOURCE = "source"
+    TARGET = "target"
+    BILINGUAL = "bilingual"
+
+    @staticmethod
+    def normalize(value: "AssOutputMode | str") -> "AssOutputMode":
+        if isinstance(value, AssOutputMode):
+            return value
+        try:
+            return AssOutputMode(str(value).strip())
+        except ValueError as e:
+            raise ValueError(f"unknown ASS output mode: {value}") from e
+
+
 @dataclass
 class TranscriptWord:
     text: str
@@ -2289,31 +2304,44 @@ def all_events(transcript: Transcript) -> list[SplitEvent]:
     return events
 
 
+@dataclass(frozen=True)
+class AssTrack:
+    field_name: str
+    style: str
+    wrap_text: bool = False
+
+
+ASS_OUTPUT_TRACKS: dict[AssOutputMode, tuple[AssTrack, ...]] = {
+    AssOutputMode.SOURCE: (AssTrack("en", "bi-en"),),
+    AssOutputMode.TARGET: (AssTrack("zh", "bi-zh", wrap_text=True),),
+    AssOutputMode.BILINGUAL: (
+        AssTrack("en", "bi-en"),
+        AssTrack("zh", "bi-zh", wrap_text=True),
+    ),
+}
+
+
 def write_ass(
     output_path: str,
     template_path: str,
     title: str,
     events: list[SplitEvent],
-    mode: str,
+    mode: AssOutputMode | str,
 ) -> None:
+    output_mode = AssOutputMode.normalize(mode)
     header, events_header = load_template(template_path)
     header = re.sub(r"Title:\s*.*", f"Title: {title}", header)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(header)
         f.write(events_header)
-        if mode in ("proofread", "bilingual"):
+        for track in ASS_OUTPUT_TRACKS[output_mode]:
             for event in events:
+                text = ass_escape(str(getattr(event, track.field_name)))
+                if track.wrap_text:
+                    text = wrap_cjk(text)
                 f.write(
                     f"Dialogue: 0,{ass_time(event.start)},{ass_time(event.end)},"
-                    f"bi-en,,0,0,0,,{ass_escape(event.en)}\n"
-                )
-        if mode in ("zh", "bilingual"):
-            style = "bi-zh" if mode == "bilingual" else "zh"
-            for event in events:
-                text = wrap_cjk(ass_escape(event.zh))
-                f.write(
-                    f"Dialogue: 0,{ass_time(event.start)},{ass_time(event.end)},"
-                    f"{style},,0,0,0,,{text}\n"
+                    f"{track.style},,0,0,0,,{text}\n"
                 )
 
 
@@ -2560,9 +2588,9 @@ def main() -> None:
     events = all_events(transcript)
     write_srt_events(ctx.split_source_srt, events, "en")
     write_srt_events(ctx.split_target_srt, events, "zh")
-    write_ass(ctx.proofread_ass, template_path, ctx.base, events, "proofread")
-    write_ass(ctx.target_ass, template_path, ctx.base, events, "zh")
-    write_ass(ctx.bilingual_ass, template_path, ctx.base, events, "bilingual")
+    write_ass(ctx.proofread_ass, template_path, ctx.base, events, AssOutputMode.SOURCE)
+    write_ass(ctx.target_ass, template_path, ctx.base, events, AssOutputMode.TARGET)
+    write_ass(ctx.bilingual_ass, template_path, ctx.base, events, AssOutputMode.BILINGUAL)
 
     if os.path.isfile(ctx.desc):
         translate_description(ctx, llm, args.quiet)

@@ -212,6 +212,34 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertIn("=====\n\n译后简介。", content)
             self.assertIn("标签：人工智能, 哲学", content)
 
+    def test_write_ass_uses_named_output_modes(self):
+        template = os.path.abspath("template.ass")
+        event = t.SplitEvent(1.0, 2.0, "source line", "目标行")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = os.path.join(tmp, "source.ass")
+            target_path = os.path.join(tmp, "target.ass")
+            bilingual_path = os.path.join(tmp, "bilingual.ass")
+
+            t.write_ass(source_path, template, "title", [event], t.AssOutputMode.SOURCE)
+            t.write_ass(target_path, template, "title", [event], t.AssOutputMode.TARGET)
+            t.write_ass(bilingual_path, template, "title", [event], t.AssOutputMode.BILINGUAL)
+
+            with open(source_path, "r", encoding="utf-8") as f:
+                source_ass = f.read()
+            with open(target_path, "r", encoding="utf-8") as f:
+                target_ass = f.read()
+            with open(bilingual_path, "r", encoding="utf-8") as f:
+                bilingual_ass = f.read()
+
+        self.assertIn(",bi-en,,0,0,0,,source line", source_ass)
+        self.assertNotIn(",bi-zh,,0,0,0,,目标行", source_ass)
+        self.assertIn(",bi-zh,,0,0,0,,目标行", target_ass)
+        self.assertNotIn(",zh,,0,0,0,,目标行", target_ass)
+        self.assertNotIn(",bi-en,,0,0,0,,source line", target_ass)
+        self.assertIn(",bi-en,,0,0,0,,source line", bilingual_ass)
+        self.assertIn(",bi-zh,,0,0,0,,目标行", bilingual_ass)
+
 
 if __name__ == "__main__":
     unittest.main()
