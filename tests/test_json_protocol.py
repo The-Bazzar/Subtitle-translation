@@ -11,6 +11,14 @@ class JsonProtocolTests(unittest.TestCase):
         data = t._extract_json_value('{"markdown": "# Glossary"}')
         self.assertEqual(data, {"markdown": "# Glossary"})
 
+    def test_glossary_output_parses_json_object(self):
+        result = t.GlossaryOutput.from_json_content('{"markdown": "# 术语知识库"}')
+        self.assertEqual(result.markdown, "# 术语知识库")
+
+    def test_glossary_output_accepts_plain_markdown_fallback(self):
+        result = t.GlossaryOutput.from_json_content("# 术语知识库\n\n## 核心术语")
+        self.assertEqual(result.markdown, "# 术语知识库\n\n## 核心术语")
+
     def test_batch_response_accepts_wrapped_items(self):
         response = t.LLMBatchResponse.from_json_value({"items": [{"id": 1, "zh": "译文"}]})
         self.assertEqual(response.to_items(), [{"id": 1, "zh": "译文"}])

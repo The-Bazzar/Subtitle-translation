@@ -646,6 +646,9 @@ _KNOWLEDGE_PROMPT = """You are a terminology expert. Analyze the ${SOURCE_LANG} 
 Return a JSON object with exactly this key:
 {"markdown": "<glossary markdown>"}
 
+Do not output raw Markdown directly. Put the complete Markdown document inside the JSON string value named "markdown".
+Escape any double quotes or backslashes inside the markdown string according to JSON rules.
+
 The markdown value must follow this format:
 # 术语知识库 — <title>
 
@@ -1178,14 +1181,17 @@ def build_glossary(
     if not quiet:
         print(f"Glossary: generating with {llm.provider}", file=sys.stderr)
     try:
-        response = llm_json_once(
+        raw_response = llm_text_once(
             llm,
             render_prompt_template(_KNOWLEDGE_PROMPT, ctx) + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
             request,
             max_tokens=4096,
             temperature=0.3,
         )
-        glossary = str(response.get("markdown", "")).strip()
+        glossary_output = GlossaryOutput.from_json_content(raw_response)
+        if not _extract_json_value(raw_response) and not quiet:
+            print("Warning: glossary response was markdown, accepted as compatibility fallback", file=sys.stderr)
+        glossary = glossary_output.markdown
     except Exception as e:
         print(f"Warning: glossary generation failed: {e}", file=sys.stderr)
         return ""
@@ -1413,6 +1419,24 @@ class LLMObjectResponse:
 
 
 @dataclass
+class GlossaryOutput:
+    markdown: str
+
+    @staticmethod
+    def from_json_content(content: str) -> "GlossaryOutput":
+        parsed = _extract_json_value(content)
+        if isinstance(parsed, dict):
+            markdown = str(parsed.get("markdown", "")).strip()
+            if markdown:
+                return GlossaryOutput(markdown)
+            raise ValueError('glossary JSON object missing non-empty "markdown"')
+        text = _strip_json_fence(content).strip()
+        if text.startswith("#"):
+            return GlossaryOutput(text)
+        raise ValueError("glossary response is neither JSON object nor markdown")
+
+
+@dataclass
 class ChatSession:
     llm: LLMConfig
     system_prompt: str
@@ -1462,6 +1486,17 @@ def llm_json_once(
     session = ChatSession(llm, system_prompt, temperature=temperature)
     content = session.ask(request.to_json_text(), max_tokens=max_tokens)
     return LLMObjectResponse.from_json_value(_extract_json_value(content)).fields
+
+
+def llm_text_once(
+    llm: LLMConfig,
+    system_prompt: str,
+    request: LLMObjectRequest,
+    max_tokens: int,
+    temperature: float = 0.3,
+) -> str:
+    session = ChatSession(llm, system_prompt, temperature=temperature)
+    return session.ask(request.to_json_text(), max_tokens=max_tokens)
 
 
 def _strip_json_fence(content: str) -> str:
