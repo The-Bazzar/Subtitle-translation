@@ -641,15 +641,9 @@ GOOD:
 
 The placeholder values above are format markers only. In your actual response, replace them with split text from the provided segment."""
 
-_KNOWLEDGE_PROMPT = """You are a terminology expert. Analyze the ${SOURCE_LANG} transcript and metadata to build a glossary for ${TARGET_LANG} subtitle translation.
+_GLOSSARY_PROMPT_FALLBACK = """You are a terminology expert. Analyze the ${SOURCE_LANG} transcript and metadata to build a glossary for ${TARGET_LANG} subtitle translation.
 
-Return a JSON object with exactly this key:
-{"markdown": "<glossary markdown>"}
-
-Do not output raw Markdown directly. Put the complete Markdown document inside the JSON string value named "markdown".
-Escape any double quotes or backslashes inside the markdown string according to JSON rules.
-
-The markdown value must follow this format:
+The glossary markdown should follow this format:
 # 术语知识库 — <title>
 
 ## 背景
@@ -671,6 +665,13 @@ Rules:
 - Search results can verify standard ${TARGET_LANG} translations.
 - If uncertain, mark with (?).
 - Keep under 100 lines."""
+
+_GLOSSARY_FORMAT = """GLOSSARY RESPONSE FORMAT:
+Return a JSON object with exactly this key:
+{"markdown": "<glossary markdown>"}
+
+Do not output raw Markdown directly. Put the complete Markdown document inside the JSON string value named "markdown".
+Escape any double quotes or backslashes inside the markdown string according to JSON rules."""
 
 STRUCTURED_MAX_TOKENS = 32768
 _PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
@@ -1183,7 +1184,13 @@ def build_glossary(
     try:
         raw_response = llm_text_once(
             llm,
-            render_prompt_template(_KNOWLEDGE_PROMPT, ctx) + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
+            render_prompt_template(load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK), ctx)
+            + "\n\n"
+            + _JSON_FORMAT
+            + "\n\n"
+            + _JSON_OBJECT_FORMAT
+            + "\n\n"
+            + _GLOSSARY_FORMAT,
             request,
             max_tokens=4096,
             temperature=0.3,

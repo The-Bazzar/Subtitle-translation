@@ -80,6 +80,7 @@ update_env_from_example() {
 echo ">>> 准备本地配置文件..."
 update_env_from_example
 copy_config_if_missing "providers.example.json" "providers.json"
+copy_config_if_missing "glossary_prompt.example.md" "glossary_prompt.md"
 copy_config_if_missing "translate_prompt.example.md" "translate_prompt.md"
 copy_config_if_missing "proofread_prompt.example.md" "proofread_prompt.md"
 copy_config_if_missing "split_prompt.example.md" "split_prompt.md"

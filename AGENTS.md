@@ -38,6 +38,7 @@ winget install Microsoft.PowerShell
 ├── template.ass              # ASS 模板；保留历史 Style: zh / bi-en / bi-zh
 ├── .env.example              # 环境变量模板
 ├── providers.example.json    # LLM provider 配置模板
+├── glossary_prompt.example.md
 ├── translate_prompt.example.md
 ├── proofread_prompt.example.md
 ├── split_prompt.example.md
@@ -51,7 +52,7 @@ winget install Microsoft.PowerShell
     └── whisper/SKILL.md
 ```
 
-本地文件 `.env`、`providers.json`、`cookies.txt`、`split_prompt.md` 和生成产物均不应提交。
+本地文件 `.env`、`providers.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和生成产物均不应提交。
 
 ## Pipeline Flow
 
@@ -113,6 +114,7 @@ video -> json -> beautified.json -> glossary.md
 - 读取 transcript、`.description`、`.tags.txt`、`.info.json`
 - 配置 `TAVILY_API_KEY` 时联网搜索，未配置时离线总结
 - 需要 `TRANSLATE_PROVIDER` 和对应 API key
+- `glossary_prompt.md` 仅允许微调 glossary 内容策略，输出格式规则由 `translate_srt.py` 内置 `_GLOSSARY_FORMAT` 强制追加
 
 ### translate / split / proofread
 
@@ -163,7 +165,7 @@ ${TARGET_LANG_CODE}
 
 ## Config
 
-`setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
+`setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
 
 | 变量 | 说明 |
 |------|------|
@@ -243,6 +245,6 @@ TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 
 - 更新文档时以实际脚本参数和文件名为准，不保留历史 SRT 流程
 - 保持 PowerShell 和 bash 入口行为对齐
-- 不要提交 `.env`、`providers.json`、`cookies.txt`、`split_prompt.md` 或生成产物
+- 不要提交 `.env`、`providers.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 或生成产物
 - 不要回退用户本地数据或未请求的工作区改动
 - `README.md` 面向用户快速使用；`AGENTS.md` 面向维护和自动化代理；`.agents/skills/*` 面向分步骤执行

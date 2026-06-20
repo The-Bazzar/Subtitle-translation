@@ -41,6 +41,12 @@ platform: Agent + Script
 
 - `glossary.md`
 
+Prompt：
+
+- `glossary_prompt.md` 或 `glossary_prompt.example.md`
+- 只用于微调 glossary 内容策略
+- JSON 输出格式由 `translate_srt.py` 内置规则追加，不要在 prompt 文件里改返回格式
+
 ## 外部 agent 工作要求
 
 1. 先读 JSON 里的整句 transcript，理解视频主题
