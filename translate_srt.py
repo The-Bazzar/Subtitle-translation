@@ -1123,6 +1123,42 @@ def read_metadata(ctx: TranscriptContext) -> tuple[str, str, list[str]]:
     return title, webpage_url, tags
 
 
+def read_metadata_header(ctx: TranscriptContext) -> str:
+    if not os.path.isfile(ctx.info_json):
+        return ""
+    try:
+        with open(ctx.info_json, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except Exception:
+        return ""
+
+    title = str(info.get("title") or "")
+    webpage_url = str(info.get("webpage_url") or "")
+    uploader = str(info.get("uploader") or info.get("channel") or "")
+    upload_time = ""
+    timestamp = info.get("timestamp")
+    if timestamp:
+        try:
+            from datetime import datetime, timezone
+
+            upload_time = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+            upload_time = upload_time[:-2] + ":" + upload_time[-2:]
+        except (TypeError, ValueError, OSError, OverflowError):
+            upload_time = ""
+    if not upload_time:
+        upload_date = str(info.get("upload_date") or "")
+        if len(upload_date) == 8 and upload_date.isdigit():
+            upload_time = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+
+    return (
+        f"原视频：{webpage_url}\n"
+        f"原标题：{title}\n"
+        f"原作者：{uploader}\n"
+        f"上传时间：{upload_time}\n"
+        f"\n=====\n\n"
+    )
+
+
 def tavily_search(query: str, api_key: str, max_results: int = 5) -> list[dict]:
     try:
         client = TavilyClient(api_key=api_key)
@@ -2284,17 +2320,22 @@ def write_ass(
 DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following video title, description, and tags from ${SOURCE_LANG} to ${TARGET_LANG}.
 
 Return a JSON object with exactly these keys:
-{"title": "<translated title>", "description": "<translated description>"}
+{"title": "<translated title>", "description": "<translated description>", "tags": ["<translated tag>", "..."]}
 
 Rules:
 - Preserve URLs, email addresses, handles, and paragraph structure.
+- Translate each tag naturally and keep the tag list order.
 - Do not add explanations."""
 
 
 def translate_description(ctx: TranscriptContext, llm: LLMConfig, quiet: bool) -> str:
     title, webpage_url, tags = read_metadata(ctx)
+    metadata_header = read_metadata_header(ctx)
     desc_text = _read_text_file(ctx.desc) if os.path.isfile(ctx.desc) else ""
     if not desc_text.strip() and not title:
+        if metadata_header:
+            with open(ctx.target_desc, "w", encoding="utf-8") as f:
+                f.write(metadata_header)
         return ctx.target_desc
     request = LLMObjectRequest(
         {
@@ -2314,14 +2355,28 @@ def translate_description(ctx: TranscriptContext, llm: LLMConfig, quiet: bool) -
         )
         translated_title = str(response_obj.get("title", "")).strip()
         translated_desc = str(response_obj.get("description", "")).strip()
-        response = f"{translated_title}\n\n{translated_desc}".strip()
+        translated_tags_raw = response_obj.get("tags", [])
+        if isinstance(translated_tags_raw, list):
+            translated_tags = [str(tag).strip() for tag in translated_tags_raw if str(tag).strip()]
+        elif isinstance(translated_tags_raw, str):
+            translated_tags = [tag.strip() for tag in re.split(r"[,，\n]+", translated_tags_raw) if tag.strip()]
+        else:
+            translated_tags = []
     except Exception as e:
         print(f"Warning: description translation failed: {e}", file=sys.stderr)
         return ctx.target_desc
 
     with open(ctx.target_desc, "w", encoding="utf-8") as f:
-        f.write(response)
-        f.write("\n")
+        if translated_title:
+            f.write(f"{translated_title}\n\n")
+        f.write(metadata_header)
+        if translated_desc:
+            f.write(translated_desc)
+            f.write("\n")
+        if translated_tags:
+            if translated_desc:
+                f.write("\n")
+            f.write(f"标签：{', '.join(translated_tags)}\n")
     if not quiet:
         print(f"Description: {ctx.target_desc}", file=sys.stderr)
     return ctx.target_desc

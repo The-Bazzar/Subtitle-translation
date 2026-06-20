@@ -1,4 +1,8 @@
+import json
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import translate_srt as t
 
@@ -158,6 +162,55 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(data["split_status"], "fallback")
         self.assertEqual(data["split_reason"], "token_reconstruct_failed")
         self.assertEqual(data["split_reason_detail"], "test detail")
+
+    def test_translate_description_writes_metadata_header_and_translated_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "title": "Original Title",
+                        "webpage_url": "https://example.test/watch",
+                        "uploader": "Original Channel",
+                        "upload_date": "20260620",
+                    },
+                    f,
+                )
+            with open(ctx.desc, "w", encoding="utf-8") as f:
+                f.write("Original description.")
+            with open(ctx.tags, "w", encoding="utf-8") as f:
+                f.write("['AI', 'philosophy']")
+
+            captured_request = {}
+
+            def fake_llm_json_once(llm, system_prompt, request, max_tokens, temperature=0.3):
+                captured_request.update(request.to_json_value())
+                return {
+                    "title": "译后标题",
+                    "description": "译后简介。",
+                    "tags": ["人工智能", "哲学"],
+                }
+
+            class FakeLLM:
+                pass
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                result = t.translate_description(ctx, FakeLLM(), quiet=True)
+
+            self.assertEqual(result, ctx.target_desc)
+            self.assertEqual(captured_request["tags"], ["AI", "philosophy"])
+            with open(ctx.target_desc, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("译后标题\n\n", content)
+            self.assertIn("原视频：https://example.test/watch\n", content)
+            self.assertIn("原标题：Original Title\n", content)
+            self.assertIn("原作者：Original Channel\n", content)
+            self.assertIn("上传时间：2026-06-20\n", content)
+            self.assertIn("=====\n\n译后简介。", content)
+            self.assertIn("标签：人工智能, 哲学", content)
 
 
 if __name__ == "__main__":
