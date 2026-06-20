@@ -10,11 +10,14 @@
         }
     },
     "deepseek": {
-	    "url": "https://api.deepseek.com",
+        "url": "https://api.deepseek.com",
         "default_model": "deepseek-v4-pro",
         "env_key": "DEEPSEEK_API_KEY",
         "auth_header": "Bearer {api_key}",
-        "extra_headers": {}
+        "extra_headers": {},
+        "response_format": {
+            "type": "json_object"
+        }
     },
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai",

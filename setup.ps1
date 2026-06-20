@@ -5,6 +5,78 @@
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ScriptDir = Split-Path $PSCommandPath -Parent
+
+function Copy-ConfigIfMissing {
+    param(
+        [string]$ExampleName,
+        [string]$TargetName
+    )
+    $ExamplePath = Join-Path $ScriptDir $ExampleName
+    $TargetPath = Join-Path $ScriptDir $TargetName
+    if ((Test-Path $ExamplePath) -and -not (Test-Path $TargetPath)) {
+        Copy-Item -LiteralPath $ExamplePath -Destination $TargetPath
+        Write-Host "  created $TargetName from $ExampleName" -ForegroundColor Gray
+    }
+}
+
+function Update-EnvFromExample {
+    $ExamplePath = Join-Path $ScriptDir ".env.example"
+    $EnvPath = Join-Path $ScriptDir ".env"
+    if (-not (Test-Path $ExamplePath)) {
+        return
+    }
+    if (-not (Test-Path $EnvPath)) {
+        Copy-Item -LiteralPath $ExamplePath -Destination $EnvPath
+        Write-Host "  created .env from .env.example" -ForegroundColor Gray
+        return
+    }
+
+    $ExistingKeys = @{}
+    foreach ($Line in Get-Content -LiteralPath $EnvPath -Encoding UTF8) {
+        if ($Line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') {
+            $ExistingKeys[$Matches[1]] = $true
+        }
+    }
+
+    $MissingLines = New-Object System.Collections.Generic.List[string]
+    $PendingComments = New-Object System.Collections.Generic.List[string]
+    foreach ($Line in Get-Content -LiteralPath $ExamplePath -Encoding UTF8) {
+        if ($Line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') {
+            $Key = $Matches[1]
+            if (-not $ExistingKeys.ContainsKey($Key)) {
+                foreach ($Comment in $PendingComments) {
+                    $MissingLines.Add($Comment)
+                }
+                $PendingComments.Clear()
+                $MissingLines.Add($Line)
+                $ExistingKeys[$Key] = $true
+            } else {
+                $PendingComments.Clear()
+            }
+        } elseif ($Line.Trim() -eq "" -or $Line.TrimStart().StartsWith("#")) {
+            $PendingComments.Add($Line)
+        } else {
+            $PendingComments.Clear()
+        }
+    }
+
+    if ($MissingLines.Count -gt 0) {
+        Add-Content -LiteralPath $EnvPath -Value ""
+        Add-Content -LiteralPath $EnvPath -Value "# Added by setup from .env.example"
+        Add-Content -LiteralPath $EnvPath -Value $MissingLines
+        Write-Host "  updated .env with $($MissingLines.Count) missing template line(s)" -ForegroundColor Gray
+    } else {
+        Write-Host "  .env: up to date" -ForegroundColor Gray
+    }
+}
+
+Write-Host ">>> 准备本地配置文件..." -ForegroundColor Yellow
+Update-EnvFromExample
+Copy-ConfigIfMissing "providers.example.json" "providers.json"
+Copy-ConfigIfMissing "translate_prompt.example.md" "translate_prompt.md"
+Copy-ConfigIfMissing "proofread_prompt.example.md" "proofread_prompt.md"
+Copy-ConfigIfMissing "split_prompt.example.md" "split_prompt.md"
+
 . "$ScriptDir\.env.ps1"
 
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -115,4 +187,4 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "setup — 完成!" -ForegroundColor Green
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Next: 配置 .env (cp .env.example .env 后编辑)" -ForegroundColor Gray
+Write-Host "Next: 编辑 .env，填入 API keys 和本机偏好配置" -ForegroundColor Gray

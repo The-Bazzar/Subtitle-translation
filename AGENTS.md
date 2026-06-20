@@ -121,8 +121,10 @@ video -> json -> beautified.json -> glossary.md
 - 顺序固定为：整句翻译 -> AI 分割 -> 词级对轴 -> split event 校对
 - 翻译使用整句 segment，避免先分割导致上下文破碎
 - 分割使用未校对源语言文本匹配 WhisperX words，校对发生在 split event 上
-- 翻译、分割、校对的 user prompt 都是 JSON array；glossary 和 description 的 user prompt 是 JSON object；远端 LLM 必须只返回 JSON
-- 翻译、分割、校对返回严格 JSON array，使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `id`, `en`, `zh`
+- 分割请求默认附带前后各 1 条 `context_before` / `context_after`，只供远端理解语义和节奏；远端必须只返回 pending item 本身
+- `split_status` 明确记录分割缓存状态：`ok`=有效分割，`fallback`=AI 分割失败后整句回退且可重试，`unsplit`=低于阈值或合法保留整句；`split_reason` 是枚举原因码，`split_reason_detail` 是具体诊断文本
+- 翻译、分割、校对的 user prompt 都是 JSON object，顶层包含 `items` array；glossary 和 description 的 user prompt 也是 JSON object；远端 LLM 必须只返回 JSON
+- 翻译、分割、校对返回严格 JSON object，顶层 `items` array 使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `id`, `en`, `zh`
 - 语言代码 key 由 `${SOURCE_LANG_CODE}` / `${TARGET_LANG_CODE}` 注入；本地解析只匹配这些 ISO code，不匹配完整语言名称或 `source` / `target`
 - 对轴时只用源语言 split 的首尾 token 匹配 `words[]`；匹配失败则整句回退到 beautified 时间轴，禁止本地强切
 - token normalize 会忽略词内 dash/hyphen，例如 `non-existent` 与 `nonexistent` 可匹配；带空格的 dash 仍作为分隔
@@ -161,7 +163,7 @@ ${TARGET_LANG_CODE}
 
 ## Config
 
-`.env` 由 `.env.example` 复制而来；PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
+`setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
 
 | 变量 | 说明 |
 |------|------|
