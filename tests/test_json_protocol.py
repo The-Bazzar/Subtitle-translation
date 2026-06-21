@@ -160,6 +160,14 @@ class JsonProtocolTests(unittest.TestCase):
 
         self.assertEqual(pairs, [("corrected source", "corrected target")])
 
+    def test_get_scene_changes_handles_missing_ffmpeg_stderr(self):
+        class FakeCompletedProcess:
+            stderr = None
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            with patch.object(t.subprocess, "run", return_value=FakeCompletedProcess()):
+                self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, quiet=True), [])
+
     def test_transcript_segment_round_trips_split_status(self):
         seg = t.TranscriptSegment.from_json(
             1,

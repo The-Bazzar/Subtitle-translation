@@ -896,11 +896,14 @@ def get_scene_changes(
         return []
 
     times = []
-    for line in result.stderr.splitlines():
+    for line in (result.stderr or "").splitlines():
         m = re.search(r"pts_time:([0-9.]+)", line)
         if not m:
             continue
-        t = float(m.group(1))
+        try:
+            t = float(m.group(1))
+        except ValueError:
+            continue
         if not times or t - times[-1] >= min_interval_sec:
             times.append(t)
     return times
