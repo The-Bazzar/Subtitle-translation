@@ -1990,35 +1990,28 @@ def parse_split_response(
     expected_set = set(expected_ids)
     if data is None:
         return source, target, 'response is not a JSON object with an "items" array'
-    if len(data) != len(expected_ids):
-        return source, target, f"JSON items length {len(data)} != expected {len(expected_ids)}"
 
     seen_ids: set[int] = set()
     for pos, item in enumerate(data, 1):
         if not isinstance(item, dict):
-            return {}, {}, f"item {pos} is not an object"
+            continue
         item_id = item.get("id")
         try:
             item_id_int = int(item_id)
         except (TypeError, ValueError):
-            return {}, {}, f"item {pos} has invalid id {item_id!r}"
+            continue
         if item_id_int not in expected_set:
-            return {}, {}, f"item {pos} id {item_id_int} not in expected ids {expected_ids}"
+            continue
         if item_id_int in seen_ids:
-            return {}, {}, f"duplicate id {item_id_int}"
+            continue
         seen_ids.add(item_id_int)
         try:
             parsed = SplitOutputItem.from_json_value(item, ctx)
-        except ValueError as e:
-            return {}, {}, f"item {pos} has invalid language-code values: {e}; got keys {sorted(item.keys())}"
-        except TypeError:
-            return {}, {}, f"item {pos} has invalid language-code values"
+        except (TypeError, ValueError):
+            continue
         if parsed.source_parts:
             source[item_id_int] = parsed.source_parts
             target[item_id_int] = parsed.target_parts
-    if seen_ids != expected_set:
-        missing = sorted(expected_set - seen_ids)
-        return {}, {}, f"missing id(s): {missing}"
     return source, target, ""
 
 

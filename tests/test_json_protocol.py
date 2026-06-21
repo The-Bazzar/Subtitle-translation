@@ -150,6 +150,51 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(source[88], ["source c", "source d"])
         self.assertEqual(target[88], ["target c"])
 
+    def test_parse_split_response_ignores_extra_context_items(self):
+        source, target, error = t.parse_split_response(
+            [
+                {"id": 34, "en": ["source a"], "zh": ["target a"]},
+                {"id": 35, "en": ["source b"], "zh": ["target b"]},
+                {"id": 33, "en": ["context before"], "zh": ["上下文前"]},
+                {"id": 36, "en": ["context after"], "zh": ["上下文后"]},
+            ],
+            [34, 35],
+            self.ctx,
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(source, {34: ["source a"], 35: ["source b"]})
+        self.assertEqual(target, {34: ["target a"], 35: ["target b"]})
+
+    def test_parse_split_response_keeps_present_ids_when_one_expected_id_is_missing(self):
+        source, target, error = t.parse_split_response(
+            [
+                {"id": 34, "en": ["source a"], "zh": ["target a"]},
+                {"id": 36, "en": ["source c"], "zh": ["target c"]},
+            ],
+            [34, 35, 36],
+            self.ctx,
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(source, {34: ["source a"], 36: ["source c"]})
+        self.assertEqual(target, {34: ["target a"], 36: ["target c"]})
+
+    def test_parse_split_response_keeps_other_ids_when_one_item_has_invalid_language_values(self):
+        source, target, error = t.parse_split_response(
+            [
+                {"id": 34, "en": ["source a"], "zh": ["target a"]},
+                {"id": 35, "en": "not an array", "zh": ["target b"]},
+                {"id": 36, "en": ["source c"], "zh": ["target c"]},
+            ],
+            [34, 35, 36],
+            self.ctx,
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(source, {34: ["source a"], 36: ["source c"]})
+        self.assertEqual(target, {34: ["target a"], 36: ["target c"]})
+
     def test_parse_proofread_response_aligns_by_actual_ids(self):
         pairs = t.parse_proofread_response(
             [{"id": 3, "en": "corrected source", "zh": "corrected target"}],
