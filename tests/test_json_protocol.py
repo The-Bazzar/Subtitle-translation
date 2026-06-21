@@ -168,6 +168,14 @@ class JsonProtocolTests(unittest.TestCase):
             with patch.object(t.subprocess, "run", return_value=FakeCompletedProcess()):
                 self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, quiet=True), [])
 
+    def test_get_scene_changes_decodes_ffmpeg_stderr_bytes_with_replacement(self):
+        class FakeCompletedProcess:
+            stderr = b"bad-byte:\xa4\n[Parsed_showinfo] pts_time:1.25\n"
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            with patch.object(t.subprocess, "run", return_value=FakeCompletedProcess()):
+                self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, quiet=True), [1.25])
+
     def test_transcript_segment_round_trips_split_status(self):
         seg = t.TranscriptSegment.from_json(
             1,

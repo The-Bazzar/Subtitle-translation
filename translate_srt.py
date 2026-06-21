@@ -771,6 +771,14 @@ def _read_text_file(filepath: str) -> str:
         return f.read()
 
 
+def subprocess_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 # --- JSON load/save -----------------------------------------------------------
 
 
@@ -858,8 +866,8 @@ def get_frame_rate(video_path: str) -> float:
         video_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        fps_str = result.stdout.strip()
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        fps_str = subprocess_text(result.stdout).strip()
         if "/" in fps_str:
             num, den = fps_str.split("/")
             return float(num) / float(den) if den != "0" else 24.0
@@ -891,12 +899,12 @@ def get_scene_changes(
         "-",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        result = subprocess.run(cmd, capture_output=True, timeout=900)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
 
     times = []
-    for line in (result.stderr or "").splitlines():
+    for line in subprocess_text(result.stderr).splitlines():
         m = re.search(r"pts_time:([0-9.]+)", line)
         if not m:
             continue
