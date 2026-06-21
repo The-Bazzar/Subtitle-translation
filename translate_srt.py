@@ -2002,8 +2002,6 @@ def parse_split_response(
             return {}, {}, f"item {pos} has invalid language-code values: {e}; got keys {sorted(item.keys())}"
         except TypeError:
             return {}, {}, f"item {pos} has invalid language-code values"
-        if len(parsed.source_parts) != len(parsed.target_parts):
-            return {}, {}, f"id {item_id_int} source parts {len(parsed.source_parts)} != target parts {len(parsed.target_parts)}"
         if parsed.source_parts:
             source[item_id_int] = parsed.source_parts
             target[item_id_int] = parsed.target_parts

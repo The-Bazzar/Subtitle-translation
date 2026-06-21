@@ -133,6 +133,23 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(source[12], ["source a", "source b"])
         self.assertEqual(target[44], ["target c"])
 
+    def test_parse_split_response_keeps_other_ids_when_one_item_has_part_count_mismatch(self):
+        source, target, error = t.parse_split_response(
+            [
+                {"id": 73, "en": ["source a"], "zh": ["target a"]},
+                {"id": 74, "en": ["source b"], "zh": ["target b"]},
+                {"id": 88, "en": ["source c", "source d"], "zh": ["target c"]},
+            ],
+            [73, 74, 88],
+            self.ctx,
+        )
+
+        self.assertEqual(error, "")
+        self.assertEqual(source[73], ["source a"])
+        self.assertEqual(target[74], ["target b"])
+        self.assertEqual(source[88], ["source c", "source d"])
+        self.assertEqual(target[88], ["target c"])
+
     def test_parse_proofread_response_aligns_by_actual_ids(self):
         pairs = t.parse_proofread_response(
             [{"id": 3, "en": "corrected source", "zh": "corrected target"}],
