@@ -22,6 +22,8 @@ platform: Win + Linux
 
 - 默认不覆盖原文件
 - 输出 `<name>.beautified.json`
+- 输出 `<name>.scenes.json`，记录 fps、threshold、frame、timecode 和 scene_changes
+- 输出 `<name>.scenechange.txt`，每行一个秒级场景切换点
 
 ## 算法
 

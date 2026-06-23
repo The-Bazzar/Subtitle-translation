@@ -102,6 +102,7 @@ video -> json -> beautified.json -> glossary.md
 
 - 已合并到 `translate_srt.py`
 - 输入 `.json`，输出 `.beautified.json`，不覆盖原始 JSON
+- 同步导出 `<base>.scenes.json` 和 `<base>.scenechange.txt`；txt 每行一个秒级场景切换点
 - 对每个 word 做场景吸附和边界修复，再用首尾有效 word 回写 segment 起止时间
 - 入点吸附到前一个场景切换，出点吸附到下一个场景切换前 `end_offset_frames`
 - 只补足最短时长，不再用最大时长截断整句；长句交给 split 阶段

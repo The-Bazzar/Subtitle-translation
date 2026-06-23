@@ -221,6 +221,31 @@ class JsonProtocolTests(unittest.TestCase):
             with patch.object(t.subprocess, "run", return_value=FakeCompletedProcess()):
                 self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, quiet=True), [1.25])
 
+    def test_write_scene_change_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.json")
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            options = t.BeautifyOptions(scene_threshold=0.12, min_scene_interval_frames=2, fps=25.0)
+
+            t.write_scene_change_sidecars(ctx, os.path.join(tmp, "video.webm"), options, [1.25, 2.5])
+
+            with open(ctx.scenes_json, "r", encoding="utf-8") as f:
+                scenes = json.load(f)
+            with open(ctx.scenechange_txt, "r", encoding="utf-8") as f:
+                scenechange = f.read()
+
+            self.assertEqual(scenes["fps"], 25.0)
+            self.assertEqual(scenes["threshold"], 0.12)
+            self.assertEqual(scenes["min_interval_sec"], 0.08)
+            self.assertEqual(
+                scenes["scene_changes"],
+                [
+                    {"index": 1, "time": 1.25, "frame": 31, "timecode": "00:00:01.250"},
+                    {"index": 2, "time": 2.5, "frame": 62, "timecode": "00:00:02.500"},
+                ],
+            )
+            self.assertEqual(scenechange, "1.250000\n2.500000\n")
+
     def test_transcript_segment_round_trips_split_status(self):
         seg = t.TranscriptSegment.from_json(
             1,

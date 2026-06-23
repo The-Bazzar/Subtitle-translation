@@ -259,6 +259,8 @@ class TranscriptContext:
     info_json: str
     tags: str
     glossary: str
+    scenes_json: str
+    scenechange_txt: str
 
     @staticmethod
     def from_json(
@@ -292,6 +294,8 @@ class TranscriptContext:
             info_json=os.path.join(directory, f"{base}.info.json"),
             tags=os.path.join(directory, f"{base}.tags.txt"),
             glossary=os.path.join(directory, "glossary.md"),
+            scenes_json=os.path.join(directory, f"{base}.scenes.json"),
+            scenechange_txt=os.path.join(directory, f"{base}.scenechange.txt"),
         )
 
 
@@ -847,7 +851,8 @@ def load_or_create_beautified(
         if not quiet:
             print("Beautify: skipped")
     else:
-        beautify_transcript_timeline(transcript, video_path, options, quiet)
+        scene_changes = beautify_transcript_timeline(transcript, video_path, options, quiet)
+        write_scene_change_sidecars(ctx, video_path, options, scene_changes)
 
     save_transcript(transcript, ctx.beautified_json)
     if not quiet:
@@ -923,6 +928,39 @@ def get_scene_changes(
     return times
 
 
+def scene_timecode(seconds: float) -> str:
+    return srt_time(seconds).replace(",", ".")
+
+
+def write_scene_change_sidecars(
+    ctx: TranscriptContext,
+    video_path: str,
+    options: BeautifyOptions,
+    scene_changes: list[float],
+) -> None:
+    payload = {
+        "video": os.path.abspath(video_path) if video_path else "",
+        "fps": options.fps,
+        "threshold": options.scene_threshold,
+        "min_interval_sec": options.min_scene_interval_frames * (1.0 / options.fps),
+        "scene_changes": [
+            {
+                "index": idx,
+                "time": round(float(time), 6),
+                "frame": int(round(float(time) * options.fps)),
+                "timecode": scene_timecode(float(time)),
+            }
+            for idx, time in enumerate(scene_changes, 1)
+        ],
+    }
+    with open(ctx.scenes_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    with open(ctx.scenechange_txt, "w", encoding="utf-8") as f:
+        for time in scene_changes:
+            f.write(f"{float(time):.6f}\n")
+
+
 def snap_to_previous(value: float, targets: list[float], max_distance: float) -> float:
     for target in reversed(targets):
         if target <= value and value - target <= max_distance:
@@ -952,7 +990,7 @@ def beautify_transcript_timeline(
     video_path: str,
     options: BeautifyOptions,
     quiet: bool = False,
-) -> None:
+) -> list[float]:
     if options.aggressive:
         options.scene_threshold = 0.08
         options.snap_frames = 12
@@ -1003,6 +1041,8 @@ def beautify_transcript_timeline(
     for seg in transcript.segments:
         segment_bounds_from_words(seg)
         seg.split_events = []
+
+    return scene_changes
 
 
 def beautify_segment_words(

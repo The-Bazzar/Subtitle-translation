@@ -56,7 +56,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 1. `download.ps1/.sh` 下载视频、封面、`.info.json`、`.description`、`.tags.txt`
 2. `whisper.ps1/.sh` 调用 `whisperx --output_format json`，输出 `<name>.json`
-3. `translate_srt.py --only-beautify` 美化 JSON 里的 word 时间轴并回写 segment，输出 `<name>.beautified.json`
+3. `translate_srt.py --only-beautify` 美化 JSON 里的 word 时间轴并回写 segment，输出 `<name>.beautified.json`、`<name>.scenes.json`、`<name>.scenechange.txt`
 4. `translate_srt.py --only-glossary` 读取整句 transcript 和元数据，生成 `glossary.md`
 5. `translate_srt.py` 使用整句 JSON 翻译
 6. AI 分割后用每个源语言 split 的首尾 word 匹配美化后的 `words[]` 回填时间，再对 split events 做最终校对，输出 `.split.<source>.srt` / `.split.<target>.srt` 和最终 ASS；显式 `--no-split` 时也继续输出 ASS
@@ -89,6 +89,8 @@ video -> json -> beautified.json -> glossary.md -> <source>.proofread.ass / <tar
 输出：
 
 - `<name>.beautified.json`：主缓存，保存 `translation`、`proofread_text`、`split_events`
+- `<name>.scenes.json`：场景切换 sidecar，包含 fps、threshold、frame、timecode 等调试信息
+- `<name>.scenechange.txt`：每行一个秒级场景切换点，例如 `12.345000`
 - `<name>.split.<source>.srt`：分割后、最终校对后的源语言 SRT 检查稿
 - `<name>.split.<target>.srt`：分割后、最终校对后的目标语言 SRT 检查稿
 - `<name>.<source>.proofread.ass`：最终校对源语言 ASS
