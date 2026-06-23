@@ -658,41 +658,41 @@ The placeholder values above are format markers only. In your actual response, r
 
 _GLOSSARY_PROMPT_FALLBACK = """You are a terminology expert. Analyze the ${SOURCE_LANG} transcript and metadata to prepare glossary content for ${TARGET_LANG} subtitle translation.
 
-Create the glossary as Markdown content. The final response must follow the mandatory JSON format provided below this prompt; put the complete Markdown document in the `markdown` string value.
-
-Do not output raw Markdown directly. Do not wrap the response in a code fence. Do not add explanations before or after the JSON object.
-
-The Markdown content should follow this structure:
-# 术语知识库 — <title>
-
-## 背景
-<2-3 sentences summarizing the video topic, written in ${TARGET_LANG}>
-
-## 核心术语
-| 原文术语 | ${TARGET_LANG} 推荐译法 | 说明 |
-|------|---------|------|
-| source term | recommended translation | why this translation fits |
-
-## 态度基调
-- <tone observation in ${TARGET_LANG}>
-
-## 关键论点
-- <core argument in ${TARGET_LANG}>
+Content requirements:
+- Title the glossary for the current video.
+- Write a short background summary in ${TARGET_LANG}.
+- Include a terminology table with source terms, recommended ${TARGET_LANG} translations, and brief rationale.
+- Include tone guidance in ${TARGET_LANG}.
+- Include key arguments in ${TARGET_LANG}.
 
 Rules:
 - Only include terms that actually appear in the transcript.
 - Search results can verify standard ${TARGET_LANG} translations.
 - If uncertain, mark with (?).
 - Keep under 100 lines.
-- Do not include greetings, explanations, code fences, or comments.
-- Do not mention JSON, response format, field names, or implementation details inside the glossary Markdown content."""
+- Do not include greetings, meta commentary, implementation notes, or tool/runtime details.
+- Do not mention whether web search was used."""
 
-_GLOSSARY_FORMAT = """GLOSSARY RESPONSE FORMAT:
-Return a JSON object with exactly this key:
-{"markdown": "<glossary markdown>"}
+_GLOSSARY_FORMAT = """MANDATORY GLOSSARY JSON PROTOCOL:
+The user message is JSON. Your response must be one machine-parseable JSON object only.
+The first response character must be `{` and the last response character must be `}`.
+Do not wrap the response in a code fence. Do not add prose before or after the JSON object.
 
-Do not output raw Markdown directly. Put the complete Markdown document inside the JSON string value named "markdown".
-Escape any double quotes or backslashes inside the markdown string according to JSON rules."""
+Return exactly one top-level key: "markdown".
+The "markdown" value must be a JSON string containing the complete glossary document in Markdown.
+
+Markdown syntax is allowed only inside the JSON string value named "markdown".
+Never output raw Markdown outside the JSON object.
+
+Required shape:
+{"markdown": "# 术语知识库 - <title>\\n\\n## 背景\\n<content>\\n\\n## 核心术语\\n| 原文术语 | ${TARGET_LANG} 推荐译法 | 说明 |\\n|---|---|---|\\n| source term | recommended translation | reason |\\n\\n## 态度基调\\n- <content>\\n\\n## 关键论点\\n- <content>"}
+
+JSON string rules:
+1. Every key and every string value must use double quotes `"`.
+2. Escape literal double quotes inside markdown text as `\"`.
+3. Escape literal backslashes as `\\`.
+4. Encode line breaks inside the markdown string as `\\n`.
+5. No trailing commas."""
 
 STRUCTURED_MAX_TOKENS = 32768
 _PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
@@ -1255,18 +1255,12 @@ def build_glossary(
             llm,
             render_prompt_template(load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK), ctx)
             + "\n\n"
-            + _JSON_FORMAT
-            + "\n\n"
-            + _JSON_OBJECT_FORMAT
-            + "\n\n"
-            + _GLOSSARY_FORMAT,
+            + render_prompt_template(_GLOSSARY_FORMAT, ctx),
             request,
             max_tokens=4096,
             temperature=0.3,
         )
         glossary_output = GlossaryOutput.from_json_content(raw_response)
-        if not _extract_json_value(raw_response) and not quiet:
-            print("Warning: glossary response was markdown, accepted as compatibility fallback", file=sys.stderr)
         glossary = glossary_output.markdown
     except Exception as e:
         print(f"Warning: glossary generation failed: {e}", file=sys.stderr)
@@ -1512,10 +1506,7 @@ class GlossaryOutput:
             if markdown:
                 return GlossaryOutput(markdown)
             raise ValueError('glossary JSON object missing non-empty "markdown"')
-        text = _strip_json_fence(content).strip()
-        if text.startswith("#"):
-            return GlossaryOutput(text)
-        raise ValueError("glossary response is neither JSON object nor markdown")
+        raise ValueError('glossary response is not a JSON object with non-empty "markdown"')
 
 
 @dataclass
