@@ -185,10 +185,15 @@ ${TARGET_LANG_CODE}
 | `PROOFREAD` | `1` / `0` 控制 split event 校对 |
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
+| `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
+| `PROOFREAD_MAX_TOKENS` | 校对单次响应 max_tokens 上限，默认 `8192` |
+| `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
 | `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` | glossary 联网搜索配置 |
+
+启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含源文 transcript chunk 和翻译/分割后生成的双语 `translation_memory` chunk；proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。
 

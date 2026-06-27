@@ -311,6 +311,9 @@ class LLMConfig:
     proofread_model: str = ""
     api_key: Optional[str] = None
     batch_size: int = 50
+    proofread_batch_size: int = 0
+    proofread_retrieval_top_k: int = 1
+    proofread_max_tokens: int = 8192
 
     def pr_provider(self) -> str:
         return self.proofread_provider or self.provider
@@ -509,20 +512,58 @@ def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[Emb
     return chunks
 
 
+def build_translation_memory_chunks(transcript: Transcript, ctx: TranscriptContext) -> list[EmbeddingChunk]:
+    chunks: list[EmbeddingChunk] = []
+    for seg in transcript.segments:
+        events = seg.split_events or []
+        if not events and seg.translation.strip():
+            events = [SplitEvent(seg.start, seg.end, seg.source_text(), seg.translation)]
+        for event_index, event in enumerate(events, 1):
+            source_text = event.en.strip()
+            target_text = event.zh.strip()
+            if not source_text or not target_text:
+                continue
+            chunks.append(
+                EmbeddingChunk(
+                    chunk_id=f"translation_memory:{seg.index}:{event_index}",
+                    source="translation_memory",
+                    text=(
+                        f"[{seg.index}.{event_index}]\n"
+                        f"SOURCE({ctx.source_lang_code}): {source_text}\n"
+                        f"TARGET({ctx.target_lang_code}): {target_text}"
+                    ),
+                    start=event.start,
+                    end=event.end,
+                    metadata={
+                        "segment_id": seg.index,
+                        "event_index": event_index,
+                        "source_lang": ctx.source_lang_code,
+                        "target_lang": ctx.target_lang_code,
+                    },
+                )
+            )
+    return chunks
+
+
 def build_embedding_index(
     transcript: Transcript,
     config: EmbeddingConfig,
     env: dict[str, str],
     quiet: bool = False,
+    ctx: Optional[TranscriptContext] = None,
 ) -> str:
     if not config.enabled:
         return ""
     chunks = build_embedding_chunks(transcript, config.chunk_chars)
+    if ctx is not None:
+        chunks.extend(build_translation_memory_chunks(transcript, ctx))
     store = open_chroma_store(config, env)
-    if chunks:
+    batch_size = max(1, int(config.batch_size or 1))
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start : start + batch_size]
         store.add_documents(
-            [chunk.to_document() for chunk in chunks],
-            ids=[chunk.chunk_id for chunk in chunks],
+            [chunk.to_document() for chunk in batch],
+            ids=[chunk.chunk_id for chunk in batch],
         )
     if not quiet:
         print(f"Embedding index: {config.chroma_dir} ({len(chunks)} chunks)", file=sys.stderr)
@@ -1914,6 +1955,7 @@ def llm_numbered_batch(
     quiet: bool,
     retries: int = 3,
     max_tokens: Optional[int] = None,
+    raise_on_failure: bool = False,
 ) -> list:
     prompt = request.to_json_text()
     item_count = len(request.items)
@@ -1930,13 +1972,43 @@ def llm_numbered_batch(
             return data.to_items()
         except Exception as e:
             last_error = str(e)
+            if raise_on_failure and is_context_length_error(e):
+                raise
             if attempt < retries - 1:
                 wait = (attempt + 1) * 3
                 if not quiet:
                     print(f"  Retry {attempt + 1}/{retries} in {wait}s...", file=sys.stderr)
                 time.sleep(wait)
-    print(f"Error: LLM batch failed after {retries} attempts: {last_error}", file=sys.stderr)
+    message = f"LLM batch failed after {retries} attempts: {last_error}"
+    if raise_on_failure:
+        raise RuntimeError(message)
+    print(f"Error: {message}", file=sys.stderr)
     return []
+
+
+def resolve_proofread_batch_size(llm: LLMConfig) -> int:
+    configured = int(getattr(llm, "proofread_batch_size", 0) or 0)
+    if configured > 0:
+        return configured
+    return max(1, int(getattr(llm, "batch_size", 1) or 1) // 2)
+
+
+def proofread_max_tokens_for_batch(item_count: int, cap: int = 8192) -> int:
+    safe_cap = max(1024, int(cap or 8192))
+    return min(safe_cap, max(1024, max(1, item_count) * 320))
+
+
+def is_context_length_error(error: Exception | str) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "maximum context length",
+            "context length",
+            "too many tokens",
+            "reduce the length",
+        )
+    )
 
 
 def translate_segments(
@@ -2021,7 +2093,9 @@ def proofread_split_events(
         provider=llm.pr_provider(),
         model=llm.pr_model(),
         api_key=llm.api_key if llm.pr_provider() == llm.provider else None,
-        batch_size=max(15, llm.batch_size // 2),
+        batch_size=resolve_proofread_batch_size(llm),
+        proofread_retrieval_top_k=max(1, int(getattr(llm, "proofread_retrieval_top_k", 1) or 1)),
+        proofread_max_tokens=max(1024, int(getattr(llm, "proofread_max_tokens", 8192) or 8192)),
     )
     if not quiet:
         print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}", file=sys.stderr)
@@ -2041,24 +2115,88 @@ def proofread_split_events(
         temperature=0.2,
     )
     changed = False
-    for start in range(0, len(events), pr_llm.batch_size):
-        batch = events[start : start + pr_llm.batch_size]
-        contexts = (
-            retriever.retrieve_texts([f"{event.en}\n{event.zh}" for event in batch])
-            if retriever
-            else [[] for _ in batch]
-        )
+
+    def apply_proofread_batch(
+        batch_events: list[SplitEvent],
+        item_offset: int,
+        batch_contexts: list[list[dict]],
+    ) -> bool:
         request = LLMBatchRequest(
             [
                 ProofreadInputItem(
-                    start + idx + 1,
+                    item_offset + idx + 1,
                     event.en,
                     event.zh,
                     ctx,
-                    retrieved_context=contexts[idx],
+                    retrieved_context=batch_contexts[idx],
                 ).to_batch_item()
-                for idx, event in enumerate(batch)
+                for idx, event in enumerate(batch_events)
             ]
+        )
+        try:
+            response_items = llm_numbered_batch(
+                request,
+                session,
+                quiet,
+                max_tokens=proofread_max_tokens_for_batch(len(batch_events), pr_llm.proofread_max_tokens),
+                raise_on_failure=True,
+            )
+        except Exception as e:
+            if len(batch_events) > 1 and is_context_length_error(e):
+                mid = len(batch_events) // 2
+                if not quiet:
+                    print(
+                        f"  Proofread batch too large; splitting {item_offset + 1}-"
+                        f"{item_offset + len(batch_events)}",
+                        file=sys.stderr,
+                    )
+                left_changed = apply_proofread_batch(
+                    batch_events[:mid],
+                    item_offset,
+                    batch_contexts[:mid],
+                )
+                right_changed = apply_proofread_batch(
+                    batch_events[mid:],
+                    item_offset + mid,
+                    batch_contexts[mid:],
+                )
+                return left_changed or right_changed
+            if is_context_length_error(e) and any(batch_contexts):
+                if not quiet:
+                    print(
+                        f"  Proofread item {item_offset + 1} too large with retrieved context; retrying without RAG context",
+                        file=sys.stderr,
+                    )
+                return apply_proofread_batch(batch_events, item_offset, [[] for _ in batch_events])
+            print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
+            response_items = []
+
+        fallback_pairs = [(event.en, event.zh) for event in batch_events]
+        parsed_pairs = parse_proofread_response(
+            response_items,
+            [item.id for item in request.items],
+            fallback_pairs,
+            ctx,
+        )
+        batch_changed = False
+        for event, (en, zh) in zip(batch_events, parsed_pairs):
+            new_en = en.strip() or event.en
+            new_zh = zh.strip() or event.zh
+            if new_en != event.en or new_zh != event.zh:
+                batch_changed = True
+            event.en = new_en
+            event.zh = new_zh
+        return batch_changed
+
+    for start in range(0, len(events), pr_llm.batch_size):
+        batch = events[start : start + pr_llm.batch_size]
+        contexts = (
+            retriever.retrieve_texts(
+                [f"{event.en}\n{event.zh}" for event in batch],
+                top_k=pr_llm.proofread_retrieval_top_k,
+            )
+            if retriever
+            else [[] for _ in batch]
         )
         if not quiet:
             print(
@@ -2066,27 +2204,7 @@ def proofread_split_events(
                 f"proofreading split events {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
-        response_items = llm_numbered_batch(
-            request,
-            session,
-            quiet,
-            max_tokens=STRUCTURED_MAX_TOKENS,
-        )
-
-        fallback_pairs = [(event.en, event.zh) for event in batch]
-        parsed_pairs = parse_proofread_response(
-            response_items,
-            [item.id for item in request.items],
-            fallback_pairs,
-            ctx,
-        )
-        for event, (en, zh) in zip(batch, parsed_pairs):
-            new_en = en.strip() or event.en
-            new_zh = zh.strip() or event.zh
-            if new_en != event.en or new_zh != event.zh:
-                changed = True
-            event.en = new_en
-            event.zh = new_zh
+        changed = apply_proofread_batch(batch, start, contexts) or changed
     return changed
 
 
@@ -2810,7 +2928,7 @@ def main() -> None:
     retriever = None
     if embedding_config.enabled:
         try:
-            build_embedding_index(transcript, embedding_config, env, args.quiet)
+            build_embedding_index(transcript, embedding_config, env, args.quiet, ctx)
             retriever = EmbeddingRetriever(embedding_config, env)
         except Exception as e:
             print(f"Error: embedding index failed: {e}", file=sys.stderr)
@@ -2833,6 +2951,9 @@ def main() -> None:
         proofread_provider=env.get("PROOFREAD_PROVIDER", ""),
         proofread_model=env.get("PROOFREAD_MODEL", ""),
         batch_size=args.batch_size,
+        proofread_batch_size=env_int(env.get("PROOFREAD_BATCH_SIZE", ""), max(1, args.batch_size // 2)),
+        proofread_retrieval_top_k=env_int(env.get("PROOFREAD_RETRIEVAL_TOP_K", ""), 1),
+        proofread_max_tokens=env_int(env.get("PROOFREAD_MAX_TOKENS", ""), 8192),
     )
 
     if not args.skip_knowledge:
@@ -2881,6 +3002,12 @@ def main() -> None:
         ),
         args.quiet,
     ) or changed
+    if embedding_config.enabled:
+        try:
+            build_embedding_index(transcript, embedding_config, env, args.quiet, ctx)
+            retriever = EmbeddingRetriever(embedding_config, env)
+        except Exception as e:
+            print(f"Warning: translation memory index update failed: {e}", file=sys.stderr)
     if (args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0"):
         changed = proofread_split_events(
             transcript,

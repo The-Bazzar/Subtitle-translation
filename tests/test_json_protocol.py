@@ -177,6 +177,7 @@ class JsonProtocolTests(unittest.TestCase):
             provider = "fake"
             batch_size = 10
             api_key = None
+            proofread_retrieval_top_k = 1
 
             def pr_provider(self):
                 return "fake"
@@ -193,11 +194,12 @@ class JsonProtocolTests(unittest.TestCase):
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
                 self.texts = texts
+                self.top_k = top_k
                 return [[{"id": "transcript:1", "text": "proofread memory"}]]
 
         captured = {}
 
-        def fake_llm_numbered_batch(request, session, quiet, retries=3, max_tokens=None):
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, max_tokens=None, raise_on_failure=False):
             captured.update(request.to_json_value())
             return [{"id": 1, "en": "source", "zh": "译文"}]
 
@@ -220,6 +222,181 @@ class JsonProtocolTests(unittest.TestCase):
 
         self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "proofread memory"}])
         self.assertEqual(retriever.texts, ["source\n译文"])
+        self.assertEqual(retriever.top_k, 1)
+
+    def test_proofread_split_events_respects_small_batch_and_dynamic_max_tokens(self):
+        class FakeLLM:
+            provider = "fake"
+            batch_size = 10
+            api_key = None
+            proofread_batch_size = 2
+            proofread_max_tokens = 8192
+            proofread_retrieval_top_k = 1
+
+            def pr_provider(self):
+                return "fake"
+
+            def pr_model(self):
+                return "fake-model"
+
+            def model_name(self):
+                return "fake-model"
+
+            def cfg(self):
+                return {}
+
+        calls = []
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, max_tokens=None, raise_on_failure=False):
+            calls.append((len(request.items), max_tokens))
+            return [
+                {"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"]}
+                for item in request.items
+            ]
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    1,
+                    0.0,
+                    3.0,
+                    "source",
+                    split_events=[
+                        t.SplitEvent(0.0, 1.0, "source one", "译文一"),
+                        t.SplitEvent(1.0, 2.0, "source two", "译文二"),
+                        t.SplitEvent(2.0, 3.0, "source three", "译文三"),
+                    ],
+                )
+            ],
+        )
+
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", quiet=True)
+
+        self.assertEqual([size for size, _ in calls], [2, 1])
+        self.assertEqual([tokens for _, tokens in calls], [1024, 1024])
+
+    def test_proofread_split_events_splits_batch_on_context_length_error(self):
+        class FakeLLM:
+            provider = "fake"
+            batch_size = 10
+            api_key = None
+            proofread_batch_size = 2
+            proofread_max_tokens = 8192
+            proofread_retrieval_top_k = 1
+
+            def pr_provider(self):
+                return "fake"
+
+            def pr_model(self):
+                return "fake-model"
+
+            def model_name(self):
+                return "fake-model"
+
+            def cfg(self):
+                return {}
+
+        calls = []
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, max_tokens=None, raise_on_failure=False):
+            calls.append(len(request.items))
+            if len(request.items) > 1:
+                raise RuntimeError("maximum context length exceeded")
+            return [
+                {"id": item.id, "en": item.fields["en"] + " fixed", "zh": item.fields["zh"] + " fixed"}
+                for item in request.items
+            ]
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    1,
+                    0.0,
+                    2.0,
+                    "source",
+                    split_events=[
+                        t.SplitEvent(0.0, 1.0, "source one", "译文一"),
+                        t.SplitEvent(1.0, 2.0, "source two", "译文二"),
+                    ],
+                )
+            ],
+        )
+
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            changed = t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", quiet=True)
+
+        self.assertTrue(changed)
+        self.assertEqual(calls, [2, 1, 1])
+        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
+        self.assertEqual(transcript.segments[0].split_events[1].zh, "译文二 fixed")
+
+    def test_proofread_split_events_drops_retrieved_context_when_single_item_is_too_large(self):
+        class FakeLLM:
+            provider = "fake"
+            batch_size = 2
+            api_key = None
+            proofread_batch_size = 1
+            proofread_max_tokens = 8192
+            proofread_retrieval_top_k = 1
+
+            def pr_provider(self):
+                return "fake"
+
+            def pr_model(self):
+                return "fake-model"
+
+            def model_name(self):
+                return "fake-model"
+
+            def cfg(self):
+                return {}
+
+        class FakeRetriever:
+            def retrieve_texts(self, texts, top_k=None):
+                return [[{"id": "transcript:1", "text": "x" * 1000}]]
+
+        saw_context = []
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, max_tokens=None, raise_on_failure=False):
+            has_context = bool(request.items[0].fields.get("retrieved_context"))
+            saw_context.append(has_context)
+            if has_context:
+                raise RuntimeError("maximum context length exceeded")
+            item = request.items[0]
+            return [{"id": item.id, "en": item.fields["en"] + " fixed", "zh": item.fields["zh"]}]
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    1,
+                    0.0,
+                    1.0,
+                    "source",
+                    split_events=[t.SplitEvent(0.0, 1.0, "source one", "译文一")],
+                )
+            ],
+        )
+
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            changed = t.proofread_split_events(
+                transcript,
+                self.ctx,
+                FakeLLM(),
+                "system",
+                quiet=True,
+                retriever=FakeRetriever(),
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(saw_context, [True, False])
+        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
 
     def test_chat_session_passes_provider_response_format(self):
         calls = []
@@ -399,6 +576,35 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(chunks[0].start, 0.0)
         self.assertEqual(chunks[0].end, 2.0)
 
+    def test_build_translation_memory_chunks_uses_split_events(self):
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    7,
+                    1.0,
+                    3.0,
+                    "source sentence",
+                    translation="目标句子",
+                    split_events=[
+                        t.SplitEvent(1.0, 2.0, "source part one", "目标一"),
+                        t.SplitEvent(2.0, 3.0, "source part two", "目标二"),
+                    ],
+                )
+            ],
+        )
+
+        chunks = t.build_translation_memory_chunks(transcript, self.ctx)
+
+        self.assertEqual([chunk.chunk_id for chunk in chunks], ["translation_memory:7:1", "translation_memory:7:2"])
+        self.assertEqual(chunks[0].source, "translation_memory")
+        self.assertEqual(chunks[0].text, "[7.1]\nSOURCE(en): source part one\nTARGET(zh): 目标一")
+        self.assertEqual(chunks[0].metadata["segment_id"], 7)
+        self.assertEqual(chunks[0].metadata["event_index"], 1)
+        self.assertEqual(chunks[0].metadata["source_lang"], "en")
+        self.assertEqual(chunks[0].metadata["target_lang"], "zh")
+
     def test_build_embedding_index_uses_chroma_add_documents_without_manual_persist(self):
         class FakeStore:
             def __init__(self):
@@ -423,6 +629,65 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(result, "index")
         self.assertEqual(fake_store.ids, ["transcript:1"])
         self.assertEqual(fake_store.documents[0].page_content, "[1] alpha beta")
+
+    def test_build_embedding_index_adds_translation_memory_chunks(self):
+        class FakeStore:
+            def __init__(self):
+                self.documents = []
+                self.ids = []
+
+            def add_documents(self, documents, ids):
+                self.documents = documents
+                self.ids = ids
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    1,
+                    0.0,
+                    1.0,
+                    "source",
+                    translation="译文",
+                    split_events=[t.SplitEvent(0.0, 1.0, "source", "译文")],
+                )
+            ],
+        )
+        cfg = t.EmbeddingConfig(enabled=True, chroma_dir="index")
+        fake_store = FakeStore()
+
+        with patch.object(t, "open_chroma_store", return_value=fake_store):
+            t.build_embedding_index(transcript, cfg, {}, quiet=True, ctx=self.ctx)
+
+        self.assertEqual(fake_store.ids, ["transcript:1", "translation_memory:1:1"])
+        self.assertIn("SOURCE(en): source", fake_store.documents[1].page_content)
+        self.assertIn("TARGET(zh): 译文", fake_store.documents[1].page_content)
+
+    def test_build_embedding_index_adds_documents_in_configured_batches(self):
+        class FakeStore:
+            def __init__(self):
+                self.calls = []
+
+            def add_documents(self, documents, ids):
+                self.calls.append((documents, ids))
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "alpha"),
+                t.TranscriptSegment(2, 1.0, 2.0, "beta"),
+                t.TranscriptSegment(3, 2.0, 3.0, "gamma"),
+            ],
+        )
+        cfg = t.EmbeddingConfig(enabled=True, chroma_dir="index", chunk_chars=1, batch_size=2)
+        fake_store = FakeStore()
+
+        with patch.object(t, "open_chroma_store", return_value=fake_store):
+            t.build_embedding_index(transcript, cfg, {}, quiet=True)
+
+        self.assertEqual([ids for _, ids in fake_store.calls], [["transcript:1", "transcript:2"], ["transcript:3"]])
 
     def test_response_keys_match_language_codes_only(self):
         source_candidates = t.response_key_candidates(self.ctx, "source")
