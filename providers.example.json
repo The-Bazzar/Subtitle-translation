@@ -1,4 +1,18 @@
 {
+    "openai": {
+        "url": "https://api.openai.com/v1",
+        "default_model": "gpt-4.1-mini",
+        "env_key": "OPENAI_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {}
+    },
+    "llama": {
+        "url": "http://localhost:11434/v1",
+        "default_model": "llama3.1",
+        "env_key": "OLLAMA_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {}
+    },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1",
         "default_model": "anthropic/claude-sonnet-4-6",

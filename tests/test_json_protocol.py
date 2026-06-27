@@ -39,6 +39,22 @@ class JsonProtocolTests(unittest.TestCase):
         item = t.TranslateInputItem(7, "source text", self.ctx)
         self.assertEqual(item.to_json_value(), {"id": 7, "en": "source text"})
 
+    def test_typed_translate_item_serializes_retrieved_context(self):
+        item = t.TranslateInputItem(
+            7,
+            "source text",
+            self.ctx,
+            retrieved_context=[{"id": "transcript:1", "text": "related context"}],
+        )
+        self.assertEqual(
+            item.to_json_value(),
+            {
+                "id": 7,
+                "en": "source text",
+                "retrieved_context": [{"id": "transcript:1", "text": "related context"}],
+            },
+        )
+
     def test_typed_split_result_parses_language_arrays(self):
         result = t.SplitOutputItem.from_json_value(
             {"id": 12, "en": ["a", "b"], "zh": ["甲", "乙"]},
@@ -72,6 +88,138 @@ class JsonProtocolTests(unittest.TestCase):
         )
         self.assertEqual(result.source_text, "corrected source")
         self.assertEqual(result.target_text, "corrected target")
+
+    def test_typed_proofread_item_serializes_retrieved_context(self):
+        item = t.ProofreadInputItem(
+            3,
+            "source text",
+            "target text",
+            self.ctx,
+            retrieved_context=[{"id": "transcript:2", "text": "nearby context"}],
+        )
+        self.assertEqual(
+            item.to_json_value(),
+            {
+                "id": 3,
+                "en": "source text",
+                "zh": "target text",
+                "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
+            },
+        )
+
+    def test_build_glossary_adds_retrieved_context(self):
+        class FakeLLM:
+            provider = "fake"
+
+        class FakeRetriever:
+            def retrieve_texts(self, texts, top_k=None):
+                self.texts = texts
+                return [[{"id": "transcript:1", "text": "important context", "score": 0.9}]]
+
+        captured = {}
+
+        def fake_llm_text_once(llm, system_prompt, request, max_tokens, temperature=0.3):
+            captured.update(request.to_json_value())
+            return '{"markdown": "# 术语知识库"}'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "alpha topic")],
+            )
+            retriever = FakeRetriever()
+            with patch.object(t, "llm_text_once", side_effect=fake_llm_text_once):
+                t.build_glossary(transcript, ctx, FakeLLM(), quiet=True, retriever=retriever)
+
+            self.assertEqual(captured["retrieved_context"], [{"id": "transcript:1", "text": "important context", "score": 0.9}])
+            self.assertTrue(retriever.texts[0])
+
+    def test_translate_segments_adds_retrieved_context(self):
+        class FakeLLM:
+            provider = "fake"
+            batch_size = 10
+
+            def model_name(self):
+                return "fake-model"
+
+            def cfg(self):
+                return {}
+
+        class FakeRetriever:
+            def retrieve_texts(self, texts, top_k=None):
+                self.texts = texts
+                return [[{"id": "transcript:1", "text": "translation memory"}]]
+
+        captured = {}
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, max_tokens=None):
+            captured.update(request.to_json_value())
+            return [{"id": 1, "zh": "译文"}]
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "source text")],
+        )
+        retriever = FakeRetriever()
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.translate_segments(transcript, self.ctx, FakeLLM(), "system", quiet=True, retriever=retriever)
+
+        self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "translation memory"}])
+        self.assertEqual(retriever.texts, ["source text"])
+
+    def test_proofread_split_events_adds_retrieved_context(self):
+        class FakeLLM:
+            provider = "fake"
+            batch_size = 10
+            api_key = None
+
+            def pr_provider(self):
+                return "fake"
+
+            def pr_model(self):
+                return "fake-model"
+
+            def model_name(self):
+                return "fake-model"
+
+            def cfg(self):
+                return {}
+
+        class FakeRetriever:
+            def retrieve_texts(self, texts, top_k=None):
+                self.texts = texts
+                return [[{"id": "transcript:1", "text": "proofread memory"}]]
+
+        captured = {}
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, max_tokens=None):
+            captured.update(request.to_json_value())
+            return [{"id": 1, "en": "source", "zh": "译文"}]
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    1,
+                    0.0,
+                    1.0,
+                    "source",
+                    split_events=[t.SplitEvent(0.0, 1.0, "source", "译文")],
+                )
+            ],
+        )
+        retriever = FakeRetriever()
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", quiet=True, retriever=retriever)
+
+        self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "proofread memory"}])
+        self.assertEqual(retriever.texts, ["source\n译文"])
 
     def test_chat_session_passes_provider_response_format(self):
         calls = []
@@ -109,6 +257,172 @@ class JsonProtocolTests(unittest.TestCase):
         t.ChatSession(FakeLLM(), "system").ask("{}", max_tokens=128)
 
         self.assertEqual(calls[0]["response_format"], {"type": "json_object"})
+
+    def test_load_providers_merges_local_config_with_builtins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            providers_path = os.path.join(tmp, "providers.json")
+            with open(providers_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "custom": {
+                            "url": "https://example.test/v1",
+                            "default_model": "custom-model",
+                            "env_key": "CUSTOM_API_KEY",
+                            "auth_header": "Bearer {api_key}",
+                            "extra_headers": {},
+                        }
+                    },
+                    f,
+                )
+
+            old_cache = t._providers_cache
+            try:
+                t._providers_cache = None
+                with patch.object(t.os.path, "dirname", return_value=tmp):
+                    providers = t.load_providers()
+            finally:
+                t._providers_cache = old_cache
+
+            self.assertIn("openai", providers)
+            self.assertIn("llama", providers)
+            self.assertIn("custom", providers)
+
+    def test_embedding_config_from_env_uses_project_chroma_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+            cfg = t.EmbeddingConfig.from_env(
+                {
+                    "EMBEDDING_ENABLED": "1",
+                    "EMBEDDING_PROVIDER": "openai",
+                    "EMBEDDING_MODEL": "text-embedding-3-small",
+                    "EMBEDDING_TOP_K": "8",
+                    "EMBEDDING_CHUNK_CHARS": "900",
+                },
+                ctx,
+            )
+
+            self.assertTrue(cfg.enabled)
+            self.assertEqual(cfg.provider, "openai")
+            self.assertEqual(cfg.model, "text-embedding-3-small")
+            self.assertEqual(cfg.store, "chroma")
+            self.assertEqual(cfg.top_k, 8)
+            self.assertEqual(cfg.chunk_chars, 900)
+            self.assertEqual(cfg.chroma_dir, os.path.join(tmp, "chroma_db"))
+
+    def test_embedding_config_ignores_legacy_pipeline_use_embedding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+            cfg = t.EmbeddingConfig.from_env({"PIPELINE_USE_EMBEDDING": "1"}, ctx)
+
+            self.assertFalse(cfg.enabled)
+
+    def test_embedding_chunk_converts_to_langchain_document(self):
+        chunk = t.EmbeddingChunk("a", "transcript", "discipline and motivation", 1.0, 2.0, {"segment": 1})
+
+        doc = chunk.to_document()
+
+        self.assertEqual(doc.page_content, "discipline and motivation")
+        self.assertEqual(
+            doc.metadata,
+            {
+                "id": "a",
+                "source": "transcript",
+                "start": 1.0,
+                "end": 2.0,
+                "segment": 1,
+            },
+        )
+
+    def test_langchain_docs_convert_to_retrieved_context(self):
+        doc = t.Document(
+            page_content="discipline and motivation",
+            metadata={"id": "transcript:1", "source": "transcript", "start": 1.0, "end": 2.0},
+        )
+
+        context = t.documents_to_retrieved_context([doc])
+
+        self.assertEqual(
+            context,
+            [
+                {
+                    "id": "transcript:1",
+                    "source": "transcript",
+                    "text": "discipline and motivation",
+                    "start": 1.0,
+                    "end": 2.0,
+                }
+            ],
+        )
+
+    def test_embedding_function_uses_provider_config_and_disables_tiktoken(self):
+        cfg = t.EmbeddingConfig(provider="llama", model="qwen3-embedding")
+        env = {"OLLAMA_API_KEY": "not-needed"}
+
+        with patch.object(
+            t,
+            "load_providers",
+            return_value={
+                "llama": {
+                    "url": "http://localhost:8080/v1",
+                    "env_key": "OLLAMA_API_KEY",
+                    "extra_headers": {"X-Test": "1"},
+                }
+            },
+        ), patch.object(t, "OpenAIEmbeddings") as fake_embeddings:
+            t.embedding_function(cfg, env)
+
+        fake_embeddings.assert_called_once_with(
+            base_url="http://localhost:8080/v1",
+            api_key="not-needed",
+            model="qwen3-embedding",
+            default_headers={"X-Test": "1"},
+            check_embedding_ctx_length=False,
+        )
+
+    def test_build_embedding_chunks_groups_transcript_segments(self):
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "alpha beta"),
+                t.TranscriptSegment(2, 1.0, 2.0, "gamma delta"),
+                t.TranscriptSegment(3, 2.0, 3.0, "epsilon"),
+            ],
+        )
+
+        chunks = t.build_embedding_chunks(transcript, chunk_chars=40)
+
+        self.assertEqual([chunk.chunk_id for chunk in chunks], ["transcript:1-2", "transcript:3"])
+        self.assertEqual(chunks[0].source, "transcript")
+        self.assertEqual(chunks[0].text, "[1] alpha beta\n[2] gamma delta")
+        self.assertEqual(chunks[0].metadata["segment_ids"], [1, 2])
+        self.assertEqual(chunks[0].start, 0.0)
+        self.assertEqual(chunks[0].end, 2.0)
+
+    def test_build_embedding_index_uses_chroma_add_documents_without_manual_persist(self):
+        class FakeStore:
+            def __init__(self):
+                self.documents = []
+                self.ids = []
+
+            def add_documents(self, documents, ids):
+                self.documents = documents
+                self.ids = ids
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "alpha beta")],
+        )
+        cfg = t.EmbeddingConfig(enabled=True, chroma_dir="index")
+        fake_store = FakeStore()
+
+        with patch.object(t, "open_chroma_store", return_value=fake_store):
+            result = t.build_embedding_index(transcript, cfg, {}, quiet=True)
+
+        self.assertEqual(result, "index")
+        self.assertEqual(fake_store.ids, ["transcript:1"])
+        self.assertEqual(fake_store.documents[0].page_content, "[1] alpha beta")
 
     def test_response_keys_match_language_codes_only(self):
         source_candidates = t.response_key_candidates(self.ctx, "source")

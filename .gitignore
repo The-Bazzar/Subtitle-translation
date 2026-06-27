@@ -9,3 +9,6 @@ proofread_prompt.md
 translate_prompt.md
 glossary_prompt.md
 split_prompt.md
+*.chroma/
+*.chroma_db/
+chroma_db/

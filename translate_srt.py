@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -26,6 +25,9 @@ from typing import Optional
 
 import langcodes
 import language_data  # noqa: F401
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_openai import OpenAIEmbeddings
 from openai import OpenAI
 from tavily import TavilyClient
 
@@ -340,6 +342,202 @@ class LLMConfig:
             default_headers=provider_cfg.get("extra_headers", {}),
         )
 
+
+@dataclass
+class EmbeddingConfig:
+    enabled: bool = False
+    provider: str = "openai"
+    model: str = "text-embedding-3-small"
+    store: str = "chroma"
+    chroma_dir: str = ""
+    top_k: int = 6
+    chunk_chars: int = 800
+    batch_size: int = 64
+
+    @staticmethod
+    def from_env(env: dict[str, str], ctx: TranscriptContext) -> "EmbeddingConfig":
+        enabled = env_flag(env.get("EMBEDDING_ENABLED", "0"))
+        provider = env.get("EMBEDDING_PROVIDER", "openai") or "openai"
+        model = env.get("EMBEDDING_MODEL", "text-embedding-3-small") or "text-embedding-3-small"
+        store = (env.get("EMBEDDING_STORE", "chroma") or "chroma").lower()
+        chroma_dir = env.get("EMBEDDING_CHROMA_DIR", "") or os.path.join(ctx.dir, "chroma_db")
+        return EmbeddingConfig(
+            enabled=enabled,
+            provider=provider,
+            model=model,
+            store=store,
+            chroma_dir=chroma_dir,
+            top_k=env_int(env.get("EMBEDDING_TOP_K", ""), 6),
+            chunk_chars=env_int(env.get("EMBEDDING_CHUNK_CHARS", ""), 800),
+            batch_size=env_int(env.get("EMBEDDING_BATCH_SIZE", ""), 64),
+        )
+
+
+@dataclass
+class EmbeddingChunk:
+    chunk_id: str
+    source: str
+    text: str
+    start: Optional[float] = None
+    end: Optional[float] = None
+    metadata: dict = field(default_factory=dict)
+
+    def to_document(self) -> Document:
+        metadata = {
+            "id": self.chunk_id,
+            "source": self.source,
+        }
+        if self.start is not None:
+            metadata["start"] = self.start
+        if self.end is not None:
+            metadata["end"] = self.end
+        metadata.update(self.metadata)
+        return Document(page_content=self.text, metadata=metadata)
+
+
+class EmbeddingRetriever:
+    def __init__(self, config: EmbeddingConfig, env: dict[str, str]):
+        self.config = config
+        self.vector_store = open_chroma_store(config, env)
+
+    def retrieve_texts(self, texts: list[str], top_k: Optional[int] = None) -> list[list[dict]]:
+        clean_texts = [text.strip() for text in texts]
+        if not clean_texts:
+            return []
+        limit = top_k or self.config.top_k
+        return [
+            documents_to_retrieved_context(self.vector_store.similarity_search(text, k=limit))
+            for text in clean_texts
+        ]
+
+
+def documents_to_retrieved_context(documents: list[Document]) -> list[dict]:
+    contexts: list[dict] = []
+    for doc in documents:
+        metadata = dict(doc.metadata or {})
+        data = {
+            "id": str(metadata.pop("id", "")),
+            "source": str(metadata.pop("source", "")),
+            "text": doc.page_content,
+        }
+        for key in ("start", "end"):
+            if key in metadata:
+                data[key] = metadata.pop(key)
+        if metadata:
+            data["metadata"] = metadata
+        contexts.append(data)
+    return contexts
+
+
+def embedding_function(config: EmbeddingConfig, env: dict[str, str]) -> OpenAIEmbeddings:
+    providers = load_providers()
+    if config.provider not in providers:
+        raise ValueError(f"unknown embedding provider: {config.provider}")
+    provider_cfg = providers[config.provider]
+    key_name = provider_cfg["env_key"]
+    api_key = env.get(key_name, "")
+    if not api_key:
+        raise ValueError(f"{key_name} not found in environment or .env file")
+    return OpenAIEmbeddings(
+        base_url=provider_cfg["url"],
+        api_key=api_key,
+        model=config.model,
+        default_headers=provider_cfg.get("extra_headers", {}),
+        check_embedding_ctx_length=False,
+    )
+
+
+def open_chroma_store(config: EmbeddingConfig, env: dict[str, str]) -> Chroma:
+    if config.store != "chroma":
+        raise ValueError(f"unsupported EMBEDDING_STORE={config.store}; only chroma is available")
+    os.makedirs(config.chroma_dir, exist_ok=True)
+    return Chroma(
+        persist_directory=config.chroma_dir,
+        embedding_function=embedding_function(config, env),
+    )
+
+
+def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[EmbeddingChunk]:
+    chunks: list[EmbeddingChunk] = []
+    current_segments: list[TranscriptSegment] = []
+    current_lines: list[str] = []
+    current_len = 0
+    max_chars = max(1, chunk_chars)
+
+    def flush() -> None:
+        nonlocal current_segments, current_lines, current_len
+        if not current_segments:
+            return
+        first = current_segments[0]
+        last = current_segments[-1]
+        if first.index == last.index:
+            chunk_id = f"transcript:{first.index}"
+        else:
+            chunk_id = f"transcript:{first.index}-{last.index}"
+        chunks.append(
+            EmbeddingChunk(
+                chunk_id=chunk_id,
+                source="transcript",
+                text="\n".join(current_lines),
+                start=first.start,
+                end=last.end,
+                metadata={
+                    "language": transcript.language,
+                    "segment_ids": [seg.index for seg in current_segments],
+                },
+            )
+        )
+        current_segments = []
+        current_lines = []
+        current_len = 0
+
+    for seg in transcript.segments:
+        text = seg.source_text().strip()
+        if not text:
+            continue
+        line = f"[{seg.index}] {text}"
+        extra_len = len(line) + (1 if current_lines else 0)
+        if current_lines and current_len + extra_len > max_chars:
+            flush()
+        current_segments.append(seg)
+        current_lines.append(line)
+        current_len += extra_len
+
+    flush()
+    return chunks
+
+
+def build_embedding_index(
+    transcript: Transcript,
+    config: EmbeddingConfig,
+    env: dict[str, str],
+    quiet: bool = False,
+) -> str:
+    if not config.enabled:
+        return ""
+    chunks = build_embedding_chunks(transcript, config.chunk_chars)
+    store = open_chroma_store(config, env)
+    if chunks:
+        store.add_documents(
+            [chunk.to_document() for chunk in chunks],
+            ids=[chunk.chunk_id for chunk in chunks],
+        )
+    if not quiet:
+        print(f"Embedding index: {config.chroma_dir} ({len(chunks)} chunks)", file=sys.stderr)
+    return config.chroma_dir
+
+
+def env_flag(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(value: str, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
 @dataclass
 class BeautifyOptions:
     scene_threshold: float = 0.15
@@ -529,6 +727,20 @@ def get_language_keyed_value(item: dict, candidates: set[str]):
 
 
 _BUILTIN_PROVIDERS = {
+    "openai": {
+        "url": "https://api.openai.com/v1",
+        "default_model": "gpt-4.1-mini",
+        "env_key": "OPENAI_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {},
+    },
+    "llama": {
+        "url": "http://localhost:11434/v1",
+        "default_model": "llama3.1",
+        "env_key": "OLLAMA_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {},
+    },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1",
         "default_model": "anthropic/claude-sonnet-4-6",
@@ -613,6 +825,11 @@ Preserve each input item's exact `id`. Do not renumber."""
 
 _JSON_OBJECT_FORMAT = """Return a JSON object.
 The first response character must be `{` and the last response character must be `}`."""
+
+_RETRIEVED_CONTEXT_RULES = """RETRIEVED CONTEXT:
+Some input items may include a "retrieved_context" array from the same transcript.
+Use it only for terminology, names, recurring concepts, tone, and local consistency.
+Do not translate, proofread, split, merge, or return retrieved_context items."""
 
 _TRANSLATE_FORMAT = """
 TRANSLATION RESPONSE FORMAT:
@@ -721,7 +938,9 @@ def load_providers() -> dict:
             with open(config_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             if loaded:
-                _providers_cache = loaded
+                providers = dict(_BUILTIN_PROVIDERS)
+                providers.update(loaded)
+                _providers_cache = providers
                 return _providers_cache
         except (json.JSONDecodeError, OSError):
             pass
@@ -1248,6 +1467,7 @@ def build_glossary(
     tavily_key: str = "",
     tavily_max_results: int = 10,
     quiet: bool = False,
+    retriever=None,
 ) -> str:
     if os.path.isfile(ctx.glossary) and os.path.getsize(ctx.glossary) > 0:
         if not quiet:
@@ -1277,15 +1497,20 @@ def build_glossary(
             for r in unique[:10]
         )
 
-    request = LLMObjectRequest(
-        {
-            "title": title,
-            "transcript_excerpt": transcript_text[:8000],
-            "description": desc_text[:1000],
-            "tags": tags[:20],
-            "search_results": search_text[:4000] if search_text else "",
-        }
-    )
+    request_fields = {
+        "title": title,
+        "transcript_excerpt": transcript_text[:8000],
+        "description": desc_text[:1000],
+        "tags": tags[:20],
+        "search_results": search_text[:4000] if search_text else "",
+    }
+    if retriever:
+        query = "\n".join([title, desc_text[:2000], " ".join(tags[:20]), transcript_text[:4000]]).strip()
+        retrieved = retriever.retrieve_texts([query], top_k=12)
+        if retrieved:
+            request_fields["retrieved_context"] = retrieved[0]
+
+    request = LLMObjectRequest(request_fields)
 
     if not quiet:
         print(f"Glossary: generating with {llm.provider}", file=sys.stderr)
@@ -1294,6 +1519,7 @@ def build_glossary(
         raw_response = llm_text_once(
             llm,
             render_prompt_template(load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK), ctx)
+            + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever else "")
             + "\n\n"
             + render_prompt_template(_GLOSSARY_FORMAT, ctx),
             request,
@@ -1337,9 +1563,13 @@ class TranslateInputItem:
     id: int
     source_text: str
     ctx: TranscriptContext
+    retrieved_context: list[dict] = field(default_factory=list)
 
     def to_batch_item(self) -> LLMBatchItem:
-        return LLMBatchItem(self.id, {self.ctx.source_lang_code: self.source_text})
+        fields = {self.ctx.source_lang_code: self.source_text}
+        if self.retrieved_context:
+            fields["retrieved_context"] = self.retrieved_context
+        return LLMBatchItem(self.id, fields)
 
     def to_json_value(self) -> dict:
         return self.to_batch_item().to_json_value()
@@ -1362,15 +1592,16 @@ class ProofreadInputItem:
     source_text: str
     target_text: str
     ctx: TranscriptContext
+    retrieved_context: list[dict] = field(default_factory=list)
 
     def to_batch_item(self) -> LLMBatchItem:
-        return LLMBatchItem(
-            self.id,
-            {
-                self.ctx.source_lang_code: self.source_text,
-                self.ctx.target_lang_code: self.target_text,
-            },
-        )
+        fields = {
+            self.ctx.source_lang_code: self.source_text,
+            self.ctx.target_lang_code: self.target_text,
+        }
+        if self.retrieved_context:
+            fields["retrieved_context"] = self.retrieved_context
+        return LLMBatchItem(self.id, fields)
 
     def to_json_value(self) -> dict:
         return self.to_batch_item().to_json_value()
@@ -1712,6 +1943,7 @@ def translate_segments(
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
+    retriever=None,
 ) -> bool:
     pending = [s for s in transcript.segments if not s.translation]
     if not pending:
@@ -1726,6 +1958,7 @@ def translate_segments(
     session = ChatSession(
         llm,
         system_prompt
+        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever else "")
         + "\n\n"
         + _JSON_FORMAT
         + "\n\n"
@@ -1742,8 +1975,12 @@ def translate_segments(
                 f"translating {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
+        contexts = retriever.retrieve_texts([seg.en_text() for seg in batch]) if retriever else [[] for _ in batch]
         request = LLMBatchRequest(
-            [TranslateInputItem(s.index, s.en_text(), ctx).to_batch_item() for s in batch]
+            [
+                TranslateInputItem(s.index, s.en_text(), ctx, retrieved_context=contexts[idx]).to_batch_item()
+                for idx, s in enumerate(batch)
+            ]
         )
         response_items = llm_numbered_batch(
             request,
@@ -1770,6 +2007,7 @@ def proofread_split_events(
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
+    retriever=None,
 ) -> bool:
     events: list[SplitEvent] = []
     for seg in transcript.segments:
@@ -1791,6 +2029,7 @@ def proofread_split_events(
     session = ChatSession(
         pr_llm,
         system_prompt
+        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever else "")
         + "\n\n"
         + _JSON_FORMAT
         + "\n\n"
@@ -1802,6 +2041,11 @@ def proofread_split_events(
     changed = False
     for start in range(0, len(events), pr_llm.batch_size):
         batch = events[start : start + pr_llm.batch_size]
+        contexts = (
+            retriever.retrieve_texts([f"{event.en}\n{event.zh}" for event in batch])
+            if retriever
+            else [[] for _ in batch]
+        )
         request = LLMBatchRequest(
             [
                 ProofreadInputItem(
@@ -1809,6 +2053,7 @@ def proofread_split_events(
                     event.en,
                     event.zh,
                     ctx,
+                    retrieved_context=contexts[idx],
                 ).to_batch_item()
                 for idx, event in enumerate(batch)
             ]
@@ -2522,6 +2767,7 @@ def main() -> None:
     source_lang = args.source_lang or env.get("SOURCE_LANG", "") or source.language or "source"
     target_lang = args.target_lang or env.get("TARGET_LANG", "") or "zh"
     ctx = TranscriptContext.from_json(args.json, args.output or "", source_lang, target_lang)
+    embedding_config = EmbeddingConfig.from_env(env, ctx)
     if args.print_output_path:
         print(os.path.abspath(ctx.bilingual_ass))
         print(f"OUTPUT_ASS={os.path.abspath(ctx.bilingual_ass)}")
@@ -2535,6 +2781,14 @@ def main() -> None:
         print(f"Target:   {ctx.target_lang}")
         if video_path:
             print(f"Video:    {video_path}")
+        if embedding_config.enabled:
+            print(f"Embedding: {embedding_config.provider} / {embedding_config.model}")
+            print(f"Embedding DB: {embedding_config.chroma_dir}")
+
+    if embedding_config.enabled:
+        if embedding_config.store != "chroma":
+            print(f"Error: unsupported EMBEDDING_STORE={embedding_config.store}; only chroma is available.", file=sys.stderr)
+            sys.exit(1)
 
     beautify_options = BeautifyOptions(
         scene_threshold=args.scene_threshold,
@@ -2551,6 +2805,14 @@ def main() -> None:
     transcript = load_or_create_beautified(
         ctx, source, video_path, beautify_options, args.skip_beautify, args.force, args.quiet
     )
+    retriever = None
+    if embedding_config.enabled:
+        try:
+            build_embedding_index(transcript, embedding_config, env, args.quiet)
+            retriever = EmbeddingRetriever(embedding_config, env)
+        except Exception as e:
+            print(f"Error: embedding index failed: {e}", file=sys.stderr)
+            sys.exit(1)
 
     if args.only_beautify:
         print(f"OUTPUT_JSON={os.path.abspath(ctx.beautified_json)}")
@@ -2579,6 +2841,7 @@ def main() -> None:
             env.get("TAVILY_API_KEY", ""),
             int(env.get("TAVILY_MAX_RESULTS", "10") or "10"),
             args.quiet,
+            retriever,
         )
 
     if args.only_glossary:
@@ -2603,7 +2866,7 @@ def main() -> None:
         system_prompt += glossary_text
         proofread_prompt += glossary_text
 
-    changed = translate_segments(transcript, ctx, llm, system_prompt, args.quiet)
+    changed = translate_segments(transcript, ctx, llm, system_prompt, args.quiet, retriever)
     changed = split_segments(
         transcript,
         ctx,
@@ -2623,6 +2886,7 @@ def main() -> None:
             llm,
             proofread_prompt,
             args.quiet,
+            retriever,
         ) or changed
     if changed:
         save_transcript(transcript, ctx.beautified_json)

@@ -124,8 +124,12 @@ DEEPSEEK_API_KEY=
 | `WHISPER_DEVICE` | `cuda` / `cpu`；留空则跟随 `TORCH_BACKEND` 自动推导 |
 | `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
-| `TRANSLATE_PROVIDER` | 翻译后端，必填 |
+| `TRANSLATE_PROVIDER` | 翻译后端，必填；可用 `openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
 | `TRANSLATE_MODEL` | 翻译模型，空则用 provider 默认 |
+| `EMBEDDING_ENABLED` | `1/0` 控制是否用 LangChain + Chroma 构建 embedding 索引，并注入 glossary/translate/proofread 上下文 |
+| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding 后端和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
+| `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
+| `EMBEDDING_TOP_K` / `EMBEDDING_CHUNK_CHARS` / `EMBEDDING_BATCH_SIZE` | embedding 检索、切块和批量调用参数 |
 | `PROOFREAD` | `1/0` 控制双语校对 |
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型 |
@@ -145,7 +149,9 @@ DEEPSEEK_API_KEY=
 | `whisperx` | 语音识别 + 词级对齐 JSON |
 | `ffmpeg` / `ffprobe` | 音频提取、场景检测、字幕硬压 |
 | `python` | Windows/WSL 下由 setup 创建 `.venv` 运行 `translate_srt.py` |
-| `openai` Python 包 | LLM 调用 |
+| `openai` Python 包 | LLM 与 embedding 调用 |
+| `langchain` / `langchain-openai` / `langchain-chroma` | RAG 检索链路和 OpenAI-compatible embedding 接入 |
+| `chromadb` | 本地持久化向量库 |
 | `langcodes[data]` Python 包 | 语言名/标签规范为 ISO 639 输出后缀 |
 | `tavily-python` | glossary 可选联网搜索 SDK |
 | `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |

@@ -175,14 +175,18 @@ ${TARGET_LANG_CODE}
 | `WHISPER_DEVICE` | `cuda` / `cpu`；留空则跟随 `TORCH_BACKEND` 自动推导 |
 | `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
-| `TRANSLATE_PROVIDER` | 翻译后端：`openrouter` / `deepseek` / `gemini` |
+| `TRANSLATE_PROVIDER` | 翻译后端：`openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
 | `TRANSLATE_MODEL` | 翻译模型，空则用 provider 默认 |
+| `EMBEDDING_ENABLED` | `1` / `0` 控制是否用 LangChain + Chroma 构建 embedding 索引并注入 glossary/translate/proofread 上下文 |
+| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding provider 和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
+| `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前仅支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
+| `EMBEDDING_TOP_K` / `EMBEDDING_CHUNK_CHARS` / `EMBEDDING_BATCH_SIZE` | embedding 检索、切块和批量调用参数 |
 | `PROOFREAD` | `1` / `0` 控制 split event 校对 |
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
-| `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM API keys |
+| `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
 | `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` | glossary 联网搜索配置 |
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。
@@ -237,7 +241,9 @@ TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 | `whisperx` | ASR + word alignment JSON |
 | `ffmpeg` / `ffprobe` | 音频提取、场景检测、硬压 |
 | `python` | Windows/WSL 下由 setup 创建 `.venv` 运行 `translate_srt.py` |
-| `openai` | LLM 调用 |
+| `openai` | LLM 与 embedding 调用 |
+| `langchain` / `langchain-openai` / `langchain-chroma` | RAG 检索链路和 OpenAI-compatible embedding 接入 |
+| `chromadb` | 本地持久化向量库 |
 | `langcodes[data]` | 语言名/标签规范为 ISO 639 输出后缀 |
 | `tavily-python` | glossary 可选联网搜索 SDK |
 | `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |
