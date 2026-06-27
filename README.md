@@ -135,14 +135,14 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
-| `PROOFREAD_MAX_TOKENS` | 校对单次响应 max_tokens 上限，默认 `8192` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `TAVILY_API_KEY` | glossary 联网搜索 |
 | `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限 |
+| `TAVILY_MAX_QUERIES` | Tavily 搜索 query 总数上限；标题、作者和有效标签优先参与检索 |
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 
-启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会同时保存源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；校对阶段会用源文+译文一起检索，以保持术语和译风一致。
+启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会同时保存 `glossary.md` 项目知识、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签。索引会自动按 Markdown 标题切分 glossary，给 transcript chunk 保留 1 条 segment overlap，并在重建前清理当前项目旧 chunk，避免残留结果污染检索。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。
 

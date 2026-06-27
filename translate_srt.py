@@ -313,7 +313,6 @@ class LLMConfig:
     batch_size: int = 50
     proofread_batch_size: int = 0
     proofread_retrieval_top_k: int = 1
-    proofread_max_tokens: int = 8192
 
     def pr_provider(self) -> str:
         return self.proofread_provider or self.provider
@@ -462,6 +461,21 @@ def open_chroma_store(config: EmbeddingConfig, env: dict[str, str]) -> Chroma:
     )
 
 
+TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS = 1
+
+
+def transcript_chunk_id(segments: list[TranscriptSegment]) -> str:
+    first = segments[0]
+    last = segments[-1]
+    if first.index == last.index:
+        return f"transcript:{first.index}"
+    return f"transcript:{first.index}-{last.index}"
+
+
+def transcript_chunk_line(seg: TranscriptSegment) -> str:
+    return f"[{seg.index}] {seg.source_text().strip()}"
+
+
 def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[EmbeddingChunk]:
     chunks: list[EmbeddingChunk] = []
     current_segments: list[TranscriptSegment] = []
@@ -475,13 +489,9 @@ def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[Emb
             return
         first = current_segments[0]
         last = current_segments[-1]
-        if first.index == last.index:
-            chunk_id = f"transcript:{first.index}"
-        else:
-            chunk_id = f"transcript:{first.index}-{last.index}"
         chunks.append(
             EmbeddingChunk(
-                chunk_id=chunk_id,
+                chunk_id=transcript_chunk_id(current_segments),
                 source="transcript",
                 text="\n".join(current_lines),
                 start=first.start,
@@ -492,23 +502,93 @@ def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[Emb
                 },
             )
         )
-        current_segments = []
-        current_lines = []
-        current_len = 0
+        overlap_segments = current_segments[-TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS:] if TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS > 0 else []
+        current_segments = list(overlap_segments)
+        current_lines = [transcript_chunk_line(seg) for seg in current_segments]
+        current_len = sum(len(line) for line in current_lines) + max(0, len(current_lines) - 1)
 
     for seg in transcript.segments:
         text = seg.source_text().strip()
         if not text:
             continue
-        line = f"[{seg.index}] {text}"
+        line = transcript_chunk_line(seg)
         extra_len = len(line) + (1 if current_lines else 0)
         if current_lines and current_len + extra_len > max_chars:
             flush()
+            if current_segments and current_segments[-1].index == seg.index:
+                continue
+            extra_len = len(line) + (1 if current_lines else 0)
         current_segments.append(seg)
         current_lines.append(line)
         current_len += extra_len
 
     flush()
+    return chunks
+
+
+def split_markdown_sections(text: str) -> list[tuple[str, list[str]]]:
+    sections: list[tuple[str, list[str]]] = []
+    current_heading = ""
+    current_lines: list[str] = []
+    heading_pattern = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+    def flush() -> None:
+        nonlocal current_lines
+        if current_lines:
+            sections.append((current_heading, current_lines))
+            current_lines = []
+
+    for line in text.splitlines():
+        match = heading_pattern.match(line)
+        if match:
+            flush()
+            current_heading = match.group(2).strip()
+        current_lines.append(line)
+    flush()
+    return sections
+
+
+def build_glossary_chunks(ctx: TranscriptContext, chunk_chars: int) -> list[EmbeddingChunk]:
+    if not os.path.isfile(ctx.glossary) or os.path.getsize(ctx.glossary) <= 0:
+        return []
+    text = _read_text_file(ctx.glossary).strip()
+    if not text:
+        return []
+
+    chunks: list[EmbeddingChunk] = []
+    max_chars = max(1, chunk_chars)
+
+    def append_chunk(current_lines: list[str], heading: str) -> None:
+        if not current_lines:
+            return
+        index = len(chunks) + 1
+        chunks.append(
+            EmbeddingChunk(
+                chunk_id=f"glossary:{index}",
+                source="glossary",
+                text="\n".join(current_lines).strip(),
+                metadata={
+                    "kind": "project_glossary",
+                    "path": ctx.glossary,
+                    "heading": heading,
+                },
+            )
+        )
+
+    for heading, section_lines in split_markdown_sections(text):
+        current_lines: list[str] = []
+        current_len = 0
+        for line in section_lines:
+            extra_len = len(line) + (1 if current_lines else 0)
+            if current_lines and current_len + extra_len > max_chars:
+                append_chunk(current_lines, heading)
+                current_lines = []
+                current_len = 0
+                extra_len = len(line)
+            current_lines.append(line)
+            current_len += extra_len
+        append_chunk(current_lines, heading)
+
     return chunks
 
 
@@ -545,19 +625,47 @@ def build_translation_memory_chunks(transcript: Transcript, ctx: TranscriptConte
     return chunks
 
 
+def is_embedding_chunk_id(chunk_id: str) -> bool:
+    return chunk_id.startswith(("transcript:", "glossary:", "translation_memory:"))
+
+
+def existing_embedding_chunk_ids(store) -> list[str]:
+    if not hasattr(store, "get"):
+        return []
+    try:
+        data = store.get(include=[])
+    except TypeError:
+        data = store.get()
+    except Exception:
+        return []
+    ids = data.get("ids", []) if isinstance(data, dict) else []
+    return [str(chunk_id) for chunk_id in ids if is_embedding_chunk_id(str(chunk_id))]
+
+
+def clear_embedding_chunks(store, chunk_ids: Optional[list[str]] = None) -> None:
+    ids = chunk_ids if chunk_ids is not None else existing_embedding_chunk_ids(store)
+    ids = [str(chunk_id) for chunk_id in ids if is_embedding_chunk_id(str(chunk_id))]
+    if not ids or not hasattr(store, "delete"):
+        return
+    store.delete(ids=ids)
+
+
 def build_embedding_index(
     transcript: Transcript,
     config: EmbeddingConfig,
     env: dict[str, str],
     quiet: bool = False,
     ctx: Optional[TranscriptContext] = None,
+    existing_chunk_ids: Optional[list[str]] = None,
 ) -> str:
     if not config.enabled:
         return ""
     chunks = build_embedding_chunks(transcript, config.chunk_chars)
     if ctx is not None:
+        chunks.extend(build_glossary_chunks(ctx, config.chunk_chars))
         chunks.extend(build_translation_memory_chunks(transcript, ctx))
     store = open_chroma_store(config, env)
+    clear_embedding_chunks(store, existing_chunk_ids)
     batch_size = max(1, int(config.batch_size or 1))
     for start in range(0, len(chunks), batch_size):
         batch = chunks[start : start + batch_size]
@@ -570,6 +678,26 @@ def build_embedding_index(
     return config.chroma_dir
 
 
+def refresh_embedding_retriever(
+    transcript: Transcript,
+    config: EmbeddingConfig,
+    env: dict[str, str],
+    quiet: bool,
+    ctx: TranscriptContext,
+    fatal: bool = False,
+    warning_label: str = "embedding index failed",
+):
+    try:
+        build_embedding_index(transcript, config, env, quiet, ctx)
+        return EmbeddingRetriever(config, env)
+    except Exception as e:
+        if fatal:
+            print(f"Error: {warning_label}: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Warning: {warning_label}: {e}", file=sys.stderr)
+        return None
+
+
 def env_flag(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -580,6 +708,11 @@ def env_int(value: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def embedding_enabled_for_stage(only_beautify: bool, only_glossary: bool) -> bool:
+    return not only_beautify
+
 
 @dataclass
 class BeautifyOptions:
@@ -754,12 +887,41 @@ def normalized_response_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
 
+@dataclass(frozen=True)
+class LanguageFields:
+    source_key: str
+    target_key: str
+
+    @staticmethod
+    def from_ctx(ctx: TranscriptContext) -> "LanguageFields":
+        return LanguageFields(ctx.source_lang_code, ctx.target_lang_code)
+
+    def source_candidates(self) -> set[str]:
+        return {normalized_response_key(self.source_key)} if self.source_key else set()
+
+    def target_candidates(self) -> set[str]:
+        return {normalized_response_key(self.target_key)} if self.target_key else set()
+
+    def build(self, source=None, target=None, extra: Optional[dict] = None) -> dict:
+        fields: dict = {}
+        if source is not None:
+            fields[self.source_key] = source
+        if target is not None:
+            fields[self.target_key] = target
+        if extra:
+            fields.update(extra)
+        return prune_empty_json(fields) or {}
+
+    def get_source(self, item: dict):
+        return get_language_keyed_value(item, self.source_candidates())
+
+    def get_target(self, item: dict):
+        return get_language_keyed_value(item, self.target_candidates())
+
+
 def response_key_candidates(ctx: TranscriptContext, side: str) -> set[str]:
-    if side == "source":
-        values = [ctx.source_lang_code]
-    else:
-        values = [ctx.target_lang_code]
-    return {normalized_response_key(value) for value in values if value}
+    fields = LanguageFields.from_ctx(ctx)
+    return fields.source_candidates() if side == "source" else fields.target_candidates()
 
 
 def get_language_keyed_value(item: dict, candidates: set[str]):
@@ -958,7 +1120,53 @@ JSON string rules:
 4. Encode line breaks inside the markdown string as `\\n`.
 5. No trailing commas."""
 
-STRUCTURED_MAX_TOKENS = 32768
+
+_TAVILY_QUERY_PROMPT = """You are a search-intent agent for a subtitle translation pipeline.
+Read the video metadata and transcript excerpt, then produce web search queries that reveal the real topic, named entities, concepts, works, claims, and terminology discussed in the video.
+
+Rules:
+- Base queries on transcript content first. Metadata can disambiguate, but do not rely on title/tags alone.
+- Prefer concrete concepts, named entities, works, quotes, technical terms, and distinctive claims.
+- Avoid generic channel promotion, merch, sponsorship, social links, and vague queries.
+- Each query must be useful as a direct Tavily/web search query.
+- Return 3 to 8 queries when possible.
+- Keep each query concise, normally under 120 characters."""
+
+_TAVILY_QUERY_FORMAT = """TAVILY SEARCH QUERY JSON PROTOCOL:
+Return exactly one top-level key: "queries".
+"queries" must be a JSON array of non-empty strings.
+
+GOOD:
+{"queries": ["specific concept from transcript", "named entity technical term", "distinctive claim from video"]}
+
+Do not include explanations, scores, markdown, or extra keys."""
+
+
+def tavily_query_system_prompt(ctx: TranscriptContext) -> str:
+    return (
+        render_prompt_template(_TAVILY_QUERY_PROMPT, ctx)
+        + "\n\n"
+        + _JSON_FORMAT
+        + "\n\n"
+        + _JSON_OBJECT_FORMAT
+        + "\n\n"
+        + _TAVILY_QUERY_FORMAT
+    )
+
+
+def glossary_system_prompt(ctx: TranscriptContext, retriever=None) -> str:
+    return (
+        render_prompt_template(load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK), ctx)
+        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
+        + "\n\n"
+        + _JSON_FORMAT
+        + "\n\n"
+        + _JSON_OBJECT_FORMAT
+        + "\n\n"
+        + render_prompt_template(_GLOSSARY_FORMAT, ctx)
+    )
+
+
 _PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
 Return exactly these keys in each "items" object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}".
 {"items": [
@@ -1427,9 +1635,17 @@ def load_glossary(glossary_path: str) -> str:
     )
 
 
-def read_metadata(ctx: TranscriptContext) -> tuple[str, str, list[str]]:
+def load_glossary_prompt_context(glossary_path: str, retriever=None) -> str:
+    if retriever is not None:
+        return ""
+    return load_glossary(glossary_path)
+
+
+def read_video_metadata_fields(ctx: TranscriptContext) -> dict:
     title = ctx.base
     webpage_url = ""
+    uploader = ""
+    upload_time = ""
     tags: list[str] = []
     if os.path.isfile(ctx.info_json):
         try:
@@ -1437,6 +1653,20 @@ def read_metadata(ctx: TranscriptContext) -> tuple[str, str, list[str]]:
                 info = json.load(f)
             title = info.get("title") or title
             webpage_url = info.get("webpage_url") or ""
+            uploader = str(info.get("uploader") or info.get("channel") or "")
+            timestamp = info.get("timestamp")
+            if timestamp:
+                try:
+                    from datetime import datetime, timezone
+
+                    upload_time = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+                    upload_time = upload_time[:-2] + ":" + upload_time[-2:]
+                except (TypeError, ValueError, OSError, OverflowError):
+                    upload_time = ""
+            if not upload_time:
+                upload_date = str(info.get("upload_date") or "")
+                if len(upload_date) == 8 and upload_date.isdigit():
+                    upload_time = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
         except Exception:
             pass
     if os.path.isfile(ctx.tags):
@@ -1454,43 +1684,118 @@ def read_metadata(ctx: TranscriptContext) -> tuple[str, str, list[str]]:
         except Exception:
             pass
     tags = list(dict.fromkeys(tags))
-    return title, webpage_url, tags
+    desc_text = _read_text_file(ctx.desc).strip() if os.path.isfile(ctx.desc) else ""
+    return {
+        "title": str(title),
+        "webpage_url": str(webpage_url),
+        "uploader": uploader,
+        "upload_time": upload_time,
+        "description": desc_text,
+        "tags": tags,
+    }
+
+
+def read_metadata(ctx: TranscriptContext) -> tuple[str, str, list[str]]:
+    fields = read_video_metadata_fields(ctx)
+    return fields["title"], fields["webpage_url"], fields["tags"]
 
 
 def read_metadata_header(ctx: TranscriptContext) -> str:
-    if not os.path.isfile(ctx.info_json):
+    fields = read_video_metadata_fields(ctx)
+    if not any(fields.get(key) for key in ("title", "webpage_url", "uploader", "upload_time")):
         return ""
-    try:
-        with open(ctx.info_json, "r", encoding="utf-8") as f:
-            info = json.load(f)
-    except Exception:
-        return ""
-
-    title = str(info.get("title") or "")
-    webpage_url = str(info.get("webpage_url") or "")
-    uploader = str(info.get("uploader") or info.get("channel") or "")
-    upload_time = ""
-    timestamp = info.get("timestamp")
-    if timestamp:
-        try:
-            from datetime import datetime, timezone
-
-            upload_time = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
-            upload_time = upload_time[:-2] + ":" + upload_time[-2:]
-        except (TypeError, ValueError, OSError, OverflowError):
-            upload_time = ""
-    if not upload_time:
-        upload_date = str(info.get("upload_date") or "")
-        if len(upload_date) == 8 and upload_date.isdigit():
-            upload_time = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
 
     return (
-        f"原视频：{webpage_url}\n"
-        f"原标题：{title}\n"
-        f"原作者：{uploader}\n"
-        f"上传时间：{upload_time}\n"
+        f"原视频：{fields['webpage_url']}\n"
+        f"原标题：{fields['title']}\n"
+        f"原作者：{fields['uploader']}\n"
+        f"上传时间：{fields['upload_time']}\n"
         f"\n=====\n\n"
     )
+
+
+DESCRIPTION_NOISE_PATTERNS = [
+    r"https?://",
+    r"\bwww\.",
+    r"\b(?:patreon|merch|shop|store|discount|sponsor|sponsored|affiliate)\b",
+    r"\b(?:subscribe|follow|newsletter|instagram|twitter|x\.com|tiktok|discord|facebook|threads)\b",
+    r"\b(?:use\s+code|promo\s+code|coupon)\b",
+    r"\b(?:chapters?|timestamps?)\b",
+    r"(?:©|\bcopyright\b)",
+]
+
+
+def filter_video_description_for_glossary(description: str, max_chars: int = 1600) -> tuple[str, bool]:
+    kept_lines: list[str] = []
+    filtered = False
+    blank_pending = False
+    for raw_line in description.splitlines():
+        line = raw_line.strip()
+        if not line:
+            blank_pending = bool(kept_lines)
+            continue
+        lowered = line.lower()
+        if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in DESCRIPTION_NOISE_PATTERNS):
+            filtered = True
+            continue
+        if re.fullmatch(r"[\W_]+", line):
+            filtered = True
+            continue
+        if blank_pending and kept_lines:
+            kept_lines.append("")
+        kept_lines.append(line)
+        blank_pending = False
+
+    text = "\n".join(kept_lines).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+        filtered = True
+    return text, filtered
+
+
+def build_local_glossary_metadata_section(ctx: TranscriptContext) -> str:
+    fields = read_video_metadata_fields(ctx)
+    lines = ["## 视频元信息", ""]
+    if fields["webpage_url"]:
+        lines.append(f"原视频：{fields['webpage_url']}")
+    if fields["title"]:
+        lines.append(f"原标题：{fields['title']}")
+    if fields["uploader"]:
+        lines.append(f"原作者：{fields['uploader']}")
+    if fields["upload_time"]:
+        lines.append(f"上传时间：{fields['upload_time']}")
+    if fields["tags"]:
+        lines.append(f"标签：{', '.join(fields['tags'])}")
+    if fields["description"]:
+        description, filtered = filter_video_description_for_glossary(fields["description"])
+        if description:
+            lines.extend(["", "原简介：", "", description])
+        if filtered:
+            lines.extend(["", "已过滤简介中的推广链接、社媒链接、赞助信息和纯 URL 行。"])
+    section = "\n".join(lines).strip()
+    return section if section != "## 视频元信息" else ""
+
+
+def ensure_local_metadata_in_glossary(glossary: str, ctx: TranscriptContext) -> str:
+    clean_glossary = glossary.strip()
+    if "## 视频元信息" in clean_glossary:
+        return clean_glossary
+    metadata_section = build_local_glossary_metadata_section(ctx)
+    if not metadata_section:
+        return clean_glossary
+    if not clean_glossary:
+        return metadata_section
+    return f"{metadata_section}\n\n{clean_glossary}"
+
+
+def write_glossary_file(ctx: TranscriptContext, glossary: str) -> str:
+    clean_glossary = glossary.strip()
+    if not clean_glossary:
+        return ""
+    with open(ctx.glossary, "w", encoding="utf-8") as f:
+        f.write(clean_glossary)
+        f.write("\n")
+    return clean_glossary
 
 
 def tavily_search(query: str, api_key: str, max_results: int = 5) -> list[dict]:
@@ -1503,19 +1808,145 @@ def tavily_search(query: str, api_key: str, max_results: int = 5) -> list[dict]:
         return []
 
 
+GENERIC_TAVILY_TAGS = {
+    "video",
+    "youtube",
+    "podcast",
+    "reaction",
+    "short",
+    "shorts",
+    "vlog",
+    "interview",
+    "clips",
+    "clip",
+    "highlights",
+    "highlight",
+    "trailer",
+    "official",
+    "channel",
+    "tag",
+    "tags",
+    "generic tag",
+}
+
+
+def is_substantive_tavily_tag(tag: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(tag).strip())
+    if len(clean) < 3:
+        return False
+    lowered = clean.lower().strip("#")
+    if lowered in GENERIC_TAVILY_TAGS:
+        return False
+    if re.fullmatch(r"[\W_]+", clean):
+        return False
+    return True
+
+
+def merge_tavily_queries_with_fallbacks(agent_queries: list[str], fields: dict, max_queries: int = 8) -> list[str]:
+    title = str(fields.get("title", "")).strip()
+    uploader = str(fields.get("uploader", "")).strip()
+    tags = fields.get("tags", [])
+    candidates: list[str] = []
+    if title:
+        candidates.append(title)
+        if uploader:
+            candidates.append(f"{title} {uploader}")
+        if isinstance(tags, list):
+            for tag in tags:
+                clean_tag = re.sub(r"\s+", " ", str(tag).strip())
+                if is_substantive_tavily_tag(clean_tag):
+                    candidates.append(f"{title} {clean_tag}")
+    candidates.extend(agent_queries)
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        query = re.sub(r"\s+", " ", str(raw).strip())
+        if not query:
+            continue
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(query[:200])
+        if len(queries) >= max_queries:
+            break
+    return queries
+
+
+def build_tavily_queries(
+    transcript: Transcript,
+    ctx: TranscriptContext,
+    llm: LLMConfig,
+    quiet: bool = False,
+    max_queries: int = 8,
+    retriever=None,
+) -> list[str]:
+    fields = read_video_metadata_fields(ctx)
+    description = filter_video_description_for_glossary(fields["description"], max_chars=1200)[0]
+    retrieved_context: list[dict] = []
+    if retriever is not None:
+        semantic_query = "\n".join(
+            part
+            for part in [
+                fields["title"],
+                fields["uploader"],
+                " ".join(fields["tags"][:20]),
+                description,
+            ]
+            if part
+        ).strip()
+        if not semantic_query:
+            semantic_query = "\n".join(transcript.text_lines()[:50]).strip()
+        if semantic_query:
+            retrieved = retriever.retrieve_texts([semantic_query], top_k=8)
+            if retrieved:
+                retrieved_context = retrieved[0]
+    request_fields = {
+        "title": fields["title"],
+        "uploader": fields["uploader"],
+        "url": fields["webpage_url"],
+        "upload_time": fields["upload_time"],
+        "description": description,
+        "tags": fields["tags"][:20],
+        "source_language": ctx.source_lang_code,
+        "target_language": ctx.target_lang_code,
+    }
+    if retrieved_context:
+        request_fields["retrieved_transcript_context"] = retrieved_context
+    else:
+        request_fields["transcript_excerpt"] = "\n".join(transcript.text_lines())[:3000]
+    request = LLMObjectRequest(request_fields)
+    try:
+        response_obj = llm_json_once(
+            llm,
+            tavily_query_system_prompt(ctx),
+            request,
+            temperature=0.2,
+        )
+        agent_queries = TavilyQueryOutput.from_json_value(response_obj, max_queries=max_queries).queries
+        return merge_tavily_queries_with_fallbacks(agent_queries, fields, max_queries=max_queries)
+    except Exception as e:
+        if not quiet:
+            print(f"  Warning: Tavily query agent failed: {e}", file=sys.stderr)
+        return merge_tavily_queries_with_fallbacks([], fields, max_queries=max_queries)
+
+
 def build_glossary(
     transcript: Transcript,
     ctx: TranscriptContext,
     llm: LLMConfig,
     tavily_key: str = "",
-    tavily_max_results: int = 10,
+    tavily_max_results: int = 20,
+    tavily_max_queries: int = 15,
     quiet: bool = False,
     retriever=None,
 ) -> str:
     if os.path.isfile(ctx.glossary) and os.path.getsize(ctx.glossary) > 0:
+        glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(_read_text_file(ctx.glossary), ctx))
         if not quiet:
             print(f"Glossary cache: {ctx.glossary}", file=sys.stderr)
-        return _read_text_file(ctx.glossary)
+        return glossary
 
     title, _, tags = read_metadata(ctx)
     desc_text = _read_text_file(ctx.desc) if os.path.isfile(ctx.desc) else ""
@@ -1524,10 +1955,19 @@ def build_glossary(
     search_text = ""
     if tavily_key:
         all_results = []
-        for q in [title] + tags[:5]:
+        queries = build_tavily_queries(
+            transcript,
+            ctx,
+            llm,
+            quiet=quiet,
+            max_queries=max(1, tavily_max_queries),
+            retriever=retriever,
+        )
+        per_query_results = max(1, min(tavily_max_results, 3))
+        for q in queries:
             if not quiet:
                 print(f"  Searching: {q[:60]}", file=sys.stderr)
-            all_results.extend(tavily_search(q, tavily_key, tavily_max_results))
+            all_results.extend(tavily_search(q, tavily_key, per_query_results))
         seen = set()
         unique = []
         for r in all_results:
@@ -1537,7 +1977,7 @@ def build_glossary(
                 unique.append(r)
         search_text = "\n\n".join(
             f"Source: {r.get('url', '')}\n{r.get('content', '')[:500]}"
-            for r in unique[:10]
+            for r in unique[: max(1, tavily_max_results)]
         )
 
     request_fields = {
@@ -1547,7 +1987,7 @@ def build_glossary(
         "tags": tags[:20],
         "search_results": search_text[:4000] if search_text else "",
     }
-    if retriever:
+    if retriever is not None:
         query = "\n".join([title, desc_text[:2000], " ".join(tags[:20]), transcript_text[:4000]]).strip()
         retrieved = retriever.retrieve_texts([query], top_k=12)
         if retrieved:
@@ -1559,18 +1999,14 @@ def build_glossary(
         print(f"Glossary: generating with {llm.provider}", file=sys.stderr)
     raw_response = ""
     try:
-        raw_response = llm_text_once(
+        response_obj = llm_json_once(
             llm,
-            render_prompt_template(load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK), ctx)
-            + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever else "")
-            + "\n\n"
-            + render_prompt_template(_GLOSSARY_FORMAT, ctx),
+            glossary_system_prompt(ctx, retriever),
             request,
-            max_tokens=4096,
             temperature=0.3,
         )
-        glossary_output = GlossaryOutput.from_json_content(raw_response)
-        glossary = glossary_output.markdown
+        glossary_output = GlossaryOutput.from_json_value(response_obj)
+        glossary = ensure_local_metadata_in_glossary(glossary_output.markdown, ctx)
     except Exception as e:
         print(f"Warning: glossary generation failed: {e}", file=sys.stderr)
         if raw_response and not quiet:
@@ -1579,11 +2015,12 @@ def build_glossary(
                 preview += "\n... <truncated>"
             print("Glossary raw response:", file=sys.stderr)
             print(preview, file=sys.stderr)
-        return ""
+        glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary("", ctx))
+        if glossary and not quiet:
+            print(f"Glossary fallback: {ctx.glossary}", file=sys.stderr)
+        return glossary
 
-    with open(ctx.glossary, "w", encoding="utf-8") as f:
-        f.write(glossary)
-        f.write("\n")
+    glossary = write_glossary_file(ctx, glossary)
     if not quiet:
         print(f"Glossary: {ctx.glossary}", file=sys.stderr)
     return glossary
@@ -1592,118 +2029,141 @@ def build_glossary(
 # --- LLM stages ---------------------------------------------------------------
 
 
+def prune_empty_json(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else None
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            clean_item = prune_empty_json(item)
+            if clean_item is not None:
+                result[key] = clean_item
+        return result or None
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            clean_item = prune_empty_json(item)
+            if clean_item is not None:
+                result.append(clean_item)
+        return result or None
+    return value
+
+
+def require_json_object(data, label: str = "response") -> dict:
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    return data
+
+
+def require_non_empty_string(data: dict, key: str, label: str) -> str:
+    value = str(data.get(key, "")).strip()
+    if not value:
+        raise ValueError(f'{label} JSON object missing non-empty "{key}"')
+    return value
+
+
+def unique_non_empty_strings(values, max_items: int = 0) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = re.sub(r"\s+", " ", str(raw).strip())
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value[:200])
+        if max_items and len(result) >= max_items:
+            break
+    return result
+
+
 @dataclass
 class LLMBatchItem:
     id: int
     fields: dict
 
     def to_json_value(self) -> dict:
-        return {"id": self.id, **self.fields}
+        return prune_empty_json({"id": self.id, **self.fields}) or {"id": self.id}
+
+
+def make_language_item(
+    item_id: int,
+    ctx: TranscriptContext,
+    source=None,
+    target=None,
+    extra: Optional[dict] = None,
+) -> LLMBatchItem:
+    return LLMBatchItem(item_id, LanguageFields.from_ctx(ctx).build(source=source, target=target, extra=extra))
+
+
+def make_source_item(
+    item_id: int,
+    ctx: TranscriptContext,
+    source_text: str,
+    retrieved_context: Optional[list[dict]] = None,
+) -> LLMBatchItem:
+    return make_language_item(
+        item_id,
+        ctx,
+        source=source_text,
+        extra={"retrieved_context": retrieved_context or []},
+    )
+
+
+def make_pair_item(
+    item_id: int,
+    ctx: TranscriptContext,
+    source_text: str,
+    target_text: str,
+    retrieved_context: Optional[list[dict]] = None,
+    context_before: Optional[list[dict]] = None,
+    context_after: Optional[list[dict]] = None,
+) -> LLMBatchItem:
+    return make_language_item(
+        item_id,
+        ctx,
+        source=source_text,
+        target=target_text,
+        extra={
+            "retrieved_context": retrieved_context or [],
+            "context_before": context_before or [],
+            "context_after": context_after or [],
+        },
+    )
+
+
+def make_pair_json(
+    item_id: int,
+    ctx: TranscriptContext,
+    source_text: str,
+    target_text: str,
+) -> dict:
+    return make_pair_item(item_id, ctx, source_text, target_text).to_json_value()
 
 
 @dataclass
-class TranslateInputItem:
+class LanguageTextResult:
     id: int
     source_text: str
-    ctx: TranscriptContext
-    retrieved_context: list[dict] = field(default_factory=list)
-
-    def to_batch_item(self) -> LLMBatchItem:
-        fields = {self.ctx.source_lang_code: self.source_text}
-        if self.retrieved_context:
-            fields["retrieved_context"] = self.retrieved_context
-        return LLMBatchItem(self.id, fields)
-
-    def to_json_value(self) -> dict:
-        return self.to_batch_item().to_json_value()
-
-
-@dataclass
-class TranslateOutputItem:
-    id: int
     target_text: str
 
     @staticmethod
-    def from_json_value(data: dict, ctx: TranscriptContext) -> "TranslateOutputItem":
-        target_value = get_language_keyed_value(data, response_key_candidates(ctx, "target"))
-        return TranslateOutputItem(int(data.get("id")), str(target_value or "").strip())
-
-
-@dataclass
-class ProofreadInputItem:
-    id: int
-    source_text: str
-    target_text: str
-    ctx: TranscriptContext
-    retrieved_context: list[dict] = field(default_factory=list)
-
-    def to_batch_item(self) -> LLMBatchItem:
-        fields = {
-            self.ctx.source_lang_code: self.source_text,
-            self.ctx.target_lang_code: self.target_text,
-        }
-        if self.retrieved_context:
-            fields["retrieved_context"] = self.retrieved_context
-        return LLMBatchItem(self.id, fields)
-
-    def to_json_value(self) -> dict:
-        return self.to_batch_item().to_json_value()
-
-
-@dataclass
-class ProofreadOutputItem:
-    id: int
-    source_text: str
-    target_text: str
-
-    @staticmethod
-    def from_json_value(data: dict, ctx: TranscriptContext) -> "ProofreadOutputItem":
-        source_value = get_language_keyed_value(data, response_key_candidates(ctx, "source"))
-        target_value = get_language_keyed_value(data, response_key_candidates(ctx, "target"))
-        return ProofreadOutputItem(
+    def from_json_value(data: dict, ctx: TranscriptContext, require_source: bool = True) -> "LanguageTextResult":
+        fields = LanguageFields.from_ctx(ctx)
+        source_value = fields.get_source(data) if require_source else ""
+        target_value = fields.get_target(data)
+        return LanguageTextResult(
             int(data.get("id")),
             _strip_speaker_labels(str(source_value or "")),
             _strip_speaker_labels(str(target_value or "")),
         )
-
-
-@dataclass
-class SplitContextItem:
-    id: int
-    source_text: str
-    target_text: str
-    ctx: TranscriptContext
-
-    def to_json_value(self) -> dict:
-        return {
-            "id": self.id,
-            self.ctx.source_lang_code: self.source_text,
-            self.ctx.target_lang_code: self.target_text,
-        }
-
-
-@dataclass
-class SplitInputItem:
-    id: int
-    source_text: str
-    target_text: str
-    ctx: TranscriptContext
-    context_before: list[SplitContextItem] = field(default_factory=list)
-    context_after: list[SplitContextItem] = field(default_factory=list)
-
-    def to_batch_item(self) -> LLMBatchItem:
-        fields = {
-            self.ctx.source_lang_code: self.source_text,
-            self.ctx.target_lang_code: self.target_text,
-        }
-        if self.context_before:
-            fields["context_before"] = [item.to_json_value() for item in self.context_before]
-        if self.context_after:
-            fields["context_after"] = [item.to_json_value() for item in self.context_after]
-        return LLMBatchItem(self.id, fields)
-
-    def to_json_value(self) -> dict:
-        return self.to_batch_item().to_json_value()
 
 
 @dataclass
@@ -1714,8 +2174,9 @@ class SplitOutputItem:
 
     @staticmethod
     def from_json_value(data: dict, ctx: TranscriptContext) -> "SplitOutputItem":
-        source_items = get_language_keyed_value(data, response_key_candidates(ctx, "source"))
-        target_items = get_language_keyed_value(data, response_key_candidates(ctx, "target"))
+        fields = LanguageFields.from_ctx(ctx)
+        source_items = fields.get_source(data)
+        target_items = fields.get_target(data)
         if not isinstance(source_items, list) or not isinstance(target_items, list):
             raise ValueError("language-code values must both be arrays")
         return SplitOutputItem(
@@ -1758,20 +2219,20 @@ class LLMBatchResponse:
     def to_items(self) -> list[dict]:
         return self.items
 
-    def to_translate_outputs(self, ctx: TranscriptContext) -> list[TranslateOutputItem]:
-        result: list[TranslateOutputItem] = []
+    def to_translate_outputs(self, ctx: TranscriptContext) -> list[LanguageTextResult]:
+        result: list[LanguageTextResult] = []
         for item in self.items:
             try:
-                result.append(TranslateOutputItem.from_json_value(item, ctx))
+                result.append(LanguageTextResult.from_json_value(item, ctx, require_source=False))
             except (TypeError, ValueError):
                 continue
         return result
 
-    def to_proofread_outputs(self, ctx: TranscriptContext) -> list[ProofreadOutputItem]:
-        result: list[ProofreadOutputItem] = []
+    def to_proofread_outputs(self, ctx: TranscriptContext) -> list[LanguageTextResult]:
+        result: list[LanguageTextResult] = []
         for item in self.items:
             try:
-                result.append(ProofreadOutputItem.from_json_value(item, ctx))
+                result.append(LanguageTextResult.from_json_value(item, ctx, require_source=True))
             except (TypeError, ValueError):
                 continue
         return result
@@ -1791,21 +2252,23 @@ class LLMObjectRequest:
     fields: dict
 
     def to_json_value(self) -> dict:
-        return dict(self.fields)
+        return prune_empty_json(dict(self.fields)) or {}
 
     def to_json_text(self) -> str:
         return json.dumps(self.to_json_value(), ensure_ascii=False, indent=2)
 
 
 @dataclass
-class LLMObjectResponse:
-    fields: dict
+class TavilyQueryOutput:
+    queries: list[str]
 
     @staticmethod
-    def from_json_value(data) -> "LLMObjectResponse":
-        if not isinstance(data, dict):
-            raise ValueError("response is not a JSON object")
-        return LLMObjectResponse(data)
+    def from_json_value(data, max_queries: int = 8) -> "TavilyQueryOutput":
+        data = require_json_object(data, "Tavily query response")
+        raw_queries = data.get("queries", [])
+        if not isinstance(raw_queries, list):
+            raise ValueError('Tavily query JSON object missing "queries" array')
+        return TavilyQueryOutput(unique_non_empty_strings(raw_queries, max_queries))
 
 
 @dataclass
@@ -1813,14 +2276,14 @@ class GlossaryOutput:
     markdown: str
 
     @staticmethod
+    def from_json_value(data) -> "GlossaryOutput":
+        data = require_json_object(data, "glossary response")
+        return GlossaryOutput(require_non_empty_string(data, "markdown", "glossary"))
+
+    @staticmethod
     def from_json_content(content: str) -> "GlossaryOutput":
         parsed = _extract_json_value(content)
-        if isinstance(parsed, dict):
-            markdown = str(parsed.get("markdown", "")).strip()
-            if markdown:
-                return GlossaryOutput(markdown)
-            raise ValueError('glossary JSON object missing non-empty "markdown"')
-        raise ValueError('glossary response is not a JSON object with non-empty "markdown"')
+        return GlossaryOutput.from_json_value(parsed)
 
 
 @dataclass
@@ -1833,13 +2296,12 @@ class ChatSession:
     def __post_init__(self) -> None:
         self.messages.append({"role": "system", "content": self.system_prompt})
 
-    def ask(self, content: str, max_tokens: int) -> str:
+    def ask(self, content: str) -> str:
         self.messages.append({"role": "user", "content": content})
         kwargs = {
             "model": self.llm.model_name(),
             "messages": self.messages,
             "temperature": self.temperature,
-            "max_tokens": max_tokens,
         }
         response_format = self.llm.cfg().get("response_format")
         if response_format:
@@ -1850,14 +2312,27 @@ class ChatSession:
         answer = message.content or ""
         if not answer.strip():
             reasoning = getattr(message, "reasoning_content", None)
+            refusal = getattr(message, "refusal", None)
             usage = getattr(resp, "usage", None)
-            details = [f"finish_reason={getattr(choice, 'finish_reason', 'unknown')}"]
+            details = [
+                f"provider={getattr(self.llm, 'provider', 'unknown')}",
+                f"model={self.llm.model_name()}",
+                f"finish_reason={getattr(choice, 'finish_reason', 'unknown')}",
+            ]
+            if refusal:
+                details.append(f"refusal={refusal}")
             if reasoning:
                 details.append(f"reasoning_chars={len(reasoning)}")
-            if usage and getattr(usage, "completion_tokens_details", None):
-                reasoning_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", None)
-                if reasoning_tokens is not None:
-                    details.append(f"reasoning_tokens={reasoning_tokens}")
+            if usage:
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = getattr(usage, key, None)
+                    if value is not None:
+                        details.append(f"{key}={value}")
+                completion_details = getattr(usage, "completion_tokens_details", None)
+                if completion_details:
+                    reasoning_tokens = getattr(completion_details, "reasoning_tokens", None)
+                    if reasoning_tokens is not None:
+                        details.append(f"reasoning_tokens={reasoning_tokens}")
             raise RuntimeError(f"LLM returned empty message.content ({', '.join(details)})")
         self.messages.append({"role": "assistant", "content": answer})
         return answer
@@ -1867,23 +2342,21 @@ def llm_json_once(
     llm: LLMConfig,
     system_prompt: str,
     request: LLMObjectRequest,
-    max_tokens: int,
     temperature: float = 0.3,
 ) -> dict:
     session = ChatSession(llm, system_prompt, temperature=temperature)
-    content = session.ask(request.to_json_text(), max_tokens=max_tokens)
-    return LLMObjectResponse.from_json_value(_extract_json_value(content)).fields
+    content = session.ask(request.to_json_text())
+    return require_json_object(_extract_json_value(content), "response")
 
 
 def llm_text_once(
     llm: LLMConfig,
     system_prompt: str,
     request: LLMObjectRequest,
-    max_tokens: int,
     temperature: float = 0.3,
 ) -> str:
     session = ChatSession(llm, system_prompt, temperature=temperature)
-    return session.ask(request.to_json_text(), max_tokens=max_tokens)
+    return session.ask(request.to_json_text())
 
 
 def _strip_json_fence(content: str) -> str:
@@ -1954,7 +2427,6 @@ def llm_numbered_batch(
     session: ChatSession,
     quiet: bool,
     retries: int = 3,
-    max_tokens: Optional[int] = None,
     raise_on_failure: bool = False,
 ) -> list:
     prompt = request.to_json_text()
@@ -1962,10 +2434,7 @@ def llm_numbered_batch(
     last_error = ""
     for attempt in range(retries):
         try:
-            content = session.ask(
-                prompt,
-                max_tokens=max_tokens or max(4096, item_count * 220),
-            )
+            content = session.ask(prompt)
             data = _extract_json_batch(content)
             if data is None:
                 raise ValueError('response is not a JSON object with an "items" array')
@@ -1991,11 +2460,6 @@ def resolve_proofread_batch_size(llm: LLMConfig) -> int:
     if configured > 0:
         return configured
     return max(1, int(getattr(llm, "batch_size", 1) or 1) // 2)
-
-
-def proofread_max_tokens_for_batch(item_count: int, cap: int = 8192) -> int:
-    safe_cap = max(1024, int(cap or 8192))
-    return min(safe_cap, max(1024, max(1, item_count) * 320))
 
 
 def is_context_length_error(error: Exception | str) -> bool:
@@ -2032,7 +2496,7 @@ def translate_segments(
     session = ChatSession(
         llm,
         system_prompt
-        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever else "")
+        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
         + "\n\n"
         + _JSON_FORMAT
         + "\n\n"
@@ -2049,10 +2513,10 @@ def translate_segments(
                 f"translating {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
-        contexts = retriever.retrieve_texts([seg.en_text() for seg in batch]) if retriever else [[] for _ in batch]
+        contexts = retriever.retrieve_texts([seg.en_text() for seg in batch]) if retriever is not None else [[] for _ in batch]
         request = LLMBatchRequest(
             [
-                TranslateInputItem(s.index, s.en_text(), ctx, retrieved_context=contexts[idx]).to_batch_item()
+                make_source_item(s.index, ctx, s.en_text(), retrieved_context=contexts[idx])
                 for idx, s in enumerate(batch)
             ]
         )
@@ -2095,7 +2559,6 @@ def proofread_split_events(
         api_key=llm.api_key if llm.pr_provider() == llm.provider else None,
         batch_size=resolve_proofread_batch_size(llm),
         proofread_retrieval_top_k=max(1, int(getattr(llm, "proofread_retrieval_top_k", 1) or 1)),
-        proofread_max_tokens=max(1024, int(getattr(llm, "proofread_max_tokens", 8192) or 8192)),
     )
     if not quiet:
         print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}", file=sys.stderr)
@@ -2105,7 +2568,7 @@ def proofread_split_events(
     session = ChatSession(
         pr_llm,
         system_prompt
-        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever else "")
+        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
         + "\n\n"
         + _JSON_FORMAT
         + "\n\n"
@@ -2123,13 +2586,13 @@ def proofread_split_events(
     ) -> bool:
         request = LLMBatchRequest(
             [
-                ProofreadInputItem(
+                make_pair_item(
                     item_offset + idx + 1,
+                    ctx,
                     event.en,
                     event.zh,
-                    ctx,
                     retrieved_context=batch_contexts[idx],
-                ).to_batch_item()
+                )
                 for idx, event in enumerate(batch_events)
             ]
         )
@@ -2138,7 +2601,6 @@ def proofread_split_events(
                 request,
                 session,
                 quiet,
-                max_tokens=proofread_max_tokens_for_batch(len(batch_events), pr_llm.proofread_max_tokens),
                 raise_on_failure=True,
             )
         except Exception as e:
@@ -2195,7 +2657,7 @@ def proofread_split_events(
                 [f"{event.en}\n{event.zh}" for event in batch],
                 top_k=pr_llm.proofread_retrieval_top_k,
             )
-            if retriever
+            if retriever is not None
             else [[] for _ in batch]
         )
         if not quiet:
@@ -2467,7 +2929,7 @@ def split_context_items(
     ctx: TranscriptContext,
     window: int,
     before: bool,
-) -> list[SplitContextItem]:
+) -> list[dict]:
     if window <= 0:
         return []
     try:
@@ -2478,10 +2940,7 @@ def split_context_items(
         candidates = transcript.segments[max(0, pos - window) : pos]
     else:
         candidates = transcript.segments[pos + 1 : pos + 1 + window]
-    return [
-        SplitContextItem(seg.index, seg.source_text(), seg.translation, ctx)
-        for seg in candidates
-    ]
+    return [make_pair_json(seg.index, ctx, seg.source_text(), seg.translation) for seg in candidates]
 
 
 def validated_split_events(
@@ -2580,14 +3039,14 @@ def split_segments(
         expected_ids = [seg.index for seg in batch]
         request = LLMBatchRequest(
             [
-                SplitInputItem(
+                make_pair_item(
                     seg.index,
+                    ctx,
                     seg.source_text(),
                     seg.translation,
-                    ctx,
                     context_before=split_context_items(transcript, seg, ctx, split.context_window, before=True),
                     context_after=split_context_items(transcript, seg, ctx, split.context_window, before=False),
-                ).to_batch_item()
+                )
                 for seg in batch
             ]
         )
@@ -2599,7 +3058,6 @@ def split_segments(
                 request,
                 session,
                 quiet,
-                max_tokens=STRUCTURED_MAX_TOKENS,
             )
             if not quiet:
                 print("Split AI raw response:", file=sys.stderr)
@@ -2789,7 +3247,6 @@ def translate_description(ctx: TranscriptContext, llm: LLMConfig, quiet: bool) -
             llm,
             render_prompt_template(DESCRIPTION_TRANSLATE_PROMPT, ctx) + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
             request,
-            max_tokens=max(2048, len(desc_text) * 2),
             temperature=0.3,
         )
         translated_title = str(response_obj.get("title", "")).strip()
@@ -2888,6 +3345,7 @@ def main() -> None:
     target_lang = args.target_lang or env.get("TARGET_LANG", "") or "zh"
     ctx = TranscriptContext.from_json(args.json, args.output or "", source_lang, target_lang)
     embedding_config = EmbeddingConfig.from_env(env, ctx)
+    embedding_active = embedding_config.enabled and embedding_enabled_for_stage(args.only_beautify, args.only_glossary)
     if args.print_output_path:
         print(os.path.abspath(ctx.bilingual_ass))
         print(f"OUTPUT_ASS={os.path.abspath(ctx.bilingual_ass)}")
@@ -2901,11 +3359,11 @@ def main() -> None:
         print(f"Target:   {ctx.target_lang}")
         if video_path:
             print(f"Video:    {video_path}")
-        if embedding_config.enabled:
+        if embedding_active:
             print(f"Embedding: {embedding_config.provider} / {embedding_config.model}")
             print(f"Embedding DB: {embedding_config.chroma_dir}")
 
-    if embedding_config.enabled:
+    if embedding_active:
         if embedding_config.store != "chroma":
             print(f"Error: unsupported EMBEDDING_STORE={embedding_config.store}; only chroma is available.", file=sys.stderr)
             sys.exit(1)
@@ -2926,13 +3384,15 @@ def main() -> None:
         ctx, source, video_path, beautify_options, args.skip_beautify, args.force, args.quiet
     )
     retriever = None
-    if embedding_config.enabled:
-        try:
-            build_embedding_index(transcript, embedding_config, env, args.quiet, ctx)
-            retriever = EmbeddingRetriever(embedding_config, env)
-        except Exception as e:
-            print(f"Error: embedding index failed: {e}", file=sys.stderr)
-            sys.exit(1)
+    if embedding_active:
+        retriever = refresh_embedding_retriever(
+            transcript,
+            embedding_config,
+            env,
+            args.quiet,
+            ctx,
+            fatal=True,
+        )
 
     if args.only_beautify:
         print(f"OUTPUT_JSON={os.path.abspath(ctx.beautified_json)}")
@@ -2953,7 +3413,6 @@ def main() -> None:
         batch_size=args.batch_size,
         proofread_batch_size=env_int(env.get("PROOFREAD_BATCH_SIZE", ""), max(1, args.batch_size // 2)),
         proofread_retrieval_top_k=env_int(env.get("PROOFREAD_RETRIEVAL_TOP_K", ""), 1),
-        proofread_max_tokens=env_int(env.get("PROOFREAD_MAX_TOKENS", ""), 8192),
     )
 
     if not args.skip_knowledge:
@@ -2962,10 +3421,21 @@ def main() -> None:
             ctx,
             llm,
             env.get("TAVILY_API_KEY", ""),
-            int(env.get("TAVILY_MAX_RESULTS", "10") or "10"),
+            int(env.get("TAVILY_MAX_RESULTS", "20") or "20"),
+            env_int(env.get("TAVILY_MAX_QUERIES", ""), 15),
             args.quiet,
             retriever,
         )
+        if embedding_active:
+            updated_retriever = refresh_embedding_retriever(
+                transcript,
+                embedding_config,
+                env,
+                args.quiet,
+                ctx,
+                warning_label="glossary index update failed",
+            )
+            retriever = updated_retriever or retriever
 
     if args.only_glossary:
         print(f"OUTPUT_GLOSSARY={os.path.abspath(ctx.glossary)}")
@@ -2981,7 +3451,7 @@ def main() -> None:
     )
     desc_context = load_description(ctx.desc)
     glossary_path = args.glossary or ctx.glossary
-    glossary_text = load_glossary(glossary_path)
+    glossary_text = load_glossary_prompt_context(glossary_path, retriever=retriever)
     if desc_context:
         system_prompt += desc_context
         proofread_prompt += desc_context
@@ -3002,12 +3472,16 @@ def main() -> None:
         ),
         args.quiet,
     ) or changed
-    if embedding_config.enabled:
-        try:
-            build_embedding_index(transcript, embedding_config, env, args.quiet, ctx)
-            retriever = EmbeddingRetriever(embedding_config, env)
-        except Exception as e:
-            print(f"Warning: translation memory index update failed: {e}", file=sys.stderr)
+    if embedding_active:
+        updated_retriever = refresh_embedding_retriever(
+            transcript,
+            embedding_config,
+            env,
+            args.quiet,
+            ctx,
+            warning_label="translation memory index update failed",
+        )
+        retriever = updated_retriever or retriever
     if (args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0"):
         changed = proofread_split_events(
             transcript,

@@ -113,6 +113,7 @@ video -> json -> beautified.json -> glossary.md
 - 位于 beautify 之后、translate 之前
 - 如果 `glossary.md` 已存在且非空，直接复用，不重新总结
 - 读取 transcript、`.description`、`.tags.txt`、`.info.json`
+- 本地脚本会把 YouTube 原视频元信息前置写入 `glossary.md`，包括标题、作者、上传时间、原简介和标签；这部分不交给远端 LLM 合成
 - 配置 `TAVILY_API_KEY` 时联网搜索，未配置时离线总结
 - 需要 `TRANSLATE_PROVIDER` 和对应 API key
 - `glossary_prompt.md` 仅允许微调 glossary 内容策略，输出格式规则由 `translate_srt.py` 内置 `_GLOSSARY_FORMAT` 强制追加
@@ -186,14 +187,13 @@ ${TARGET_LANG_CODE}
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
-| `PROOFREAD_MAX_TOKENS` | 校对单次响应 max_tokens 上限，默认 `8192` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
-| `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` | glossary 联网搜索配置 |
+| `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` / `TAVILY_MAX_QUERIES` | glossary 联网搜索配置；query 总数限制会优先保留标题、作者和有效标签 |
 
-启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含源文 transcript chunk 和翻译/分割后生成的双语 `translation_memory` chunk；proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。
+启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`transcript:*` 自动保留 1 条 segment overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。
 
