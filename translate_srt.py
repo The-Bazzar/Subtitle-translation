@@ -714,6 +714,10 @@ def embedding_enabled_for_stage(only_beautify: bool, only_glossary: bool) -> boo
     return not only_beautify
 
 
+DEFAULT_SPLIT_MAX_CHARS = 72
+DEFAULT_SPLIT_MAX_DURATION = 3.8
+
+
 @dataclass
 class BeautifyOptions:
     scene_threshold: float = 0.15
@@ -721,7 +725,6 @@ class BeautifyOptions:
     end_offset_frames: int = 2
     min_scene_interval_frames: int = 2
     min_duration: float = 1.0
-    max_duration: float = 8.0
     min_gap: float = 0.083
     max_gap_merge: float = 0.5
     no_scene_snap: bool = False
@@ -732,8 +735,8 @@ class BeautifyOptions:
 @dataclass
 class SplitConfig:
     enabled: bool = True
-    max_chars: int = 60
-    max_duration: float = 3.0
+    max_chars: int = DEFAULT_SPLIT_MAX_CHARS
+    max_duration: float = DEFAULT_SPLIT_MAX_DURATION
     context_window: int = 1
 
 
@@ -3317,8 +3320,8 @@ def main() -> None:
     parser.add_argument("--skip-knowledge", action="store_true")
     parser.add_argument("--force", action="store_true", help="Rebuild beautified JSON")
     parser.add_argument("--no-split", action="store_true")
-    parser.add_argument("--split-max-chars", type=int, default=60)
-    parser.add_argument("--split-max-duration", type=float, default=3.0)
+    parser.add_argument("--split-max-chars", type=int, default=DEFAULT_SPLIT_MAX_CHARS)
+    parser.add_argument("--split-max-duration", type=float, default=DEFAULT_SPLIT_MAX_DURATION)
     parser.add_argument("--split-context-window", type=int, default=1, help="Neighbor segment count included as split-only context")
     parser.add_argument("--proofread", action="store_true", default=True)
     parser.add_argument("--no-proofread", action="store_true")
@@ -3328,7 +3331,6 @@ def main() -> None:
     parser.add_argument("--end-offset-frames", type=int, default=2)
     parser.add_argument("--min-scene-interval-frames", type=int, default=2)
     parser.add_argument("--min-duration", type=float, default=1.0)
-    parser.add_argument("--max-duration", type=float, default=8.0)
     parser.add_argument("--min-gap", type=float, default=0.083)
     parser.add_argument("--max-gap-merge", type=float, default=0.5)
     parser.add_argument("--aggressive", action="store_true")
@@ -3374,7 +3376,6 @@ def main() -> None:
         end_offset_frames=args.end_offset_frames,
         min_scene_interval_frames=args.min_scene_interval_frames,
         min_duration=args.min_duration,
-        max_duration=args.max_duration,
         min_gap=args.min_gap,
         max_gap_merge=args.max_gap_merge,
         no_scene_snap=args.no_scene_snap,

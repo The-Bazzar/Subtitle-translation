@@ -11,6 +11,12 @@ class JsonProtocolTests(unittest.TestCase):
     def setUp(self):
         self.ctx = t.TranscriptContext.from_json("video.json", "", "en", "zh")
 
+    def test_subtitle_layout_threshold_defaults_match_1080p_template(self):
+        self.assertEqual(t.DEFAULT_SPLIT_MAX_CHARS, 72)
+        self.assertEqual(t.DEFAULT_SPLIT_MAX_DURATION, 3.8)
+        self.assertEqual(t.SplitConfig().max_chars, t.DEFAULT_SPLIT_MAX_CHARS)
+        self.assertEqual(t.SplitConfig().max_duration, t.DEFAULT_SPLIT_MAX_DURATION)
+
     def test_extract_json_object_rejects_array_shape(self):
         data = t._extract_json_value('{"markdown": "# Glossary"}')
         self.assertEqual(data, {"markdown": "# Glossary"})

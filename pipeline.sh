@@ -143,7 +143,6 @@ JSON beautify 选项 (在 -- 之后):
   --end-offset-frames N         出点对齐到场景前 N 帧 (默认 2)
   --min-scene-interval-frames N 场景切换最小帧间隔 (默认 2, Netflix: 7)
   --min-duration N              最短字幕时长秒 (默认 1.0)
-  --max-duration N              兼容参数；JSON 美化不再用它截断整句
   --min-gap N                   字幕最小间距秒 (默认 0.083)
   --max-gap-merge N             小于此值的间隙合并秒 (默认 0.5)
   --aggressive                  激进模式 (threshold=0.08, snap=12帧, end-offset=0, min-interval=1)
@@ -422,4 +421,3 @@ if [ -n "${ASS_PATH:-}" ] && [ -f "$ASS_PATH" ]; then
     echo "双语 ASS: $ASS_PATH"
 fi
 echo "============================================="
-
