@@ -40,6 +40,16 @@ $WhisperXExe             = Get-EnvValue 'WHISPERX_PATH_WIN' ''
 if (-not $WhisperXExe) {
     $WhisperXExe = Join-Path $PSScriptRoot ".venv\Scripts\whisperx.exe"
 }
+$HfToken = Get-EnvValue 'HF_TOKEN' ''
+if (-not $HfToken) {
+    $HfToken = Get-EnvValue 'HUGGING_FACE_HUB_TOKEN' ''
+}
+if ($HfToken) {
+    $env:HF_TOKEN = $HfToken
+    if (-not $env:HUGGING_FACE_HUB_TOKEN) {
+        $env:HUGGING_FACE_HUB_TOKEN = $HfToken
+    }
+}
 
 if ($Help -or (-not $VideoPath)) {
     @"

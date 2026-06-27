@@ -122,6 +122,7 @@ DEEPSEEK_API_KEY=
 | `WHISPER_MODEL` | WhisperX 模型，默认 `large-v3-turbo` |
 | `WHISPER_ALIGN_MODEL` | 对齐模型，空则自动选择 |
 | `WHISPER_DEVICE` | `cuda` / `cpu`；留空则跟随 `TORCH_BACKEND` 自动推导 |
+| `HF_TOKEN` | Hugging Face token；用于提高 WhisperX/对齐模型下载速率限制，可留空 |
 | `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
 | `TRANSLATE_PROVIDER` | 翻译后端，必填；可用 `openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
