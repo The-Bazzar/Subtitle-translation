@@ -29,15 +29,30 @@
         "env_key": "DEEPSEEK_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},
-        "response_format": {
-            "type": "json_object"
+        "request_kwargs": {
+            "response_format": {
+                "type": "json_object"
+            }
         }
     },
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-2.5-pro",
+        "default_model": "gemini-3.5-flash",
         "env_key": "GEMINI_API_KEY",
         "auth_header": "Bearer {api_key}",
-        "extra_headers": {}
+        "extra_headers": {},
+        "request_kwargs": {
+            "extra_body": {
+                "extra_body": {
+                    "google": {
+                        "tools": [
+                            {
+                                "google_search": {}
+                            }
+                        ]
+                    }
+                }
+            }
+        }
     }
 }

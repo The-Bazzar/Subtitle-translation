@@ -1,10 +1,103 @@
 import json
+import io
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import translate_srt as t
+
+
+class FakeSDKMessage:
+    def __init__(self, content="", tool_calls=None, role="assistant", **extra):
+        self.content = content
+        self.tool_calls = tool_calls or []
+        self.role = role
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+
+class FakeSDKChoice:
+    def __init__(self, message, finish_reason="stop"):
+        self.message = message
+        self.finish_reason = finish_reason
+
+
+class FakeSDKResponse:
+    def __init__(self, message=None, finish_reason="stop", usage=None):
+        self.choices = [FakeSDKChoice(message or FakeSDKMessage(), finish_reason)]
+        if usage is not None:
+            self.usage = usage
+
+
+class FakeSDKCompletions:
+    def __init__(self, responses, calls):
+        self.responses = list(responses or [FakeSDKResponse()])
+        self.calls = calls
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        index = min(len(self.calls) - 1, len(self.responses) - 1)
+        response = self.responses[index]
+        return response(kwargs) if callable(response) else response
+
+
+class FakeChatLLM:
+    provider = "fake"
+    batch_size = 50
+    api_key = None
+
+    def __init__(self, responses=None, cfg=None, calls=None, model="fake-model", provider="fake"):
+        self.responses = responses or [FakeSDKResponse()]
+        self.config = cfg or {}
+        self.calls = calls if calls is not None else []
+        self.model = model
+        self.provider = provider
+
+    def model_name(self):
+        return self.model
+
+    def cfg(self):
+        return self.config
+
+    def _client(self):
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeSDKCompletions(self.responses, self.calls))
+        )
+
+
+class FakeProviderLLM:
+    provider = "fake"
+    batch_size = 50
+    api_key = None
+
+    def model_name(self):
+        return "fake-model"
+
+    def cfg(self):
+        return {}
+
+
+class FakeBatchLLM(FakeProviderLLM):
+    def __init__(self, batch_size):
+        self.batch_size = batch_size
+
+
+def fake_tool_call(query: str, call_id: str = "call_1", topic_hints=None):
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(
+            name="tavily_search",
+            arguments=json.dumps(
+                {
+                    "query": query,
+                    "topic_hints": topic_hints or [],
+                },
+                ensure_ascii=False,
+            ),
+        ),
+    )
 
 
 class JsonProtocolTests(unittest.TestCase):
@@ -162,9 +255,6 @@ class JsonProtocolTests(unittest.TestCase):
         )
 
     def test_build_glossary_adds_retrieved_context(self):
-        class FakeLLM:
-            provider = "fake"
-
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
                 self.texts = texts
@@ -172,7 +262,7 @@ class JsonProtocolTests(unittest.TestCase):
 
         captured = {}
 
-        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
             captured.update(request.to_json_value())
             return {"markdown": "# 术语知识库"}
 
@@ -187,16 +277,18 @@ class JsonProtocolTests(unittest.TestCase):
             )
             retriever = FakeRetriever()
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                t.build_glossary(transcript, ctx, FakeLLM(), quiet=True, retriever=retriever)
+                t.build_glossary(
+                    transcript,
+                    ctx,
+                    FakeProviderLLM(),
+                    t.GlossaryBuildOptions(quiet=True, retriever=retriever),
+                )
 
             self.assertEqual(captured["retrieved_context"], [{"id": "transcript:1", "text": "important context", "score": 0.9}])
             self.assertTrue(retriever.texts[0])
 
     def test_build_glossary_prefixes_local_video_metadata(self):
-        class FakeLLM:
-            provider = "fake"
-
-        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
             return {"markdown": "# 术语知识库\n\n## 核心术语\n\n- discipline：纪律"}
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,7 +316,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                glossary = t.build_glossary(transcript, ctx, FakeLLM(), quiet=True)
+                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
 
             self.assertIn("## 视频元信息", glossary)
             self.assertIn("原标题：Original Title", glossary)
@@ -234,6 +326,57 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertIn("A long-form discussion", glossary)
             self.assertIn("标签：philosophy, discipline", glossary)
             self.assertIn("## 核心术语", glossary)
+
+    def test_build_glossary_reuses_existing_cache_by_default(self):
+        def fake_llm_json_once(*args, **kwargs):
+            raise AssertionError("cached glossary should not call LLM")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.glossary, "w", encoding="utf-8") as f:
+                f.write("# 术语知识库\n\n- cached term：缓存术语")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "alpha topic")],
+            )
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
+
+        self.assertIn("cached term", glossary)
+
+    def test_build_glossary_force_overwrites_existing_cache(self):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+            return {"markdown": "# 术语知识库\n\n## 核心术语\n\n- fresh term：新术语"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.glossary, "w", encoding="utf-8") as f:
+                f.write("# 术语知识库\n\n- stale term：旧术语")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "alpha topic")],
+            )
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                glossary = t.build_glossary(
+                    transcript,
+                    ctx,
+                    FakeProviderLLM(),
+                    t.GlossaryBuildOptions(quiet=True, force=True),
+                )
+            with open(ctx.glossary, "r", encoding="utf-8") as f:
+                saved = f.read()
+
+        self.assertIn("fresh term", glossary)
+        self.assertIn("fresh term", saved)
+        self.assertNotIn("stale term", saved)
 
     def test_local_glossary_metadata_filters_promotional_description_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,10 +410,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("已过滤简介中的推广链接、社媒链接、赞助信息和纯 URL 行。", section)
 
     def test_build_glossary_saves_local_metadata_when_llm_generation_fails(self):
-        class FakeLLM:
-            provider = "fake"
-
-        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
             raise RuntimeError("bad json")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -286,7 +426,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                glossary = t.build_glossary(transcript, ctx, FakeLLM(), quiet=True)
+                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
 
             self.assertTrue(os.path.isfile(ctx.glossary))
             with open(ctx.glossary, "r", encoding="utf-8") as f:
@@ -297,12 +437,9 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("原作者：Original Channel", saved)
 
     def test_build_glossary_system_prompt_includes_strict_json_protocols(self):
-        class FakeLLM:
-            provider = "fake"
-
         captured = {}
 
-        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
             captured["system_prompt"] = system_prompt
             return {"markdown": "# 术语知识库"}
 
@@ -317,17 +454,508 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                t.build_glossary(transcript, ctx, FakeLLM(), quiet=True)
+                t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
 
         self.assertIn("MANDATORY JSON PROTOCOL", captured["system_prompt"])
         self.assertIn("Return a JSON object.", captured["system_prompt"])
         self.assertIn("MANDATORY GLOSSARY JSON PROTOCOL", captured["system_prompt"])
         self.assertIn('Return exactly one top-level key: "markdown".', captured["system_prompt"])
+        self.assertIn("Treat web search results as the primary evidence", captured["system_prompt"])
+        self.assertIn("actively correct likely ASR errors", captured["system_prompt"])
+        self.assertIn("Do not copy ASR mistakes into the glossary", captured["system_prompt"])
+        self.assertNotIn("Keep under 100 lines", captured["system_prompt"])
+        self.assertIn("Core terminology", captured["system_prompt"])
+        self.assertIn("Key arguments", captured["system_prompt"])
+
+    def test_build_glossary_tool_session_executes_tavily_in_same_session(self):
+        calls = []
+        searched = []
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg={"request_kwargs": {"response_format": {"type": "json_object"}}},
+            responses=[
+                FakeSDKResponse(FakeSDKMessage(tool_calls=[fake_tool_call("corrected term", topic_hints=["anime"])])),
+                FakeSDKResponse(
+                    FakeSDKMessage(
+                        content='{"markdown": "# 术语知识库\\n\\n## 核心术语\\n- corrected term：校正术语"}'
+                    )
+                ),
+            ],
+        )
+
+        def fake_tavily_search(query, api_key, max_results=5, preferred_domains=None):
+            searched.append((query, api_key, max_results, preferred_domains))
+            return [{"url": "https://zh.wikipedia.org/wiki/Corrected", "content": "百科证据"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Original Title", "uploader": "Original Channel"}, f)
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "asr-ish source topic")],
+            )
+
+            with patch.object(t, "tavily_search", side_effect=fake_tavily_search), patch.object(
+                t,
+                "load_tavily_domain_preferences",
+                return_value=t.TavilyDomainPreferences.from_json_value(
+                    {
+                        "global_domains": ["wikipedia.org"],
+                        "topics": [
+                            {
+                                "name": "anime",
+                                "keywords": ["anime"],
+                                "domains": ["bgm.tv"],
+                            }
+                        ],
+                    }
+                ),
+            ):
+                glossary = t.build_glossary(
+                    transcript,
+                    ctx,
+                    llm,
+                    t.GlossaryBuildOptions(
+                        tavily_key="tk",
+                        tavily_max_results=6,
+                        tavily_max_queries=2,
+                        quiet=True,
+                    ),
+                )
+
+        first_request = json.loads(calls[0]["messages"][1]["content"])
+        self.assertIn("tavily_domain_preferences", first_request)
+        self.assertEqual(searched[0], ("corrected term", "tk", 3, ["wikipedia.org", "bgm.tv"]))
+        self.assertEqual(calls[1]["messages"][-1]["role"], "tool")
+        self.assertEqual(calls[1]["messages"][-1]["tool_call_id"], "call_1")
+        self.assertNotIn("response_format", calls[0])
+        self.assertIn("## 视频元信息", glossary)
+        self.assertIn("corrected term", glossary)
+
+    def test_glossary_options_ignore_deprecated_tool_rounds_env(self):
+        deprecated_env_key = "GLOSSARY_" + "TOOL_MAX_ROUNDS"
+        deprecated_attr = "tavily_" + "tool_rounds"
+        options = t.GlossaryBuildOptions.from_env(
+            {
+                "TAVILY_API_KEY": "tk",
+                "TAVILY_MAX_QUERIES": "4",
+                deprecated_env_key: "0",
+            },
+            quiet=True,
+        )
+
+        self.assertEqual(options.tavily_max_queries, 4)
+        self.assertTrue(options.use_tool_session())
+        self.assertFalse(hasattr(options, deprecated_attr))
+
+    def test_build_glossary_tool_session_falls_back_when_query_budget_is_exhausted(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg={"request_kwargs": {"response_format": {"type": "json_object"}}},
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(tool_calls=[fake_tool_call("still needs search")]),
+                    finish_reason="tool_calls",
+                )
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Fallback Title", "uploader": "Fallback Channel"}, f)
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+
+            with patch.object(t, "tavily_search", return_value=[]), patch("sys.stderr", new_callable=io.StringIO) as err:
+                glossary = t.build_glossary(
+                    transcript,
+                    ctx,
+                    llm,
+                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                )
+
+        self.assertEqual(calls[0]["tool_choice"], "auto")
+        self.assertEqual(calls[1]["tool_choice"], "none")
+        self.assertNotIn("response_format", calls[0])
+        self.assertNotIn("response_format", calls[1])
+        self.assertIn("glossary Tavily query budget reached", err.getvalue())
+        self.assertIn("## 视频元信息", glossary)
+        self.assertIn("Fallback Title", glossary)
+
+    def test_build_glossary_request_fields_prunes_empty_metadata_but_keeps_domain_preferences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+            fields = {
+                "title": "Title",
+                "uploader": "",
+                "webpage_url": "",
+                "upload_time": "",
+                "description": "",
+                "tags": [],
+            }
+            preferences = t.TavilyDomainPreferences.from_json_value(
+                {"global_domains": ["wikipedia.org"], "topics": [{"name": "anime", "domains": ["bgm.tv"]}]}
+            )
+
+            request = t.LLMObjectRequest(
+                t.build_glossary_request_fields(
+                    transcript,
+                    ctx,
+                    t.GlossaryRequestArgs(metadata_fields=fields, tavily_preferences=preferences),
+                )
+            ).to_json_value()
+
+        self.assertNotIn("description", request)
+        self.assertNotIn("tags", request)
+        self.assertEqual(request["tavily_domain_preferences"]["global_domains"], ["wikipedia.org"])
+        self.assertEqual(request["tavily_domain_preferences"]["topics"][0]["domains"], ["bgm.tv"])
+        self.assertIn("transcript_excerpt", request)
+
+    def test_tavily_query_translation_prompt_prefers_active_translation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+
+            prompt = t.tavily_query_translate_system_prompt(ctx)
+
+        self.assertIn("Translate aggressively", prompt)
+        self.assertIn("Translate concepts, claims, descriptive phrases, and genre/topic terms", prompt)
+        self.assertIn("Preserve only", prompt)
+        self.assertIn("Do not return a query that is merely the source query", prompt)
+        self.assertIn("add target-language context", prompt)
+        self.assertIn("Do not translate as subtitle prose", prompt)
+        self.assertIn("Localize the search intent", prompt)
+        self.assertIn("If the input includes topic_hints, return topic_hints", prompt)
+        self.assertIn('"queries" is required', prompt)
+        self.assertIn('"topic_hints" is required when the input contains topic_hints', prompt)
+        self.assertIn("same number of queries in the same order", prompt)
+
+    def test_tavily_query_prompt_requires_compact_diverse_keywords(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+
+            prompt = t.tavily_query_system_prompt(ctx)
+
+        self.assertIn("compact keyword queries", prompt)
+        self.assertIn("Do not copy full transcript sentences", prompt)
+        self.assertIn("2 to 6 important words or named entities", prompt)
+        self.assertIn("one distinct search angle", prompt)
+        self.assertIn("Do not create near-duplicates", prompt)
+        self.assertIn("BAD", prompt)
+        self.assertIn("full spoken sentence copied from transcript", prompt)
+
+    def test_tavily_query_prompt_corrects_likely_asr_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+
+            prompt = t.tavily_query_system_prompt(ctx)
+
+        self.assertIn("WhisperX ASR", prompt)
+        self.assertIn("correct likely ASR errors", prompt)
+        self.assertIn("Do not preserve a suspicious ASR token", prompt)
+        self.assertIn("metadata, neighboring context, and domain knowledge", prompt)
+        self.assertIn("uncertain correction", prompt)
+
+    def test_tavily_domain_preferences_merge_example_and_local_configs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "tavily_domains.example.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "global_domains": ["wikipedia.org", "baike.baidu.com"],
+                        "topics": [
+                            {
+                                "name": "anime",
+                                "keywords": ["anime", "动画"],
+                                "domains": ["bgm.tv"],
+                            }
+                        ],
+                    },
+                    f,
+                )
+            with open(os.path.join(tmp, "tavily_domains.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "global": ["wikidata.org", "wikipedia.org"],
+                        "topics": {
+                            "anime": {
+                                "keywords": ["番剧"],
+                                "domains": ["bangumi.tv"],
+                            },
+                            "philosophy": {
+                                "keywords": ["stoicism"],
+                                "domains": ["plato.stanford.edu"],
+                            },
+                        },
+                    },
+                    f,
+                )
+
+            prefs = t.load_tavily_domain_preferences(tmp)
+
+        self.assertEqual(prefs.global_domains, ("wikipedia.org", "baike.baidu.com", "wikidata.org"))
+        anime = next(topic for topic in prefs.topics if topic.name == "anime")
+        self.assertEqual(anime.keywords, ("anime", "动画", "番剧"))
+        self.assertEqual(anime.domains, ("bgm.tv", "bangumi.tv"))
+        self.assertTrue(any(topic.name == "philosophy" for topic in prefs.topics))
+
+    def test_select_tavily_preferred_domains_matches_video_topic(self):
+        prefs = t.TavilyDomainPreferences.from_json_value(
+            {
+                "global_domains": ["wikipedia.org", "baike.baidu.com"],
+                "topics": [
+                    {
+                        "name": "anime",
+                        "keywords": ["anime", "动画"],
+                        "domains": ["bgm.tv", "bangumi.tv"],
+                    },
+                    {
+                        "name": "game",
+                        "keywords": ["game"],
+                        "domains": ["wiki.gg"],
+                    },
+                ],
+            }
+        )
+        fields = {
+            "title": "Hunting for the Anime Genre That Doesn't Exist",
+            "uploader": "",
+            "description": "",
+            "tags": ["video", "manga"],
+        }
+
+        domains = t.select_tavily_preferred_domains("lost anime genre", fields, prefs)
+
+        self.assertEqual(domains, ["wikipedia.org", "baike.baidu.com", "bgm.tv", "bangumi.tv"])
+
+    def test_select_tavily_preferred_domains_uses_query_agent_topic_hints(self):
+        prefs = t.TavilyDomainPreferences.from_json_value(
+            {
+                "global_domains": ["wikipedia.org"],
+                "topics": [
+                    {
+                        "name": "anime",
+                        "keywords": ["anime", "manga", "动画"],
+                        "domains": ["bgm.tv", "bangumi.tv"],
+                    }
+                ],
+            }
+        )
+        fields = {
+            "title": "A misleading abstract video title",
+            "uploader": "",
+            "description": "",
+            "tags": [],
+        }
+
+        domains = t.select_tavily_preferred_domains(
+            "genre taxonomy",
+            fields,
+            prefs,
+            topic_hints=["manga criticism", "lost anime genre"],
+        )
+
+        self.assertEqual(domains, ["wikipedia.org", "bgm.tv", "bangumi.tv"])
+
+    def test_build_tavily_search_plan_extracts_topic_hints_from_query_agent(self):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+            if "TAVILY QUERY TRANSLATION JSON PROTOCOL" in system_prompt:
+                return {"queries": ["标题", "概念"], "topic_hints": ["动漫"]}
+            if "TAVILY SEARCH QUERY JSON PROTOCOL" in system_prompt:
+                return {
+                    "queries": ["specific source concept"],
+                    "topic_hints": ["anime", "manga criticism"],
+                }
+            raise AssertionError(system_prompt)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Original Title"}, f)
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                plan = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True, max_queries=2)
+
+        self.assertEqual(plan.queries, ["Original Title", "标题", "specific source concept", "概念"])
+        self.assertEqual(plan.topic_hints, ["anime", "manga criticism", "动漫"])
+
+    def test_translate_tavily_query_output_prints_raw_response(self):
+        raw_response = '{"queries": ["目标查询"], "topic_hints": ["目标题材"]}'
+
+        class FakeChatSession:
+            def __init__(self, llm, system_prompt, temperature=0.3, disable_response_format=False):
+                pass
+
+            def ask(self, content):
+                return raw_response
+
+        stderr = io.StringIO()
+        with patch.object(t, "ChatSession", FakeChatSession), patch("sys.stderr", stderr):
+            output = t.translate_tavily_query_output(["source query"], self.ctx, FakeProviderLLM(), quiet=False)
+
+        self.assertEqual(output.queries, ["目标查询"])
+        self.assertIn("translate_tavily_query_output raw response:", stderr.getvalue())
+        self.assertIn(raw_response, stderr.getvalue())
+
+    def test_build_tavily_search_plan_passes_function_names_as_raw_labels(self):
+        raw_labels = []
+
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+            raw_labels.append(raw_label)
+            if "TAVILY QUERY TRANSLATION JSON PROTOCOL" in system_prompt:
+                return {"queries": ["目标查询"]}
+            if "TAVILY SEARCH QUERY JSON PROTOCOL" in system_prompt:
+                return {"queries": ["source query"]}
+            raise AssertionError(system_prompt)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=False, max_queries=2)
+
+        self.assertEqual(raw_labels, ["build_tavily_search_plan", "translate_tavily_query_output"])
+
+    def test_build_glossary_uses_query_agent_topic_hints_for_domain_selection(self):
+        preferred_domains_by_query = {}
+
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+            if "TAVILY QUERY TRANSLATION JSON PROTOCOL" in system_prompt:
+                return {"queries": []}
+            if "TAVILY SEARCH QUERY JSON PROTOCOL" in system_prompt:
+                return {
+                    "queries": ["genre taxonomy"],
+                    "topic_hints": ["anime"],
+                }
+            return {"markdown": "# 术语知识库"}
+
+        def fake_tavily_search(query, api_key, max_results=5, preferred_domains=None):
+            preferred_domains_by_query[query] = preferred_domains or []
+            return [{"url": f"https://example.com/{query}", "content": f"result for {query}"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Misleading Abstract Title"}, f)
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once), patch.object(
+                t, "load_tavily_domain_preferences",
+                return_value=t.TavilyDomainPreferences.from_json_value(
+                    {
+                        "global_domains": ["wikipedia.org"],
+                        "topics": [
+                            {
+                                "name": "anime",
+                                "keywords": ["anime"],
+                                "domains": ["bgm.tv"],
+                            }
+                        ],
+                    }
+                ),
+            ), patch.object(t, "tavily_search", side_effect=fake_tavily_search):
+                t.build_glossary(
+                    transcript,
+                    ctx,
+                    FakeProviderLLM(),
+                    t.GlossaryBuildOptions(tavily_key="tk", quiet=True),
+                )
+
+        self.assertIn("bgm.tv", preferred_domains_by_query["genre taxonomy"])
+
+    def test_tavily_search_prefers_domains_then_falls_back_to_general(self):
+        calls = []
+
+        class FakeClient:
+            def __init__(self, api_key):
+                self.api_key = api_key
+
+            def search(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs.get("include_domains"):
+                    return {
+                        "results": [
+                            {"url": "https://zh.wikipedia.org/wiki/Topic", "content": "wiki"},
+                        ]
+                    }
+                return {
+                    "results": [
+                        {"url": "https://example.com/topic", "content": "general"},
+                        {"url": "https://zh.wikipedia.org/wiki/Topic", "content": "duplicate"},
+                    ]
+                }
+
+        with patch.object(t, "TavilyClient", FakeClient):
+            results = t.tavily_search(
+                "topic",
+                "tk",
+                max_results=3,
+                preferred_domains=["wikipedia.org", "baike.baidu.com"],
+            )
+
+        self.assertEqual([call.get("include_domains") for call in calls], [["wikipedia.org", "baike.baidu.com"], None])
+        self.assertEqual([item["url"] for item in results], ["https://zh.wikipedia.org/wiki/Topic", "https://example.com/topic"])
+
+    def test_tavily_search_skips_general_when_preferred_results_are_enough(self):
+        calls = []
+
+        class FakeClient:
+            def __init__(self, api_key):
+                self.api_key = api_key
+
+            def search(self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "results": [
+                        {"url": "https://baike.baidu.com/item/one", "content": "one"},
+                        {"url": "https://zh.wikipedia.org/wiki/Two", "content": "two"},
+                    ]
+                }
+
+        with patch.object(t, "TavilyClient", FakeClient):
+            results = t.tavily_search("topic", "tk", max_results=2, preferred_domains=["wikipedia.org", "baike.baidu.com"])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["include_domains"], ["wikipedia.org", "baike.baidu.com"])
+        self.assertEqual(len(results), 2)
 
     def test_build_glossary_uses_agent_queries_for_tavily_search(self):
-        class FakeLLM:
-            provider = "fake"
-
         class FakeRetriever:
             def __init__(self):
                 self.calls = []
@@ -342,7 +970,7 @@ class JsonProtocolTests(unittest.TestCase):
         prompts = []
         query_request = {}
 
-        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
             prompts.append(system_prompt)
             if "TAVILY SEARCH QUERY JSON PROTOCOL" in system_prompt:
                 data = request.to_json_value()
@@ -350,7 +978,7 @@ class JsonProtocolTests(unittest.TestCase):
                 return {"queries": ["counterfeit version altar of convenience", "discipline motivation therapist"]}
             return {"markdown": "# 术语知识库"}
 
-        def fake_tavily_search(query, api_key, max_results=5):
+        def fake_tavily_search(query, api_key, max_results=5, preferred_domains=None):
             queries.append(query)
             return [{"url": f"https://example.com/{len(queries)}", "content": f"result for {query}"}]
 
@@ -368,11 +996,20 @@ class JsonProtocolTests(unittest.TestCase):
                 segments=[t.TranscriptSegment(1, 0.0, 1.0, "We sacrifice ourselves on the altar of convenience.")],
             )
 
-            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once), patch.object(
-                t, "tavily_search", side_effect=fake_tavily_search
-            ):
+            with patch.object(t, "build_glossary_with_tools", side_effect=RuntimeError("tool unavailable")), patch.object(
+                t, "llm_json_once", side_effect=fake_llm_json_once
+            ), patch.object(t, "tavily_search", side_effect=fake_tavily_search):
                 retriever = FakeRetriever()
-                t.build_glossary(transcript, ctx, FakeLLM(), tavily_key="tk", quiet=True, retriever=retriever)
+                t.build_glossary(
+                    transcript,
+                    ctx,
+                    FakeProviderLLM(),
+                    t.GlossaryBuildOptions(
+                        tavily_key="tk",
+                        quiet=True,
+                        retriever=retriever,
+                    ),
+                )
 
         self.assertEqual(
             queries,
@@ -390,10 +1027,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertTrue(any("MANDATORY GLOSSARY JSON PROTOCOL" in prompt for prompt in prompts))
 
     def test_tavily_query_agent_failure_still_returns_metadata_fallbacks(self):
-        class FakeLLM:
-            provider = "fake"
-
-        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
             raise RuntimeError("query failed")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -411,7 +1045,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                queries = t.build_tavily_queries(transcript, ctx, FakeLLM(), quiet=True)
+                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True).queries
 
         self.assertEqual(
             queries,
@@ -457,6 +1091,131 @@ class JsonProtocolTests(unittest.TestCase):
 
         self.assertEqual(queries, ["Original Title", "Original Title Original Channel"])
 
+    def test_tavily_queries_dedupe_with_whitespace_case_and_terminal_punctuation(self):
+        fields = {
+            "title": "Original Title",
+            "uploader": "",
+            "tags": ["AI Ethics"],
+        }
+
+        queries = t.merge_tavily_queries_with_fallbacks(
+            ["  original   title ai ethics.  ", "Agent Useful Query"],
+            fields,
+            max_queries=8,
+        )
+
+        self.assertEqual(
+            queries,
+            [
+                "Original Title",
+                "Original Title AI Ethics",
+                "Agent Useful Query",
+            ],
+        )
+
+    def test_tavily_queries_dedupe_typographic_quotes_and_internal_punctuation(self):
+        fields = {
+            "title": "Anime Genre That Doesn’t Exist",
+            "uploader": "",
+            "tags": [],
+        }
+
+        queries = t.merge_tavily_queries_with_fallbacks(
+            [
+                "Anime Genre That Doesn't Exist",
+                "Anime Genre That Doesnt Exist",
+                "Anime--Genre That Doesn’t Exist",
+                "distinctive source concept",
+            ],
+            fields,
+            max_queries=8,
+        )
+
+        self.assertEqual(
+            queries,
+            [
+                "Anime Genre That Doesn’t Exist",
+                "distinctive source concept",
+            ],
+        )
+
+    def test_tavily_source_target_merge_dedupes_before_language_limit(self):
+        queries = t.merge_source_and_target_tavily_queries(
+            ["alpha", "beta", "gamma"],
+            ["alpha", "beta.", "目标甲", "目标乙", "目标丙"],
+            max_queries_per_language=3,
+        )
+
+        self.assertEqual(queries, ["alpha", "目标甲", "beta", "目标乙", "gamma", "目标丙"])
+
+    def test_build_tavily_search_plan_searches_source_and_target_language_queries(self):
+        prompts = []
+
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+            prompts.append(system_prompt)
+            if "TAVILY QUERY TRANSLATION JSON PROTOCOL" in system_prompt:
+                self.assertEqual(
+                    request.to_json_value()["queries"],
+                    ["Original Title", "Original Title Original Channel", "source concept"],
+                )
+                return {"queries": ["原标题", "原标题 原频道", "目标概念"]}
+            if "TAVILY SEARCH QUERY JSON PROTOCOL" in system_prompt:
+                return {"queries": ["source concept"]}
+            raise AssertionError(system_prompt)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Original Title", "uploader": "Original Channel"}, f)
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True, max_queries=3).queries
+
+        self.assertEqual(
+            queries,
+            [
+                "Original Title",
+                "原标题",
+                "Original Title Original Channel",
+                "原标题 原频道",
+                "source concept",
+                "目标概念",
+            ],
+        )
+        self.assertTrue(any("TAVILY QUERY TRANSLATION JSON PROTOCOL" in prompt for prompt in prompts))
+
+    def test_build_tavily_search_plan_falls_back_to_source_queries_when_translation_fails(self):
+        def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+            if "TAVILY QUERY TRANSLATION JSON PROTOCOL" in system_prompt:
+                raise RuntimeError("translation failed")
+            if "TAVILY SEARCH QUERY JSON PROTOCOL" in system_prompt:
+                return {"queries": ["source concept"]}
+            raise AssertionError(system_prompt)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Original Title"}, f)
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True, max_queries=4).queries
+
+        self.assertEqual(queries, ["Original Title", "source concept"])
+
     def test_glossary_prompt_context_skips_full_text_when_retriever_is_available(self):
         class FalseyRetriever:
             def __bool__(self):
@@ -473,16 +1232,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("# 术语知识库", fallback)
 
     def test_translate_segments_omits_retrieved_context_without_retriever(self):
-        class FakeLLM:
-            provider = "fake"
-            batch_size = 10
-
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {}
-
         captured = {}
 
         def fake_llm_numbered_batch(request, session, quiet, retries=3):
@@ -496,22 +1245,12 @@ class JsonProtocolTests(unittest.TestCase):
             segments=[t.TranscriptSegment(1, 0.0, 1.0, "source text")],
         )
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.translate_segments(transcript, self.ctx, FakeLLM(), "system", quiet=True, retriever=None)
+            t.translate_segments(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=None)
 
         self.assertNotIn("retrieved_context", captured["request"]["items"][0])
         self.assertNotIn("RETRIEVED CONTEXT:", captured["system_prompt"])
 
     def test_translate_segments_adds_retrieved_context(self):
-        class FakeLLM:
-            provider = "fake"
-            batch_size = 10
-
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {}
-
         class FakeRetriever:
             def __bool__(self):
                 return False
@@ -533,30 +1272,12 @@ class JsonProtocolTests(unittest.TestCase):
         )
         retriever = FakeRetriever()
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.translate_segments(transcript, self.ctx, FakeLLM(), "system", quiet=True, retriever=retriever)
+            t.translate_segments(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=retriever)
 
         self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "translation memory"}])
         self.assertEqual(retriever.texts, ["source text"])
 
     def test_proofread_split_events_adds_retrieved_context(self):
-        class FakeLLM:
-            provider = "fake"
-            batch_size = 10
-            api_key = None
-            proofread_retrieval_top_k = 1
-
-            def pr_provider(self):
-                return "fake"
-
-            def pr_model(self):
-                return "fake-model"
-
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {}
-
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
                 self.texts = texts
@@ -584,32 +1305,13 @@ class JsonProtocolTests(unittest.TestCase):
         )
         retriever = FakeRetriever()
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", quiet=True, retriever=retriever)
+            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=retriever)
 
         self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "proofread memory"}])
         self.assertEqual(retriever.texts, ["source\n译文"])
         self.assertEqual(retriever.top_k, 1)
 
     def test_proofread_split_events_respects_small_batch_without_token_limit(self):
-        class FakeLLM:
-            provider = "fake"
-            batch_size = 10
-            api_key = None
-            proofread_batch_size = 2
-            proofread_retrieval_top_k = 1
-
-            def pr_provider(self):
-                return "fake"
-
-            def pr_model(self):
-                return "fake-model"
-
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {}
-
         calls = []
 
         def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
@@ -638,30 +1340,11 @@ class JsonProtocolTests(unittest.TestCase):
         )
 
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", quiet=True)
+            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
 
         self.assertEqual(calls, [2, 1])
 
     def test_proofread_split_events_splits_batch_on_context_length_error(self):
-        class FakeLLM:
-            provider = "fake"
-            batch_size = 10
-            api_key = None
-            proofread_batch_size = 2
-            proofread_retrieval_top_k = 1
-
-            def pr_provider(self):
-                return "fake"
-
-            def pr_model(self):
-                return "fake-model"
-
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {}
-
         calls = []
 
         def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
@@ -691,7 +1374,7 @@ class JsonProtocolTests(unittest.TestCase):
         )
 
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            changed = t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", quiet=True)
+            changed = t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
 
         self.assertTrue(changed)
         self.assertEqual(calls, [2, 1, 1])
@@ -699,25 +1382,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(transcript.segments[0].split_events[1].zh, "译文二 fixed")
 
     def test_proofread_split_events_drops_retrieved_context_when_single_item_is_too_large(self):
-        class FakeLLM:
-            provider = "fake"
-            batch_size = 2
-            api_key = None
-            proofread_batch_size = 1
-            proofread_retrieval_top_k = 1
-
-            def pr_provider(self):
-                return "fake"
-
-            def pr_model(self):
-                return "fake-model"
-
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {}
-
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
                 return [[{"id": "transcript:1", "text": "x" * 1000}]]
@@ -750,7 +1414,7 @@ class JsonProtocolTests(unittest.TestCase):
             changed = t.proofread_split_events(
                 transcript,
                 self.ctx,
-                FakeLLM(),
+                FakeBatchLLM(1),
                 "system",
                 quiet=True,
                 retriever=FakeRetriever(),
@@ -762,41 +1426,73 @@ class JsonProtocolTests(unittest.TestCase):
 
     def test_chat_session_passes_provider_response_format(self):
         calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg={"response_format": {"type": "json_object"}},
+            responses=[FakeSDKResponse(FakeSDKMessage(content='{"markdown": "ok"}'))],
+        )
 
-        class FakeMessage:
-            content = '{"markdown": "ok"}'
-
-        class FakeChoice:
-            message = FakeMessage()
-
-        class FakeResponse:
-            choices = [FakeChoice()]
-
-        class FakeCompletions:
-            def create(self, **kwargs):
-                calls.append(kwargs)
-                return FakeResponse()
-
-        class FakeChat:
-            completions = FakeCompletions()
-
-        class FakeClient:
-            chat = FakeChat()
-
-        class FakeLLM:
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {"response_format": {"type": "json_object"}}
-
-            def _client(self):
-                return FakeClient()
-
-        t.ChatSession(FakeLLM(), "system").ask("{}")
+        t.ChatSession(llm, "system").ask("{}")
 
         self.assertEqual(calls[0]["response_format"], {"type": "json_object"})
         self.assertEqual(set(calls[0]), {"model", "messages", "temperature", "response_format"})
+
+    def test_chat_session_merges_provider_request_kwargs(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg={
+                "request_kwargs": {
+                    "extra_body": {"google": {"tools": [{"google_search": {}}]}},
+                    "seed": 7,
+                }
+            },
+            responses=[FakeSDKResponse(FakeSDKMessage(content='{"markdown": "ok"}'))],
+        )
+
+        t.ChatSession(llm, "system").ask("{}")
+
+        self.assertIn("extra_body", calls[0])
+        self.assertEqual(
+            calls[0]["extra_body"],
+            {"google": {"tools": [{"google_search": {}}]}},
+        )
+        self.assertIn("seed", calls[0])
+        self.assertEqual(calls[0]["seed"], 7)
+        self.assertEqual(calls[0]["model"], "fake-model")
+        self.assertEqual(calls[0]["temperature"], 0.3)
+
+    def test_chat_session_disable_response_format_wins_after_extra_kwargs(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg={
+                "response_format": {"type": "json_object"},
+                "request_kwargs": {"response_format": {"type": "json_object"}},
+            },
+        )
+
+        session = t.ChatSession(llm, "system", disable_response_format=True)
+        session.create(response_format={"type": "json_object"})
+
+        self.assertNotIn("response_format", calls[0])
+
+    def test_provider_example_uses_request_kwargs_for_sdk_options(self):
+        with open("providers.example.json", "r", encoding="utf-8") as f:
+            providers = json.load(f)
+
+        deepseek = providers["deepseek"]
+        self.assertNotIn("response_format", deepseek)
+        self.assertEqual(
+            deepseek["request_kwargs"]["response_format"],
+            {"type": "json_object"},
+        )
+
+        gemini = providers["gemini"]
+        self.assertEqual(
+            gemini["request_kwargs"]["extra_body"]["extra_body"]["google"]["tools"],
+            [{"google_search": {}}],
+        )
 
     def test_chat_session_empty_content_error_includes_provider_details(self):
         class FakeUsageDetails:
@@ -808,41 +1504,22 @@ class JsonProtocolTests(unittest.TestCase):
             total_tokens = 300
             completion_tokens_details = FakeUsageDetails()
 
-        class FakeMessage:
-            content = ""
-            reasoning_content = "model thought but produced no content"
-            refusal = "blocked by provider"
-
-        class FakeChoice:
-            finish_reason = "length"
-            message = FakeMessage()
-
-        class FakeResponse:
-            choices = [FakeChoice()]
-            usage = FakeUsage()
-
-        class FakeCompletions:
-            def create(self, **kwargs):
-                return FakeResponse()
-
-        class FakeChat:
-            completions = FakeCompletions()
-
-        class FakeClient:
-            chat = FakeChat()
-
-        class FakeLLM:
-            def model_name(self):
-                return "fake-model"
-
-            def cfg(self):
-                return {}
-
-            def _client(self):
-                return FakeClient()
+        llm = FakeChatLLM(
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(
+                        content="",
+                        reasoning_content="model thought but produced no content",
+                        refusal="blocked by provider",
+                    ),
+                    finish_reason="length",
+                    usage=FakeUsage(),
+                )
+            ]
+        )
 
         try:
-            t.ChatSession(FakeLLM(), "system").ask("{}")
+            t.ChatSession(llm, "system").ask("{}")
         except RuntimeError as e:
             message = str(e)
         else:
@@ -885,6 +1562,90 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertIn("llama", providers)
             self.assertIn("custom", providers)
 
+    def test_glossary_llm_from_env_uses_dedicated_provider_and_model(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", api_key="shared-key", batch_size=17)
+
+        glossary_llm = t.glossary_llm_from_env(
+            {
+                "GLOSSARY_PROVIDER": "openrouter",
+                "GLOSSARY_MODEL": "anthropic/claude-opus-4.1",
+            },
+            translate_llm,
+        )
+
+        self.assertEqual(glossary_llm.provider, "openrouter")
+        self.assertEqual(glossary_llm.model, "anthropic/claude-opus-4.1")
+        self.assertIsNone(glossary_llm.api_key)
+        self.assertEqual(glossary_llm.batch_size, 17)
+
+    def test_glossary_llm_from_env_falls_back_to_translate_provider(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-v4-pro", api_key="shared-key")
+
+        glossary_llm = t.glossary_llm_from_env({}, translate_llm)
+
+        self.assertEqual(glossary_llm.provider, "deepseek")
+        self.assertEqual(glossary_llm.model, "deepseek-v4-pro")
+        self.assertEqual(glossary_llm.api_key, "shared-key")
+
+    def test_translate_llm_from_env_does_not_carry_proofread_config(self):
+        llm = t.translate_llm_from_env(
+            {
+                "TRANSLATE_PROVIDER": "deepseek",
+                "TRANSLATE_MODEL": "deepseek-chat",
+                "PROOFREAD_PROVIDER": "openrouter",
+                "PROOFREAD_MODEL": "anthropic/claude-sonnet-4-6",
+                "PROOFREAD_BATCH_SIZE": "3",
+            },
+            batch_size=12,
+        )
+
+        self.assertEqual(llm.provider, "deepseek")
+        self.assertEqual(llm.model, "deepseek-chat")
+        self.assertEqual(llm.batch_size, 12)
+        self.assertFalse(hasattr(llm, "proofread_provider"))
+        self.assertFalse(hasattr(llm, "proofread_model"))
+
+    def test_proofread_llm_from_env_returns_dedicated_llm_config(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", api_key="shared-key", batch_size=12)
+
+        proofread_llm = t.proofread_llm_from_env(
+            {
+                "PROOFREAD_PROVIDER": "openrouter",
+                "PROOFREAD_MODEL": "anthropic/claude-sonnet-4-6",
+                "PROOFREAD_BATCH_SIZE": "3",
+            },
+            translate_llm,
+            batch_size=12,
+        )
+
+        self.assertEqual(proofread_llm.provider, "openrouter")
+        self.assertEqual(proofread_llm.model, "anthropic/claude-sonnet-4-6")
+        self.assertIsNone(proofread_llm.api_key)
+        self.assertEqual(proofread_llm.batch_size, 3)
+
+    def test_proofread_llm_from_env_reuses_translate_provider_when_unset(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", api_key="shared-key", batch_size=12)
+
+        proofread_llm = t.proofread_llm_from_env({}, translate_llm, batch_size=12)
+
+        self.assertEqual(proofread_llm.provider, "deepseek")
+        self.assertEqual(proofread_llm.model, "deepseek-chat")
+        self.assertEqual(proofread_llm.api_key, "shared-key")
+        self.assertEqual(proofread_llm.batch_size, 6)
+
+    def test_only_glossary_does_not_require_translate_provider(self):
+        class Args:
+            only_glossary = True
+            skip_knowledge = False
+
+        env = {
+            "GLOSSARY_PROVIDER": "deepseek",
+            "TRANSLATE_PROVIDER": "",
+        }
+
+        self.assertFalse(t.needs_translate_llm(Args))
+        self.assertEqual(t.required_glossary_provider(env), "deepseek")
+
     def test_embedding_config_from_env_uses_project_chroma_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
@@ -915,7 +1676,15 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertFalse(cfg.enabled)
 
     def test_embedding_chunk_converts_to_langchain_document(self):
-        chunk = t.EmbeddingChunk("a", "transcript", "discipline and motivation", 1.0, 2.0, {"segment": 1})
+        chunk = t.EmbeddingChunk(
+            "a",
+            "transcript",
+            "discipline and motivation",
+            1.0,
+            2.0,
+            {"segment": 1},
+            context_text="[1 00:00:01.000-00:00:02.000] discipline and motivation",
+        )
 
         doc = chunk.to_document()
 
@@ -928,13 +1697,20 @@ class JsonProtocolTests(unittest.TestCase):
                 "start": 1.0,
                 "end": 2.0,
                 "segment": 1,
+                "context_text": "[1 00:00:01.000-00:00:02.000] discipline and motivation",
             },
         )
 
     def test_langchain_docs_convert_to_retrieved_context(self):
         doc = t.Document(
             page_content="discipline and motivation",
-            metadata={"id": "transcript:1", "source": "transcript", "start": 1.0, "end": 2.0},
+            metadata={
+                "id": "transcript:1",
+                "source": "transcript",
+                "start": 1.0,
+                "end": 2.0,
+                "context_text": "[1 00:00:01.000-00:00:02.000] discipline and motivation",
+            },
         )
 
         context = t.documents_to_retrieved_context([doc])
@@ -945,7 +1721,7 @@ class JsonProtocolTests(unittest.TestCase):
                 {
                     "id": "transcript:1",
                     "source": "transcript",
-                    "text": "discipline and motivation",
+                    "text": "[1 00:00:01.000-00:00:02.000] discipline and motivation",
                     "start": 1.0,
                     "end": 2.0,
                 }
@@ -998,27 +1774,46 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual([chunk.chunk_id for chunk in chunks], ["transcript:1-2", "transcript:2-3"])
         self.assertEqual(chunks[0].source, "transcript")
         self.assertEqual(chunks[0].text, "[1] alpha beta\n[2] gamma delta")
+        self.assertEqual(
+            chunks[0].context_text,
+            "[1 00:00:00.000-00:00:01.000] alpha beta\n[2 00:00:01.000-00:00:02.000] gamma delta",
+        )
         self.assertEqual(chunks[0].metadata["segment_ids"], [1, 2])
         self.assertEqual(chunks[0].start, 0.0)
         self.assertEqual(chunks[0].end, 2.0)
         self.assertEqual(chunks[1].metadata["segment_ids"], [2, 3])
 
-    def test_build_embedding_chunks_overlaps_transcript_boundaries(self):
+    def test_build_embedding_chunks_uses_time_aware_overlap(self):
         transcript = t.Transcript(
             path="video.json",
             language="en",
             segments=[
-                t.TranscriptSegment(1, 0.0, 1.0, "alpha beta"),
-                t.TranscriptSegment(2, 1.0, 2.0, "gamma delta"),
-                t.TranscriptSegment(3, 2.0, 3.0, "epsilon zeta"),
-                t.TranscriptSegment(4, 3.0, 4.0, "eta theta"),
+                t.TranscriptSegment(1, 0.0, 10.0, "alpha beta"),
+                t.TranscriptSegment(2, 10.0, 20.0, "gamma delta"),
+                t.TranscriptSegment(3, 20.0, 30.0, "epsilon zeta"),
+                t.TranscriptSegment(4, 30.0, 40.0, "eta theta"),
             ],
         )
 
-        chunks = t.build_embedding_chunks(transcript, chunk_chars=32)
+        chunks = t.build_embedding_chunks(transcript, chunk_chars=52)
 
-        self.assertEqual([chunk.metadata["segment_ids"] for chunk in chunks], [[1, 2], [2, 3], [3, 4]])
-        self.assertEqual([chunk.chunk_id for chunk in chunks], ["transcript:1-2", "transcript:2-3", "transcript:3-4"])
+        self.assertEqual([chunk.metadata["segment_ids"] for chunk in chunks], [[1, 2, 3], [3, 4]])
+        self.assertEqual([chunk.chunk_id for chunk in chunks], ["transcript:1-3", "transcript:3-4"])
+
+    def test_build_embedding_chunks_splits_long_time_windows(self):
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(1, 0.0, 30.0, "alpha"),
+                t.TranscriptSegment(2, 30.0, 60.0, "beta"),
+                t.TranscriptSegment(3, 60.0, 90.0, "gamma"),
+            ],
+        )
+
+        chunks = t.build_embedding_chunks(transcript, chunk_chars=1000)
+
+        self.assertEqual([chunk.metadata["segment_ids"] for chunk in chunks], [[1, 2], [2, 3]])
 
     def test_build_translation_memory_chunks_uses_split_events(self):
         transcript = t.Transcript(
@@ -1262,13 +2057,12 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual([ids for _, ids in fake_store.calls], [["transcript:1", "transcript:1-2"], ["transcript:2-3"]])
 
     def test_response_keys_match_language_codes_only(self):
-        source_candidates = t.response_key_candidates(self.ctx, "source")
-        target_candidates = t.response_key_candidates(self.ctx, "target")
+        fields = t.LanguageFields.from_ctx(self.ctx)
 
-        self.assertEqual(t.get_language_keyed_value({"en": "source text"}, source_candidates), "source text")
-        self.assertEqual(t.get_language_keyed_value({"zh": "target text"}, target_candidates), "target text")
-        self.assertIsNone(t.get_language_keyed_value({"source": "legacy"}, source_candidates))
-        self.assertIsNone(t.get_language_keyed_value({"target": "legacy"}, target_candidates))
+        self.assertEqual(fields.get_source({"en": "source text"}), "source text")
+        self.assertEqual(fields.get_target({"zh": "target text"}), "target text")
+        self.assertIsNone(fields.get_source({"source": "legacy"}))
+        self.assertIsNone(fields.get_target({"target": "legacy"}))
 
     def test_parse_split_response_aligns_by_actual_ids(self):
         source, target, error = t.parse_split_response(
@@ -1440,7 +2234,7 @@ class JsonProtocolTests(unittest.TestCase):
 
             captured_request = {}
 
-            def fake_llm_json_once(llm, system_prompt, request, temperature=0.3):
+            def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
                 captured_request.update(request.to_json_value())
                 return {
                     "title": "译后标题",
@@ -1448,11 +2242,8 @@ class JsonProtocolTests(unittest.TestCase):
                     "tags": ["人工智能", "哲学"],
                 }
 
-            class FakeLLM:
-                pass
-
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                result = t.translate_description(ctx, FakeLLM(), quiet=True)
+                result = t.translate_description(ctx, FakeProviderLLM(), quiet=True)
 
             self.assertEqual(result, ctx.target_desc)
             self.assertEqual(captured_request["tags"], ["AI", "philosophy"])

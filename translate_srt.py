@@ -21,9 +21,10 @@ import sys
 import time
 
 import unicodedata
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlparse
 
 import langcodes
 import language_data  # noqa: F401
@@ -307,18 +308,8 @@ class TranscriptContext:
 class LLMConfig:
     provider: str
     model: str = ""
-    proofread_provider: str = ""
-    proofread_model: str = ""
     api_key: Optional[str] = None
     batch_size: int = 50
-    proofread_batch_size: int = 0
-    proofread_retrieval_top_k: int = 1
-
-    def pr_provider(self) -> str:
-        return self.proofread_provider or self.provider
-
-    def pr_model(self) -> str:
-        return self.proofread_model or self.model
 
     def resolve_key(self) -> str:
         if self.api_key is None:
@@ -345,6 +336,66 @@ class LLMConfig:
             api_key=self.resolve_key(),
             default_headers=provider_cfg.get("extra_headers", {}),
         )
+
+
+def translate_llm_from_env(env: dict[str, str], batch_size: int) -> LLMConfig:
+    return LLMConfig(
+        provider=env.get("TRANSLATE_PROVIDER", "").strip(),
+        model=env.get("TRANSLATE_MODEL", "").strip(),
+        batch_size=batch_size,
+    )
+
+
+def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_size: int) -> LLMConfig:
+    configured_provider = env.get("PROOFREAD_PROVIDER", "").strip()
+    provider = configured_provider or translate_llm.provider
+    configured_model = env.get("PROOFREAD_MODEL", "").strip()
+    if configured_model:
+        model = configured_model
+    elif configured_provider:
+        model = ""
+    else:
+        model = translate_llm.model
+    return LLMConfig(
+        provider=provider,
+        model=model,
+        api_key=translate_llm.api_key if provider == translate_llm.provider else None,
+        batch_size=env_int(env.get("PROOFREAD_BATCH_SIZE", ""), max(1, batch_size // 2)),
+    )
+
+
+def glossary_llm_from_env(
+    env: dict[str, str],
+    translate_llm: Optional[LLMConfig] = None,
+    batch_size: int = 50,
+) -> LLMConfig:
+    configured_provider = env.get("GLOSSARY_PROVIDER", "").strip()
+    provider = configured_provider or (translate_llm.provider if translate_llm else env.get("TRANSLATE_PROVIDER", "").strip())
+    configured_model = env.get("GLOSSARY_MODEL", "").strip()
+    if configured_model:
+        model = configured_model
+    elif configured_provider:
+        model = ""
+    else:
+        model = translate_llm.model if translate_llm else env.get("TRANSLATE_MODEL", "").strip()
+    return LLMConfig(
+        provider=provider,
+        model=model,
+        api_key=translate_llm.api_key if translate_llm and provider == translate_llm.provider else None,
+        batch_size=translate_llm.batch_size if translate_llm else batch_size,
+    )
+
+
+def required_glossary_provider(env: dict[str, str]) -> str:
+    return env.get("GLOSSARY_PROVIDER", "").strip() or env.get("TRANSLATE_PROVIDER", "").strip()
+
+
+def needs_translate_llm(args) -> bool:
+    return not bool(getattr(args, "only_glossary", False))
+
+
+def proofread_retrieval_top_k_from_env(env: dict[str, str]) -> int:
+    return env_int(env.get("PROOFREAD_RETRIEVAL_TOP_K", ""), 1)
 
 
 @dataclass
@@ -385,6 +436,7 @@ class EmbeddingChunk:
     start: Optional[float] = None
     end: Optional[float] = None
     metadata: dict = field(default_factory=dict)
+    context_text: Optional[str] = None
 
     def to_document(self) -> Document:
         metadata = {
@@ -395,6 +447,8 @@ class EmbeddingChunk:
             metadata["start"] = self.start
         if self.end is not None:
             metadata["end"] = self.end
+        if self.context_text and self.context_text != self.text:
+            metadata["context_text"] = self.context_text
         metadata.update(self.metadata)
         return Document(page_content=self.text, metadata=metadata)
 
@@ -419,10 +473,11 @@ def documents_to_retrieved_context(documents: list[Document]) -> list[dict]:
     contexts: list[dict] = []
     for doc in documents:
         metadata = dict(doc.metadata or {})
+        context_text = metadata.pop("context_text", doc.page_content)
         data = {
             "id": str(metadata.pop("id", "")),
             "source": str(metadata.pop("source", "")),
-            "text": doc.page_content,
+            "text": str(context_text),
         }
         for key in ("start", "end"):
             if key in metadata:
@@ -461,7 +516,11 @@ def open_chroma_store(config: EmbeddingConfig, env: dict[str, str]) -> Chroma:
     )
 
 
-TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS = 1
+TRANSCRIPT_CHUNK_MAX_SECONDS = 60.0
+TRANSCRIPT_CHUNK_MAX_SEGMENTS = 24
+TRANSCRIPT_CHUNK_OVERLAP_SECONDS = 10.0
+TRANSCRIPT_CHUNK_OVERLAP_MAX_SEGMENTS = 4
+TRANSCRIPT_CHUNK_OVERLAP_MAX_RATIO = 0.25
 
 
 def transcript_chunk_id(segments: list[TranscriptSegment]) -> str:
@@ -474,6 +533,62 @@ def transcript_chunk_id(segments: list[TranscriptSegment]) -> str:
 
 def transcript_chunk_line(seg: TranscriptSegment) -> str:
     return f"[{seg.index}] {seg.source_text().strip()}"
+
+
+def embedding_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(float(seconds) * 1000)))
+    ms = total_ms % 1000
+    total_seconds = total_ms // 1000
+    s = total_seconds % 60
+    total_minutes = total_seconds // 60
+    m = total_minutes % 60
+    h = total_minutes // 60
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def transcript_chunk_context_line(seg: TranscriptSegment) -> str:
+    return (
+        f"[{seg.index} {embedding_timestamp(seg.start)}-{embedding_timestamp(seg.end)}] "
+        f"{seg.source_text().strip()}"
+    )
+
+
+def transcript_chunk_len(lines: list[str]) -> int:
+    return sum(len(line) for line in lines) + max(0, len(lines) - 1)
+
+
+def transcript_chunk_duration(segments: list[TranscriptSegment]) -> float:
+    if not segments:
+        return 0.0
+    return max(0.0, float(segments[-1].end) - float(segments[0].start))
+
+
+def transcript_overlap_segments(segments: list[TranscriptSegment], chunk_len: int) -> list[TranscriptSegment]:
+    if not segments:
+        return []
+    window_start = float(segments[-1].end) - TRANSCRIPT_CHUNK_OVERLAP_SECONDS
+    candidates = [
+        seg
+        for seg in segments
+        if float(seg.end) > window_start
+    ][-TRANSCRIPT_CHUNK_OVERLAP_MAX_SEGMENTS:]
+    if not candidates:
+        candidates = [segments[-1]]
+
+    max_overlap_len = max(
+        len(transcript_chunk_line(candidates[-1])),
+        int(chunk_len * TRANSCRIPT_CHUNK_OVERLAP_MAX_RATIO),
+    )
+    selected: list[TranscriptSegment] = []
+    selected_lines: list[str] = []
+    for seg in reversed(candidates):
+        line = transcript_chunk_line(seg)
+        projected = transcript_chunk_len([line, *selected_lines])
+        if selected and projected > max_overlap_len:
+            break
+        selected.insert(0, seg)
+        selected_lines.insert(0, line)
+    return selected or [segments[-1]]
 
 
 def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[EmbeddingChunk]:
@@ -500,12 +615,13 @@ def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[Emb
                     "language": transcript.language,
                     "segment_ids": [seg.index for seg in current_segments],
                 },
+                context_text="\n".join(transcript_chunk_context_line(seg) for seg in current_segments),
             )
         )
-        overlap_segments = current_segments[-TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS:] if TRANSCRIPT_CHUNK_OVERLAP_SEGMENTS > 0 else []
+        overlap_segments = transcript_overlap_segments(current_segments, current_len)
         current_segments = list(overlap_segments)
         current_lines = [transcript_chunk_line(seg) for seg in current_segments]
-        current_len = sum(len(line) for line in current_lines) + max(0, len(current_lines) - 1)
+        current_len = transcript_chunk_len(current_lines)
 
     for seg in transcript.segments:
         text = seg.source_text().strip()
@@ -513,7 +629,12 @@ def build_embedding_chunks(transcript: Transcript, chunk_chars: int) -> list[Emb
             continue
         line = transcript_chunk_line(seg)
         extra_len = len(line) + (1 if current_lines else 0)
-        if current_lines and current_len + extra_len > max_chars:
+        next_segments = current_segments + [seg]
+        if current_lines and (
+            current_len + extra_len > max_chars
+            or len(next_segments) > TRANSCRIPT_CHUNK_MAX_SEGMENTS
+            or transcript_chunk_duration(next_segments) > TRANSCRIPT_CHUNK_MAX_SECONDS
+        ):
             flush()
             if current_segments and current_segments[-1].index == seg.index:
                 continue
@@ -686,7 +807,7 @@ def refresh_embedding_retriever(
     ctx: TranscriptContext,
     fatal: bool = False,
     warning_label: str = "embedding index failed",
-):
+) -> EmbeddingRetriever | None:
     try:
         build_embedding_index(transcript, config, env, quiet, ctx)
         return EmbeddingRetriever(config, env)
@@ -922,11 +1043,6 @@ class LanguageFields:
         return get_language_keyed_value(item, self.target_candidates())
 
 
-def response_key_candidates(ctx: TranscriptContext, side: str) -> set[str]:
-    fields = LanguageFields.from_ctx(ctx)
-    return fields.source_candidates() if side == "source" else fields.target_candidates()
-
-
 def get_language_keyed_value(item: dict, candidates: set[str]):
     for key, value in item.items():
         if normalized_response_key(str(key)) in candidates:
@@ -965,14 +1081,29 @@ _BUILTIN_PROVIDERS = {
         "env_key": "DEEPSEEK_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},
-        "response_format": {"type": "json_object"},
+        "request_kwargs": {
+            "response_format": {"type": "json_object"},
+        },
     },
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-2.5-pro",
+        "default_model": "gemini-3.5-flash",
         "env_key": "GEMINI_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},
+        "request_kwargs": {
+            "extra_body": {
+                "extra_body": {
+                    "google": {
+                        "tools": [
+                            {
+                                "google_search": {}
+                            }
+                        ]
+                    }
+                }
+            }
+        },
     },
 }
 
@@ -1085,22 +1216,20 @@ GOOD:
 
 The placeholder values above are format markers only. In your actual response, replace them with split text from the provided segment."""
 
-_GLOSSARY_PROMPT_FALLBACK = """You are a terminology expert. Analyze the ${SOURCE_LANG} transcript and metadata to prepare glossary content for ${TARGET_LANG} subtitle translation.
+_GLOSSARY_PROMPT_FALLBACK = """You are a terminology expert. Build a rigorous glossary for ${TARGET_LANG} subtitle translation from the ${SOURCE_LANG} transcript, metadata, and any provided search evidence.
 
-Content requirements:
-- Title the glossary for the current video.
-- Write a short background summary in ${TARGET_LANG}.
-- Include a terminology table with source terms, recommended ${TARGET_LANG} translations, and brief rationale.
-- Include tone guidance in ${TARGET_LANG}.
-- Include key arguments in ${TARGET_LANG}.
+Glossary core:
+- Background: identify the real topic, domain, works, people, and context in ${TARGET_LANG}.
+- Core terminology: source term, corrected form if ASR is likely wrong, recommended ${TARGET_LANG} translation, and concise rationale.
+- Tone: practical guidance for preserving speaker attitude and register in ${TARGET_LANG}.
+- Key arguments: only the claims needed to keep translation choices consistent.
 
-Rules:
-- Only include terms that actually appear in the transcript.
-- Search results can verify standard ${TARGET_LANG} translations.
-- If uncertain, mark with (?).
-- Keep under 100 lines.
-- Do not include greetings, meta commentary, implementation notes, or tool/runtime details.
-- Do not mention whether web search was used."""
+Evidence rules:
+- Treat web search results as the primary evidence when they are provided; use the transcript to identify what matters, then verify names, titles, concepts, and standard ${TARGET_LANG} translations against search evidence.
+- If transcript text conflicts with reliable search evidence, prefer the search evidence and mark uncertainty only when the correction is not clear.
+- You must actively correct likely ASR errors in names, titles, quotes, source terms, and concepts. Do not copy ASR mistakes into the glossary.
+- Include only terms, concepts, tone notes, and arguments that are actually useful for translating this video.
+- If a term or correction remains uncertain after checking evidence, mark it with (?)."""
 
 _GLOSSARY_FORMAT = """MANDATORY GLOSSARY JSON PROTOCOL:
 The user message is JSON. Your response must be one machine-parseable JSON object only.
@@ -1125,24 +1254,68 @@ JSON string rules:
 
 
 _TAVILY_QUERY_PROMPT = """You are a search-intent agent for a subtitle translation pipeline.
-Read the video metadata and transcript excerpt, then produce web search queries that reveal the real topic, named entities, concepts, works, claims, and terminology discussed in the video.
+Read the video metadata and transcript excerpt, then produce compact keyword queries that reveal the real topic, named entities, concepts, works, claims, and terminology discussed in the video.
 
 Rules:
 - Base queries on transcript content first. Metadata can disambiguate, but do not rely on title/tags alone.
+- The transcript excerpt comes from WhisperX ASR and may contain misheard names, works, quotes, proper nouns, or technical terms.
+- Before writing a query, correct likely ASR errors by using metadata, neighboring context, and domain knowledge.
+- Do not preserve a suspicious ASR token in a search query when a more likely canonical name, title, quote, or term can be inferred.
+- If a correction is uncertain, prefer a broader canonical concept query over the dubious ASR wording; include only one uncertain correction at most.
+- Compress long spoken ideas into search keywords. Do not copy full transcript sentences, subtitle lines, filler speech, or rhetorical questions as queries.
 - Prefer concrete concepts, named entities, works, quotes, technical terms, and distinctive claims.
+- Each query should normally contain 2 to 6 important words or named entities, not a complete sentence.
+- Each query should cover one distinct search angle: person/work, technical term, historical background, core claim, quote/source, or domain-specific concept.
+- Do not create near-duplicates, paraphrases of the same query, or multiple queries that only change function words.
+- Also extract compact topic hints for selecting authoritative domain groups, such as anime, philosophy, game, film, AI, history, medicine, or their source/target-language equivalents.
 - Avoid generic channel promotion, merch, sponsorship, social links, and vague queries.
 - Each query must be useful as a direct Tavily/web search query.
+- Topic hints are not search queries; they are short domain/category keywords.
 - Return 3 to 8 queries when possible.
-- Keep each query concise, normally under 120 characters."""
+- Keep each query concise, normally under 80 characters."""
 
 _TAVILY_QUERY_FORMAT = """TAVILY SEARCH QUERY JSON PROTOCOL:
-Return exactly one top-level key: "queries".
+Return exactly two top-level keys: "queries" and "topic_hints".
 "queries" must be a JSON array of non-empty strings.
+"topic_hints" must be a JSON array of short topic/category keywords useful for selecting domain groups.
 
 GOOD:
-{"queries": ["specific concept from transcript", "named entity technical term", "distinctive claim from video"]}
+{"queries": ["named entity technical term", "work title concept", "distinctive claim keywords"], "topic_hints": ["anime", "film criticism"]}
+
+BAD:
+{"queries": ["full spoken sentence copied from transcript with filler words and no keyword compression", "same concept with slightly different wording", "suspicious ASR gibberish kept as keyword"], "topic_hints": ["topic"]}
 
 Do not include explanations, scores, markdown, or extra keys."""
+
+
+_TAVILY_QUERY_TRANSLATE_PROMPT = """You localize web search intent for a subtitle translation pipeline.
+Convert each search query from ${SOURCE_LANG_CODE} into a natural ${TARGET_LANG_CODE} web/encyclopedia search query.
+Do not translate as subtitle prose. Localize the search intent for how people search the target-language web.
+
+Rules:
+- Translate aggressively. The translated query should normally look like a natural ${TARGET_LANG_CODE} web/encyclopedia search, not a lightly edited copy of the source query.
+- Translate concepts, claims, descriptive phrases, and genre/topic terms into natural ${TARGET_LANG_CODE} search wording; also translate explanatory wording when it helps search.
+- Prefer target-language encyclopedia, wiki, fandom, database, and glossary terminology over literal wording.
+- Do not return a query that is merely the source query with minor punctuation, spacing, casing, or word-order changes.
+- Preserve only named entities, titles, works, brands, and proper nouns whose original form is normally the best ${TARGET_LANG_CODE} search term.
+- When a preserved name would make the query too similar to the source, add target-language context around it.
+- When both forms are useful, include the common ${TARGET_LANG_CODE} wording plus the original name if concise.
+- If a query mixes a proper noun with a generic concept, translate the generic concept even when preserving the proper noun.
+- If the input includes topic_hints, return topic_hints localized into compact ${TARGET_LANG_CODE} topic/category keywords for domain selection.
+- Topic hints should be broad enough to match site groups, such as anime, animation, game, film, philosophy, AI, history, medicine, or their target-language equivalents.
+- Keep each translated query concise.
+- Return the same number of queries in the same order."""
+
+_TAVILY_QUERY_TRANSLATE_FORMAT = """TAVILY QUERY TRANSLATION JSON PROTOCOL:
+Return exactly one JSON object.
+"queries" is required and must be a JSON array of translated non-empty strings.
+"topic_hints" is required when the input contains topic_hints; otherwise omit it.
+"topic_hints" must be a JSON array of localized short topic/category keywords, not full search queries.
+
+GOOD:
+{"queries": ["translated search query", "translated named entity concept"], "topic_hints": ["localized topic", "localized domain category"]}
+
+Do not include explanations, scores, markdown, source-language notes, or extra keys."""
 
 
 def tavily_query_system_prompt(ctx: TranscriptContext) -> str:
@@ -1157,7 +1330,19 @@ def tavily_query_system_prompt(ctx: TranscriptContext) -> str:
     )
 
 
-def glossary_system_prompt(ctx: TranscriptContext, retriever=None) -> str:
+def tavily_query_translate_system_prompt(ctx: TranscriptContext) -> str:
+    return (
+        render_prompt_template(_TAVILY_QUERY_TRANSLATE_PROMPT, ctx)
+        + "\n\n"
+        + _JSON_FORMAT
+        + "\n\n"
+        + _JSON_OBJECT_FORMAT
+        + "\n\n"
+        + _TAVILY_QUERY_TRANSLATE_FORMAT
+    )
+
+
+def glossary_system_prompt(ctx: TranscriptContext, retriever: EmbeddingRetriever | None) -> str:
     return (
         render_prompt_template(load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK), ctx)
         + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
@@ -1638,7 +1823,7 @@ def load_glossary(glossary_path: str) -> str:
     )
 
 
-def load_glossary_prompt_context(glossary_path: str, retriever=None) -> str:
+def load_glossary_prompt_context(glossary_path: str, retriever: EmbeddingRetriever | None) -> str:
     if retriever is not None:
         return ""
     return load_glossary(glossary_path)
@@ -1801,14 +1986,275 @@ def write_glossary_file(ctx: TranscriptContext, glossary: str) -> str:
     return clean_glossary
 
 
-def tavily_search(query: str, api_key: str, max_results: int = 5) -> list[dict]:
+def normalize_tavily_domain(domain: str) -> str:
+    raw = str(domain or "").strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"^\*\.", "", raw)
+    parse_target = raw if "://" in raw else f"//{raw}"
+    parsed = urlparse(parse_target)
+    host = (parsed.netloc or parsed.path).split("/")[0]
+    host = host.split("@")[-1].split(":")[0].strip().strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host if "." in host else ""
+
+
+def json_string_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def unique_tavily_domains(domains) -> list[str]:
+    if isinstance(domains, str):
+        domains = [domains]
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in domains or []:
+        domain = normalize_tavily_domain(str(raw))
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        result.append(domain)
+    return result
+
+
+@dataclass(frozen=True)
+class TavilyTopicDomains:
+    name: str
+    keywords: tuple[str, ...] = ()
+    domains: tuple[str, ...] = ()
+
+    @staticmethod
+    def from_json_value(name: str, data) -> "TavilyTopicDomains":
+        topic_name = str(name or "").strip()
+        keywords = []
+        domains = []
+        if isinstance(data, dict):
+            topic_name = str(data.get("name") or topic_name).strip()
+            keywords = json_string_list(data.get("keywords", []))
+            domains = data.get("domains", data.get("sites", []))
+        elif isinstance(data, list):
+            domains = data
+        if topic_name and topic_name not in keywords:
+            keywords = [topic_name, *list(keywords or [])]
+        return TavilyTopicDomains(
+            name=topic_name,
+            keywords=tuple(unique_non_empty_strings(list(keywords or []))),
+            domains=tuple(unique_tavily_domains(domains)),
+        )
+
+    def merge(self, other: "TavilyTopicDomains") -> "TavilyTopicDomains":
+        return TavilyTopicDomains(
+            name=self.name or other.name,
+            keywords=tuple(unique_non_empty_strings([*self.keywords, *other.keywords])),
+            domains=tuple(unique_tavily_domains([*self.domains, *other.domains])),
+        )
+
+
+@dataclass(frozen=True)
+class TavilyDomainPreferences:
+    global_domains: tuple[str, ...] = ()
+    topics: tuple[TavilyTopicDomains, ...] = ()
+
+    @staticmethod
+    def from_json_value(data) -> "TavilyDomainPreferences":
+        if not isinstance(data, dict):
+            return TavilyDomainPreferences()
+        global_raw = data.get("global_domains", data.get("global", []))
+        if isinstance(global_raw, dict):
+            global_raw = global_raw.get("domains", global_raw.get("sites", []))
+
+        topics_by_name: dict[str, TavilyTopicDomains] = {}
+        raw_topics = data.get("topics", [])
+        if isinstance(raw_topics, dict):
+            topic_items = raw_topics.items()
+        elif isinstance(raw_topics, list):
+            topic_items = ((str(item.get("name", "")) if isinstance(item, dict) else "", item) for item in raw_topics)
+        else:
+            topic_items = []
+        for raw_name, raw_topic in topic_items:
+            topic = TavilyTopicDomains.from_json_value(raw_name, raw_topic)
+            if not topic.name or not topic.domains:
+                continue
+            key = topic.name.casefold()
+            topics_by_name[key] = topics_by_name[key].merge(topic) if key in topics_by_name else topic
+
+        return TavilyDomainPreferences(
+            global_domains=tuple(unique_tavily_domains(global_raw)),
+            topics=tuple(topics_by_name.values()),
+        )
+
+    def merge(self, other: "TavilyDomainPreferences") -> "TavilyDomainPreferences":
+        topics_by_name = {topic.name.casefold(): topic for topic in self.topics}
+        for topic in other.topics:
+            key = topic.name.casefold()
+            topics_by_name[key] = topics_by_name[key].merge(topic) if key in topics_by_name else topic
+        return TavilyDomainPreferences(
+            global_domains=tuple(unique_tavily_domains([*self.global_domains, *other.global_domains])),
+            topics=tuple(topics_by_name.values()),
+        )
+
+
+def load_tavily_domain_preferences(base_dir: str = "") -> TavilyDomainPreferences:
+    root = base_dir or os.path.dirname(os.path.abspath(__file__))
+    preferences = TavilyDomainPreferences()
+    for filename in ("tavily_domains.example.json", "tavily_domains.json"):
+        path = os.path.join(root, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                preferences = preferences.merge(TavilyDomainPreferences.from_json_value(json.load(f)))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  Warning: failed to load {filename}: {e}", file=sys.stderr)
+    return preferences
+
+
+def select_tavily_preferred_domains(
+    query: str,
+    fields: dict,
+    preferences: TavilyDomainPreferences,
+    topic_hints: Optional[list[str]] = None,
+) -> list[str]:
+    domains: list[str] = [*preferences.global_domains]
+    tags = fields.get("tags", [])
+    if not isinstance(tags, list):
+        tags = []
+    haystack = "\n".join(
+        str(part)
+        for part in [
+            query,
+            fields.get("title", ""),
+            fields.get("uploader", ""),
+            fields.get("description", ""),
+            " ".join(str(tag) for tag in tags),
+            " ".join(str(hint) for hint in (topic_hints or [])),
+        ]
+        if part
+    )
+    match_text = tavily_query_dedupe_key(haystack)
+    for topic in preferences.topics:
+        keywords = unique_non_empty_strings([topic.name, *topic.keywords])
+        keyword_keys = [tavily_query_dedupe_key(keyword) for keyword in keywords]
+        if any(key and key in match_text for key in keyword_keys):
+            domains.extend(topic.domains)
+    return unique_tavily_domains(domains)
+
+
+def tavily_url_host(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    host = parsed.netloc.lower()
+    if not host and parsed.path and "://" not in str(url):
+        host = parsed.path.split("/")[0].lower()
+    host = host.split("@")[-1].split(":")[0].strip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def tavily_url_matches_domains(url: str, preferred_domains: list[str]) -> bool:
+    host = tavily_url_host(url)
+    if not host:
+        return False
+    for domain in unique_tavily_domains(preferred_domains):
+        if host == domain or host.endswith(f".{domain}"):
+            return True
+    return False
+
+
+def tavily_url_key(url: str) -> str:
+    raw = str(url or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path.rstrip("/")
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}{query}"
+    return raw.rstrip("/").casefold()
+
+
+def merge_tavily_results(
+    preferred_results: list[dict],
+    general_results: Optional[list[dict]] = None,
+    preferred_domains: Optional[list[str]] = None,
+    max_results: int = 0,
+) -> list[dict]:
+    domains = unique_tavily_domains(preferred_domains or [])
+    decorated: list[tuple[int, int, dict]] = []
+    order = 0
+    for stage_bonus, results in ((1, preferred_results), (0, general_results or [])):
+        for result in results or []:
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url", "")).strip()
+            if not url:
+                continue
+            domain_score = 10 if tavily_url_matches_domains(url, domains) else 0
+            decorated.append((-(domain_score + stage_bonus), order, result))
+            order += 1
+    decorated.sort(key=lambda item: (item[0], item[1]))
+
+    merged: list[dict] = []
+    seen_urls: set[str] = set()
+    for _, _, result in decorated:
+        url_key = tavily_url_key(str(result.get("url", "")))
+        if not url_key or url_key in seen_urls:
+            continue
+        seen_urls.add(url_key)
+        merged.append(result)
+        if max_results and len(merged) >= max_results:
+            break
+    return merged
+
+
+def _tavily_client_search(client, query: str, max_results: int, include_domains: Optional[list[str]] = None) -> list[dict]:
+    kwargs = {
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "basic",
+    }
+    if include_domains:
+        kwargs["include_domains"] = include_domains
+    data = client.search(**kwargs)
+    if not isinstance(data, dict):
+        return []
+    results = data.get("results", [])
+    return results if isinstance(results, list) else []
+
+
+def tavily_search(
+    query: str,
+    api_key: str,
+    max_results: int = 5,
+    preferred_domains: Optional[list[str]] = None,
+) -> list[dict]:
+    max_results = max(1, int(max_results or 1))
+    domains = unique_tavily_domains(preferred_domains or [])
     try:
         client = TavilyClient(api_key=api_key)
-        data = client.search(query=query, max_results=max_results, search_depth="basic")
-        return data.get("results", [])
+    except Exception as e:
+        print(f"  Warning: Tavily client init failed: {e}", file=sys.stderr)
+        return []
+
+    preferred_results: list[dict] = []
+    if domains:
+        try:
+            preferred_results = _tavily_client_search(client, query, max_results, include_domains=domains)
+        except Exception as e:
+            print(f"  Warning: Tavily preferred-domain search failed: {e}", file=sys.stderr)
+
+    preferred_unique = merge_tavily_results(preferred_results, preferred_domains=domains, max_results=max_results)
+    if domains and len(preferred_unique) >= max_results:
+        return preferred_unique
+
+    general_results: list[dict] = []
+    try:
+        general_results = _tavily_client_search(client, query, max_results)
     except Exception as e:
         print(f"  Warning: Tavily search failed: {e}", file=sys.stderr)
-        return []
+
+    return merge_tavily_results(preferred_results, general_results, preferred_domains=domains, max_results=max_results)
 
 
 GENERIC_TAVILY_TAGS = {
@@ -1845,6 +2291,42 @@ def is_substantive_tavily_tag(tag: str) -> bool:
     return True
 
 
+def tavily_query_dedupe_key(query: str) -> str:
+    clean = unicodedata.normalize("NFKC", str(query))
+    clean = "".join(ch for ch in clean if unicodedata.category(ch) != "Cf")
+    clean = clean.casefold()
+    clean = re.sub(r"[`'’‘´]", "", clean)
+    clean = re.sub(r"[‐‑‒–—―-]+", " ", clean)
+    clean = re.sub(r"[^\w\s+#]+", " ", clean, flags=re.UNICODE)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def normalize_tavily_query(query: str) -> str:
+    return re.sub(r"\s+", " ", str(query).strip())[:200].rstrip()
+
+
+def unique_tavily_queries(
+    raw_queries: list[str],
+    max_queries: int,
+    seen_keys: Optional[set[str]] = None,
+) -> list[str]:
+    query_by_key: dict[str, str] = {}
+    seen = seen_keys if seen_keys is not None else set()
+    for raw in raw_queries:
+        if len(query_by_key) >= max_queries:
+            break
+        query = normalize_tavily_query(raw)
+        if not query:
+            continue
+        key = tavily_query_dedupe_key(query)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        query_by_key[key] = query
+    return list(query_by_key.values())
+
+
 def merge_tavily_queries_with_fallbacks(agent_queries: list[str], fields: dict, max_queries: int = 8) -> list[str]:
     title = str(fields.get("title", "")).strip()
     uploader = str(fields.get("uploader", "")).strip()
@@ -1861,30 +2343,69 @@ def merge_tavily_queries_with_fallbacks(agent_queries: list[str], fields: dict, 
                     candidates.append(f"{title} {clean_tag}")
     candidates.extend(agent_queries)
 
-    queries: list[str] = []
+    return unique_tavily_queries(candidates, max_queries)
+
+
+def merge_source_and_target_tavily_queries(
+    source_queries: list[str],
+    target_queries: list[str],
+    max_queries_per_language: int,
+) -> list[str]:
+    max_queries_per_language = max(1, int(max_queries_per_language or 1))
     seen: set[str] = set()
-    for raw in candidates:
-        query = re.sub(r"\s+", " ", str(raw).strip())
-        if not query:
-            continue
-        key = query.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        queries.append(query[:200])
-        if len(queries) >= max_queries:
-            break
+    source_unique = unique_tavily_queries(source_queries, max_queries_per_language, seen)
+    target_unique = unique_tavily_queries(target_queries, max_queries_per_language, seen)
+
+    queries: list[str] = []
+    max_len = max(len(source_unique), len(target_unique))
+    for idx in range(max_len):
+        if idx < len(source_unique):
+            queries.append(source_unique[idx])
+        if idx < len(target_unique):
+            queries.append(target_unique[idx])
     return queries
 
 
-def build_tavily_queries(
+def translate_tavily_query_output(
+    source_queries: list[str],
+    ctx: TranscriptContext,
+    llm: LLMConfig,
+    quiet: bool = False,
+    topic_hints: Optional[list[str]] = None,
+) -> TavilyQueryOutput:
+    if not source_queries or ctx.source_lang_code == ctx.target_lang_code:
+        return TavilyQueryOutput([])
+    fields = {
+        "source_language": ctx.source_lang_code,
+        "target_language": ctx.target_lang_code,
+        "queries": source_queries,
+    }
+    if topic_hints:
+        fields["topic_hints"] = topic_hints
+    request = LLMObjectRequest(fields)
+    try:
+        response_obj = llm_json_once(
+            llm,
+            tavily_query_translate_system_prompt(ctx),
+            request,
+            temperature=0.1,
+            raw_label=None if quiet else "translate_tavily_query_output",
+        )
+        return TavilyQueryOutput.from_json_value(response_obj, max_queries=len(source_queries))
+    except Exception as e:
+        if not quiet:
+            print(f"  Warning: Tavily query translation failed: {e}", file=sys.stderr)
+        return TavilyQueryOutput([])
+
+
+def build_tavily_search_plan(
     transcript: Transcript,
     ctx: TranscriptContext,
     llm: LLMConfig,
     quiet: bool = False,
     max_queries: int = 8,
-    retriever=None,
-) -> list[str]:
+    retriever: EmbeddingRetriever | None = None,
+) -> TavilySearchPlan:
     fields = read_video_metadata_fields(ctx)
     description = filter_video_description_for_glossary(fields["description"], max_chars=1200)[0]
     retrieved_context: list[dict] = []
@@ -1926,62 +2447,421 @@ def build_tavily_queries(
             tavily_query_system_prompt(ctx),
             request,
             temperature=0.2,
+            raw_label=None if quiet else "build_tavily_search_plan",
         )
-        agent_queries = TavilyQueryOutput.from_json_value(response_obj, max_queries=max_queries).queries
-        return merge_tavily_queries_with_fallbacks(agent_queries, fields, max_queries=max_queries)
+        agent_output = TavilyQueryOutput.from_json_value(response_obj, max_queries=max_queries)
+        source_queries = merge_tavily_queries_with_fallbacks(agent_output.queries, fields, max_queries=max_queries)
+        target_output = translate_tavily_query_output(
+            source_queries,
+            ctx,
+            llm,
+            quiet=quiet,
+            topic_hints=agent_output.topic_hints,
+        )
+        queries = merge_source_and_target_tavily_queries(
+            source_queries,
+            target_output.queries,
+            max_queries_per_language=max_queries,
+        )
+        topic_hints = unique_non_empty_strings([*agent_output.topic_hints, *target_output.topic_hints], 32)
+        return TavilySearchPlan(queries=queries, topic_hints=topic_hints)
     except Exception as e:
         if not quiet:
             print(f"  Warning: Tavily query agent failed: {e}", file=sys.stderr)
-        return merge_tavily_queries_with_fallbacks([], fields, max_queries=max_queries)
+        source_queries = merge_tavily_queries_with_fallbacks([], fields, max_queries=max_queries)
+        target_output = translate_tavily_query_output(source_queries, ctx, llm, quiet=quiet)
+        queries = merge_source_and_target_tavily_queries(
+            source_queries,
+            target_output.queries,
+            max_queries_per_language=max_queries,
+        )
+        return TavilySearchPlan(queries=queries, topic_hints=target_output.topic_hints)
+
+
+def tavily_domain_preferences_to_json(preferences: TavilyDomainPreferences) -> dict:
+    return {
+        "global_domains": list(preferences.global_domains),
+        "topics": [
+            {
+                "name": topic.name,
+                "keywords": list(topic.keywords),
+                "domains": list(topic.domains),
+            }
+            for topic in preferences.topics
+        ],
+    }
+
+
+@dataclass(frozen=True)
+class GlossaryBuildOptions:
+    tavily_key: str = ""
+    tavily_max_results: int = 20
+    tavily_max_queries: int = 15
+    quiet: bool = False
+    retriever: EmbeddingRetriever = None
+    force: bool = False
+
+    @staticmethod
+    def from_env(env: dict[str, str], quiet: bool = False, retriever=None, force: bool = False) -> "GlossaryBuildOptions":
+        return GlossaryBuildOptions(
+            tavily_key=env.get("TAVILY_API_KEY", ""),
+            tavily_max_results=env_int(env.get("TAVILY_MAX_RESULTS", ""), 20),
+            tavily_max_queries=env_int(env.get("TAVILY_MAX_QUERIES", ""), 15),
+            quiet=quiet,
+            retriever=retriever,
+            force=force,
+        )
+
+    def use_tool_session(self) -> bool:
+        return bool(self.tavily_key and int(self.tavily_max_queries or 0) > 0)
+
+
+@dataclass(frozen=True)
+class GlossaryRequestArgs:
+    metadata_fields: dict
+    retriever: EmbeddingRetriever = None
+    tavily_preferences: Optional[TavilyDomainPreferences] = None
+
+
+@dataclass(frozen=True)
+class GlossaryToolRuntime:
+    tavily_key: str
+    metadata_fields: dict
+    preferences: TavilyDomainPreferences
+    max_results: int
+
+    def execute_tavily_search(self, args: dict) -> dict:
+        query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())
+        topic_hints = json_string_list(args.get("topic_hints", []))
+        requested_domains = unique_tavily_domains(json_string_list(args.get("preferred_domains", [])))
+        if not query:
+            return {"error": "missing query", "results": []}
+
+        preferred_domains = unique_tavily_domains(
+            [
+                *select_tavily_preferred_domains(
+                    query,
+                    self.metadata_fields,
+                    self.preferences,
+                    topic_hints=topic_hints,
+                ),
+                *requested_domains,
+            ]
+        )
+        results = tavily_search(
+            query,
+            self.tavily_key,
+            max_results=max(1, min(self.max_results, 3)),
+            preferred_domains=preferred_domains,
+        )
+        return {
+            "query": query,
+            "preferred_domains": preferred_domains,
+            "results": [
+                {
+                    "url": str(item.get("url", ""))[:500],
+                    "title": str(item.get("title", ""))[:200],
+                    "content": str(item.get("content", ""))[:1000],
+                }
+                for item in results
+                if isinstance(item, dict)
+            ],
+        }
+
+
+def glossary_tavily_tool_schema() -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "tavily_search",
+            "description": (
+                "Search the web for authoritative terminology, names, works, quotes, "
+                "background concepts, and ASR corrections needed to build the glossary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Compact keyword query. Correct likely ASR errors before searching.",
+                    },
+                    "topic_hints": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional topic/category hints used to select preferred domains.",
+                    },
+                    "preferred_domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional extra authoritative domains to prefer for this query.",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def tool_call_to_message_value(tool_call) -> dict:
+    function = get_message_value(tool_call, "function")
+    return {
+        "id": str(get_message_value(tool_call, "id", "")),
+        "type": str(get_message_value(tool_call, "type", "function") or "function"),
+        "function": {
+            "name": str(get_message_value(function, "name", "")),
+            "arguments": str(get_message_value(function, "arguments", "") or "{}"),
+        },
+    }
+
+
+def get_message_value(value, key: str, default=None):
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def assistant_message_to_json_value(message) -> dict:
+    data = {
+        "role": str(get_message_value(message, "role", "assistant") or "assistant"),
+        "content": get_message_value(message, "content", None),
+    }
+    tool_calls = get_message_value(message, "tool_calls", None) or []
+    if tool_calls:
+        data["tool_calls"] = [tool_call_to_message_value(call) for call in tool_calls]
+    return data
+
+
+def parse_tool_arguments(tool_call) -> dict:
+    function = get_message_value(tool_call, "function")
+    raw_args = str(get_message_value(function, "arguments", "") or "{}")
+    try:
+        args = json.loads(raw_args)
+    except json.JSONDecodeError:
+        return {}
+    return args if isinstance(args, dict) else {}
+
+
+def build_glossary_request_fields(
+    transcript: Transcript,
+    ctx: TranscriptContext,
+    args: GlossaryRequestArgs,
+) -> dict:
+    metadata_fields = args.metadata_fields
+    title = metadata_fields["title"]
+    desc_text = metadata_fields["description"]
+    tags = metadata_fields["tags"]
+    transcript_text = "\n".join(transcript.text_lines())
+    request_fields = {
+        "title": title,
+        "uploader": metadata_fields["uploader"],
+        "url": metadata_fields["webpage_url"],
+        "upload_time": metadata_fields["upload_time"],
+        "source_language": ctx.source_lang_code,
+        "target_language": ctx.target_lang_code,
+        "description": desc_text[:1000],
+        "tags": tags[:20],
+    }
+    if args.tavily_preferences is not None:
+        request_fields["tavily_domain_preferences"] = tavily_domain_preferences_to_json(args.tavily_preferences)
+        request_fields["tool_instructions"] = (
+            "Use tavily_search when web evidence is needed. Prefer compact keyword queries, "
+            "correct likely ASR mistakes before searching, and use the provided domain preferences."
+        )
+    if args.retriever is not None:
+        query = "\n".join([title, desc_text[:2000], " ".join(tags[:20]), transcript_text[:4000]]).strip()
+        retrieved = args.retriever.retrieve_texts([query], top_k=12)
+        if retrieved:
+            request_fields["retrieved_context"] = retrieved[0]
+    if "retrieved_context" not in request_fields:
+        request_fields["transcript_excerpt"] = transcript_text[:8000]
+    return request_fields
+
+
+def build_glossary_with_tools(
+    transcript: Transcript,
+    ctx: TranscriptContext,
+    llm: LLMConfig,
+    options: GlossaryBuildOptions,
+) -> str:
+    metadata_fields = read_video_metadata_fields(ctx)
+    preferences = load_tavily_domain_preferences()
+    runtime = GlossaryToolRuntime(
+        tavily_key=options.tavily_key,
+        metadata_fields=metadata_fields,
+        preferences=preferences,
+        max_results=options.tavily_max_results,
+    )
+    request = LLMObjectRequest(
+        build_glossary_request_fields(
+            transcript,
+            ctx,
+            GlossaryRequestArgs(
+                metadata_fields=metadata_fields,
+                retriever=options.retriever,
+                tavily_preferences=preferences,
+            ),
+        )
+    )
+    session = ChatSession(
+        llm,
+        glossary_system_prompt(ctx, options.retriever)
+        + "\n\n"
+        + (
+            "You may call tavily_search for web evidence before returning the final glossary JSON. "
+            "When tool calls are no longer available, return the best final glossary JSON using the evidence already provided."
+        ),
+        temperature=0.3,
+        disable_response_format=True,
+    )
+    session.messages.append({"role": "user", "content": request.to_json_text()})
+    tools = [glossary_tavily_tool_schema()]
+    max_tool_queries = max(0, int(options.tavily_max_queries or 0))
+    used_tool_queries = 0
+
+    for _ in range(max_tool_queries + 2):
+        allow_tools = used_tool_queries < max_tool_queries
+        kwargs = {
+            "tools": tools,
+            "tool_choice": "auto" if allow_tools else "none",
+        }
+        response = session.create(**kwargs)
+        choice = response.choices[0]
+        message = choice.message
+        tool_calls = get_message_value(message, "tool_calls", None) or []
+        if tool_calls and allow_tools:
+            session.messages.append(assistant_message_to_json_value(message))
+            for tool_call in tool_calls:
+                tool_name = get_message_value(get_message_value(tool_call, "function"), "name", "")
+                if used_tool_queries >= max_tool_queries:
+                    tool_result = {"error": "Tavily query budget exhausted", "results": []}
+                elif tool_name != "tavily_search":
+                    used_tool_queries += 1
+                    tool_result = {"error": f"unknown tool: {tool_name}", "results": []}
+                else:
+                    used_tool_queries += 1
+                    tool_result = runtime.execute_tavily_search(parse_tool_arguments(tool_call))
+                if not options.quiet:
+                    print(
+                        f"Glossary tool result ({tool_name}, {used_tool_queries}/{max_tool_queries}): "
+                        f"{tool_result.get('query', '')}",
+                        file=sys.stderr,
+                    )
+                session.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(get_message_value(tool_call, "id", "")),
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    }
+                )
+            continue
+        if tool_calls:
+            raise RuntimeError("glossary Tavily query budget reached before final answer")
+        content = str(get_message_value(message, "content", "") or "")
+        if not options.quiet:
+            print("build_glossary raw response:", file=sys.stderr)
+            print(content, file=sys.stderr)
+        return GlossaryOutput.from_json_content(content).markdown
+
+    raise RuntimeError("glossary tool session ended without final answer")
+
+
+def write_glossary_generation_fallback(ctx: TranscriptContext, options: GlossaryBuildOptions) -> str:
+    glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary("", ctx))
+    if glossary and not options.quiet:
+        print(f"Glossary fallback: {ctx.glossary}", file=sys.stderr)
+    return glossary
+
+
+def build_tavily_search_evidence(
+    transcript: Transcript,
+    ctx: TranscriptContext,
+    llm: LLMConfig,
+    metadata_fields: dict,
+    options: GlossaryBuildOptions,
+) -> str:
+    if not options.tavily_key or int(options.tavily_max_queries or 0) <= 0:
+        return ""
+
+    all_results = []
+    all_preferred_domains: list[str] = []
+    domain_preferences = load_tavily_domain_preferences()
+    search_plan = build_tavily_search_plan(
+        transcript,
+        ctx,
+        llm,
+        quiet=options.quiet,
+        max_queries=max(1, options.tavily_max_queries),
+        retriever=options.retriever,
+    )
+    per_query_results = max(1, min(options.tavily_max_results, 3))
+    for q in search_plan.queries:
+        preferred_domains = select_tavily_preferred_domains(
+            q,
+            metadata_fields,
+            domain_preferences,
+            topic_hints=search_plan.topic_hints,
+        )
+        all_preferred_domains.extend(preferred_domains)
+        if not options.quiet:
+            domain_hint = f" ({len(preferred_domains)} preferred domains)" if preferred_domains else ""
+            print(f"  Searching: {q[:60]}{domain_hint}", file=sys.stderr)
+        all_results.extend(tavily_search(q, options.tavily_key, per_query_results, preferred_domains=preferred_domains))
+
+    unique = merge_tavily_results(
+        all_results,
+        preferred_domains=unique_tavily_domains(all_preferred_domains),
+        max_results=max(1, options.tavily_max_results),
+    )
+    return "\n\n".join(
+        f"Source: {r.get('url', '')}\n{r.get('content', '')[:500]}"
+        for r in unique
+    )
 
 
 def build_glossary(
     transcript: Transcript,
     ctx: TranscriptContext,
     llm: LLMConfig,
-    tavily_key: str = "",
-    tavily_max_results: int = 20,
-    tavily_max_queries: int = 15,
-    quiet: bool = False,
-    retriever=None,
+    options: Optional[GlossaryBuildOptions] = None,
 ) -> str:
-    if os.path.isfile(ctx.glossary) and os.path.getsize(ctx.glossary) > 0:
+    options = options or GlossaryBuildOptions()
+    if not options.force and os.path.isfile(ctx.glossary) and os.path.getsize(ctx.glossary) > 0:
         glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(_read_text_file(ctx.glossary), ctx))
-        if not quiet:
+        if not options.quiet:
             print(f"Glossary cache: {ctx.glossary}", file=sys.stderr)
         return glossary
 
-    title, _, tags = read_metadata(ctx)
-    desc_text = _read_text_file(ctx.desc) if os.path.isfile(ctx.desc) else ""
+    metadata_fields = read_video_metadata_fields(ctx)
+    title = metadata_fields["title"]
+    tags = metadata_fields["tags"]
+    desc_text = metadata_fields["description"]
     transcript_text = "\n".join(transcript.text_lines())
 
-    search_text = ""
-    if tavily_key:
-        all_results = []
-        queries = build_tavily_queries(
-            transcript,
-            ctx,
-            llm,
-            quiet=quiet,
-            max_queries=max(1, tavily_max_queries),
-            retriever=retriever,
-        )
-        per_query_results = max(1, min(tavily_max_results, 3))
-        for q in queries:
-            if not quiet:
-                print(f"  Searching: {q[:60]}", file=sys.stderr)
-            all_results.extend(tavily_search(q, tavily_key, per_query_results))
-        seen = set()
-        unique = []
-        for r in all_results:
-            url = r.get("url", "")
-            if url and url not in seen:
-                seen.add(url)
-                unique.append(r)
-        search_text = "\n\n".join(
-            f"Source: {r.get('url', '')}\n{r.get('content', '')[:500]}"
-            for r in unique[: max(1, tavily_max_results)]
-        )
+    if options.use_tool_session():
+        if not options.quiet:
+            print(
+                f"Glossary: generating with {llm.provider} / {llm.model_name()} "
+                f"(Tavily queries={options.tavily_max_queries})",
+                file=sys.stderr,
+            )
+        try:
+            glossary_markdown = build_glossary_with_tools(
+                transcript,
+                ctx,
+                llm,
+                options,
+            )
+            glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(glossary_markdown, ctx))
+            if not options.quiet:
+                print(f"Glossary: {ctx.glossary}", file=sys.stderr)
+            return glossary
+        except Exception as e:
+            print(f"Warning: glossary tool session failed: {e}", file=sys.stderr)
+            if not options.quiet:
+                print("Glossary: falling back to query-agent Tavily search", file=sys.stderr)
+
+    search_text = build_tavily_search_evidence(transcript, ctx, llm, metadata_fields, options)
 
     request_fields = {
         "title": title,
@@ -1990,41 +2870,33 @@ def build_glossary(
         "tags": tags[:20],
         "search_results": search_text[:4000] if search_text else "",
     }
-    if retriever is not None:
+    if options.retriever is not None:
         query = "\n".join([title, desc_text[:2000], " ".join(tags[:20]), transcript_text[:4000]]).strip()
-        retrieved = retriever.retrieve_texts([query], top_k=12)
+        retrieved = options.retriever.retrieve_texts([query], top_k=12)
         if retrieved:
             request_fields["retrieved_context"] = retrieved[0]
 
     request = LLMObjectRequest(request_fields)
 
-    if not quiet:
-        print(f"Glossary: generating with {llm.provider}", file=sys.stderr)
-    raw_response = ""
+    if not options.quiet:
+        print(f"Glossary: generating with {llm.provider} / {llm.model_name()}", file=sys.stderr)
     try:
         response_obj = llm_json_once(
             llm,
-            glossary_system_prompt(ctx, retriever),
+            glossary_system_prompt(ctx, options.retriever),
             request,
             temperature=0.3,
+            raw_label=None if options.quiet else "build_glossary",
+            disable_response_format=True,
         )
         glossary_output = GlossaryOutput.from_json_value(response_obj)
         glossary = ensure_local_metadata_in_glossary(glossary_output.markdown, ctx)
     except Exception as e:
         print(f"Warning: glossary generation failed: {e}", file=sys.stderr)
-        if raw_response and not quiet:
-            preview = raw_response[:2000]
-            if len(raw_response) > len(preview):
-                preview += "\n... <truncated>"
-            print("Glossary raw response:", file=sys.stderr)
-            print(preview, file=sys.stderr)
-        glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary("", ctx))
-        if glossary and not quiet:
-            print(f"Glossary fallback: {ctx.glossary}", file=sys.stderr)
-        return glossary
+        return write_glossary_generation_fallback(ctx, options)
 
     glossary = write_glossary_file(ctx, glossary)
-    if not quiet:
+    if not options.quiet:
         print(f"Glossary: {ctx.glossary}", file=sys.stderr)
     return glossary
 
@@ -2264,6 +3136,7 @@ class LLMObjectRequest:
 @dataclass
 class TavilyQueryOutput:
     queries: list[str]
+    topic_hints: list[str] = field(default_factory=list)
 
     @staticmethod
     def from_json_value(data, max_queries: int = 8) -> "TavilyQueryOutput":
@@ -2271,7 +3144,17 @@ class TavilyQueryOutput:
         raw_queries = data.get("queries", [])
         if not isinstance(raw_queries, list):
             raise ValueError('Tavily query JSON object missing "queries" array')
-        return TavilyQueryOutput(unique_non_empty_strings(raw_queries, max_queries))
+        raw_topic_hints = data.get("topic_hints", data.get("topics", data.get("keywords", [])))
+        return TavilyQueryOutput(
+            queries=unique_non_empty_strings(raw_queries, max_queries),
+            topic_hints=unique_non_empty_strings(json_string_list(raw_topic_hints) if isinstance(raw_topic_hints, str) else raw_topic_hints, 24),
+        )
+
+
+@dataclass
+class TavilySearchPlan:
+    queries: list[str]
+    topic_hints: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2294,22 +3177,35 @@ class ChatSession:
     llm: LLMConfig
     system_prompt: str
     temperature: float = 0.3
+    disable_response_format: bool = False
     messages: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.messages.append({"role": "system", "content": self.system_prompt})
 
-    def ask(self, content: str) -> str:
-        self.messages.append({"role": "user", "content": content})
+    def create(self, **extra_kwargs):
         kwargs = {
             "model": self.llm.model_name(),
             "messages": self.messages,
             "temperature": self.temperature,
         }
-        response_format = self.llm.cfg().get("response_format")
-        if response_format:
+        provider_cfg = self.llm.cfg()
+        request_kwargs = provider_cfg.get("request_kwargs")
+        if request_kwargs is not None:
+            if not isinstance(request_kwargs, dict):
+                raise ValueError("provider request_kwargs must be a JSON object")
+            kwargs.update(request_kwargs)
+        response_format = provider_cfg.get("response_format")
+        if response_format and "response_format" not in kwargs:
             kwargs["response_format"] = response_format
-        resp = self.llm._client().chat.completions.create(**kwargs)
+        kwargs.update(extra_kwargs)
+        if self.disable_response_format:
+            kwargs.pop("response_format", None)
+        return self.llm._client().chat.completions.create(**kwargs)
+
+    def ask(self, content: str) -> str:
+        self.messages.append({"role": "user", "content": content})
+        resp = self.create()
         choice = resp.choices[0]
         message = choice.message
         answer = message.content or ""
@@ -2346,20 +3242,15 @@ def llm_json_once(
     system_prompt: str,
     request: LLMObjectRequest,
     temperature: float = 0.3,
+    raw_label: Optional[str] = None,
+    disable_response_format: bool = False,
 ) -> dict:
-    session = ChatSession(llm, system_prompt, temperature=temperature)
+    session = ChatSession(llm, system_prompt, temperature=temperature, disable_response_format=disable_response_format)
     content = session.ask(request.to_json_text())
+    if raw_label:
+        print(f"{raw_label} raw response:", file=sys.stderr)
+        print(content, file=sys.stderr)
     return require_json_object(_extract_json_value(content), "response")
-
-
-def llm_text_once(
-    llm: LLMConfig,
-    system_prompt: str,
-    request: LLMObjectRequest,
-    temperature: float = 0.3,
-) -> str:
-    session = ChatSession(llm, system_prompt, temperature=temperature)
-    return session.ask(request.to_json_text())
 
 
 def _strip_json_fence(content: str) -> str:
@@ -2458,13 +3349,6 @@ def llm_numbered_batch(
     return []
 
 
-def resolve_proofread_batch_size(llm: LLMConfig) -> int:
-    configured = int(getattr(llm, "proofread_batch_size", 0) or 0)
-    if configured > 0:
-        return configured
-    return max(1, int(getattr(llm, "batch_size", 1) or 1) // 2)
-
-
 def is_context_length_error(error: Exception | str) -> bool:
     message = str(error).lower()
     return any(
@@ -2484,7 +3368,7 @@ def translate_segments(
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
-    retriever=None,
+    retriever: EmbeddingRetriever | None = None,
 ) -> bool:
     pending = [s for s in transcript.segments if not s.translation]
     if not pending:
@@ -2548,7 +3432,8 @@ def proofread_split_events(
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
-    retriever=None,
+    retriever: EmbeddingRetriever | None = None,
+    proofread_retrieval_top_k: int = 1,
 ) -> bool:
     events: list[SplitEvent] = []
     for seg in transcript.segments:
@@ -2556,13 +3441,8 @@ def proofread_split_events(
     if not events:
         return False
 
-    pr_llm = LLMConfig(
-        provider=llm.pr_provider(),
-        model=llm.pr_model(),
-        api_key=llm.api_key if llm.pr_provider() == llm.provider else None,
-        batch_size=resolve_proofread_batch_size(llm),
-        proofread_retrieval_top_k=max(1, int(getattr(llm, "proofread_retrieval_top_k", 1) or 1)),
-    )
+    pr_llm = llm
+    retrieval_top_k = max(1, int(proofread_retrieval_top_k or 1))
     if not quiet:
         print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}", file=sys.stderr)
         print(f"Total split events: {len(events)}", file=sys.stderr)
@@ -2658,7 +3538,7 @@ def proofread_split_events(
         contexts = (
             retriever.retrieve_texts(
                 [f"{event.en}\n{event.zh}" for event in batch],
-                top_k=pr_llm.proofread_retrieval_top_k,
+                top_k=retrieval_top_k,
             )
             if retriever is not None
             else [[] for _ in batch]
@@ -3251,6 +4131,7 @@ def translate_description(ctx: TranscriptContext, llm: LLMConfig, quiet: bool) -
             render_prompt_template(DESCRIPTION_TRANSLATE_PROMPT, ctx) + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
             request,
             temperature=0.3,
+            raw_label=None if quiet else "translate_description",
         )
         translated_title = str(response_obj.get("title", "")).strip()
         translated_desc = str(response_obj.get("description", "")).strip()
@@ -3399,33 +4280,31 @@ def main() -> None:
         print(f"OUTPUT_JSON={os.path.abspath(ctx.beautified_json)}")
         return
 
-    provider = env.get("TRANSLATE_PROVIDER", "")
-    if not provider:
+    llm = None
+    if needs_translate_llm(args):
+        provider = env.get("TRANSLATE_PROVIDER", "").strip()
+        if not provider:
+            print(
+                f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        llm = translate_llm_from_env(env, args.batch_size)
+
+    if not args.skip_knowledge and not required_glossary_provider(env):
         print(
-            f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
+            f"Error: GLOSSARY_PROVIDER or TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
             file=sys.stderr,
         )
         sys.exit(1)
-    llm = LLMConfig(
-        provider=provider,
-        model=env.get("TRANSLATE_MODEL", ""),
-        proofread_provider=env.get("PROOFREAD_PROVIDER", ""),
-        proofread_model=env.get("PROOFREAD_MODEL", ""),
-        batch_size=args.batch_size,
-        proofread_batch_size=env_int(env.get("PROOFREAD_BATCH_SIZE", ""), max(1, args.batch_size // 2)),
-        proofread_retrieval_top_k=env_int(env.get("PROOFREAD_RETRIEVAL_TOP_K", ""), 1),
-    )
 
     if not args.skip_knowledge:
+        glossary_llm = glossary_llm_from_env(env, llm, batch_size=args.batch_size)
         build_glossary(
             transcript,
             ctx,
-            llm,
-            env.get("TAVILY_API_KEY", ""),
-            int(env.get("TAVILY_MAX_RESULTS", "20") or "20"),
-            env_int(env.get("TAVILY_MAX_QUERIES", ""), 15),
-            args.quiet,
-            retriever,
+            glossary_llm,
+            GlossaryBuildOptions.from_env(env, quiet=args.quiet, retriever=retriever, force=args.only_glossary),
         )
         if embedding_active:
             updated_retriever = refresh_embedding_retriever(
@@ -3441,6 +4320,13 @@ def main() -> None:
     if args.only_glossary:
         print(f"OUTPUT_GLOSSARY={os.path.abspath(ctx.glossary)}")
         return
+
+    if llm is None:
+        print(
+            f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     system_prompt = render_prompt_template(
         load_prompt("translate_prompt", _TRANSLATE_PROMPT_FALLBACK),
@@ -3483,14 +4369,16 @@ def main() -> None:
             warning_label="translation memory index update failed",
         )
         retriever = updated_retriever or retriever
-    if (args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0"):
+    if args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0":
+        proofread_llm = proofread_llm_from_env(env, llm, args.batch_size)
         changed = proofread_split_events(
             transcript,
             ctx,
-            llm,
+            proofread_llm,
             proofread_prompt,
             args.quiet,
             retriever,
+            proofread_retrieval_top_k=proofread_retrieval_top_k_from_env(env),
         ) or changed
     if changed:
         save_transcript(transcript, ctx.beautified_json)

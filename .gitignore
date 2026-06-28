@@ -3,6 +3,7 @@
 .venv
 __pycache__
 providers.json
+tavily_domains.json
 cookies.txt
 batch-result.txt
 proofread_prompt.md

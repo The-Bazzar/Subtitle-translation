@@ -38,6 +38,7 @@ winget install Microsoft.PowerShell
 ├── template.ass              # ASS 模板；保留历史 Style: zh / bi-en / bi-zh
 ├── .env.example              # 环境变量模板
 ├── providers.example.json    # LLM provider 配置模板
+├── tavily_domains.example.json # Tavily 域名优先配置模板
 ├── glossary_prompt.example.md
 ├── translate_prompt.example.md
 ├── proofread_prompt.example.md
@@ -53,7 +54,7 @@ winget install Microsoft.PowerShell
     └── whisper/SKILL.md
 ```
 
-本地文件 `.env`、`providers.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和生成产物均不应提交。
+本地文件 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和生成产物均不应提交。
 
 ## Pipeline Flow
 
@@ -62,7 +63,7 @@ winget install Microsoft.PowerShell
 1. `download.ps1` 下载视频、封面、`.info.json`、`.description`、`.tags.txt`
 2. `whisper.ps1` 调用 WhisperX，只输出 `<base>.json`
 3. `translate_srt.py --only-beautify` 美化 JSON 中的 word 时间轴，输出 `<base>.beautified.json`
-4. `translate_srt.py --only-glossary` 在翻译前生成或复用 `glossary.md`
+4. `translate_srt.py --only-glossary` 在翻译前强制重新生成并覆盖 `glossary.md`
 5. `translate_srt.py` 整句翻译、AI 分割、词级对轴、split event 校对，输出最终字幕
 6. `ffmpeg-burn.ps1` 可选硬压双语 ASS 到 `burned.mkv`
 
@@ -112,11 +113,17 @@ video -> json -> beautified.json -> glossary.md
 
 - 已合并到 `translate_srt.py`
 - 位于 beautify 之后、translate 之前
-- 如果 `glossary.md` 已存在且非空，直接复用，不重新总结
+- 普通 pipeline 中如果 `glossary.md` 已存在且非空，直接复用，不重新总结
+- 手动运行 `--only-glossary` 时忽略已有缓存，重新生成并覆盖 `glossary.md`
 - 读取 transcript、`.description`、`.tags.txt`、`.info.json`
 - 本地脚本会把 YouTube 原视频元信息前置写入 `glossary.md`，包括标题、作者、上传时间、原简介和标签；这部分不交给远端 LLM 合成
 - 配置 `TAVILY_API_KEY` 时联网搜索，未配置时离线总结
-- 需要 `TRANSLATE_PROVIDER` 和对应 API key
+- 联网搜索结果是 glossary 的优先证据来源；远端 LLM 应用搜索结果校正 transcript 中可能的 ASR 人名、标题、引文和术语错误
+- Tavily 搜索默认由 glossary agent 在同一个 ChatSession 中通过 `tavily_search` tool calls 发起；脚本执行搜索后将 tool result 回喂同一 session
+- 第一轮 glossary user JSON 会包含 metadata、transcript/retrieved context 和合并后的 `tavily_domains.json` 域名偏好
+- Tavily tool 本地先按 `tavily_domains.json` 的全局百科域名和题材站点执行 `include_domains` 搜索；结果不足时再执行普通搜索；合并时优先百科/知识库域名
+- 使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 指定术语知识库专用 LLM；空则回退到 `TRANSLATE_PROVIDER` / `TRANSLATE_MODEL`
+- 术语知识库阶段必须使用用户可用范围内最顶级模型，因为它负责搜索意图、网页证据判断、ASR 纠错、背景归纳和定译决策
 - `glossary_prompt.md` 仅允许微调 glossary 内容策略，输出格式规则由 `translate_srt.py` 内置 `_GLOSSARY_FORMAT` 强制追加
 
 ### translate / split / proofread
@@ -169,7 +176,7 @@ ${TARGET_LANG_CODE}
 
 ## Config
 
-`setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
+`setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
 
 | 变量 | 说明 |
 |------|------|
@@ -181,6 +188,8 @@ ${TARGET_LANG_CODE}
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
 | `TRANSLATE_PROVIDER` | 翻译后端：`openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
 | `TRANSLATE_MODEL` | 翻译模型，空则用 provider 默认 |
+| `GLOSSARY_PROVIDER` | glossary 专用 provider；强烈建议配置为可用范围内最顶级模型对应 provider，空则复用翻译 provider |
+| `GLOSSARY_MODEL` | glossary 专用模型；负责搜索意图、ASR 纠错、背景归纳和术语定译，空则复用翻译模型或 provider 默认 |
 | `EMBEDDING_ENABLED` | `1` / `0` 控制是否用 LangChain + Chroma 构建 embedding 索引并注入 glossary/translate/proofread 上下文 |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding provider 和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
 | `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前仅支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
@@ -193,13 +202,17 @@ ${TARGET_LANG_CODE}
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
-| `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` / `TAVILY_MAX_QUERIES` | glossary 联网搜索配置；query 总数限制会优先保留标题、作者和有效标签 |
+| `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` / `TAVILY_MAX_QUERIES` | glossary 联网搜索配置；`TAVILY_MAX_QUERIES` 在 tool-call 路径下是最大 Tavily tool 查询次数，在 fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily |
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
-启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`transcript:*` 自动保留 1 条 segment overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
+配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用同一个 LLM session 执行 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session，最后由模型返回 glossary JSON。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。Tavily tool 会结合 metadata、模型给出的 `topic_hints` 和 `tavily_domains.json` 做域名优先搜索，并在最终合并时给百科/知识库域名加权。该阶段使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL`，不要为了省成本使用弱模型。
 
-`providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。
+glossary 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；输出格式仍由内置 prompt 要求返回 JSON object。
+
+启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`transcript:*` 使用干净字幕文本建向量，retrieved context 返回带时间码的字幕行，并按字符数、时间跨度、segment 数量切块，按末尾时间窗口自动 overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
+
+`providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
 ## Key Commands
 
@@ -262,6 +275,6 @@ TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 
 - 更新文档时以实际脚本参数和文件名为准，不保留历史 SRT 流程
 - 保持 PowerShell 和 bash 入口行为对齐
-- 不要提交 `.env`、`providers.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 或生成产物
+- 不要提交 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 或生成产物
 - 不要回退用户本地数据或未请求的工作区改动
 - `README.md` 面向用户快速使用；`AGENTS.md` 面向维护和自动化代理；`.agents/skills/*` 面向分步骤执行

@@ -26,13 +26,14 @@
 ├── template.ass
 ├── .env.example
 ├── providers.example.json
+├── tavily_domains.example.json
 ├── glossary_prompt.example.md
 ├── translate_prompt.example.md
 ├── proofread_prompt.example.md
 └── split_prompt.example.md
 ```
 
-时间轴美化和 glossary 生成已集中到 `translate_srt.py`。主链路不再使用 SRT，WhisperX `.json` 是唯一字幕输入。`glossary_prompt.md` / `split_prompt.md` 可作为本地风格微调文件使用，但不提交；仓库只提交对应 example。
+时间轴美化和 glossary 生成已集中到 `translate_srt.py`。主链路不再使用 SRT，WhisperX `.json` 是唯一字幕输入。`glossary_prompt.md` / `split_prompt.md` 可作为本地风格微调文件使用，`tavily_domains.json` 可维护题材相关站点；这些本地文件不提交，仓库只提交对应 example。
 
 ## 快速使用
 
@@ -57,7 +58,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 1. `download.ps1/.sh` 下载视频、封面、`.info.json`、`.description`、`.tags.txt`
 2. `whisper.ps1/.sh` 调用 `whisperx --output_format json`，输出 `<name>.json`
 3. `translate_srt.py --only-beautify` 美化 JSON 里的 word 时间轴并回写 segment，输出 `<name>.beautified.json`、`<name>.scenes.json`、`<name>.scenechange.txt`
-4. `translate_srt.py --only-glossary` 读取整句 transcript 和元数据，生成 `glossary.md`
+4. `translate_srt.py --only-glossary` 读取整句 transcript 和元数据，重新生成并覆盖 `glossary.md`
 5. `translate_srt.py` 使用整句 JSON 翻译
 6. AI 分割后用每个源语言 split 的首尾 word 匹配美化后的 `words[]` 回填时间，再对 split events 做最终校对，输出 `.split.<source>.srt` / `.split.<target>.srt` 和最终 ASS；显式 `--no-split` 时也继续输出 ASS
 7. `ffmpeg-burn.ps1/.sh` 使用双语 `.ass` 硬压字幕
@@ -104,16 +105,17 @@ video -> json -> beautified.json -> glossary.md -> <source>.proofread.ass / <tar
 
 默认模板以 1080p 双语观看为基准：`bi-zh` / `bg-bi-zh` 字号为 68，`bi-en` / `bg-bi-en` 字号为 44；AI 分割默认在源文超过 72 字符或 3.8 秒时触发。beautify 只负责词级时间轴吸附和边界修复，不再提供本地硬截整句参数。
 
-`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`glossary_prompt.md` 只用于微调 glossary 内容策略，`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。
+`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`glossary_prompt.md` 只用于微调 glossary 内容策略，`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。配置 Tavily 搜索时，glossary 会优先依据网页搜索结果校正 ASR 中可能误识别的人名、标题、引文和术语。
 
 ## 配置
 
-运行 `setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但你本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。
+运行 `setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但你本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。
 
 setup 后至少配置：
 
 ```ini
 TRANSLATE_PROVIDER=deepseek
+GLOSSARY_PROVIDER=deepseek
 DEEPSEEK_API_KEY=
 ```
 
@@ -129,6 +131,8 @@ DEEPSEEK_API_KEY=
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
 | `TRANSLATE_PROVIDER` | 翻译后端，必填；可用 `openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
 | `TRANSLATE_MODEL` | 翻译模型，空则用 provider 默认 |
+| `GLOSSARY_PROVIDER` | 术语知识库构建后端；强烈建议使用可用范围内最顶级模型，空则复用翻译 provider |
+| `GLOSSARY_MODEL` | 术语知识库构建模型；负责搜索意图、ASR 纠错、背景归纳和译名决策，空则复用翻译模型或 provider 默认 |
 | `EMBEDDING_ENABLED` | `1/0` 控制是否用 LangChain + Chroma 构建 embedding 索引，并注入 glossary/translate/proofread 上下文 |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding 后端和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
 | `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
@@ -140,15 +144,23 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `TAVILY_API_KEY` | glossary 联网搜索 |
 | `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限 |
-| `TAVILY_MAX_QUERIES` | Tavily 搜索 query 总数上限；标题、作者和有效标签优先参与检索 |
+| `TAVILY_MAX_QUERIES` | glossary 联网搜索预算；tool-call 路径下是最大 Tavily tool 查询次数，fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily 搜索 |
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 
 `BURN_OVCOPTS=source-bitrate` 会用 `ffprobe` 读取源视频码率，并用 VBR 的 `b/maxrate/bufsize` 让硬字幕输出尽量接近源码率；显式设置 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
-启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会同时保存 `glossary.md` 项目知识、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签。索引会自动按 Markdown 标题切分 glossary，给 transcript chunk 保留 1 条 segment overlap，并在重建前清理当前项目旧 chunk，避免残留结果污染检索。
+配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用同一个 LLM session 执行 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session，最后由模型返回 glossary JSON。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。
 
-`providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。
+`GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
+
+glossary 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；输出格式仍由内置 prompt 要求返回 JSON object。
+
+Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 query / `topic_hints`、metadata 与 `tavily_domains.json` 中的全局百科域名、题材关键词和站点执行 `include_domains` 搜索；如果结果不足，再执行普通 Tavily 搜索；最终合并去重时会优先保留百科/知识库域名结果。`tavily_domains.json` 由 `tavily_domains.example.json` 初始化，用户可以自行添加题材、关键词和站点。
+
+启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会同时保存 `glossary.md` 项目知识、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签。索引会自动按 Markdown 标题切分 glossary；transcript chunk 使用干净字幕文本建向量，但返回给 LLM 的 retrieved context 会带 segment 时间码，并按末尾时间窗口自动 overlap，避免长视频上下文断裂。重建索引前会清理当前项目旧 chunk，避免残留结果污染检索。
+
+`providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
 ## 依赖
 
@@ -168,12 +180,12 @@ DEEPSEEK_API_KEY=
 
 ## 注意事项
 
-- `.env`、`providers.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
+- `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
 - 不要把 Python 包安装到系统环境；Windows 运行 `.\setup.ps1`，Linux/WSL 运行 `./setup.sh`，它们会创建/更新仓库 `.venv`
 - 运行 pipeline 或任一 `.py` 相关脚本前必须先完成 setup；脚本统一使用项目 `.venv`，不调用全局 `python` / `python3`
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
-- `TRANSLATE_PROVIDER` 必须配置，否则翻译和 glossary 会报错
+- 完整翻译流程必须配置 `TRANSLATE_PROVIDER`；只构建 glossary 时可改用 `GLOSSARY_PROVIDER`
 - WhisperX 首次运行会下载模型
 - 默认不硬压，推荐先人工校对 ASS，再决定是否压制
 - `.srt` 已退出主流程；不要再把 SRT 当作翻译输入
