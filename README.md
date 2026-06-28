@@ -144,6 +144,8 @@ DEEPSEEK_API_KEY=
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 
+`BURN_OVCOPTS=source-bitrate` 会用 `ffprobe` 读取源视频码率，并用 VBR 的 `b/maxrate/bufsize` 让硬字幕输出尽量接近源码率；显式设置 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
+
 启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会同时保存 `glossary.md` 项目知识、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签。索引会自动按 Markdown 标题切分 glossary，给 transcript chunk 保留 1 条 segment overlap，并在重建前清理当前项目旧 chunk，避免残留结果污染检索。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。

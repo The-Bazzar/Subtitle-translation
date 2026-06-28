@@ -10,8 +10,8 @@ param(
     [Parameter(HelpMessage = "Video encoder (default: hevc_nvenc)")]
     [string]$Ovc = "hevc_nvenc",
 
-    [Parameter(HelpMessage = "Video encoder options (default: qp=20)")]
-    [string]$Ovcopts = "qp=20",
+    [Parameter(HelpMessage = "Video encoder options (default: source-bitrate)")]
+    [string]$Ovcopts = "source-bitrate",
 
     [Parameter(HelpMessage = "Audio encoder (default: aac)")]
     [string]$Oac = "aac",
@@ -94,7 +94,7 @@ if (-not $PSBoundParameters.ContainsKey('Ovc')) {
     $Ovc = Merge-EnvDefault 'BURN_OVC' '' 'hevc_nvenc'
 }
 if (-not $PSBoundParameters.ContainsKey('Ovcopts')) {
-    $Ovcopts = Merge-EnvDefault 'BURN_OVCOPTS' '' 'qp=20'
+    $Ovcopts = Merge-EnvDefault 'BURN_OVCOPTS' '' 'source-bitrate'
 }
 if (-not $PSBoundParameters.ContainsKey('Oac')) {
     $Oac = Merge-EnvDefault 'BURN_OAC' '' 'aac'

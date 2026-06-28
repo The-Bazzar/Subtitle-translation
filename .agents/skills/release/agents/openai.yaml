@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release"
+  short_description: "提交变更、递增版本标签并整理发布说明。"
+  default_prompt: "Use $release to commit the verified project changes, bump the latest tag, and draft Chinese release notes."

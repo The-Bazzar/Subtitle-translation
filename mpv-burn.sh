@@ -27,7 +27,7 @@ MPV="${MPV_PATH_LINUX:-mpv}"
 OUTPUT=""
 SUB_FILE=""
 OVC="hevc_nvenc"
-OVCOPTS="qp=20"
+OVCOPTS="source-bitrate"
 OAC="aac"
 RES=""
 
@@ -48,7 +48,7 @@ mpv-burn.sh — Linux 字幕硬压脚本 (mpv 编码模式)
   -o, --output PATH       输出文件路径 (默认: 输入同目录 burned.mkv)
   --sub-file PATH         字幕文件路径 (如 .en-zh.ass 双语 ASS)
   --ovc CODEC             视频编码器 (默认: hevc_nvenc)
-  --ovcopts OPTS          视频编码器参数 (默认: qp=20)
+  --ovcopts OPTS          视频编码器参数 (默认: source-bitrate, 自动接近源视频码率)
   --res WxH               输出分辨率 (如 1920x1080, 保持宽高比加黑边)
   --oac CODEC             音频编码器 (默认: aac)
   --dry-run               仅打印命令, 不执行
@@ -57,6 +57,7 @@ mpv-burn.sh — Linux 字幕硬压脚本 (mpv 编码模式)
 示例:
   ./mpv-burn.sh video.webm --sub-file video.en-zh.ass
   ./mpv-burn.sh video.webm --sub-file sub.ass -o burned.mkv
+  ./mpv-burn.sh video.webm --ovcopts source-bitrate
   ./mpv-burn.sh video.webm --ovc libx265 --ovcopts crf=23
   ./mpv-burn.sh video.webm -- --vf-append=vapoursynth="~~/vs/MEMC_RIFE_NV.vpy"
 
@@ -182,6 +183,88 @@ if [ -n "$SUB_FILE" ]; then
     fi
 fi
 
+resolve_ffprobe() {
+    if [ -n "${FFPROBE_PATH_LINUX:-}" ]; then
+        echo "$FFPROBE_PATH_LINUX"
+        return
+    fi
+    if [ -n "${FFMPEG_PATH_LINUX:-}" ] && [ "$FFMPEG_PATH_LINUX" != "ffmpeg" ]; then
+        local dir
+        dir="$(dirname "$FFMPEG_PATH_LINUX")"
+        if [ -x "$dir/ffprobe" ]; then
+            echo "$dir/ffprobe"
+            return
+        fi
+        if [ -x "$dir/ffprobe.exe" ]; then
+            echo "$dir/ffprobe.exe"
+            return
+        fi
+    fi
+    echo "ffprobe"
+}
+
+is_source_bitrate_ovcopts() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        auto|source|source-bitrate|source_bitrate|match-source) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+probe_first_number() {
+    "$FFPROBE" "$@" 2>/dev/null | awk 'NF && $1 != "N/A" { print $1; exit }'
+}
+
+source_video_bitrate_kbps() {
+    local stream_bps format_bps duration size
+    stream_bps="$(probe_first_number -v error -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 "$VIDEO_ABS" || true)"
+    if [[ "$stream_bps" =~ ^[0-9]+$ ]] && [ "$stream_bps" -gt 0 ]; then
+        awk -v bps="$stream_bps" 'BEGIN { printf "%d\n", int((bps + 999) / 1000) }'
+        return 0
+    fi
+
+    format_bps="$(probe_first_number -v error -show_entries format=bit_rate -of default=noprint_wrappers=1:nokey=1 "$VIDEO_ABS" || true)"
+    if [[ "$format_bps" =~ ^[0-9]+$ ]] && [ "$format_bps" -gt 0 ]; then
+        awk -v bps="$format_bps" 'BEGIN { printf "%d\n", int((bps + 999) / 1000) }'
+        return 0
+    fi
+
+    duration="$(probe_first_number -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_ABS" || true)"
+    size="$(stat -c%s "$VIDEO_ABS" 2>/dev/null || wc -c < "$VIDEO_ABS")"
+    if [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v d="$duration" 'BEGIN { exit !(d > 0) }'; then
+        awk -v bytes="$size" -v seconds="$duration" 'BEGIN { printf "%d\n", int(((bytes * 8 / seconds) + 999) / 1000) }'
+        return 0
+    fi
+    return 1
+}
+
+source_bitrate_ovcopts() {
+    local kbps maxrate bufsize prefix encoder
+    kbps="$(source_video_bitrate_kbps)" || return 1
+    [ -n "$kbps" ] && [ "$kbps" -gt 0 ] || return 1
+    maxrate=$(( (kbps * 125 + 99) / 100 ))
+    bufsize=$(( kbps * 2 ))
+    encoder="$(printf '%s' "$OVC" | tr '[:upper:]' '[:lower:]')"
+    prefix=""
+    case "$encoder" in
+        *nvenc*) prefix="rc=vbr," ;;
+    esac
+    echo "${prefix}b=${kbps}k,maxrate=${maxrate}k,bufsize=${bufsize}k"
+}
+
+FFPROBE="$(resolve_ffprobe)"
+RESOLVED_OVCOPTS="$OVCOPTS"
+SOURCE_BITRATE_KBPS=""
+if is_source_bitrate_ovcopts "$OVCOPTS"; then
+    if AUTO_OVCOPTS="$(source_bitrate_ovcopts)"; then
+        RESOLVED_OVCOPTS="$AUTO_OVCOPTS"
+        SOURCE_BITRATE_KBPS="${AUTO_OVCOPTS#*b=}"
+        SOURCE_BITRATE_KBPS="${SOURCE_BITRATE_KBPS%%k,*}"
+    else
+        echo "Warning: failed to probe source bitrate with ffprobe; fallback to qp=20." >&2
+        RESOLVED_OVCOPTS="qp=20"
+    fi
+fi
+
 # ── 执行 ──────────────────────────────────────────────────────────────────────
 
 echo "============================================="
@@ -197,7 +280,8 @@ if [ -n "$SUB_FILE" ]; then
     echo "       → $SUB_FILE_WIN"
 fi
 [ -n "$RES" ] && echo "分辨率:  $RES (保持宽高比+黑边)"
-echo "视频:    --ovc=$OVC --ovcopts=$OVCOPTS"
+echo "视频:    --ovc=$OVC --ovcopts=$RESOLVED_OVCOPTS"
+[ -n "$SOURCE_BITRATE_KBPS" ] && echo "码率:    source-bitrate -> ${SOURCE_BITRATE_KBPS}k"
 echo "音频:    --oac=$OAC"
 if [ ${#EXTRA_MPV_ARGS[@]} -gt 0 ]; then
     echo "额外:    ${EXTRA_MPV_ARGS[*]}"
@@ -210,7 +294,7 @@ MPV_CMD=(
     "$VIDEO_WIN"
     "--o=$OUTPUT_WIN"
     "--ovc=$OVC"
-    "--ovcopts=$OVCOPTS"
+    "--ovcopts=$RESOLVED_OVCOPTS"
     "--oac=$OAC"
     "${EXTRA_MPV_ARGS[@]}"
 )

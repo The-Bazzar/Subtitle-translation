@@ -48,6 +48,7 @@ winget install Microsoft.PowerShell
     ├── beautify/SKILL.md
     ├── download/SKILL.md
     ├── knowledge/SKILL.md
+    ├── release/SKILL.md
     ├── translate/SKILL.md
     └── whisper/SKILL.md
 ```
@@ -193,6 +194,8 @@ ${TARGET_LANG_CODE}
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
 | `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` / `TAVILY_MAX_QUERIES` | glossary 联网搜索配置；query 总数限制会优先保留标题、作者和有效标签 |
+
+`BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
 启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`transcript:*` 自动保留 1 条 segment overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
 

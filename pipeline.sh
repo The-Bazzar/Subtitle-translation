@@ -105,7 +105,7 @@ SKIP_BURN="${SKIP_BURN:-${PIPELINE_SKIP_BURN:-0}}"
 
 # 压制参数
 BURN_OVC="${BURN_OVC:-hevc_nvenc}"
-BURN_OVCOPTS="${BURN_OVCOPTS:-qp=20}"
+BURN_OVCOPTS="${BURN_OVCOPTS:-source-bitrate}"
 BURN_OAC="${BURN_OAC:-aac}"
 BURN_RES="${BURN_RES:-}"
 
@@ -164,7 +164,7 @@ JSON beautify 选项 (在 -- 之后):
   PROOFREAD_PROVIDER      校对专用后端 (默认: 同翻译)
   PROOFREAD_MODEL         校对专用模型 (默认: 同翻译)
   BURN_OVC                视频编码器 (默认: hevc_nvenc)
-  BURN_OVCOPTS            编码器参数 (默认: qp=20)
+  BURN_OVCOPTS            编码器参数 (默认: source-bitrate, 自动接近源视频码率)
   BURN_OAC                音频编码器 (默认: aac)
   BURN_RES                输出分辨率 (默认: 原始)
 EOF
