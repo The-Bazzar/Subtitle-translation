@@ -1,3 +1,4 @@
+import copy
 import json
 import io
 import os
@@ -37,7 +38,7 @@ class FakeSDKCompletions:
         self.calls = calls
 
     def create(self, **kwargs):
-        self.calls.append(kwargs)
+        self.calls.append(copy.deepcopy(kwargs))
         index = min(len(self.calls) - 1, len(self.responses) - 1)
         response = self.responses[index]
         return response(kwargs) if callable(response) else response
@@ -552,6 +553,50 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertTrue(options.use_tool_session())
         self.assertFalse(hasattr(options, deprecated_attr))
 
+    def test_build_glossary_tool_session_retries_malformed_tool_call_message(self):
+        calls = []
+        searched = []
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(content="<｜｜DSML｜｜tool_calls>"),
+                    finish_reason="tool_calls",
+                ),
+                FakeSDKResponse(
+                    FakeSDKMessage(tool_calls=[fake_tool_call("retry term")]),
+                    finish_reason="tool_calls",
+                ),
+                FakeSDKResponse(FakeSDKMessage(content='{"markdown": "# 术语知识库\\n- retry term：重试术语"}')),
+            ],
+        )
+
+        def fake_tavily_search(query, api_key, max_results=5, preferred_domains=None):
+            searched.append(query)
+            return [{"url": "https://example.com/retry", "content": "retry evidence"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source topic")],
+            )
+
+            with patch.object(t, "tavily_search", side_effect=fake_tavily_search):
+                glossary = t.build_glossary_with_tools(
+                    transcript,
+                    ctx,
+                    llm,
+                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                )
+
+        self.assertEqual([call["tool_choice"] for call in calls], ["auto", "auto", "none"])
+        self.assertEqual(searched, ["retry term"])
+        self.assertIn("retry term", glossary)
+
     def test_build_glossary_tool_session_falls_back_when_query_budget_is_exhausted(self):
         calls = []
         llm = FakeChatLLM(
@@ -811,6 +856,9 @@ class JsonProtocolTests(unittest.TestCase):
 
             def ask(self, content):
                 return raw_response
+
+            def ask_validated(self, content, validator=None, retry_template=None):
+                return raw_response, validator(raw_response) if validator is not None else raw_response
 
         stderr = io.StringIO()
         with patch.object(t, "ChatSession", FakeChatSession), patch("sys.stderr", stderr):
@@ -1476,6 +1524,56 @@ class JsonProtocolTests(unittest.TestCase):
         session.create(response_format={"type": "json_object"})
 
         self.assertNotIn("response_format", calls[0])
+
+    def test_chat_session_retries_completion_failure_with_same_request(self):
+        calls = []
+
+        def fail_once(_kwargs):
+            raise TimeoutError("temporary network failure")
+
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                fail_once,
+                FakeSDKResponse(FakeSDKMessage(content='{"markdown": "ok"}')),
+            ],
+        )
+        session = t.ChatSession(llm, "system")
+
+        answer = session.ask(
+            '{"request": 1}',
+            retry_template=t.CompletionRetryTemplate(attempts=2, base_delay=0, quiet=True),
+        )
+
+        self.assertEqual(answer, '{"markdown": "ok"}')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["messages"], calls[1]["messages"])
+        self.assertEqual([m["role"] for m in calls[1]["messages"]], ["system", "user"])
+        self.assertEqual([m["role"] for m in session.messages], ["system", "user", "assistant"])
+
+    def test_chat_session_retries_invalid_response_without_recording_bad_assistant(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                FakeSDKResponse(FakeSDKMessage(content="not json")),
+                FakeSDKResponse(FakeSDKMessage(content='{"markdown": "ok"}')),
+            ],
+        )
+        session = t.ChatSession(llm, "system")
+
+        content, parsed = session.ask_validated(
+            '{"request": 1}',
+            lambda value: t.require_json_object(t._extract_json_value(value), "response"),
+            retry_template=t.CompletionRetryTemplate(attempts=2, base_delay=0, quiet=True),
+        )
+
+        self.assertEqual(content, '{"markdown": "ok"}')
+        self.assertEqual(parsed, {"markdown": "ok"})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([m["role"] for m in calls[0]["messages"]], ["system", "user"])
+        self.assertEqual([m["role"] for m in calls[1]["messages"]], ["system", "user"])
+        self.assertEqual([m["role"] for m in session.messages], ["system", "user", "assistant"])
 
     def test_provider_example_uses_request_kwargs_for_sdk_options(self):
         with open("providers.example.json", "r", encoding="utf-8") as f:
@@ -2256,6 +2354,43 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertIn("上传时间：2026-06-20\n", content)
             self.assertIn("=====\n\n译后简介。", content)
             self.assertIn("标签：人工智能, 哲学", content)
+
+    def test_translate_description_adds_retrieved_context(self):
+        class FakeRetriever:
+            def retrieve_texts(self, texts, top_k=None):
+                self.texts = texts
+                self.top_k = top_k
+                return [[{"id": "glossary:1", "text": "Use 反直觉 as the established term."}]]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Counterintuitive Title", "webpage_url": "https://example.test/watch"}, f)
+            with open(ctx.desc, "w", encoding="utf-8") as f:
+                f.write("A description about a counterintuitive idea.")
+            with open(ctx.tags, "w", encoding="utf-8") as f:
+                f.write("['psychology']")
+
+            captured_request = {}
+
+            def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+                captured_request.update(request.to_json_value())
+                return {"title": "译后标题", "description": "译后简介。", "tags": ["心理学"]}
+
+            retriever = FakeRetriever()
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                t.translate_description(ctx, FakeProviderLLM(), quiet=True, retriever=retriever)
+
+            self.assertEqual(
+                captured_request["retrieved_context"],
+                [{"id": "glossary:1", "text": "Use 反直觉 as the established term."}],
+            )
+            self.assertIn("Counterintuitive Title", retriever.texts[0])
+            self.assertIn("counterintuitive idea", retriever.texts[0])
+            self.assertIn("psychology", retriever.texts[0])
+            self.assertEqual(retriever.top_k, 6)
 
     def test_write_ass_uses_named_output_modes(self):
         template = os.path.abspath("template.ass")

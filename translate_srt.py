@@ -1166,7 +1166,7 @@ _JSON_OBJECT_FORMAT = """Return a JSON object.
 The first response character must be `{` and the last response character must be `}`."""
 
 _RETRIEVED_CONTEXT_RULES = """RETRIEVED CONTEXT:
-Some input items may include a "retrieved_context" array from the same transcript.
+Some input items may include a "retrieved_context" array from the same project memory.
 Use it only for terminology, names, recurring concepts, tone, and local consistency.
 Do not translate, proofread, split, merge, or return retrieved_context items."""
 
@@ -2642,6 +2642,16 @@ def parse_tool_arguments(tool_call) -> dict:
     return args if isinstance(args, dict) else {}
 
 
+def is_glossary_tool_call_format_issue(choice, message) -> bool:
+    if get_message_value(message, "tool_calls", None):
+        return False
+    finish_reason = str(get_message_value(choice, "finish_reason", "") or "").strip()
+    if finish_reason == "tool_calls":
+        return True
+    content = str(get_message_value(message, "content", "") or "").strip()
+    return bool(content and "tool_calls" in content and not content.startswith("{"))
+
+
 def build_glossary_request_fields(
     transcript: Transcript,
     ctx: TranscriptContext,
@@ -2718,18 +2728,39 @@ def build_glossary_with_tools(
     tools = [glossary_tavily_tool_schema()]
     max_tool_queries = max(0, int(options.tavily_max_queries or 0))
     used_tool_queries = 0
+    max_format_retries = max(1, max_tool_queries)
+    format_retries = 0
 
-    for _ in range(max_tool_queries + 2):
+    for _ in range(max_tool_queries + max_format_retries + 2):
         allow_tools = used_tool_queries < max_tool_queries
         kwargs = {
             "tools": tools,
             "tool_choice": "auto" if allow_tools else "none",
         }
-        response = session.create(**kwargs)
+        response = session.create(
+            retry_template=CompletionRetryTemplate(
+                attempts=3,
+                quiet=options.quiet,
+                label="Glossary tool completion",
+            ),
+            **kwargs,
+        )
         choice = response.choices[0]
         message = choice.message
         tool_calls = get_message_value(message, "tool_calls", None) or []
+        if allow_tools and is_glossary_tool_call_format_issue(choice, message):
+            format_retries += 1
+            if format_retries > max_format_retries:
+                raise RuntimeError("glossary tool call format retry limit reached")
+            if not options.quiet:
+                print(
+                    f"Glossary: malformed tool-call response, retrying "
+                    f"({format_retries}/{max_format_retries})",
+                    file=sys.stderr,
+                )
+            continue
         if tool_calls and allow_tools:
+            format_retries = 0
             session.messages.append(assistant_message_to_json_value(message))
             for tool_call in tool_calls:
                 tool_name = get_message_value(get_message_value(tool_call, "function"), "name", "")
@@ -3173,6 +3204,20 @@ class GlossaryOutput:
 
 
 @dataclass
+class CompletionRetryTemplate:
+    attempts: int = 3
+    base_delay: float = 0.0
+    quiet: bool = False
+    label: str = "LLM completion"
+
+    def normalized_attempts(self) -> int:
+        return max(1, int(self.attempts or 1))
+
+    def wait_seconds(self, attempt_index: int) -> float:
+        return max(0.0, float(self.base_delay or 0.0) * float(attempt_index + 1))
+
+
+@dataclass
 class ChatSession:
     llm: LLMConfig
     system_prompt: str
@@ -3183,7 +3228,20 @@ class ChatSession:
     def __post_init__(self) -> None:
         self.messages.append({"role": "system", "content": self.system_prompt})
 
-    def create(self, **extra_kwargs):
+    def create(self, retry_template: Optional[CompletionRetryTemplate] = None, **extra_kwargs):
+        template = retry_template or CompletionRetryTemplate(attempts=1)
+        last_error: Exception | None = None
+        for attempt in range(template.normalized_attempts()):
+            try:
+                return self._create_once(extra_kwargs)
+            except Exception as e:
+                last_error = e
+                if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
+                    raise
+                self._wait_before_retry(template, attempt, e)
+        raise RuntimeError(f"LLM completion failed: {last_error}")
+
+    def _create_once(self, extra_kwargs: dict):
         kwargs = {
             "model": self.llm.model_name(),
             "messages": self.messages,
@@ -3203,9 +3261,34 @@ class ChatSession:
             kwargs.pop("response_format", None)
         return self.llm._client().chat.completions.create(**kwargs)
 
-    def ask(self, content: str) -> str:
+    def ask(self, content: str, retry_template: Optional[CompletionRetryTemplate] = None) -> str:
+        answer, _ = self.ask_validated(content, retry_template=retry_template)
+        return answer
+
+    def ask_validated(
+        self,
+        content: str,
+        validator=None,
+        retry_template: Optional[CompletionRetryTemplate] = None,
+    ):
+        template = retry_template or CompletionRetryTemplate(attempts=1)
         self.messages.append({"role": "user", "content": content})
-        resp = self.create()
+        last_error: Exception | None = None
+        for attempt in range(template.normalized_attempts()):
+            try:
+                resp = self._create_once({})
+                answer = self._answer_from_response(resp)
+                parsed = validator(answer) if validator is not None else answer
+                self.messages.append({"role": "assistant", "content": answer})
+                return answer, parsed
+            except Exception as e:
+                last_error = e
+                if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
+                    raise
+                self._wait_before_retry(template, attempt, e)
+        raise RuntimeError(f"LLM completion failed: {last_error}")
+
+    def _answer_from_response(self, resp) -> str:
         choice = resp.choices[0]
         message = choice.message
         answer = message.content or ""
@@ -3233,8 +3316,18 @@ class ChatSession:
                     if reasoning_tokens is not None:
                         details.append(f"reasoning_tokens={reasoning_tokens}")
             raise RuntimeError(f"LLM returned empty message.content ({', '.join(details)})")
-        self.messages.append({"role": "assistant", "content": answer})
         return answer
+
+    def _wait_before_retry(self, template: CompletionRetryTemplate, attempt_index: int, error: Exception) -> None:
+        wait = template.wait_seconds(attempt_index)
+        if not template.quiet:
+            print(
+                f"  {template.label} retry {attempt_index + 1}/{template.normalized_attempts()} "
+                f"in {wait:g}s: {error}",
+                file=sys.stderr,
+            )
+        if wait > 0:
+            time.sleep(wait)
 
 
 def llm_json_once(
@@ -3246,11 +3339,19 @@ def llm_json_once(
     disable_response_format: bool = False,
 ) -> dict:
     session = ChatSession(llm, system_prompt, temperature=temperature, disable_response_format=disable_response_format)
-    content = session.ask(request.to_json_text())
+    content, response_obj = session.ask_validated(
+        request.to_json_text(),
+        lambda value: require_json_object(_extract_json_value(value), "response"),
+        retry_template=CompletionRetryTemplate(
+            attempts=3,
+            quiet=raw_label is None,
+            label=raw_label or "LLM JSON",
+        ),
+    )
     if raw_label:
         print(f"{raw_label} raw response:", file=sys.stderr)
         print(content, file=sys.stderr)
-    return require_json_object(_extract_json_value(content), "response")
+    return response_obj
 
 
 def _strip_json_fence(content: str) -> str:
@@ -3291,6 +3392,13 @@ def _extract_json_batch(content: str) -> Optional[LLMBatchResponse]:
         return None
 
 
+def require_json_batch_response(content: str) -> LLMBatchResponse:
+    data = _extract_json_batch(content)
+    if data is None:
+        raise ValueError('response is not a JSON object with an "items" array')
+    return data
+
+
 def _strip_speaker_labels(text: str) -> str:
     value = text.strip()
     for _ in range(3):
@@ -3324,29 +3432,26 @@ def llm_numbered_batch(
     raise_on_failure: bool = False,
 ) -> list:
     prompt = request.to_json_text()
-    item_count = len(request.items)
-    last_error = ""
-    for attempt in range(retries):
-        try:
-            content = session.ask(prompt)
-            data = _extract_json_batch(content)
-            if data is None:
-                raise ValueError('response is not a JSON object with an "items" array')
-            return data.to_items()
-        except Exception as e:
-            last_error = str(e)
-            if raise_on_failure and is_context_length_error(e):
-                raise
-            if attempt < retries - 1:
-                wait = (attempt + 1) * 3
-                if not quiet:
-                    print(f"  Retry {attempt + 1}/{retries} in {wait}s...", file=sys.stderr)
-                time.sleep(wait)
-    message = f"LLM batch failed after {retries} attempts: {last_error}"
-    if raise_on_failure:
-        raise RuntimeError(message)
-    print(f"Error: {message}", file=sys.stderr)
-    return []
+    try:
+        _content, data = session.ask_validated(
+            prompt,
+            require_json_batch_response,
+            retry_template=CompletionRetryTemplate(
+                attempts=retries,
+                base_delay=3.0,
+                quiet=quiet,
+                label="LLM batch",
+            ),
+        )
+        return data.to_items()
+    except Exception as e:
+        if raise_on_failure and is_context_length_error(e):
+            raise
+        message = f"LLM batch failed after {retries} attempts: {e}"
+        if raise_on_failure:
+            raise RuntimeError(message)
+        print(f"Error: {message}", file=sys.stderr)
+        return []
 
 
 def is_context_length_error(error: Exception | str) -> bool:
@@ -4108,7 +4213,12 @@ Rules:
 - Do not add explanations."""
 
 
-def translate_description(ctx: TranscriptContext, llm: LLMConfig, quiet: bool) -> str:
+def translate_description(
+    ctx: TranscriptContext,
+    llm: LLMConfig,
+    quiet: bool,
+    retriever: EmbeddingRetriever | None = None,
+) -> str:
     title, webpage_url, tags = read_metadata(ctx)
     metadata_header = read_metadata_header(ctx)
     desc_text = _read_text_file(ctx.desc) if os.path.isfile(ctx.desc) else ""
@@ -4117,18 +4227,37 @@ def translate_description(ctx: TranscriptContext, llm: LLMConfig, quiet: bool) -
             with open(ctx.target_desc, "w", encoding="utf-8") as f:
                 f.write(metadata_header)
         return ctx.target_desc
+    request_fields = {
+        "title": title,
+        "url": webpage_url,
+        "description": desc_text,
+        "tags": tags,
+    }
+    if retriever is not None:
+        query = "\n".join(
+            part
+            for part in [
+                title,
+                webpage_url,
+                desc_text,
+                " ".join(tags),
+            ]
+            if part
+        ).strip()
+        if query:
+            retrieved = retriever.retrieve_texts([query], top_k=6)
+            if retrieved:
+                request_fields["retrieved_context"] = retrieved[0]
     request = LLMObjectRequest(
-        {
-            "title": title,
-            "url": webpage_url,
-            "description": desc_text,
-            "tags": tags,
-        }
+        request_fields
     )
     try:
+        system_prompt = render_prompt_template(DESCRIPTION_TRANSLATE_PROMPT, ctx)
+        if retriever is not None:
+            system_prompt += "\n\n" + _RETRIEVED_CONTEXT_RULES
         response_obj = llm_json_once(
             llm,
-            render_prompt_template(DESCRIPTION_TRANSLATE_PROMPT, ctx) + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
+            system_prompt + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
             request,
             temperature=0.3,
             raw_label=None if quiet else "translate_description",
@@ -4395,7 +4524,7 @@ def main() -> None:
     write_ass(ctx.bilingual_ass, template_path, ctx.base, events, AssOutputMode.BILINGUAL)
 
     if os.path.isfile(ctx.desc):
-        translate_description(ctx, llm, args.quiet)
+        translate_description(ctx, llm, args.quiet, retriever=retriever)
 
     if not args.quiet:
         print(f"SRT:      {ctx.split_source_srt}")
