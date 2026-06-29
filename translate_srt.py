@@ -1123,6 +1123,8 @@ _PROOFREAD_PROMPT_FALLBACK = """You are a bilingual subtitle proofreader. Review
 
 Step 1 - Check the source-language text for ASR errors:
 - Homophone confusion, garbled terms, missing negation, obvious grammar breaks.
+- If the glossary or retrieved_context explicitly identifies a source-language ASR error, apply that correction to the source-language text.
+- Treat glossary corrections for proper names, titles, quotes, and terminology as stronger evidence than the WhisperX ASR text.
 - Fix only errors that affect correctness or readability.
 - Keep the original source-language sentence structure and word order. Do not rewrite, paraphrase, merge, split, or reorder source text.
 - Source-language edits should normally be single-word or short-phrase ASR corrections so word-level timing remains traceable.
@@ -1168,7 +1170,13 @@ The first response character must be `{` and the last response character must be
 _RETRIEVED_CONTEXT_RULES = """RETRIEVED CONTEXT:
 Some input items may include a "retrieved_context" array from the same project memory.
 Use it only for terminology, names, recurring concepts, tone, and local consistency.
-Do not translate, proofread, split, merge, or return retrieved_context items."""
+Do not output, translate, proofread, split, merge, or return retrieved_context items themselves."""
+
+_PROOFREAD_ASR_CONTEXT_RULES = """PROOFREAD ASR CORRECTION PRIORITY:
+If the glossary or retrieved_context identifies a source-language ASR error, you must apply that correction to the source-language field.
+This applies especially to proper names, work titles, technical terms, quotes, and domain-specific terminology.
+Treat explicit glossary ASR corrections as stronger evidence than the WhisperX text.
+Keep the source sentence structure and timing-aligned event count unchanged; correct only the misheard word or short phrase."""
 
 _TRANSLATE_FORMAT = """
 TRANSLATION RESPONSE FORMAT:
@@ -1817,15 +1825,13 @@ def load_glossary(glossary_path: str) -> str:
     if not content:
         return ""
     return (
-        "\n\n以下是本视频的术语知识库, 请在翻译和校对时严格遵循其中的术语理解、"
+        "\n\n以下是本视频的术语知识库, 请在翻译、校对和简介翻译时严格遵循其中的术语理解、"
         "推荐译法、语气判断和一致性要求:\n\n"
         + content
     )
 
 
 def load_glossary_prompt_context(glossary_path: str, retriever: EmbeddingRetriever | None) -> str:
-    if retriever is not None:
-        return ""
     return load_glossary(glossary_path)
 
 
@@ -3424,6 +3430,16 @@ def parse_proofread_response(
     return fallback_pairs
 
 
+def proofread_retrieval_query(event: SplitEvent) -> str:
+    return "\n".join(
+        [
+            "ASR correction glossary proofread source-language proper names terminology",
+            f"Source: {event.en}",
+            f"Target: {event.zh}",
+        ]
+    )
+
+
 def llm_numbered_batch(
     request: LLMBatchRequest,
     session: ChatSession,
@@ -3558,6 +3574,8 @@ def proofread_split_events(
         system_prompt
         + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
         + "\n\n"
+        + _PROOFREAD_ASR_CONTEXT_RULES
+        + "\n\n"
         + _JSON_FORMAT
         + "\n\n"
         + _JSON_BATCH_FORMAT
@@ -3642,7 +3660,7 @@ def proofread_split_events(
         batch = events[start : start + pr_llm.batch_size]
         contexts = (
             retriever.retrieve_texts(
-                [f"{event.en}\n{event.zh}" for event in batch],
+                [proofread_retrieval_query(event) for event in batch],
                 top_k=retrieval_top_k,
             )
             if retriever is not None
@@ -4218,6 +4236,7 @@ def translate_description(
     llm: LLMConfig,
     quiet: bool,
     retriever: EmbeddingRetriever | None = None,
+    glossary_path: str = "",
 ) -> str:
     title, webpage_url, tags = read_metadata(ctx)
     metadata_header = read_metadata_header(ctx)
@@ -4253,6 +4272,9 @@ def translate_description(
     )
     try:
         system_prompt = render_prompt_template(DESCRIPTION_TRANSLATE_PROMPT, ctx)
+        glossary_context = load_glossary_prompt_context(glossary_path or ctx.glossary, retriever=retriever)
+        if glossary_context:
+            system_prompt += glossary_context
         if retriever is not None:
             system_prompt += "\n\n" + _RETRIEVED_CONTEXT_RULES
         response_obj = llm_json_once(
@@ -4524,7 +4546,7 @@ def main() -> None:
     write_ass(ctx.bilingual_ass, template_path, ctx.base, events, AssOutputMode.BILINGUAL)
 
     if os.path.isfile(ctx.desc):
-        translate_description(ctx, llm, args.quiet, retriever=retriever)
+        translate_description(ctx, llm, args.quiet, retriever=retriever, glossary_path=glossary_path)
 
     if not args.quiet:
         print(f"SRT:      {ctx.split_source_srt}")

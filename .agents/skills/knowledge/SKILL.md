@@ -80,5 +80,6 @@ Prompt：
 - 普通 pipeline 中已存在且非空的 `glossary.md` 不需要重新总结
 - 手动运行 `--only-glossary` 时忽略已有缓存，重新生成并覆盖 `glossary.md`
 - 不要把“离线生成”“联网生成”之类元信息写进 glossary
-- glossary 是给后续翻译和校对 prompt 直接注入的
+- glossary 是后续翻译、校对和视频简介翻译的常驻 system prompt 硬规则，不会因为启用 embedding 而省略
+- embedding / Chroma 召回的 `retrieved_context` 只是逐条动态补充记忆，不能替代完整 glossary
 - 不确定的术语宁可少写，也不要硬猜一堆

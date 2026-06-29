@@ -1264,7 +1264,7 @@ class JsonProtocolTests(unittest.TestCase):
 
         self.assertEqual(queries, ["Original Title", "source concept"])
 
-    def test_glossary_prompt_context_skips_full_text_when_retriever_is_available(self):
+    def test_glossary_prompt_context_keeps_full_text_when_retriever_is_available(self):
         class FalseyRetriever:
             def __bool__(self):
                 return False
@@ -1274,10 +1274,12 @@ class JsonProtocolTests(unittest.TestCase):
             with open(glossary, "w", encoding="utf-8") as f:
                 f.write("# 术语知识库\n\n- discipline: 纪律")
 
-            self.assertEqual(t.load_glossary_prompt_context(glossary, retriever=FalseyRetriever()), "")
+            resident = t.load_glossary_prompt_context(glossary, retriever=FalseyRetriever())
             fallback = t.load_glossary_prompt_context(glossary, retriever=None)
 
+        self.assertIn("# 术语知识库", resident)
         self.assertIn("# 术语知识库", fallback)
+        self.assertEqual(resident, fallback)
 
     def test_translate_segments_omits_retrieved_context_without_retriever(self):
         captured = {}
@@ -1356,8 +1358,74 @@ class JsonProtocolTests(unittest.TestCase):
             t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=retriever)
 
         self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "proofread memory"}])
-        self.assertEqual(retriever.texts, ["source\n译文"])
+        self.assertIn("ASR correction", retriever.texts[0])
+        self.assertIn("glossary", retriever.texts[0])
+        self.assertIn("Source: source", retriever.texts[0])
+        self.assertIn("Target: 译文", retriever.texts[0])
         self.assertEqual(retriever.top_k, 1)
+
+    def test_proofread_prompt_prioritizes_glossary_asr_corrections(self):
+        class FakeRetriever:
+            def retrieve_texts(self, texts, top_k=None):
+                return [[{"id": "glossary:1", "source": "glossary", "text": "ASR correction: bar Drill -> Baudrillard"}]]
+
+        captured = {}
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
+            captured["system_prompt"] = session.system_prompt
+            return [{"id": 1, "en": "Baudrillard", "zh": "鲍德里亚"}]
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    1,
+                    0.0,
+                    1.0,
+                    "bar Drill",
+                    split_events=[t.SplitEvent(0.0, 1.0, "bar Drill", "巴德里尔")],
+                )
+            ],
+        )
+
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "custom proofread", quiet=True, retriever=FakeRetriever())
+
+        self.assertIn("glossary or retrieved_context identifies a source-language ASR error", captured["system_prompt"])
+        self.assertIn("must apply that correction to the source-language field", captured["system_prompt"])
+        self.assertIn("Baudrillard", transcript.segments[0].split_events[0].en)
+
+    def test_proofread_retrieval_query_asks_for_asr_corrections(self):
+        class FakeRetriever:
+            def retrieve_texts(self, texts, top_k=None):
+                self.texts = texts
+                return [[{"id": "glossary:1", "text": "ASR correction"}]]
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
+            return [{"id": 1, "en": "source", "zh": "译文"}]
+
+        transcript = t.Transcript(
+            path="video.json",
+            language="en",
+            segments=[
+                t.TranscriptSegment(
+                    1,
+                    0.0,
+                    1.0,
+                    "source",
+                    split_events=[t.SplitEvent(0.0, 1.0, "source", "译文")],
+                )
+            ],
+        )
+        retriever = FakeRetriever()
+
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=retriever)
+
+        self.assertIn("ASR correction", retriever.texts[0])
+        self.assertIn("glossary", retriever.texts[0])
+        self.assertIn("source", retriever.texts[0])
 
     def test_proofread_split_events_respects_small_batch_without_token_limit(self):
         calls = []
@@ -2391,6 +2459,30 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertIn("counterintuitive idea", retriever.texts[0])
             self.assertIn("psychology", retriever.texts[0])
             self.assertEqual(retriever.top_k, 6)
+
+    def test_translate_description_keeps_glossary_resident_without_retriever(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.info_json, "w", encoding="utf-8") as f:
+                json.dump({"title": "Original Title"}, f)
+            with open(ctx.desc, "w", encoding="utf-8") as f:
+                f.write("A description about discipline.")
+            with open(ctx.glossary, "w", encoding="utf-8") as f:
+                f.write("# 术语知识库\n\n- discipline: 定译为自律")
+
+            captured = {}
+
+            def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
+                captured["system_prompt"] = system_prompt
+                return {"title": "译后标题", "description": "译后简介。", "tags": []}
+
+            with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
+                t.translate_description(ctx, FakeProviderLLM(), quiet=True)
+
+        self.assertIn("# 术语知识库", captured["system_prompt"])
+        self.assertIn("discipline: 定译为自律", captured["system_prompt"])
 
     def test_write_ass_uses_named_output_modes(self):
         template = os.path.abspath("template.ass")

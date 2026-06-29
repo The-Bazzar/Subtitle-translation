@@ -61,4 +61,5 @@ platform: Win + Linux
 - token normalize 仅用于匹配，不改显示文本；词内 dash/hyphen 会被忽略，带空格 dash 仍作为分隔
 - 源语言校对发生在 split event 上，只做 ASR 纠错和轻量可读性修正，不改变事件数量或时间轴；目标语言翻译可以按目标语言表达自然调整
 - 禁止本地强切 fallback，宁可不分割也不把源/目标文本硬切错位
-- glossary 推荐在翻译前建立，这样正式校对就能直接受术语约束
+- glossary 推荐在翻译前建立；一旦存在，会完整常驻注入翻译、校对和视频简介翻译的 system prompt
+- embedding / Chroma 的 `retrieved_context` 只做逐条补充记忆，不替代完整 glossary

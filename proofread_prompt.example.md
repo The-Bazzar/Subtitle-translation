@@ -5,6 +5,8 @@ Step 1 — Check the ${SOURCE_LANG} text for ASR errors:
 - Garbled proper names, brand names, or technical terms
 - Missing or extra negation
 - Obvious grammar breaks that distort meaning
+- If the glossary or retrieved_context explicitly identifies a source-language ASR error, apply that correction to the ${SOURCE_LANG} text
+- Treat glossary corrections for proper names, titles, quotes, and terminology as stronger evidence than the WhisperX ASR text
 - Keep the original source-language sentence structure and word order
 - Do not rewrite, paraphrase, merge, split, or reorder the source-language text
 - Source-language edits should normally be single-word or short-phrase ASR corrections so word-level timing remains traceable
