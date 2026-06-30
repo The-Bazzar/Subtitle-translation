@@ -9,13 +9,13 @@ PlayResY: 1080
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: en,Cascadia Code,58,&H00FAFAFA,&H0000FFFF,&H00241A1A,&H00000000,-1,0,0,0,100,100,0,0,1,1,1,2,0,0,10,1
-Style: zh,Noto Serif CJK SC,76,&H00CCF2FF,&H00FFFFFF,&H00241A1A,&H00000000,-1,0,0,0,100,100,0,0,1,2.0,1.0,2,0,0,10,1
-Style: bi-en,Cascadia Code,44,&H00FAFAFA,&H0000FFFF,&H00241A1A,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,0,0,1,1
-Style: bi-zh,Noto Serif CJK SC,68,&H00CCF2FF,&H00FFFFFF,&H00241A1A,&H00000000,-1,0,0,0,100,100,0,0,1,2.0,1.0,2,0,0,47,1
-Style: bg-bi-en,Cascadia Code,44,&H00FAFAFA,&H0000FFFF,&H00241A1A,&H37505050,0,0,0,0,100,100,0,0,4,1,1,2,0,0,1,1
-Style: bg-bi-zh,Noto Serif CJK SC,68,&H00CCF2FF,&H00FFFFFF,&H00241A1A,&H37505050,-1,0,0,0,100,100,0,0,4,2.0,1.0,2,0,0,47,1
-Style: anno,,38,&H00FAFAFA,&H0000FFFF,&H00241A1A,&H69505050,0,0,0,0,100,100,0,0,4,1,1,9,0,0,0,1
+Style: en,Cascadia Code,58,&H00FAFAFA,&H0000FFFF,&H001A1A1A,&H00000000,-1,0,0,0,100,100,0,0,1,3,1,2,0,0,20,1
+Style: zh,Noto Serif CJK SC,90,&H00CCF2FF,&H00FFFFFF,&H001A1A1A,&H00000000,-1,0,0,0,100,100,0,0,1,4,1.0,2,0,0,20,1
+Style: bi-en,Cascadia Code,48,&H00D8D4D4,&H0000FFFF,&H001A1A1A,&H00000000,0,0,0,0,100,100,0,0,1,3,1,2,0,0,20,1
+Style: bi-zh,Noto Serif CJK SC,90,&H00CCF2FF,&H00FFFFFF,&H001A1A1A,&H00000000,-1,0,0,0,100,100,0,0,1,4,1.0,2,0,0,68,1
+Style: bg-bi-en,Cascadia Code,58,&H00D8D4D4,&H0000FFFF,&H001A1A1A,&H37505050,0,0,0,0,100,100,0,0,4,3,1,2,0,0,20,1
+Style: bg-bi-zh,Noto Serif CJK SC,90,&H00CCF2FF,&H00FFFFFF,&H001A1A1A,&H37505050,-1,0,0,0,100,100,0,0,4,4,1.0,2,0,0,68,1
+Style: anno,Noto Serif CJK SC,38,&H00FAFAFA,&H0000FFFF,&H001A1A1A,&H69505050,0,0,0,0,100,100,0,0,4,2,1,9,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
