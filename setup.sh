@@ -130,7 +130,7 @@ fi
 # ── Python venv ────────────────────────────────────────────────────────────
 echo ">>> 创建/复用项目 .venv..."
 cd "$SCRIPT_DIR"
-uv venv .venv --python 3.13.12
+uv venv .venv --clear --python 3.13.12
 
 # ── PyTorch backend ────────────────────────────────────────────────────────
 TORCH_BACKEND="${TORCH_BACKEND:-auto}"

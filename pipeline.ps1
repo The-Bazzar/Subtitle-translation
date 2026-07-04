@@ -122,13 +122,13 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
 用法: .\pipeline.ps1 <YouTube URL> [选项...]
 
-流程: 下载 → JSON 语音识别 → JSON 美化 → 术语库 → 翻译 → 硬压 (纯 Windows)
-  1. yt-dlp 下载视频 + 元数据
-  2. WhisperX 生成词级 JSON
+流程: 下载原片 + 编辑版 → JSON 语音识别 → JSON 美化 → 术语库 → 翻译 → 硬压 (纯 Windows)
+  1. yt-dlp 下载原片 + 元数据，并重编码出同 basename 的编辑版 mp4
+  2. WhisperX 对编辑版生成词级 JSON
   3. 场景检测美化 JSON 时间轴 (Netflix 规范)
   4. translate_srt.py 可选联网搜索 + LLM 生成术语知识库 (glossary.md)
   5. 整句翻译 + 校对 + 分割 + 词级对轴 → .<source>-<target>.ass
-  6. ffmpeg 硬压 → burned.mkv
+  6. ffmpeg 使用保留的 .original 原片硬压 → burned.mkv
 
 参数:
   -Url                YouTube 视频链接 (必选)
@@ -203,14 +203,19 @@ if ($SkipDownload) {
         Write-Host "Error: Video file not found: $VideoPath" -ForegroundColor Red
         exit 1
     }
+    $VideoPath = (Get-Item $VideoPath).FullName
+    $RenderVideoPath = $VideoPath
 } else {
     Write-Host ""
     Write-Host ">>> Step 1/6: Download" -ForegroundColor Cyan
     $VideoPath = $null
+    $RenderVideoPath = $null
     & $DownloadPs1 $Url 2>&1 | ForEach-Object {
         $_
         if ($_ -match '^OUTPUT_VIDEO=(.+)$') {
             $VideoPath = $Matches[1].Trim()
+        } elseif ($_ -match '^OUTPUT_RENDER_VIDEO=(.+)$') {
+            $RenderVideoPath = $Matches[1].Trim()
         }
     }
     $DownloadExitCode = $LASTEXITCODE
@@ -221,6 +226,9 @@ if ($SkipDownload) {
     if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
         Write-Host "Error: Failed to locate downloaded video." -ForegroundColor Red
         exit 1
+    }
+    if (-not $RenderVideoPath -or -not (Test-Path $RenderVideoPath)) {
+        $RenderVideoPath = $VideoPath
     }
 }
 
@@ -326,6 +334,9 @@ if ($SkipBurn) {
     Write-Host "=============================================" -ForegroundColor Green
     Write-Host "Done! (burn skipped)" -ForegroundColor Green
     Write-Host "Video:   $VideoPath" -ForegroundColor Gray
+    if ($RenderVideoPath -and ($RenderVideoPath -ne $VideoPath)) {
+        Write-Host "Render:  $RenderVideoPath" -ForegroundColor Gray
+    }
     Write-Host "JSON:    $FinalJsonPath" -ForegroundColor Gray
     Write-Host "ASS:     $AssPath" -ForegroundColor Gray
     Write-Host "=============================================" -ForegroundColor Green
@@ -341,7 +352,7 @@ Write-Host ""
 Write-Host "Step 6/6: Burn" -ForegroundColor Cyan
 
 $BurnParams = @{
-    VideoPath = $VideoPath
+    VideoPath = $RenderVideoPath
     SubFile   = $AssPath
     Ovc       = $Ovc
     Ovcopts   = $Ovcopts
@@ -363,7 +374,10 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ""
 Write-Host "=============================================" -ForegroundColor Green
 Write-Host "Pipeline complete!" -ForegroundColor Green
-Write-Host "Video:   $VideoPath" -ForegroundColor Gray
+Write-Host "Edit:    $VideoPath" -ForegroundColor Gray
+if ($RenderVideoPath -and ($RenderVideoPath -ne $VideoPath)) {
+    Write-Host "Render:  $RenderVideoPath" -ForegroundColor Gray
+}
 Write-Host "ASS:     $AssPath" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Green
 

@@ -1,12 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# pipeline.sh — 一键流水线: 下载 → JSON → 美化 → 术语库 → 翻译 → 硬压
+# pipeline.sh — 一键流水线: 下载原片 + 编辑版 → JSON → 美化 → 术语库 → 翻译 → 硬压
 #
 # 串联 download.sh → whisper.sh → translate_srt.py → (ffmpeg-burn.sh)
 # 从 YouTube 链接直达双语 .<source>-<target>.ass 字幕 / burned.mkv 硬字幕。
 #
 # 成果物链:
-#   VIDEO_PATH → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
+#   OUTPUT_VIDEO(编辑版 mp4) → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
+#   OUTPUT_RENDER_VIDEO(原片) → ffmpeg-burn.sh
 #
 # 用法:
 #   ./pipeline.sh <YouTube URL> [-- <beautify选项>]
@@ -113,20 +114,21 @@ BURN_RES="${BURN_RES:-}"
 
 show_help() {
     cat << 'EOF'
-pipeline.sh — 一键流水线: 下载视频 + WhisperX 字幕 + 时间码美化 + LLM 翻译 [+ 硬压]
+pipeline.sh — 一键流水线: 下载原片 + 编辑版 + WhisperX 字幕 + 时间码美化 + LLM 翻译 [+ 硬压]
 
 用法:
   ./pipeline.sh <YouTube URL> [-- <beautify选项>]
 
 流程:
-  1. yt-dlp 下载视频 + 元数据 (SponsorBlock 去广告)
-  2. WhisperX large-v3-turbo 生成词级 JSON
+  1. yt-dlp 下载原片 + 元数据 (SponsorBlock 去广告)，并重编码出编辑版 mp4
+  2. WhisperX large-v3-turbo 对编辑版生成词级 JSON
   3. ffmpeg 场景检测 → JSON 时间轴吸附对齐 → .beautified.json
   4. translate_srt.py 从整句 JSON 生成 glossary.md
   5. 整句翻译 + 校对 + 分割 + 词级对轴 → .<source>-<target>.ass + .<target>.ass + .<source>.proofread.ass
-  6. ffmpeg 硬压字幕 → burned.mkv (默认启用, BURN=0 跳过)
+  6. ffmpeg 使用保留的 .original 原片硬压字幕 → burned.mkv (默认启用, BURN=0 跳过)
 
-成果物链: VIDEO_PATH → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
+成果物链: OUTPUT_VIDEO(编辑版 mp4) → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
+           OUTPUT_RENDER_VIDEO(原片) → ffmpeg-burn.sh
   - 已存在的中间产物自动跳过 (跳过美化/跳过翻译)
   - 使用 EXISTING_ASS 指定已有双语 ASS
 
@@ -218,6 +220,8 @@ if [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then
     echo ""
     echo "请提供视频文件路径:"
     read -r VIDEO_PATH
+    VIDEO_PATH="$(realpath "$VIDEO_PATH" 2>/dev/null || readlink -f "$VIDEO_PATH" 2>/dev/null || echo "$VIDEO_PATH")"
+    RENDER_VIDEO_PATH="$VIDEO_PATH"
 else
     echo "============================================="
     echo "pipeline — 步骤 1/6: 下载视频"
@@ -225,6 +229,7 @@ else
     echo ""
 
     VIDEO_PATH=""
+    RENDER_VIDEO_PATH=""
     DOWNLOAD_LOG="$(mktemp)"
     if ! bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1 | tee "$DOWNLOAD_LOG"; then
         echo ""
@@ -233,12 +238,16 @@ else
         exit 1
     fi
     VIDEO_PATH="$(awk -F= '/^OUTPUT_VIDEO=/{print substr($0, index($0, "=") + 1)}' "$DOWNLOAD_LOG" | tail -n 1)"
+    RENDER_VIDEO_PATH="$(awk -F= '/^OUTPUT_RENDER_VIDEO=/{print substr($0, index($0, "=") + 1)}' "$DOWNLOAD_LOG" | tail -n 1)"
     rm -f "$DOWNLOAD_LOG"
 
     if [ -z "$VIDEO_PATH" ] || [ ! -f "$VIDEO_PATH" ]; then
         echo ""
         echo "Error: Failed to locate downloaded video file." >&2
         exit 1
+    fi
+    if [ -z "$RENDER_VIDEO_PATH" ] || [ ! -f "$RENDER_VIDEO_PATH" ]; then
+        RENDER_VIDEO_PATH="$VIDEO_PATH"
     fi
 fi
 
@@ -395,7 +404,7 @@ else
     if [ -z "${ASS_PATH:-}" ] || [ ! -f "$ASS_PATH" ]; then
         echo "Warning: bilingual ASS not found, skipping burn." >&2
     else
-        bash "$BURN_SCRIPT" "$VIDEO_PATH" \
+        bash "$BURN_SCRIPT" "$RENDER_VIDEO_PATH" \
             --sub-file "$ASS_PATH" \
             --ovc "$BURN_OVC" \
             --ovcopts "$BURN_OVCOPTS" \
@@ -410,7 +419,10 @@ echo ""
 echo "============================================="
 echo "pipeline — 全部完成!"
 echo "============================================="
-echo "视频:     $VIDEO_PATH"
+echo "编辑视频: $VIDEO_PATH"
+if [ "$RENDER_VIDEO_PATH" != "$VIDEO_PATH" ]; then
+    echo "渲染原片: $RENDER_VIDEO_PATH"
+fi
 if [ -n "${JSON_PATH:-}" ] && [ -f "$JSON_PATH" ]; then
     echo "JSON:     $JSON_PATH"
 fi

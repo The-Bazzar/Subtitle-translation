@@ -2,7 +2,7 @@
 
 从 YouTube 链接出发，完成：
 
-`下载视频 -> WhisperX JSON -> JSON 时间轴美化 -> glossary 术语知识库 -> 整句翻译 -> 分割对轴 -> split 校对 -> 双语 ASS -> burned.mkv`
+`下载原片 + 重编码编辑版 -> WhisperX JSON -> JSON 时间轴美化 -> glossary 术语知识库 -> 整句翻译 -> 分割对轴 -> split 校对 -> 双语 ASS -> burned.mkv`
 
 > 必须使用 PowerShell 7。旧版 Windows PowerShell 5.x 会导致 `.ps1` 脚本报错。升级命令：`winget install Microsoft.PowerShell`
 
@@ -55,18 +55,19 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 ## 主流程
 
-1. `download.ps1/.sh` 下载视频、封面、`.info.json`、`.description`、`.tags.txt`
-2. `whisper.ps1/.sh` 调用 `whisperx --output_format json`，输出 `<name>.json`
+1. `download.ps1/.sh` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，然后把原片改名为 `<name>.original.<ext>`，并统一重编码出编辑用 `<name>.mp4`
+2. `whisper.ps1/.sh` 对编辑版 `<name>.mp4` 调用 `whisperx --output_format json`，输出 `<name>.json`
 3. `translate_srt.py --only-beautify` 美化 JSON 里的 word 时间轴并回写 segment，输出 `<name>.beautified.json`、`<name>.scenes.json`、`<name>.scenechange.txt`
 4. `translate_srt.py --only-glossary` 读取整句 transcript 和元数据，重新生成并覆盖 `glossary.md`
 5. `translate_srt.py` 使用整句 JSON 翻译
 6. AI 分割后用每个源语言 split 的首尾 word 匹配美化后的 `words[]` 回填时间，再对 split events 做最终校对，输出 `.split.<source>.srt` / `.split.<target>.srt` 和最终 ASS；显式 `--no-split` 时也继续输出 ASS
-7. `ffmpeg-burn.ps1/.sh` 使用双语 `.ass` 硬压字幕
+7. `ffmpeg-burn.ps1/.sh` 使用双语 `.ass` 硬压字幕；pipeline 默认回到 `<name>.original.<ext>` 原片压制
 
 成果物链：
 
 ```text
-video -> json -> beautified.json -> glossary.md -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
+<name>.original.<ext> + <name>.mp4 -> <name>.json -> <name>.beautified.json
+-> glossary.md -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
 ```
 
 ## translate_srt.py
@@ -74,17 +75,17 @@ video -> json -> beautified.json -> glossary.md -> <source>.proofread.ass / <tar
 入口只接受 WhisperX JSON：
 
 ```powershell
-.\.venv\Scripts\python.exe translate_srt.py video.json --video video.webm
-.\.venv\Scripts\python.exe translate_srt.py video.json --video video.webm --only-beautify
-.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang ja
-.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.webm -o custom.en-ja.ass
+.\.venv\Scripts\python.exe translate_srt.py video.json --video video.mp4
+.\.venv\Scripts\python.exe translate_srt.py video.json --video video.mp4 --only-beautify
+.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.mp4 --source-lang en --target-lang ja
+.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.mp4 -o custom.en-ja.ass
 ```
 
 ```bash
-./.venv/bin/python translate_srt.py video.json --video video.webm
-./.venv/bin/python translate_srt.py video.json --video video.webm --only-beautify
-./.venv/bin/python translate_srt.py video.beautified.json --video video.webm --source-lang en --target-lang ja
-./.venv/bin/python translate_srt.py video.beautified.json --video video.webm -o custom.en-ja.ass
+./.venv/bin/python translate_srt.py video.json --video video.mp4
+./.venv/bin/python translate_srt.py video.json --video video.mp4 --only-beautify
+./.venv/bin/python translate_srt.py video.beautified.json --video video.mp4 --source-lang en --target-lang ja
+./.venv/bin/python translate_srt.py video.beautified.json --video video.mp4 -o custom.en-ja.ass
 ```
 
 输出：
@@ -185,6 +186,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 - 运行 pipeline 或任一 `.py` 相关脚本前必须先完成 setup；脚本统一使用项目 `.venv`，不调用全局 `python` / `python3`
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
+- `download.ps1/.sh` 会固定输出两条路径：`OUTPUT_VIDEO` 是编辑用 `<name>.mp4`，`OUTPUT_RENDER_VIDEO` 是保留给最终压制的 `<name>.original.<ext>`；编辑版会先用 CPU 默认解码成 `yuv4mpegpipe` 纯净帧流，再回拼原音频
 - 完整翻译流程必须配置 `TRANSLATE_PROVIDER`；只构建 glossary 时可改用 `GLOSSARY_PROVIDER`
 - WhisperX 首次运行会下载模型
 - 默认不硬压，推荐先人工校对 ASS，再决定是否压制

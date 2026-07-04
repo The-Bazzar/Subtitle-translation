@@ -115,7 +115,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 # ── Python venv ────────────────────────────────────────────────────────────
 Write-Host ">>> 创建/复用项目 .venv..." -ForegroundColor Yellow
 Push-Location $ScriptDir
-uv venv .venv --python 3.13.12
+uv venv .venv --clear --python 3.13.12
 Pop-Location
 
 # ── PyTorch backend ────────────────────────────────────────────────────────

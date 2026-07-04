@@ -13,3 +13,4 @@ split_prompt.md
 *.chroma/
 *.chroma_db/
 chroma_db/
+uv.lock
