@@ -67,7 +67,8 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 ```text
 <name>.original.<ext> + <name>.mp4 -> <name>.json -> <name>.beautified.json
--> glossary.md -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
+-> <name>.web_evidence.json + glossary.md
+-> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
 ```
 
 ## translate_srt.py
@@ -93,6 +94,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 - `<name>.beautified.json`：主缓存，保存 `translation`、`proofread_text`、`split_events`
 - `<name>.scenes.json`：场景切换 sidecar，包含 fps、threshold、frame、timecode 等调试信息
 - `<name>.scenechange.txt`：每行一个秒级场景切换点，例如 `12.345000`
+- `<name>.web_evidence.json`：Tavily 网页证据 sidecar，保存规范化 query、域名、URL、标题和证据摘要，用于 embedding 检索
 - `<name>.split.<source>.srt`：分割后、最终校对后的源语言 SRT 检查稿
 - `<name>.split.<target>.srt`：分割后、最终校对后的目标语言 SRT 检查稿
 - `<name>.<source>.proofread.ass`：最终校对源语言 ASS
@@ -106,7 +108,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 默认模板以 1080p 双语观看为基准：`bi-zh` / `bg-bi-zh` 字号为 68，`bi-en` / `bg-bi-en` 字号为 44；AI 分割默认在源文超过 72 字符或 3.8 秒时触发。beautify 只负责词级时间轴吸附和边界修复，不再提供本地硬截整句参数。
 
-`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`glossary_prompt.md` 只用于微调 glossary 内容策略，`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。配置 Tavily 搜索时，glossary 会优先依据网页搜索结果校正 ASR 中可能误识别的人名、标题、引文和术语。
+`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`glossary_prompt.md` 只用于微调 glossary 内容策略，`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。配置 Tavily 搜索时，glossary 会优先依据网页搜索结果校正 ASR 中可能误识别的人名、标题、引文和术语；原始网页证据会另外保存到 `<name>.web_evidence.json`，供后续 embedding 检索使用，而不是直接常驻注入 prompt。
 
 ## 配置
 
@@ -153,13 +155,15 @@ DEEPSEEK_API_KEY=
 
 配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用同一个 LLM session 执行 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session，最后由模型返回 glossary JSON。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。
 
+如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且 Tavily 可用，脚本会补建 sidecar 而不重写 glossary。
+
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 
 glossary 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；输出格式仍由内置 prompt 要求返回 JSON object。
 
 Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 query / `topic_hints`、metadata 与 `tavily_domains.json` 中的全局百科域名、题材关键词和站点执行 `include_domains` 搜索；如果结果不足，再执行普通 Tavily 搜索；最终合并去重时会优先保留百科/知识库域名结果。`tavily_domains.json` 由 `tavily_domains.example.json` 初始化，用户可以自行添加题材、关键词和站点。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会额外保存 `glossary.md` 项目知识、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签。索引会自动按 Markdown 标题切分 glossary；transcript chunk 使用干净字幕文本建向量，但返回给 LLM 的 retrieved context 会带 segment 时间码，并按末尾时间窗口自动 overlap，避免长视频上下文断裂。重建索引前会清理当前项目旧 chunk，避免残留结果污染检索。
+`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会额外保存 `glossary.md` 项目知识、`web_evidence.json` 网页证据、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签；`web_evidence:*` chunk 来自 `<name>.web_evidence.json` 中的规范化 Tavily 结果，保留 query、域名、标题、URL 和证据摘要。索引会自动按 Markdown 标题切分 glossary；transcript chunk 使用干净字幕文本建向量，但返回给 LLM 的 retrieved context 会带 segment 时间码，并按末尾时间窗口自动 overlap，避免长视频上下文断裂。重建索引前会清理当前项目旧 chunk，避免残留结果污染检索。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 

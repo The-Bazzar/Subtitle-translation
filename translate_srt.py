@@ -266,6 +266,7 @@ class TranscriptContext:
     glossary: str
     scenes_json: str
     scenechange_txt: str
+    web_evidence_json: str
 
     @staticmethod
     def from_json(
@@ -301,7 +302,151 @@ class TranscriptContext:
             glossary=os.path.join(directory, "glossary.md"),
             scenes_json=os.path.join(directory, f"{base}.scenes.json"),
             scenechange_txt=os.path.join(directory, f"{base}.scenechange.txt"),
+            web_evidence_json=os.path.join(directory, f"{base}.web_evidence.json"),
         )
+
+
+@dataclass
+class WebEvidenceEntry:
+    url: str
+    title: str = ""
+    content: str = ""
+    domain: str = ""
+    preferred_domain_hit: bool = False
+    rank: int = 0
+
+    @staticmethod
+    def from_json_value(data) -> "WebEvidenceEntry":
+        data = require_json_object(data, "web evidence entry")
+        url = str(data.get("url", "")).strip()
+        title = str(data.get("title", "")).strip()
+        content = str(data.get("content", "")).strip()
+        domain = str(data.get("domain", "")).strip() or tavily_url_host(url)
+        return WebEvidenceEntry(
+            url=url,
+            title=title,
+            content=content,
+            domain=domain,
+            preferred_domain_hit=bool(data.get("preferred_domain_hit", False)),
+            rank=int(data.get("rank", 0) or 0),
+        )
+
+    def to_json_value(self) -> dict:
+        return prune_empty_json(
+            {
+                "url": self.url.strip(),
+                "title": self.title.strip(),
+                "content": self.content.strip(),
+                "domain": (self.domain.strip() or tavily_url_host(self.url)),
+                "preferred_domain_hit": self.preferred_domain_hit,
+                "rank": self.rank,
+            }
+        ) or {}
+
+
+@dataclass
+class WebEvidenceRecord:
+    query: str
+    topic_hints: list[str] = field(default_factory=list)
+    preferred_domains: list[str] = field(default_factory=list)
+    search_stage: str = ""
+    results: list[WebEvidenceEntry] = field(default_factory=list)
+
+    @staticmethod
+    def from_json_value(data) -> "WebEvidenceRecord":
+        data = require_json_object(data, "web evidence record")
+        raw_results = data.get("results", [])
+        results = []
+        if isinstance(raw_results, list):
+            for item in raw_results:
+                try:
+                    entry = WebEvidenceEntry.from_json_value(item)
+                except Exception:
+                    continue
+                if entry.url and (entry.title or entry.content):
+                    results.append(entry)
+        return WebEvidenceRecord(
+            query=str(data.get("query", "")).strip(),
+            topic_hints=unique_non_empty_strings(json_string_list(data.get("topic_hints", [])), 24),
+            preferred_domains=unique_tavily_domains(json_string_list(data.get("preferred_domains", []))),
+            search_stage=str(data.get("search_stage", "")).strip(),
+            results=results,
+        )
+
+    def to_json_value(self) -> dict:
+        return prune_empty_json(
+            {
+                "query": self.query.strip(),
+                "topic_hints": unique_non_empty_strings(self.topic_hints, 24),
+                "preferred_domains": unique_tavily_domains(self.preferred_domains),
+                "search_stage": self.search_stage.strip(),
+                "results": [entry.to_json_value() for entry in self.results if entry.url],
+            }
+        ) or {}
+
+
+@dataclass
+class WebEvidenceSidecar:
+    version: int = 1
+    records: list[WebEvidenceRecord] = field(default_factory=list)
+
+    @staticmethod
+    def from_json_value(data) -> "WebEvidenceSidecar":
+        if isinstance(data, list):
+            raw_records = data
+            version = 1
+        else:
+            data = require_json_object(data, "web evidence sidecar")
+            raw_records = data.get("records", [])
+            version = int(data.get("version", 1) or 1)
+        records = []
+        if isinstance(raw_records, list):
+            for item in raw_records:
+                try:
+                    record = WebEvidenceRecord.from_json_value(item)
+                except Exception:
+                    continue
+                if record.query and record.results:
+                    records.append(record)
+        return WebEvidenceSidecar(version=max(1, version), records=records)
+
+    def to_json_value(self) -> dict:
+        return {
+            "version": max(1, int(self.version or 1)),
+            "records": [record.to_json_value() for record in self.records if record.query and record.results],
+        }
+
+    def has_records(self) -> bool:
+        return any(record.query and record.results for record in self.records)
+
+    def unique_entries(self) -> list[tuple[WebEvidenceRecord, WebEvidenceEntry]]:
+        seen_urls: set[str] = set()
+        pairs: list[tuple[WebEvidenceRecord, WebEvidenceEntry]] = []
+        for record in self.records:
+            for entry in record.results:
+                url_key = tavily_url_key(entry.url)
+                if not url_key or url_key in seen_urls:
+                    continue
+                seen_urls.add(url_key)
+                pairs.append((record, entry))
+        return pairs
+
+    def prompt_text(self, max_chars: int = 0) -> str:
+        blocks = [
+            f"Source: {entry.url}\n{entry.content[:500]}"
+            for _, entry in self.unique_entries()
+            if entry.url and entry.content
+        ]
+        text = "\n\n".join(blocks).strip()
+        if max_chars and len(text) > max_chars:
+            return text[:max_chars].rstrip()
+        return text
+
+
+@dataclass
+class GlossaryBuildArtifact:
+    markdown: str
+    web_evidence: WebEvidenceSidecar = field(default_factory=WebEvidenceSidecar)
 
 
 @dataclass
@@ -713,6 +858,89 @@ def build_glossary_chunks(ctx: TranscriptContext, chunk_chars: int) -> list[Embe
     return chunks
 
 
+def clip_text_for_embedding(text: str, max_chars: int) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "").strip())
+    if len(clean) <= max_chars:
+        return clean
+    cut = clean[:max_chars]
+    boundary = max(cut.rfind(". "), cut.rfind("; "), cut.rfind(", "), cut.rfind(" "))
+    if boundary >= max_chars // 2:
+        cut = cut[:boundary]
+    return cut.rstrip()
+
+
+def load_web_evidence_sidecar(path: str) -> WebEvidenceSidecar:
+    if not path or not os.path.isfile(path):
+        return WebEvidenceSidecar()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return WebEvidenceSidecar()
+    try:
+        return WebEvidenceSidecar.from_json_value(data)
+    except Exception:
+        return WebEvidenceSidecar()
+
+
+def write_web_evidence_sidecar(ctx: TranscriptContext, sidecar: WebEvidenceSidecar) -> WebEvidenceSidecar:
+    if not sidecar.has_records():
+        if os.path.isfile(ctx.web_evidence_json):
+            try:
+                os.remove(ctx.web_evidence_json)
+            except OSError:
+                pass
+        return sidecar
+    with open(ctx.web_evidence_json, "w", encoding="utf-8") as f:
+        json.dump(sidecar.to_json_value(), f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return sidecar
+
+
+def build_web_evidence_chunks(ctx: TranscriptContext, chunk_chars: int) -> list[EmbeddingChunk]:
+    sidecar = load_web_evidence_sidecar(ctx.web_evidence_json)
+    if not sidecar.has_records():
+        return []
+
+    chunks: list[EmbeddingChunk] = []
+    max_chars = max(240, int(chunk_chars or 1))
+    for index, (record, entry) in enumerate(sidecar.unique_entries(), 1):
+        query_text = "; ".join(unique_non_empty_strings([record.query], 3))
+        topic_text = ", ".join(unique_non_empty_strings(record.topic_hints, 8))
+        lines = []
+        if query_text:
+            lines.append(f"Query: {query_text}")
+        if entry.domain:
+            lines.append(f"Domain: {entry.domain}")
+        if entry.title:
+            lines.append(f"Title: {entry.title}")
+        lines.append(f"URL: {entry.url}")
+        if topic_text:
+            lines.append(f"Topic hints: {topic_text}")
+        if entry.content:
+            lines.extend(["Evidence:", entry.content])
+        context_text = "\n".join(lines).strip()
+        if not context_text:
+            continue
+        chunks.append(
+            EmbeddingChunk(
+                chunk_id=f"web_evidence:{index}",
+                source="web_evidence",
+                text=clip_text_for_embedding(context_text, max_chars),
+                metadata={
+                    "kind": "web_evidence",
+                    "path": ctx.web_evidence_json,
+                    "url": entry.url,
+                    "domain": entry.domain,
+                    "query": record.query,
+                    "search_stage": record.search_stage,
+                },
+                context_text=context_text,
+            )
+        )
+    return chunks
+
+
 def build_translation_memory_chunks(transcript: Transcript, ctx: TranscriptContext) -> list[EmbeddingChunk]:
     chunks: list[EmbeddingChunk] = []
     for seg in transcript.segments:
@@ -747,7 +975,7 @@ def build_translation_memory_chunks(transcript: Transcript, ctx: TranscriptConte
 
 
 def is_embedding_chunk_id(chunk_id: str) -> bool:
-    return chunk_id.startswith(("transcript:", "glossary:", "translation_memory:"))
+    return chunk_id.startswith(("transcript:", "glossary:", "web_evidence:", "translation_memory:"))
 
 
 def existing_embedding_chunk_ids(store) -> list[str]:
@@ -784,6 +1012,7 @@ def build_embedding_index(
     chunks = build_embedding_chunks(transcript, config.chunk_chars)
     if ctx is not None:
         chunks.extend(build_glossary_chunks(ctx, config.chunk_chars))
+        chunks.extend(build_web_evidence_chunks(ctx, config.chunk_chars))
         chunks.extend(build_translation_memory_chunks(transcript, ctx))
     store = open_chroma_store(config, env)
     clear_embedding_chunks(store, existing_chunk_ids)
@@ -2214,6 +2443,49 @@ def merge_tavily_results(
     return merged
 
 
+def build_web_evidence_record(
+    query: str,
+    results: list[dict],
+    topic_hints: Optional[list[str]] = None,
+    preferred_domains: Optional[list[str]] = None,
+    search_stage: str = "",
+) -> WebEvidenceRecord:
+    clean_query = re.sub(r"\s+", " ", str(query or "").strip())
+    domains = unique_tavily_domains(preferred_domains or [])
+    entries: list[WebEvidenceEntry] = []
+    seen_urls: set[str] = set()
+    for rank, item in enumerate(results or [], 1):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        url_key = tavily_url_key(url)
+        if not url or not url_key or url_key in seen_urls:
+            continue
+        seen_urls.add(url_key)
+        title = re.sub(r"\s+", " ", str(item.get("title", "")).strip())[:300]
+        content = re.sub(r"\s+", " ", str(item.get("content", "")).strip())[:1600]
+        if not title and not content:
+            continue
+        domain = str(item.get("domain", "")).strip() or tavily_url_host(url)
+        entries.append(
+            WebEvidenceEntry(
+                url=url[:1000],
+                title=title,
+                content=content,
+                domain=domain,
+                preferred_domain_hit=tavily_url_matches_domains(url, domains),
+                rank=rank,
+            )
+        )
+    return WebEvidenceRecord(
+        query=clean_query,
+        topic_hints=unique_non_empty_strings(topic_hints or [], 24),
+        preferred_domains=domains,
+        search_stage=str(search_stage or "").strip(),
+        results=entries,
+    )
+
+
 def _tavily_client_search(client, query: str, max_results: int, include_domains: Optional[list[str]] = None) -> list[dict]:
     kwargs = {
         "query": query,
@@ -2562,6 +2834,7 @@ class GlossaryToolRuntime:
         )
         return {
             "query": query,
+            "topic_hints": unique_non_empty_strings(topic_hints, 24),
             "preferred_domains": preferred_domains,
             "results": [
                 {
@@ -2699,7 +2972,7 @@ def build_glossary_with_tools(
     ctx: TranscriptContext,
     llm: LLMConfig,
     options: GlossaryBuildOptions,
-) -> str:
+) -> GlossaryBuildArtifact:
     metadata_fields = read_video_metadata_fields(ctx)
     preferences = load_tavily_domain_preferences()
     runtime = GlossaryToolRuntime(
@@ -2736,6 +3009,7 @@ def build_glossary_with_tools(
     used_tool_queries = 0
     max_format_retries = max(1, max_tool_queries)
     format_retries = 0
+    evidence_records: list[WebEvidenceRecord] = []
 
     for _ in range(max_tool_queries + max_format_retries + 2):
         allow_tools = used_tool_queries < max_tool_queries
@@ -2778,6 +3052,15 @@ def build_glossary_with_tools(
                 else:
                     used_tool_queries += 1
                     tool_result = runtime.execute_tavily_search(parse_tool_arguments(tool_call))
+                    record = build_web_evidence_record(
+                        tool_result.get("query", ""),
+                        tool_result.get("results", []),
+                        topic_hints=json_string_list(tool_result.get("topic_hints", [])),
+                        preferred_domains=json_string_list(tool_result.get("preferred_domains", [])),
+                        search_stage="tool",
+                    )
+                    if record.query and record.results:
+                        evidence_records.append(record)
                 if not options.quiet:
                     print(
                         f"Glossary tool result ({tool_name}, {used_tool_queries}/{max_tool_queries}): "
@@ -2798,7 +3081,10 @@ def build_glossary_with_tools(
         if not options.quiet:
             print("build_glossary raw response:", file=sys.stderr)
             print(content, file=sys.stderr)
-        return GlossaryOutput.from_json_content(content).markdown
+        return GlossaryBuildArtifact(
+            markdown=GlossaryOutput.from_json_content(content).markdown,
+            web_evidence=WebEvidenceSidecar(records=evidence_records),
+        )
 
     raise RuntimeError("glossary tool session ended without final answer")
 
@@ -2816,12 +3102,11 @@ def build_tavily_search_evidence(
     llm: LLMConfig,
     metadata_fields: dict,
     options: GlossaryBuildOptions,
-) -> str:
+) -> WebEvidenceSidecar:
     if not options.tavily_key or int(options.tavily_max_queries or 0) <= 0:
-        return ""
+        return WebEvidenceSidecar()
 
-    all_results = []
-    all_preferred_domains: list[str] = []
+    records: list[WebEvidenceRecord] = []
     domain_preferences = load_tavily_domain_preferences()
     search_plan = build_tavily_search_plan(
         transcript,
@@ -2839,21 +3124,21 @@ def build_tavily_search_evidence(
             domain_preferences,
             topic_hints=search_plan.topic_hints,
         )
-        all_preferred_domains.extend(preferred_domains)
         if not options.quiet:
             domain_hint = f" ({len(preferred_domains)} preferred domains)" if preferred_domains else ""
             print(f"  Searching: {q[:60]}{domain_hint}", file=sys.stderr)
-        all_results.extend(tavily_search(q, options.tavily_key, per_query_results, preferred_domains=preferred_domains))
+        results = tavily_search(q, options.tavily_key, per_query_results, preferred_domains=preferred_domains)
+        record = build_web_evidence_record(
+            q,
+            results,
+            topic_hints=search_plan.topic_hints,
+            preferred_domains=preferred_domains,
+            search_stage="fallback",
+        )
+        if record.query and record.results:
+            records.append(record)
 
-    unique = merge_tavily_results(
-        all_results,
-        preferred_domains=unique_tavily_domains(all_preferred_domains),
-        max_results=max(1, options.tavily_max_results),
-    )
-    return "\n\n".join(
-        f"Source: {r.get('url', '')}\n{r.get('content', '')[:500]}"
-        for r in unique
-    )
+    return WebEvidenceSidecar(records=records)
 
 
 def build_glossary(
@@ -2863,13 +3148,18 @@ def build_glossary(
     options: Optional[GlossaryBuildOptions] = None,
 ) -> str:
     options = options or GlossaryBuildOptions()
+    metadata_fields = read_video_metadata_fields(ctx)
     if not options.force and os.path.isfile(ctx.glossary) and os.path.getsize(ctx.glossary) > 0:
         glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(_read_text_file(ctx.glossary), ctx))
+        if options.tavily_key and int(options.tavily_max_queries or 0) > 0 and not load_web_evidence_sidecar(ctx.web_evidence_json).has_records():
+            sidecar = build_tavily_search_evidence(transcript, ctx, llm, metadata_fields, options)
+            write_web_evidence_sidecar(ctx, sidecar)
+            if sidecar.has_records() and not options.quiet:
+                print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
         if not options.quiet:
             print(f"Glossary cache: {ctx.glossary}", file=sys.stderr)
         return glossary
 
-    metadata_fields = read_video_metadata_fields(ctx)
     title = metadata_fields["title"]
     tags = metadata_fields["tags"]
     desc_text = metadata_fields["description"]
@@ -2883,22 +3173,27 @@ def build_glossary(
                 file=sys.stderr,
             )
         try:
-            glossary_markdown = build_glossary_with_tools(
+            artifact = build_glossary_with_tools(
                 transcript,
                 ctx,
                 llm,
                 options,
             )
-            glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(glossary_markdown, ctx))
+            write_web_evidence_sidecar(ctx, artifact.web_evidence)
+            glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(artifact.markdown, ctx))
             if not options.quiet:
                 print(f"Glossary: {ctx.glossary}", file=sys.stderr)
+                if artifact.web_evidence.has_records():
+                    print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
             return glossary
         except Exception as e:
             print(f"Warning: glossary tool session failed: {e}", file=sys.stderr)
             if not options.quiet:
                 print("Glossary: falling back to query-agent Tavily search", file=sys.stderr)
 
-    search_text = build_tavily_search_evidence(transcript, ctx, llm, metadata_fields, options)
+    sidecar = build_tavily_search_evidence(transcript, ctx, llm, metadata_fields, options)
+    write_web_evidence_sidecar(ctx, sidecar)
+    search_text = sidecar.prompt_text(max_chars=4000)
 
     request_fields = {
         "title": title,
@@ -2935,6 +3230,8 @@ def build_glossary(
     glossary = write_glossary_file(ctx, glossary)
     if not options.quiet:
         print(f"Glossary: {ctx.glossary}", file=sys.stderr)
+        if sidecar.has_records():
+            print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
     return glossary
 
 

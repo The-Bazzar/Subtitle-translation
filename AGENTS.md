@@ -74,7 +74,7 @@ winget install Microsoft.PowerShell
 ### Output Chain
 
 ```text
-<base>.original.<ext> + <base>.mp4 -> json -> beautified.json -> glossary.md
+<base>.original.<ext> + <base>.mp4 -> json -> beautified.json -> web_evidence.json + glossary.md
       -> split.<source>.srt / split.<target>.srt
       -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass
       -> burned.mkv
@@ -117,12 +117,14 @@ winget install Microsoft.PowerShell
 - 已合并到 `translate_srt.py`
 - 位于 beautify 之后、translate 之前
 - 普通 pipeline 中如果 `glossary.md` 已存在且非空，直接复用，不重新总结
+- 如果 `glossary.md` 已缓存但 `<base>.web_evidence.json` 缺失，且 Tavily 可用，会补建 sidecar 而不重写 glossary
 - 手动运行 `--only-glossary` 时忽略已有缓存，重新生成并覆盖 `glossary.md`
 - 读取 transcript、`.description`、`.tags.txt`、`.info.json`
 - 本地脚本会把 YouTube 原视频元信息前置写入 `glossary.md`，包括标题、作者、上传时间、原简介和标签；这部分不交给远端 LLM 合成
 - 配置 `TAVILY_API_KEY` 时联网搜索，未配置时离线总结
 - 联网搜索结果是 glossary 的优先证据来源；远端 LLM 应用搜索结果校正 transcript 中可能的 ASR 人名、标题、引文和术语错误
 - Tavily 搜索默认由 glossary agent 在同一个 ChatSession 中通过 `tavily_search` tool calls 发起；脚本执行搜索后将 tool result 回喂同一 session
+- Tavily 原始网页证据会规范化写入 `<base>.web_evidence.json` sidecar；它独立于 `glossary.md`，用于后续 embedding 检索，不作为常驻硬规则 prompt
 - 第一轮 glossary user JSON 会包含 metadata、transcript/retrieved context 和合并后的 `tavily_domains.json` 域名偏好
 - Tavily tool 本地先按 `tavily_domains.json` 的全局百科域名和题材站点执行 `include_domains` 搜索；结果不足时再执行普通搜索；合并时优先百科/知识库域名
 - 使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 指定术语知识库专用 LLM；空则回退到 `TRANSLATE_PROVIDER` / `TRANSLATE_MODEL`
@@ -214,7 +216,7 @@ ${TARGET_LANG_CODE}
 
 glossary 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；输出格式仍由内置 prompt 要求返回 JSON object。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`transcript:*` 使用干净字幕文本建向量，retrieved context 返回带时间码的字幕行，并按字符数、时间跨度、segment 数量切块，按末尾时间窗口自动 overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
+`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`web_evidence:*` Tavily 网页证据 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`web_evidence:*` 由 `<base>.web_evidence.json` 中的规范化 Tavily 结果构建，保留 query、域名、标题、URL 和证据摘要；`transcript:*` 使用干净字幕文本建向量，retrieved context 返回带时间码的字幕行，并按字符数、时间跨度、segment 数量切块，按末尾时间窗口自动 overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 

@@ -105,6 +105,9 @@ class JsonProtocolTests(unittest.TestCase):
     def setUp(self):
         self.ctx = t.TranscriptContext.from_json("video.json", "", "en", "zh")
 
+    def test_transcript_context_exposes_web_evidence_sidecar_path(self):
+        self.assertTrue(self.ctx.web_evidence_json.endswith("video.web_evidence.json"))
+
     def test_subtitle_layout_threshold_defaults_match_1080p_template(self):
         self.assertEqual(t.DEFAULT_SPLIT_MAX_CHARS, 72)
         self.assertEqual(t.DEFAULT_SPLIT_MAX_DURATION, 3.8)
@@ -162,6 +165,37 @@ class JsonProtocolTests(unittest.TestCase):
                 "nested": {"keep": "value"},
             },
         )
+
+    def test_web_evidence_sidecar_round_trips_json(self):
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="discipline concept",
+                    topic_hints=["philosophy"],
+                    preferred_domains=["wikipedia.org"],
+                    search_stage="tool",
+                    results=[
+                        t.WebEvidenceEntry(
+                            url="https://zh.wikipedia.org/wiki/Discipline",
+                            title="Discipline",
+                            content="Encyclopedia evidence about discipline.",
+                            domain="wikipedia.org",
+                            preferred_domain_hit=True,
+                            rank=1,
+                        )
+                    ],
+                )
+            ]
+        )
+
+        data = sidecar.to_json_value()
+        parsed = t.WebEvidenceSidecar.from_json_value(data)
+
+        self.assertEqual(parsed.version, 1)
+        self.assertEqual(parsed.records[0].query, "discipline concept")
+        self.assertEqual(parsed.records[0].topic_hints, ["philosophy"])
+        self.assertEqual(parsed.records[0].results[0].domain, "wikipedia.org")
+        self.assertTrue(parsed.records[0].results[0].preferred_domain_hit)
 
     def test_batch_item_prunes_empty_values(self):
         item = t.LLMBatchItem(
@@ -527,6 +561,7 @@ class JsonProtocolTests(unittest.TestCase):
                         quiet=True,
                     ),
                 )
+            sidecar = t.load_web_evidence_sidecar(ctx.web_evidence_json)
 
         first_request = json.loads(calls[0]["messages"][1]["content"])
         self.assertIn("tavily_domain_preferences", first_request)
@@ -536,6 +571,11 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertNotIn("response_format", calls[0])
         self.assertIn("## 视频元信息", glossary)
         self.assertIn("corrected term", glossary)
+        self.assertEqual(len(sidecar.records), 1)
+        self.assertEqual(sidecar.records[0].query, "corrected term")
+        self.assertEqual(sidecar.records[0].topic_hints, ["anime"])
+        self.assertEqual(sidecar.records[0].results[0].url, "https://zh.wikipedia.org/wiki/Corrected")
+        self.assertEqual(sidecar.records[0].results[0].domain, "zh.wikipedia.org")
 
     def test_glossary_options_ignore_deprecated_tool_rounds_env(self):
         deprecated_env_key = "GLOSSARY_" + "TOOL_MAX_ROUNDS"
@@ -586,7 +626,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "tavily_search", side_effect=fake_tavily_search):
-                glossary = t.build_glossary_with_tools(
+                artifact = t.build_glossary_with_tools(
                     transcript,
                     ctx,
                     llm,
@@ -595,7 +635,7 @@ class JsonProtocolTests(unittest.TestCase):
 
         self.assertEqual([call["tool_choice"] for call in calls], ["auto", "auto", "none"])
         self.assertEqual(searched, ["retry term"])
-        self.assertIn("retry term", glossary)
+        self.assertIn("retry term", artifact.markdown)
 
     def test_build_glossary_tool_session_falls_back_when_query_budget_is_exhausted(self):
         calls = []
@@ -1073,6 +1113,45 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(retriever.calls[0][1], 8)
         self.assertTrue(any("TAVILY SEARCH QUERY JSON PROTOCOL" in prompt for prompt in prompts))
         self.assertTrue(any("MANDATORY GLOSSARY JSON PROTOCOL" in prompt for prompt in prompts))
+
+    def test_build_glossary_cache_backfills_missing_web_evidence_sidecar(self):
+        queries = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            with open(ctx.glossary, "w", encoding="utf-8") as f:
+                f.write("# 术语知识库\n\n- cached term：缓存术语")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "alpha topic")],
+            )
+
+            def fake_tavily_search(query, api_key, max_results=5, preferred_domains=None):
+                queries.append(query)
+                return [{"url": "https://example.com/evidence", "title": "Evidence", "content": "cached glossary evidence"}]
+
+            with patch.object(
+                t,
+                "build_tavily_search_plan",
+                return_value=t.TavilySearchPlan(queries=["discipline concept"], topic_hints=["philosophy"]),
+            ), patch.object(t, "tavily_search", side_effect=fake_tavily_search):
+                glossary = t.build_glossary(
+                    transcript,
+                    ctx,
+                    FakeProviderLLM(),
+                    t.GlossaryBuildOptions(tavily_key="tk", quiet=True),
+                )
+                sidecar = t.load_web_evidence_sidecar(ctx.web_evidence_json)
+
+        self.assertIn("cached term", glossary)
+        self.assertEqual(queries, ["discipline concept"])
+        self.assertEqual(len(sidecar.records), 1)
+        self.assertEqual(sidecar.records[0].query, "discipline concept")
+        self.assertEqual(sidecar.records[0].topic_hints, ["philosophy"])
+        self.assertEqual(sidecar.records[0].results[0].content, "cached glossary evidence")
 
     def test_tavily_query_agent_failure_still_returns_metadata_fallbacks(self):
         def fake_llm_json_once(llm, system_prompt, request, temperature=0.3, raw_label=None, disable_response_format=False):
@@ -2138,6 +2217,56 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(fake_store.ids, ["transcript:1", "glossary:1"])
         self.assertIn("原标题：Original Title", fake_store.documents[1].page_content)
 
+    def test_build_embedding_index_adds_web_evidence_chunks(self):
+        class FakeStore:
+            def __init__(self):
+                self.documents = []
+                self.ids = []
+
+            def add_documents(self, documents, ids):
+                self.documents = documents
+                self.ids = ids
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            sidecar = t.WebEvidenceSidecar(
+                records=[
+                    t.WebEvidenceRecord(
+                        query="discipline concept",
+                        topic_hints=["philosophy"],
+                        preferred_domains=["wikipedia.org"],
+                        search_stage="fallback",
+                        results=[
+                            t.WebEvidenceEntry(
+                                url="https://zh.wikipedia.org/wiki/Discipline",
+                                title="Discipline",
+                                content="Evidence text about discipline and terminology.",
+                                domain="zh.wikipedia.org",
+                                preferred_domain_hit=True,
+                                rank=1,
+                            )
+                        ],
+                    )
+                ]
+            )
+            t.write_web_evidence_sidecar(ctx, sidecar)
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "source")],
+            )
+            cfg = t.EmbeddingConfig(enabled=True, chroma_dir="index")
+            fake_store = FakeStore()
+
+            with patch.object(t, "open_chroma_store", return_value=fake_store):
+                t.build_embedding_index(transcript, cfg, {}, quiet=True, ctx=ctx)
+
+        self.assertEqual(fake_store.ids, ["transcript:1", "web_evidence:1"])
+        self.assertIn("discipline concept", fake_store.documents[1].page_content)
+        self.assertIn("https://zh.wikipedia.org/wiki/Discipline", fake_store.documents[1].metadata["context_text"])
+
     def test_build_embedding_index_clears_project_chunks_before_rebuild(self):
         class FakeStore:
             def __init__(self):
@@ -2163,6 +2292,24 @@ class JsonProtocolTests(unittest.TestCase):
 
         self.assertEqual(fake_store.deleted, ["transcript:1", "transcript:2"])
         self.assertEqual(fake_store.ids, ["transcript:1"])
+
+    def test_existing_embedding_chunk_ids_includes_web_evidence(self):
+        class FakeStore:
+            def get(self, include=None):
+                return {
+                    "ids": [
+                        "transcript:1",
+                        "glossary:1",
+                        "web_evidence:1",
+                        "translation_memory:1:1",
+                        "other:skip",
+                    ]
+                }
+
+        self.assertEqual(
+            t.existing_embedding_chunk_ids(FakeStore()),
+            ["transcript:1", "glossary:1", "web_evidence:1", "translation_memory:1:1"],
+        )
 
     def test_refresh_embedding_retriever_rebuilds_with_existing_glossary(self):
         calls = []
