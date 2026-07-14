@@ -1,6 +1,6 @@
 param(
     [Alias("u")]
-    [Parameter(Mandatory, Position = 0, HelpMessage = "YouTube video URL")]
+    [Parameter(Position = 0, HelpMessage = "YouTube video URL")]
     [string]$Url,
 
     [Alias("h")]
@@ -10,7 +10,7 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-if ($Help) {
+if ($Help -or (-not $Url)) {
     @"
 download.ps1 — 下载 YouTube 视频 + 元数据 (不含字幕生成)
 
@@ -19,10 +19,13 @@ download.ps1 — 下载 YouTube 视频 + 元数据 (不含字幕生成)
 
 说明:
   下载原片、缩略图 (PNG)、元数据、简介、标签。
-  然后保留 <标题>.original.<ext> 原片，并通过 CPU 默认解码 + yuv4mpegpipe 纯净帧流重编码出 <标题>.mp4 编辑版。
+  然后保留 <标题>.original.<ext> 原片，并重编码出 <标题>.mkv 编辑版。
   只负责下载和重编码，不运行 WhisperX。
 "@
-    exit 0
+    if ($Help) {
+        exit 0
+    }
+    exit 1
 }
 
 # ── 从 .env 读取配置 ─────────────────────────────────────────────────────────
@@ -35,96 +38,82 @@ function Resolve-AbsolutePath {
     return (Get-Item $Path).FullName
 }
 
-function Start-PipedNativeProcess {
+function Format-NativeCommand {
     param(
         [Parameter(Mandatory)][string]$FilePath,
-        [Parameter(Mandatory)][string[]]$Arguments,
-        [switch]$RedirectStdout,
-        [switch]$RedirectStdin
+        [Parameter(Mandatory)][string[]]$Arguments
     )
 
-    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $FilePath
-    foreach ($arg in $Arguments) {
-        [void]$psi.ArgumentList.Add([string]$arg)
+    $quoted = foreach ($arg in $Arguments) {
+        $text = [string]$arg
+        if ($text -match '[\s"`]') {
+            '"' + ($text -replace '"', '\"') + '"'
+        } else {
+            $text
+        }
     }
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $RedirectStdout.IsPresent
-    $psi.RedirectStandardInput = $RedirectStdin.IsPresent
-    $psi.CreateNoWindow = $true
 
-    $proc = [System.Diagnostics.Process]::new()
-    $proc.StartInfo = $psi
-    if (-not $proc.Start()) {
-        throw "Failed to start process: $FilePath"
-    }
-    return $proc
+    return ((@($FilePath) + @($quoted)) -join ' ').Trim()
 }
 
-function Stop-ProcessQuietly {
-    param([System.Diagnostics.Process]$Process)
-    if (-not $Process) {
-        return
-    }
+function Test-FfmpegEncoder {
+    param([Parameter(Mandatory)][string]$Name)
     try {
-        if (-not $Process.HasExited) {
-            $Process.Kill($true)
-        }
-    } catch {}
-    try {
-        $Process.Dispose()
-    } catch {}
-}
-
-function Invoke-FfmpegFramePipeAttempt {
-    param(
-        [Parameter(Mandatory)][string[]]$DecodeArgs,
-        [Parameter(Mandatory)][string[]]$EncodeArgs,
-        [Parameter(Mandatory)][string]$OutputPath,
-        [Parameter(Mandatory)][string]$Label
-    )
-
-    $decoder = $null
-    $encoder = $null
-    try {
-        if (Test-Path $OutputPath) {
-            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
-        }
-
-        Write-Host "尝试: $Label" -ForegroundColor DarkGray
-        $encoder = Start-PipedNativeProcess -FilePath $Ffmpeg -Arguments $EncodeArgs -RedirectStdin
-        $decoder = Start-PipedNativeProcess -FilePath $Ffmpeg -Arguments $DecodeArgs -RedirectStdout
-
-        $copyTask = $decoder.StandardOutput.BaseStream.CopyToAsync($encoder.StandardInput.BaseStream)
-        $decoder.WaitForExit()
-        $copyTask.GetAwaiter().GetResult()
-        $encoder.StandardInput.Close()
-        $encoder.WaitForExit()
-
-        if ($decoder.ExitCode -eq 0 -and $encoder.ExitCode -eq 0 -and (Test-Path $OutputPath)) {
-            return $true
-        }
-
-        Write-Host "Warning: 帧流重编码失败: decode=$($decoder.ExitCode), encode=$($encoder.ExitCode)" -ForegroundColor Yellow
-        if (Test-Path $OutputPath) {
-            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
-        }
-        return $false
+        $encoders = & $Ffmpeg -hide_banner -encoders 2>$null
+        return (($LASTEXITCODE -eq 0) -and (($encoders | Select-String -SimpleMatch $Name -Quiet) -eq $true))
     } catch {
-        Write-Host "Warning: 帧流重编码异常: $($_.Exception.Message)" -ForegroundColor Yellow
-        if (Test-Path $OutputPath) {
-            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
-        }
         return $false
-    } finally {
-        if ($decoder) {
-            try { $decoder.StandardOutput.Dispose() } catch {}
-        }
-        if ($encoder) {
-            try { $encoder.StandardInput.Dispose() } catch {}
-        }
-        Stop-ProcessQuietly $decoder
-        Stop-ProcessQuietly $encoder
+    }
+}
+
+function Test-NvidiaAvailable {
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if (-not $nvidiaSmi) {
+        return $false
+    }
+
+    try {
+        & $nvidiaSmi.Source -L *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function New-EditVideoReencodeArgs {
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)][string[]]$VideoArgs
+    )
+
+    return @(
+        '-hide_banner',
+        '-stats',
+        '-i', $InputPath,
+        '-pix_fmt', 'yuv420p'
+    ) + $VideoArgs + @(
+        '-filter_complex', '[0:a]aresample=async=1:out_sample_fmt=s16[aout]',
+        '-map', '0:v:0',
+        '-map', '[aout]',
+        '-c:a', 'flac',
+        '-map_metadata', '-1',
+        '-movflags', '+faststart',
+        '-y',
+        $OutputPath
+    )
+}
+
+function Test-NonEmptyFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        return (Get-Item -LiteralPath $Path).Length -gt 0
+    } catch {
+        return $false
     }
 }
 
@@ -139,76 +128,63 @@ function Invoke-EditVideoReencode {
     Write-Host "=============================================" -ForegroundColor Cyan
     Write-Host "原片: $InputPath" -ForegroundColor Gray
     Write-Host "编辑: $OutputPath" -ForegroundColor Gray
-    Write-Host "模式: CPU 默认解码出 yuv4mpegpipe 纯净帧流，再与原音频合并编码" -ForegroundColor Gray
+    Write-Host "模式: 优先 h264_nvenc；不可用时回退 libx264；音频统一 aresample s16 + flac" -ForegroundColor Gray
 
-    $decodeArgs = @(
-        '-hide_banner',
-        '-stats',
-        '-i', $InputPath,
-        '-map', '0:v:0',
-        '-f', 'yuv4mpegpipe',
-        '-'
-    )
+    if (Test-Path $OutputPath) {
+        Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+    }
 
-    $encodeAttempts = @(
-        @{
-            Name = 'NVENC encode + original audio'
-            Args = @(
-                '-hide_banner',
-                '-stats',
-                '-y',
-                '-fflags', '+genpts',
-                '-i', 'pipe:0',
-                '-i', $InputPath,
-                '-filter_complex', '[1:a]aresample=async=1:first_pts=0[aout]',
-                '-map', '0:v:0',
-                '-map', '[aout]',
-                '-pix_fmt', 'yuv420p',
-                '-c:v', 'hevc_nvenc',
-                '-preset', 'p5',
-                '-rc', 'vbr',
-                '-cq', '19',
-                '-b:v', '0',
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-movflags', '+faststart',
-                '-avoid_negative_ts', 'make_zero',
-                $OutputPath
-            )
-        },
-        @{
-            Name = 'libx264 encode + original audio'
-            Args = @(
-                '-hide_banner',
-                '-stats',
-                '-y',
-                '-fflags', '+genpts',
-                '-i', 'pipe:0',
-                '-i', $InputPath,
-                '-filter_complex', '[1:a]aresample=async=1:first_pts=0[aout]',
-                '-map', '0:v:0',
-                '-map', '[aout]',
-                '-pix_fmt', 'yuv420p',
-                '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '23',
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-movflags', '+faststart',
-                '-avoid_negative_ts', 'make_zero',
-                $OutputPath
+    $attempts = @()
+    if ((Test-NvidiaAvailable) -and (Test-FfmpegEncoder -Name 'h264_nvenc')) {
+        $attempts += @{
+            Name = 'h264_nvenc'
+            Args = New-EditVideoReencodeArgs -InputPath $InputPath -OutputPath $OutputPath -VideoArgs @(
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p7',
+                '-cq', '19'
             )
         }
-    )
+    } else {
+        Write-Host "跳过 h264_nvenc: 未检测到可用 NVIDIA GPU 或 ffmpeg h264_nvenc 编码器" -ForegroundColor Yellow
+    }
 
-    foreach ($encodeAttempt in $encodeAttempts) {
-        if (Invoke-FfmpegFramePipeAttempt -DecodeArgs $decodeArgs -EncodeArgs $encodeAttempt.Args -OutputPath $OutputPath -Label $encodeAttempt.Name) {
+    $attempts += @{
+        Name = 'libx264'
+        Args = New-EditVideoReencodeArgs -InputPath $InputPath -OutputPath $OutputPath -VideoArgs @(
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '19'
+        )
+    }
+
+    $lastExitCode = 1
+    foreach ($attempt in $attempts) {
+        if (Test-Path $OutputPath) {
+            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Host "尝试: $($attempt.Name)" -ForegroundColor DarkGray
+        [Console]::Error.WriteLine("ffmpeg cmd: $(Format-NativeCommand -FilePath $Ffmpeg -Arguments $attempt.Args)")
+        & $Ffmpeg @($attempt.Args)
+        $lastExitCode = $LASTEXITCODE
+        if ($lastExitCode -eq 0 -and (Test-Path $OutputPath)) {
             return
+        }
+
+        if ($attempt.Name -eq 'h264_nvenc' -and $lastExitCode -ne 0 -and (Test-NonEmptyFile -Path $OutputPath)) {
+            Write-Host "Warning: h264_nvenc 返回 exit=$lastExitCode，但已输出非 0B 文件，继续使用该文件" -ForegroundColor Yellow
+            return
+        }
+
+        Write-Host "Warning: $($attempt.Name) 重编码失败: exit=$lastExitCode" -ForegroundColor Yellow
+
+        if (Test-Path $OutputPath) {
+            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
         }
     }
 
-    Write-Host "Error: ffmpeg frame-pipe re-encode failed." -ForegroundColor Red
-    exit 1
+    Write-Host "Error: ffmpeg re-encode failed." -ForegroundColor Red
+    exit $lastExitCode
 }
 
 # ── 步骤 1: 获取视频标题并创建文件夹 ──────────────────────────────────────────
@@ -240,27 +216,52 @@ if (-not $FolderName) {
 Write-Host "视频下载目录: $FolderName" -ForegroundColor Gray
 
 New-Item -ItemType Directory -Force -Path $FolderName | Out-Null
+$ExistingOriginalMkv = Join-Path $FolderName "$FolderName.original.mkv"
+$HasExistingOriginalMkv = Test-Path $ExistingOriginalMkv -PathType Leaf
+if ($HasExistingOriginalMkv) {
+    Write-Host "发现已有原片: $ExistingOriginalMkv" -ForegroundColor Green
+    Write-Host "将跳过视频下载，仅补充 metadata / thumbnail / description / tags" -ForegroundColor Gray
+}
 
 # ── 步骤 2: 下载视频 + 元数据 ──────────────────────────────────────────────────
 
 Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "步骤 2: yt-dlp 下载视频、元数据及封面" -ForegroundColor Cyan
+if ($HasExistingOriginalMkv) {
+    Write-Host "步骤 2: yt-dlp 下载元数据及封面" -ForegroundColor Cyan
+} else {
+    Write-Host "步骤 2: yt-dlp 下载视频、元数据及封面" -ForegroundColor Cyan
+}
 Write-Host "=============================================" -ForegroundColor Cyan
 
-$YtdlArgs = @(
-    '-o', "$FolderName/$FolderName.%(ext)s",
-    '--cookies', 'cookies.txt',
-    '--embed-metadata',
-    '--embed-thumbnail',
-    '--write-thumbnail',
-    '--convert-thumbnails', 'png',
-    '--write-info-json',
-    '--write-description',
-    '--no-mtime',
-    '--sponsorblock-remove', 'sponsor,selfpromo',
-    '--print-to-file', 'tags', "$FolderName/${FolderName}.tags.txt",
-    $Url
-)
+if ($HasExistingOriginalMkv) {
+    $YtdlArgs = @(
+        '-o', "$FolderName/$FolderName.%(ext)s",
+        '--cookies', 'cookies.txt',
+        '--skip-download',
+        '--write-thumbnail',
+        '--convert-thumbnails', 'png',
+        '--write-info-json',
+        '--write-description',
+        '--no-mtime',
+        '--print-to-file', 'tags', "$FolderName/${FolderName}.tags.txt",
+        $Url
+    )
+} else {
+    $YtdlArgs = @(
+        '-o', "$FolderName/$FolderName.%(ext)s",
+        '--cookies', 'cookies.txt',
+        '--embed-metadata',
+        '--embed-thumbnail',
+        '--write-thumbnail',
+        '--convert-thumbnails', 'png',
+        '--write-info-json',
+        '--write-description',
+        '--no-mtime',
+        '--sponsorblock-remove', 'sponsor,selfpromo',
+        '--print-to-file', 'tags', "$FolderName/${FolderName}.tags.txt",
+        $Url
+    )
+}
 
 & $Ytdlp @YtdlArgs
 if ($LASTEXITCODE -ne 0) {
@@ -274,34 +275,40 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "步骤 3: 寻找下载好的视频文件" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 
-$VideoFile = $null
-foreach ($ext in @('mp4', 'mkv', 'webm', 'flv', 'avi')) {
-    $candidate = Join-Path $FolderName "$FolderName.$ext"
-    if (Test-Path $candidate) {
-        $VideoFile = $candidate
-        break
+$EditVideoPath = Join-Path $FolderName "$FolderName.mkv"
+if ($HasExistingOriginalMkv) {
+    $RenderVideoPath = $ExistingOriginalMkv
+    $RenderVideoAbs = Resolve-AbsolutePath $RenderVideoPath
+    Write-Host "使用已有原片: $RenderVideoPath" -ForegroundColor Green
+} else {
+    $VideoFile = $null
+    foreach ($ext in @('mp4', 'mkv', 'webm', 'flv', 'avi')) {
+        $candidate = Join-Path $FolderName "$FolderName.$ext"
+        if (Test-Path $candidate) {
+            $VideoFile = $candidate
+            break
+        }
     }
+
+    if (-not $VideoFile) {
+        Write-Host "Error: 未找到下载完成的视频文件!" -ForegroundColor Red
+        Write-Host "预期: $FolderName/$FolderName.<mp4|mkv|webm|...>" -ForegroundColor Gray
+        exit 1
+    }
+
+    Write-Host "成功定位视频文件: $VideoFile" -ForegroundColor Green
+
+    $OriginalVideoAbs = Resolve-AbsolutePath $VideoFile
+    $OriginalExt = [System.IO.Path]::GetExtension($OriginalVideoAbs)
+    $RenderVideoPath = Join-Path $FolderName "$FolderName.original$OriginalExt"
+
+    if (Test-Path $RenderVideoPath) {
+        Remove-Item $RenderVideoPath -Force
+    }
+    Move-Item -LiteralPath $OriginalVideoAbs -Destination $RenderVideoPath -Force
+    $RenderVideoAbs = Resolve-AbsolutePath $RenderVideoPath
 }
-
-if (-not $VideoFile) {
-    Write-Host "Error: 未找到下载完成的视频文件!" -ForegroundColor Red
-    Write-Host "预期: $FolderName/$FolderName.<mp4|mkv|webm|...>" -ForegroundColor Gray
-    exit 1
-}
-
-Write-Host "成功定位视频文件: $VideoFile" -ForegroundColor Green
-
-$OriginalVideoAbs = Resolve-AbsolutePath $VideoFile
-$OriginalExt = [System.IO.Path]::GetExtension($OriginalVideoAbs)
-$RenderVideoPath = Join-Path $FolderName "$FolderName.original$OriginalExt"
-$EditVideoPath = Join-Path $FolderName "$FolderName.mp4"
-
-if (Test-Path $RenderVideoPath) {
-    Remove-Item $RenderVideoPath -Force
-}
-Move-Item -LiteralPath $OriginalVideoAbs -Destination $RenderVideoPath -Force
-$RenderVideoAbs = Resolve-AbsolutePath $RenderVideoPath
-$EditVideoAbs = Join-Path (Resolve-Path $FolderName).Path "$FolderName.mp4"
+$EditVideoAbs = Join-Path (Resolve-Path $FolderName).Path "$FolderName.mkv"
 
 Invoke-EditVideoReencode -InputPath $RenderVideoAbs -OutputPath $EditVideoAbs
 

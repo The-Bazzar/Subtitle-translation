@@ -4,7 +4,7 @@
 
 ## Overview
 
-`download(original + edit mp4) -> whisper(json) -> beautify(json words) -> glossary -> translate -> split -> proofread -> ass -> burn`
+`download(original + edit mkv) -> whisper(json) -> beautify(json words) -> glossary -> translate -> split -> proofread -> ass -> burn`
 
 Windows 主机必须使用 PowerShell 7，旧版 Windows PowerShell 5.x 会导致 `.ps1` 脚本报错。升级命令：
 
@@ -60,8 +60,8 @@ winget install Microsoft.PowerShell
 
 ### Windows `pipeline.ps1`
 
-1. `download.ps1` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，把原片改名为 `<base>.original.<ext>`，并统一重编码出编辑用 `<base>.mp4`
-2. `whisper.ps1` 对编辑版 `<base>.mp4` 调用 WhisperX，只输出 `<base>.json`
+1. `download.ps1` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，把原片改名为 `<base>.original.<ext>`，并统一重编码出编辑用 `<base>.mkv`
+2. `whisper.ps1` 对编辑版 `<base>.mkv` 调用 WhisperX，只输出 `<base>.json`
 3. `translate_srt.py --only-beautify` 美化 JSON 中的 word 时间轴，输出 `<base>.beautified.json`
 4. `translate_srt.py --only-glossary` 在翻译前强制重新生成并覆盖 `glossary.md`
 5. `translate_srt.py` 整句翻译、AI 分割、词级对轴、split event 校对，输出最终字幕
@@ -74,7 +74,7 @@ winget install Microsoft.PowerShell
 ### Output Chain
 
 ```text
-<base>.original.<ext> + <base>.mp4 -> json -> beautified.json -> web_evidence.json + glossary.md
+<base>.original.<ext> + <base>.mkv -> json -> beautified.json -> web_evidence.json + glossary.md
       -> split.<source>.srt / split.<target>.srt
       -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass
       -> burned.mkv
@@ -87,11 +87,12 @@ winget install Microsoft.PowerShell
 ### download
 
 - 输出目录名和视频基名相同，视频路径形如 `<video_dir>/<video_dir>.<ext>`
-- 下载后会保留原片为 `<video_dir>/<video_dir>.original.<ext>`，并始终重编码生成编辑用 `<video_dir>/<video_dir>.mp4`
-- 脚本输出 `OUTPUT_VIDEO=<编辑版 mp4>` 和 `OUTPUT_RENDER_VIDEO=<原片>`；pipeline 前半段使用前者，burn 使用后者
+- 下载后会保留原片为 `<video_dir>/<video_dir>.original.<ext>`，并始终重编码生成编辑用 `<video_dir>/<video_dir>.mkv`
+- 如果 `<video_dir>/<video_dir>.original.mkv` 已存在，download 脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`，然后直接进入编辑版重编码
+- 脚本输出 `OUTPUT_VIDEO=<编辑版 mkv>` 和 `OUTPUT_RENDER_VIDEO=<原片>`；pipeline 前半段使用前者，burn 使用后者
 - 同步保存 `.png` 封面、`.info.json` 元数据、`.description` 简介、`.tags.txt` 标签
 - SponsorBlock 移除 `sponsor,selfpromo`
-- 下载后固定做一次时间戳抚平重编码：先用 CPU 默认解码把原视频画面解成 `yuv4mpegpipe` 纯净帧流，再与原音频回拼；优先尝试 `hevc_nvenc`，失败时回退 `libx264`
+- 下载后固定做一次时间戳抚平重编码：优先使用 `h264_nvenc -preset p7 -cq 19` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -preset fast -crf 19`；音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
 - `cookies.txt` 通过相对路径引用，必须在仓库根目录运行脚本
 - Windows 文件夹名会做 Unicode 标点和非法字符清理，避免引号、破折号等导致跨 Windows/WSL 路径乱码
 
@@ -175,7 +176,7 @@ ${TARGET_LANG_CODE}
 ### burn
 
 - pipeline 默认调用 ffmpeg ASS 滤镜硬压
-- pipeline 正常下载模式下，字幕编辑链路使用 `<base>.mp4`，最终硬压回到 `<base>.original.<ext>`
+- pipeline 正常下载模式下，字幕编辑链路使用 `<base>.mkv`，最终硬压回到 `<base>.original.<ext>`
 - `-SkipBurn` / `SKIP_BURN=1` / `PIPELINE_SKIP_BURN=1` 会跳过硬压
 - `BURN_RES` 指定输出分辨率时保持宽高比并补黑边
 - `ExistingAss` / `EXISTING_ASS` 可指定已有双语 ASS 跳过翻译，直接用于硬压

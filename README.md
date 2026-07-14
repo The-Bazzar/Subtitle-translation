@@ -55,8 +55,8 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 ## 主流程
 
-1. `download.ps1/.sh` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，然后把原片改名为 `<name>.original.<ext>`，并统一重编码出编辑用 `<name>.mp4`
-2. `whisper.ps1/.sh` 对编辑版 `<name>.mp4` 调用 `whisperx --output_format json`，输出 `<name>.json`
+1. `download.ps1/.sh` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，然后把原片改名为 `<name>.original.<ext>`，并统一重编码出编辑用 `<name>.mkv`
+2. `whisper.ps1/.sh` 对编辑版 `<name>.mkv` 调用 `whisperx --output_format json`，输出 `<name>.json`
 3. `translate_srt.py --only-beautify` 美化 JSON 里的 word 时间轴并回写 segment，输出 `<name>.beautified.json`、`<name>.scenes.json`、`<name>.scenechange.txt`
 4. `translate_srt.py --only-glossary` 读取整句 transcript 和元数据，重新生成并覆盖 `glossary.md`
 5. `translate_srt.py` 使用整句 JSON 翻译
@@ -66,7 +66,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 成果物链：
 
 ```text
-<name>.original.<ext> + <name>.mp4 -> <name>.json -> <name>.beautified.json
+<name>.original.<ext> + <name>.mkv -> <name>.json -> <name>.beautified.json
 -> <name>.web_evidence.json + glossary.md
 -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
 ```
@@ -190,7 +190,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 - 运行 pipeline 或任一 `.py` 相关脚本前必须先完成 setup；脚本统一使用项目 `.venv`，不调用全局 `python` / `python3`
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
-- `download.ps1/.sh` 会固定输出两条路径：`OUTPUT_VIDEO` 是编辑用 `<name>.mp4`，`OUTPUT_RENDER_VIDEO` 是保留给最终压制的 `<name>.original.<ext>`；编辑版会先用 CPU 默认解码成 `yuv4mpegpipe` 纯净帧流，再回拼原音频
+- `download.ps1/.sh` 会固定输出两条路径：`OUTPUT_VIDEO` 是编辑用 `<name>.mkv`，`OUTPUT_RENDER_VIDEO` 是保留给最终压制的 `<name>.original.<ext>`；若目录中已有 `<name>.original.mkv`，脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`，然后直接进入重编码。编辑版优先使用 `h264_nvenc` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264`，并统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建音频时间轴。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
 - 完整翻译流程必须配置 `TRANSLATE_PROVIDER`；只构建 glossary 时可改用 `GLOSSARY_PROVIDER`
 - WhisperX 首次运行会下载模型
 - 默认不硬压，推荐先人工校对 ASS，再决定是否压制
