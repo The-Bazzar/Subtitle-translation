@@ -1489,6 +1489,35 @@ JSON string rules:
 4. Encode line breaks inside the markdown string as `\\n`.
 5. No trailing commas."""
 
+_GLOSSARY_FINALIZER_FORMAT = """GLOSSARY FINALIZER PROTOCOL:
+Tool calls are not available in this stage. Do not request tools, write pseudo tool calls, or mention additional searches.
+Use only the user JSON, provided web_evidence, glossary context, and transcript context.
+Return the final glossary in exactly one of these machine-parseable formats:
+
+Preferred JSON:
+{"markdown": "# 术语知识库 - <title>\\n\\n## 背景\\n<content>\\n\\n## 核心术语\\n| 原文术语 | ${TARGET_LANG} 推荐译法 | 说明 |\\n|---|---|---|\\n| source term | recommended translation | reason |\\n\\n## 态度基调\\n- <content>\\n\\n## 关键论点\\n- <content>"}
+
+Fallback tagged Markdown, only if you cannot reliably emit valid JSON:
+<GLOSSARY_MARKDOWN>
+# 术语知识库 - <title>
+
+## 背景
+<content>
+
+## 核心术语
+| 原文术语 | ${TARGET_LANG} 推荐译法 | 说明 |
+|---|---|---|
+| source term | recommended translation | reason |
+
+## 态度基调
+- <content>
+
+## 关键论点
+- <content>
+</GLOSSARY_MARKDOWN>
+
+Do not add prose before or after the JSON object or the tagged Markdown block."""
+
 
 _TAVILY_QUERY_PROMPT = """You are a search-intent agent for a subtitle translation pipeline.
 Read the video metadata and transcript excerpt, then produce compact keyword queries that reveal the real topic, named entities, concepts, works, claims, and terminology discussed in the video.
@@ -1579,10 +1608,16 @@ def tavily_query_translate_system_prompt(ctx: TranscriptContext) -> str:
     )
 
 
-def glossary_system_prompt(ctx: TranscriptContext, retriever: EmbeddingRetriever | None) -> str:
+def glossary_base_prompt(ctx: TranscriptContext, retriever: EmbeddingRetriever | None) -> str:
     return (
         render_prompt_template(load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK), ctx)
         + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
+    )
+
+
+def glossary_system_prompt(ctx: TranscriptContext, retriever: EmbeddingRetriever | None) -> str:
+    return (
+        glossary_base_prompt(ctx, retriever)
         + "\n\n"
         + _JSON_FORMAT
         + "\n\n"
@@ -1590,6 +1625,10 @@ def glossary_system_prompt(ctx: TranscriptContext, retriever: EmbeddingRetriever
         + "\n\n"
         + render_prompt_template(_GLOSSARY_FORMAT, ctx)
     )
+
+
+def glossary_finalizer_system_prompt(ctx: TranscriptContext, retriever: EmbeddingRetriever | None) -> str:
+    return glossary_base_prompt(ctx, retriever) + "\n\n" + render_prompt_template(_GLOSSARY_FINALIZER_FORMAT, ctx)
 
 
 _PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
@@ -2967,6 +3006,110 @@ def build_glossary_request_fields(
     return request_fields
 
 
+def build_glossary_finalizer_request_fields(request_fields: dict, sidecar: WebEvidenceSidecar) -> dict:
+    fields = {
+        key: value
+        for key, value in request_fields.items()
+        if key not in {"tavily_domain_preferences", "tool_instructions"}
+    }
+    if sidecar.has_records():
+        fields["web_evidence"] = sidecar.to_json_value()
+    fields["finalization_instruction"] = (
+        "Search is complete or unavailable. Build the final glossary now; do not request more tools."
+    )
+    return fields
+
+
+def local_glossary_markdown_from_evidence(request_fields: dict, sidecar: WebEvidenceSidecar) -> str:
+    title = str(request_fields.get("title", "") or "").strip()
+    source_language = str(request_fields.get("source_language", "") or "").strip()
+    target_language = str(request_fields.get("target_language", "") or "").strip()
+    heading = "# 术语知识库" + (f" - {title}" if title else "")
+    lines = [
+        heading,
+        "",
+        "## 背景",
+        "- 远端模型未返回可解析的 glossary 格式；以下为本地根据已获取网页证据生成的保守草稿。",
+    ]
+    if source_language or target_language:
+        lines.append(f"- 语言方向：{source_language or '?'} -> {target_language or '?'}")
+    lines.extend(
+        [
+            "",
+            "## 核心术语",
+            "| 原文术语 | 推荐译法 | 说明 |",
+            "|---|---|---|",
+            "| (?) | (?) | 请根据下方网页证据人工补充和确认。 |",
+            "",
+            "## 态度基调",
+            "- 待人工根据视频内容补充。",
+            "",
+            "## 关键论点",
+            "- 待人工根据视频内容补充。",
+        ]
+    )
+    if sidecar.has_records():
+        lines.extend(["", "## 网页证据"])
+        for record in sidecar.records:
+            if not record.query or not record.results:
+                continue
+            lines.append(f"- Query: {record.query}")
+            for entry in record.results[:3]:
+                label = entry.title or entry.domain or entry.url
+                summary = re.sub(r"\s+", " ", entry.content).strip()[:300]
+                if entry.url:
+                    lines.append(f"  - {label}: {entry.url}")
+                if summary:
+                    lines.append(f"    - {summary}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def finalize_glossary_from_evidence(
+    request_fields: dict,
+    sidecar: WebEvidenceSidecar,
+    ctx: TranscriptContext,
+    llm: LLMConfig,
+    options: GlossaryBuildOptions,
+) -> GlossaryBuildArtifact:
+    request = LLMObjectRequest(build_glossary_finalizer_request_fields(request_fields, sidecar))
+    session = ChatSession(
+        llm,
+        glossary_finalizer_system_prompt(ctx, options.retriever),
+        temperature=0.3,
+        disable_response_format=True,
+    )
+    try:
+        content, glossary_output = session.ask_validated(
+            request.to_json_text(),
+            lambda value: GlossaryOutput.from_model_content(value),
+            retry_template=CompletionRetryTemplate(
+                attempts=3,
+                quiet=options.quiet,
+                label="Glossary finalizer",
+            ),
+            retry_feedback=lambda _answer, error, _attempt: (
+                "INVALID FORMAT. The previous response could not be parsed: "
+                f"{error}\n\n"
+                "Do not output <tool_call>, tool_calls, search requests, analysis prose, or markdown outside the allowed wrapper.\n"
+                "Return only one of these two formats:\n"
+                '1. A JSON object exactly like {"markdown": "..."}\n'
+                "2. A tagged markdown block exactly wrapped by <GLOSSARY_MARKDOWN> and </GLOSSARY_MARKDOWN>\n"
+                "Use the existing web_evidence in the previous user JSON. Do not ask for more search."
+            ),
+        )
+    except Exception as e:
+        if not options.quiet:
+            print(f"Warning: glossary finalizer failed; using local web-evidence draft: {e}", file=sys.stderr)
+        return GlossaryBuildArtifact(
+            markdown=local_glossary_markdown_from_evidence(request_fields, sidecar),
+            web_evidence=sidecar,
+        )
+    if not options.quiet:
+        print("build_glossary finalizer raw response:", file=sys.stderr)
+        print(content, file=sys.stderr)
+    return GlossaryBuildArtifact(markdown=glossary_output.markdown, web_evidence=sidecar)
+
+
 def build_glossary_with_tools(
     transcript: Transcript,
     ctx: TranscriptContext,
@@ -2981,17 +3124,16 @@ def build_glossary_with_tools(
         preferences=preferences,
         max_results=options.tavily_max_results,
     )
-    request = LLMObjectRequest(
-        build_glossary_request_fields(
-            transcript,
-            ctx,
-            GlossaryRequestArgs(
-                metadata_fields=metadata_fields,
-                retriever=options.retriever,
-                tavily_preferences=preferences,
-            ),
-        )
+    request_fields = build_glossary_request_fields(
+        transcript,
+        ctx,
+        GlossaryRequestArgs(
+            metadata_fields=metadata_fields,
+            retriever=options.retriever,
+            tavily_preferences=preferences,
+        ),
     )
+    request = LLMObjectRequest(request_fields)
     session = ChatSession(
         llm,
         glossary_system_prompt(ctx, options.retriever)
@@ -3081,10 +3223,18 @@ def build_glossary_with_tools(
         if not options.quiet:
             print("build_glossary raw response:", file=sys.stderr)
             print(content, file=sys.stderr)
-        return GlossaryBuildArtifact(
-            markdown=GlossaryOutput.from_json_content(content).markdown,
-            web_evidence=WebEvidenceSidecar(records=evidence_records),
-        )
+        sidecar = WebEvidenceSidecar(records=evidence_records)
+        if sidecar.has_records():
+            return finalize_glossary_from_evidence(request_fields, sidecar, ctx, llm, options)
+        try:
+            return GlossaryBuildArtifact(
+                markdown=GlossaryOutput.from_model_content(content).markdown,
+                web_evidence=sidecar,
+            )
+        except Exception as e:
+            if not options.quiet:
+                print(f"Glossary: final response was not parseable; using finalizer retry: {e}", file=sys.stderr)
+            return finalize_glossary_from_evidence(request_fields, sidecar, ctx, llm, options)
 
     raise RuntimeError("glossary tool session ended without final answer")
 
@@ -3505,6 +3655,23 @@ class GlossaryOutput:
         parsed = _extract_json_value(content)
         return GlossaryOutput.from_json_value(parsed)
 
+    @staticmethod
+    def from_model_content(content: str) -> "GlossaryOutput":
+        try:
+            return GlossaryOutput.from_json_content(content)
+        except Exception as json_error:
+            match = re.search(
+                r"<GLOSSARY_MARKDOWN>\s*(.*?)\s*</GLOSSARY_MARKDOWN>",
+                str(content or ""),
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not match:
+                raise json_error
+            markdown = match.group(1).strip()
+            if not markdown:
+                raise ValueError("glossary tagged markdown is empty")
+            return GlossaryOutput(markdown)
+
 
 @dataclass
 class CompletionRetryTemplate:
@@ -3573,11 +3740,13 @@ class ChatSession:
         content: str,
         validator=None,
         retry_template: Optional[CompletionRetryTemplate] = None,
+        retry_feedback=None,
     ):
         template = retry_template or CompletionRetryTemplate(attempts=1)
         self.messages.append({"role": "user", "content": content})
         last_error: Exception | None = None
         for attempt in range(template.normalized_attempts()):
+            answer: str | None = None
             try:
                 resp = self._create_once({})
                 answer = self._answer_from_response(resp)
@@ -3588,6 +3757,14 @@ class ChatSession:
                 last_error = e
                 if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
                     raise
+                if retry_feedback is not None and answer is not None:
+                    self.messages.append({"role": "assistant", "content": answer})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": str(retry_feedback(answer, e, attempt)),
+                        }
+                    )
                 self._wait_before_retry(template, attempt, e)
         raise RuntimeError(f"LLM completion failed: {last_error}")
 

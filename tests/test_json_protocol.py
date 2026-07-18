@@ -502,7 +502,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("Core terminology", captured["system_prompt"])
         self.assertIn("Key arguments", captured["system_prompt"])
 
-    def test_build_glossary_tool_session_executes_tavily_in_same_session(self):
+    def test_build_glossary_tool_session_collects_tavily_evidence_then_finalizes(self):
         calls = []
         searched = []
         llm = FakeChatLLM(
@@ -633,9 +633,171 @@ class JsonProtocolTests(unittest.TestCase):
                     t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
                 )
 
-        self.assertEqual([call["tool_choice"] for call in calls], ["auto", "auto", "none"])
+        self.assertEqual([call["tool_choice"] for call in calls[:3]], ["auto", "auto", "none"])
+        self.assertNotIn("tools", calls[3])
         self.assertEqual(searched, ["retry term"])
         self.assertIn("retry term", artifact.markdown)
+
+    def test_build_glossary_tool_session_finalizes_after_pseudo_tool_call_content(self):
+        calls = []
+        searched = []
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(tool_calls=[fake_tool_call("Klein-Gordon equation Chinese translation")]),
+                    finish_reason="tool_calls",
+                ),
+                FakeSDKResponse(
+                    FakeSDKMessage(
+                        content=(
+                            "Now I have sufficient evidence.<tool_call>tavily_search"
+                            "<arg_key>query</arg_key><arg_value>more search</arg_value></tool_call>"
+                        )
+                    )
+                ),
+                FakeSDKResponse(
+                    FakeSDKMessage(
+                        content=(
+                            "<GLOSSARY_MARKDOWN>\n"
+                            "# 术语知识库\n"
+                            "- Klein-Gordon equation：克莱因-戈尔登方程\n"
+                            "</GLOSSARY_MARKDOWN>"
+                        )
+                    )
+                ),
+            ],
+        )
+
+        def fake_tavily_search(query, api_key, max_results=5, preferred_domains=None):
+            searched.append(query)
+            return [{"url": "https://baike.baidu.com/item/example", "content": "克莱因-戈尔登方程证据"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[t.TranscriptSegment(1, 0.0, 1.0, "Klein Gordon source topic")],
+            )
+
+            with patch.object(t, "tavily_search", side_effect=fake_tavily_search):
+                artifact = t.build_glossary_with_tools(
+                    transcript,
+                    ctx,
+                    llm,
+                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                )
+
+        self.assertEqual(searched, ["Klein-Gordon equation Chinese translation"])
+        self.assertEqual([call.get("tool_choice") for call in calls[:2]], ["auto", "none"])
+        self.assertNotIn("tools", calls[2])
+        self.assertIn("web_evidence", json.loads(calls[2]["messages"][1]["content"]))
+        self.assertIn("Klein-Gordon equation", artifact.markdown)
+        self.assertEqual(len(artifact.web_evidence.records), 1)
+
+    def test_glossary_finalizer_retries_with_format_feedback(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                FakeSDKResponse(FakeSDKMessage(content="<tool_call>tavily_search</tool_call>")),
+                FakeSDKResponse(
+                    FakeSDKMessage(
+                        content=(
+                            "<GLOSSARY_MARKDOWN>\n"
+                            "# 术语知识库\n"
+                            "- retry：格式纠错后成功\n"
+                            "</GLOSSARY_MARKDOWN>"
+                        )
+                    )
+                ),
+            ],
+        )
+        request_fields = {
+            "title": "Video",
+            "source_language": "en",
+            "target_language": "zh",
+            "transcript_excerpt": "source topic",
+        }
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="retry",
+                    results=[t.WebEvidenceEntry(url="https://example.com", content="evidence")],
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            artifact = t.finalize_glossary_from_evidence(
+                request_fields,
+                sidecar,
+                ctx,
+                llm,
+                t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+            )
+
+        self.assertEqual(len(calls), 2)
+        retry_messages = calls[1]["messages"]
+        self.assertEqual(retry_messages[-1]["role"], "user")
+        self.assertIn("INVALID FORMAT", retry_messages[-1]["content"])
+        self.assertIn("Do not output <tool_call>", retry_messages[-1]["content"])
+        self.assertIn("格式纠错后成功", artifact.markdown)
+
+    def test_glossary_finalizer_falls_back_to_local_evidence_markdown(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                FakeSDKResponse(FakeSDKMessage(content="<tool_call>tavily_search</tool_call>")),
+                FakeSDKResponse(FakeSDKMessage(content="still not json <tool_call>more</tool_call>")),
+                FakeSDKResponse(FakeSDKMessage(content="plain prose without allowed wrapper")),
+            ],
+        )
+        request_fields = {
+            "title": "Physics Video",
+            "source_language": "en",
+            "target_language": "zh",
+            "transcript_excerpt": "Klein Gordon equation",
+        }
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="Klein-Gordon equation Chinese translation",
+                    preferred_domains=["baike.baidu.com"],
+                    results=[
+                        t.WebEvidenceEntry(
+                            url="https://baike.baidu.com/item/example",
+                            title="克莱因-戈尔登方程",
+                            content="克莱因-戈尔登方程是相对论性波动方程。",
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            open(json_path, "w", encoding="utf-8").close()
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            artifact = t.finalize_glossary_from_evidence(
+                request_fields,
+                sidecar,
+                ctx,
+                llm,
+                t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("## 网页证据", artifact.markdown)
+        self.assertIn("Klein-Gordon equation Chinese translation", artifact.markdown)
+        self.assertIn("克莱因-戈尔登方程", artifact.markdown)
 
     def test_build_glossary_tool_session_falls_back_when_query_budget_is_exhausted(self):
         calls = []
