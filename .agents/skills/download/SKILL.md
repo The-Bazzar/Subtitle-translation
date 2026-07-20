@@ -41,4 +41,4 @@ platform: Win + Linux
 - 需要 `cookies.txt` (YouTube 凭证, gitignored)
 - yt-dlp 从 `.env` 的 `YTDLP_PATH_WIN` / `YTDLP_PATH_LINUX` 读取
 - 如果输出目录中已有 `视频标题.original.mkv`，脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`，然后直接进入编辑版重编码
-- 下载后固定做一次时间戳抚平重编码：优先使用 `h264_nvenc -preset p7 -cq 19` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -preset fast -crf 19`；音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
+- 下载后固定做一次时间戳抚平重编码：优先使用 `h264_nvenc -cq 12` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -crf 12`；音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。

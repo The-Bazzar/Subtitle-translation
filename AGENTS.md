@@ -92,7 +92,7 @@ winget install Microsoft.PowerShell
 - 脚本输出 `OUTPUT_VIDEO=<编辑版 mkv>` 和 `OUTPUT_RENDER_VIDEO=<原片>`；pipeline 前半段使用前者，burn 使用后者
 - 同步保存 `.png` 封面、`.info.json` 元数据、`.description` 简介、`.tags.txt` 标签
 - SponsorBlock 移除 `sponsor,selfpromo`
-- 下载后固定做一次时间戳抚平重编码：优先使用 `h264_nvenc -preset p7 -cq 19` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -preset fast -crf 19`；音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
+- 下载后固定做一次时间戳抚平重编码：优先使用 `h264_nvenc -cq 12` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -crf 12`；音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
 - `cookies.txt` 通过相对路径引用，必须在仓库根目录运行脚本
 - Windows 文件夹名会做 Unicode 标点和非法字符清理，避免引号、破折号等导致跨 Windows/WSL 路径乱码
 

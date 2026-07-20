@@ -107,14 +107,14 @@ run_edit_reencode() {
     }
 
     if nvidia_available && ffmpeg_encoder_available "h264_nvenc"; then
-        if run_reencode_attempt "h264_nvenc" -c:v h264_nvenc -preset p7 -cq 19; then
+        if run_reencode_attempt "h264_nvenc" -c:v h264_nvenc -cq 12; then
             return 0
         fi
     else
         echo "跳过 h264_nvenc: 未检测到可用 NVIDIA GPU 或 ffmpeg h264_nvenc 编码器" >&2
     fi
 
-    if run_reencode_attempt "libx264" -c:v libx264 -preset fast -crf 19; then
+    if run_reencode_attempt "libx264" -c:v libx264 -crf 12; then
         return 0
     fi
 

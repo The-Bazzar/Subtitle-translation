@@ -140,8 +140,7 @@ function Invoke-EditVideoReencode {
             Name = 'h264_nvenc'
             Args = New-EditVideoReencodeArgs -InputPath $InputPath -OutputPath $OutputPath -VideoArgs @(
                 '-c:v', 'h264_nvenc',
-                '-preset', 'p7',
-                '-cq', '19'
+                '-cq', '12'
             )
         }
     } else {
@@ -152,8 +151,7 @@ function Invoke-EditVideoReencode {
         Name = 'libx264'
         Args = New-EditVideoReencodeArgs -InputPath $InputPath -OutputPath $OutputPath -VideoArgs @(
             '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '19'
+            '-crf', '12'
         )
     }
 
