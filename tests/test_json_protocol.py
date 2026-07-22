@@ -2818,8 +2818,9 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn(",bi-zh,,0,0,0,,目标行", target_ass)
         self.assertNotIn(",zh,,0,0,0,,目标行", target_ass)
         self.assertNotIn(",bi-en,,0,0,0,,source line", target_ass)
-        self.assertIn(",bi-en,,0,0,0,,source line", bilingual_ass)
-        self.assertIn(",bi-zh,,0,0,0,,目标行", bilingual_ass)
+        self.assertEqual(bilingual_ass.count("Dialogue:"), 1)
+        self.assertIn(",bi-zh,,0,0,0,,目标行\\N{\\rbi-en}source line", bilingual_ass)
+        self.assertNotIn(",bi-en,,0,0,0,,source line", bilingual_ass)
 
 
 if __name__ == "__main__":

@@ -4643,6 +4643,10 @@ def wrap_cjk(text: str, max_chars: int = 25) -> str:
     return ass_escape(text)
 
 
+def bilingual_ass_text(source_text: str, target_text: str) -> str:
+    return f"{ass_escape(target_text)}\\N{{\\rbi-en}}{ass_escape(source_text)}"
+
+
 def all_events(transcript: Transcript) -> list[SplitEvent]:
     events: list[SplitEvent] = []
     for seg in transcript.segments:
@@ -4660,13 +4664,12 @@ class AssTrack:
     wrap_text: bool = False
 
 
+ASS_BILINGUAL_STYLE = "bi-zh"
+
+
 ASS_OUTPUT_TRACKS: dict[AssOutputMode, tuple[AssTrack, ...]] = {
     AssOutputMode.SOURCE: (AssTrack("en", "bi-en"),),
     AssOutputMode.TARGET: (AssTrack("zh", "bi-zh", wrap_text=True),),
-    AssOutputMode.BILINGUAL: (
-        AssTrack("en", "bi-en"),
-        AssTrack("zh", "bi-zh", wrap_text=True),
-    ),
 }
 
 
@@ -4683,6 +4686,13 @@ def write_ass(
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(header)
         f.write(events_header)
+        if output_mode == AssOutputMode.BILINGUAL:
+            for event in events:
+                f.write(
+                    f"Dialogue: 0,{ass_time(event.start)},{ass_time(event.end)},"
+                    f"{ASS_BILINGUAL_STYLE},,0,0,0,,{bilingual_ass_text(event.en, event.zh)}\n"
+                )
+            return
         for track in ASS_OUTPUT_TRACKS[output_mode]:
             for event in events:
                 text = ass_escape(str(getattr(event, track.field_name)))
