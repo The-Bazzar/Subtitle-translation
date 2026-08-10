@@ -5,6 +5,8 @@ __pycache__
 providers.json
 tavily_domains.json
 cookies.txt
+models/
+llama-runtime/
 batch-result.txt
 proofread_prompt.md
 translate_prompt.md

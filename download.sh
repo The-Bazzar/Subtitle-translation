@@ -12,6 +12,7 @@
 # 环境变量:
 #   YTDLP_PATH_LINUX  yt-dlp 路径 (默认: yt-dlp)
 #   FFMPEG_PATH_LINUX ffmpeg 路径 (默认: ffmpeg)
+#   YTDLP_PROXY       yt-dlp HTTP/SOCKS 代理 (可选)
 # =============================================================================
 
 set -euo pipefail
@@ -21,6 +22,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 YTDLP="${YTDLP_PATH_LINUX:-yt-dlp}"
 FFMPEG="${FFMPEG_PATH_LINUX:-ffmpeg}"
 PYTHON_BIN="${PYTHON_PATH_LINUX:-$SCRIPT_DIR/.venv/bin/python}"
+YTDLP_PROXY="${YTDLP_PROXY:-}"
+YTDLP_PROXY_ARGS=()
+if [ -n "$YTDLP_PROXY" ]; then
+    YTDLP_PROXY_ARGS=(--proxy "$YTDLP_PROXY")
+    echo "yt-dlp proxy: $YTDLP_PROXY"
+fi
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "错误: Python venv not found. Run ./setup.sh first, or set PYTHON_PATH_LINUX." >&2
     exit 1
@@ -126,7 +133,7 @@ echo "============================================="
 echo "download — 步骤 1/3: 抓取视频标题"
 echo "============================================="
 
-VIDEO_TITLE=$($YTDLP --get-title "$URL")
+VIDEO_TITLE=$("$YTDLP" "${YTDLP_PROXY_ARGS[@]}" --get-title "$URL")
 FOLDER_NAME=$("$PYTHON_BIN" - "$VIDEO_TITLE" <<'PY'
 import re
 import sys
@@ -164,7 +171,7 @@ fi
 echo "============================================="
 
 if [ "$HAS_EXISTING_ORIGINAL_MKV" = true ]; then
-    $YTDLP -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
+    "$YTDLP" "${YTDLP_PROXY_ARGS[@]}" -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
         --cookies cookies.txt \
         --skip-download \
         --write-thumbnail \
@@ -175,7 +182,7 @@ if [ "$HAS_EXISTING_ORIGINAL_MKV" = true ]; then
         --print-to-file tags "$FOLDER_NAME/${FOLDER_NAME}.tags.txt" \
         "$URL"
 else
-    $YTDLP -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
+    "$YTDLP" "${YTDLP_PROXY_ARGS[@]}" -o "$FOLDER_NAME/$FOLDER_NAME.%(ext)s" \
         --cookies cookies.txt \
         --embed-metadata \
         --embed-thumbnail \

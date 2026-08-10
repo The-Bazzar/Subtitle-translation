@@ -271,6 +271,26 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(result.source_text, "corrected source")
         self.assertEqual(result.target_text, "corrected target")
 
+    def test_typed_translation_result_preserves_human_review_metadata(self):
+        result = t.LanguageTextResult.from_json_value(
+            {
+                "id": 3,
+                "zh": "自然译文",
+                "review": {
+                    "needs_human": True,
+                    "categories": ["pun"],
+                    "reasons": ["双关有两种合理解释"],
+                    "alternatives": ["备选译法"],
+                    "note": "确认笑点语境",
+                },
+            },
+            self.ctx,
+            require_source=False,
+        )
+        self.assertEqual(result.target_text, "自然译文")
+        self.assertEqual(result.review["categories"], ["pun"])
+        self.assertTrue(result.review["needs_human"])
+
     def test_typed_proofread_item_serializes_retrieved_context(self):
         item = t.make_pair_item(
             3,
@@ -288,6 +308,40 @@ class JsonProtocolTests(unittest.TestCase):
                 "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
             },
         )
+
+    def test_human_review_sidecar_contains_translation_and_proofread_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[
+                    t.TranscriptSegment(
+                        1,
+                        0.0,
+                        2.0,
+                        "source pun",
+                        translation="译文",
+                        review={"needs_human": True, "categories": ["pun"], "reasons": ["需确认双关"]},
+                        split_events=[
+                            t.SplitEvent(
+                                0.0,
+                                2.0,
+                                "source pun",
+                                "译文",
+                                {"needs_human": True, "categories": ["subtext"], "reasons": ["潜台词不确定"]},
+                            )
+                        ],
+                    )
+                ],
+            )
+            t.write_human_review_sidecar(ctx, transcript)
+            with open(ctx.review_json, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertEqual(payload["format"], "subtitle-human-review")
+            self.assertEqual(payload["items"][0]["translation_review"]["categories"], ["pun"])
+            self.assertEqual(payload["items"][0]["event_reviews"][0]["proofread_review"]["categories"], ["subtext"])
 
     def test_build_glossary_adds_retrieved_context(self):
         class FakeRetriever:
@@ -1889,6 +1943,7 @@ class JsonProtocolTests(unittest.TestCase):
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
+        self.assertEqual(deepseek["default_model"], "deepseek-v4-flash")
         self.assertNotIn("response_format", deepseek)
         self.assertEqual(
             deepseek["request_kwargs"]["response_format"],
@@ -1900,6 +1955,7 @@ class JsonProtocolTests(unittest.TestCase):
             gemini["request_kwargs"]["extra_body"]["extra_body"]["google"]["tools"],
             [{"google_search": {}}],
         )
+        self.assertEqual(providers["hy-mt2-local"]["url"], "http://127.0.0.1:8080/v1")
 
     def test_chat_session_empty_content_error_includes_provider_details(self):
         class FakeUsageDetails:

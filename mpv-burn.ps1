@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Position = 0, HelpMessage = "Video file path")]
     [string]$VideoPath,
 
@@ -34,7 +34,10 @@ param(
     [string[]]$MpvExtraArgs
 )
 
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$Utf8 = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = $Utf8
+[Console]::OutputEncoding = $Utf8
+$OutputEncoding = $Utf8
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 

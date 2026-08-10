@@ -191,6 +191,7 @@ ${TARGET_LANG_CODE}
 | `WHISPER_ALIGN_MODEL` | WhisperX 对齐模型，空则自动 |
 | `WHISPER_DEVICE` | `cuda` / `cpu`；留空则跟随 `TORCH_BACKEND` 自动推导 |
 | `HF_TOKEN` | Hugging Face token；用于提高 WhisperX/对齐模型下载速率限制，可留空 |
+| `HF_PROXY` | 可选的 Hugging Face 模型下载 HTTP/SOCKS 代理；空时复用 `YTDLP_PROXY` |
 | `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
 | `TRANSLATE_PROVIDER` | 翻译后端：`openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
@@ -210,6 +211,7 @@ ${TARGET_LANG_CODE}
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
 | `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` / `TAVILY_MAX_QUERIES` | glossary 联网搜索配置；`TAVILY_MAX_QUERIES` 在 tool-call 路径下是最大 Tavily tool 查询次数，在 fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily |
+| `YTDLP_PROXY` | 可选的 yt-dlp HTTP/SOCKS 代理，例如 `http://127.0.0.1:7897` |
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 

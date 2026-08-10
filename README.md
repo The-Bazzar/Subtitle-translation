@@ -101,10 +101,11 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 - `<name>.<target>.ass`：目标语言 ASS
 - `<name>.<source>-<target>.ass`：双语 ASS
 - `<name>.<target>.description`：目标语言简介
+- `<name>.human-review.json`：双语翻译/校对的不确定项、原因、备选译法和人工处理提示；不会写入字幕画面
 
 `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名，例如 `en`、`en-US`、`Japanese`、`Chinese Simplified`。输出文件后缀会通过 `langcodes` 规范为 ISO 639 代码，例如 `English -> en`、`Japanese -> ja`。未显式设置 `SOURCE_LANG` 时，脚本使用 WhisperX JSON 中的 `language`；`TARGET_LANG` 默认 `zh`。
 
-翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON object，顶层包含 `items` array，返回也必须是同形态 JSON object；`items` 内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。分割阶段默认给 pending segment 附带前后各 1 条 `context_before` / `context_after`，仅用于理解语义和节奏，远端只返回 pending item 本身；可用 `--split-context-window` 调整。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。`.beautified.json` 会用 `split_status` 记录状态：`ok` 为有效分割，`fallback` 为分割失败后整句回退且可重试，`unsplit` 为低于阈值或合法保留整句；`split_reason` 保存原因码，`split_reason_detail` 保存具体诊断文本。
+翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON object，顶层包含 `items` array，返回也必须是同形态 JSON object；`items` 内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。首译默认给每条 pending segment 附带前后各 2 条只读源文上下文，校对默认给每条 event 附带前后各 2 条双语上下文；分别可用 `TRANSLATE_CONTEXT_WINDOW` / `--translate-context-window` 和 `PROOFREAD_CONTEXT_WINDOW` / `--proofread-context-window` 调整。分割阶段默认给 pending segment 附带前后各 1 条 `context_before` / `context_after`，仅用于理解语义和节奏，远端只返回 pending item 本身；可用 `--split-context-window` 调整。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。`.beautified.json` 会用 `split_status` 记录状态：`ok` 为有效分割，`fallback` 为分割失败后整句回退且可重试，`unsplit` 为低于阈值或合法保留整句；`split_reason` 保存原因码，`split_reason_detail` 保存具体诊断文本。校对若有充分证据修正源文，会把修正前文本保存在 event 的 `original_en`，原始 WhisperX segment `text` 始终不变。
 
 默认模板以 1080p 双语观看为基准：`bi-zh` / `bg-bi-zh` 字号为 68，`bi-en` / `bg-bi-en` 字号为 44；AI 分割默认在源文超过 72 字符或 3.8 秒时触发。beautify 只负责词级时间轴吸附和边界修复，不再提供本地硬截整句参数。
 
@@ -130,10 +131,14 @@ DEEPSEEK_API_KEY=
 | `WHISPER_ALIGN_MODEL` | 对齐模型，空则自动选择 |
 | `WHISPER_DEVICE` | `cuda` / `cpu`；留空则跟随 `TORCH_BACKEND` 自动推导 |
 | `HF_TOKEN` | Hugging Face token；用于提高 WhisperX/对齐模型下载速率限制，可留空 |
+| `HF_PROXY` | 可选的 Hugging Face 模型下载 HTTP/SOCKS 代理；空时复用 `YTDLP_PROXY` |
 | `SOURCE_LANG` | 源语言标签；空则使用 WhisperX JSON language |
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
-| `TRANSLATE_PROVIDER` | 翻译后端，必填；可用 `openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
+| `TRANSLATE_PROVIDER` | 翻译后端，必填；可用 `openai` / `llama` / `hy-mt2-local` / `openrouter` / `deepseek` / `gemini` |
 | `TRANSLATE_MODEL` | 翻译模型，空则用 provider 默认 |
+| `TRANSLATE_BATCH_SIZE` | 首译批量；本地 Hy-MT2 默认 `8`，也可被 CLI `--batch-size` 覆盖 |
+| `TRANSLATE_CONTEXT_WINDOW` | 首译每条字幕前后注入的只读源文条数，默认 `2` |
+| `LOCAL_EVIDENCE_TOP_K` | embedding 关闭或不可用时，按当前字幕从 glossary/网页证据关键词召回的片段数，默认 `3` |
 | `GLOSSARY_PROVIDER` | 术语知识库构建后端；强烈建议使用可用范围内最顶级模型，空则复用翻译 provider |
 | `GLOSSARY_MODEL` | 术语知识库构建模型；负责搜索意图、ASR 纠错、背景归纳和译名决策，空则复用翻译模型或 provider 默认 |
 | `EMBEDDING_ENABLED` | `1/0` 控制是否用 LangChain + Chroma 构建 embedding 索引，为 glossary/description/translate/proofread 提供动态 `retrieved_context` |
@@ -145,9 +150,11 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD_MODEL` | 校对专用模型 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
+| `PROOFREAD_CONTEXT_WINDOW` | 校对每条字幕前后注入的双语事件数，默认 `2` |
 | `TAVILY_API_KEY` | glossary 联网搜索 |
 | `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限 |
 | `TAVILY_MAX_QUERIES` | glossary 联网搜索预算；tool-call 路径下是最大 Tavily tool 查询次数，fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily 搜索 |
+| `YTDLP_PROXY` | 可选的 yt-dlp HTTP/SOCKS 代理，例如 `http://127.0.0.1:7897` |
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 
@@ -155,15 +162,38 @@ DEEPSEEK_API_KEY=
 
 配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。
 
-如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且 Tavily 可用，脚本会补建 sidecar 而不重写 glossary。
+如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且 Tavily 可用，脚本会补建 sidecar，并重新把新证据融合进 glossary。缓存使用字幕、元数据、网页证据和 glossary 提示词的指纹；任一输入变化都会失效，避免“证据已搜到、旧术语表却继续命中”的陈旧缓存。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
+
+### 本地 Hy-MT2 首译 + DeepSeek V4 Flash 校对（Windows）
+
+项目支持用官方 `tencent/Hy-MT2-30B-A3B-GGUF` 的 `Q4_K_M` 文件作为本地首轮翻译，并把校对切换到 DeepSeek V4 Flash。当前默认本地端点是 `http://127.0.0.1:8080/v1`，启动脚本会使用 `llama-runtime` 下的 CUDA 12.4 `llama-server.exe`、RTX GPU offload、8192 context 和单并发。
+
+```powershell
+hf download tencent/Hy-MT2-30B-A3B-GGUF `
+  --include '*Q4_K_M*' `
+  --local-dir .\models\Hy-MT2-30B-A3B-GGUF `
+  --max-workers 1
+
+.\start-hy-mt2.ps1
+```
+
+保持本地服务窗口运行，并在另一个 PowerShell 中执行：
+
+```powershell
+.\pipeline.ps1 'https://www.youtube.com/watch?v=VIDEO_ID' -SkipBurn
+```
+
+对应配置为 `TRANSLATE_PROVIDER=hy-mt2-local`、`TRANSLATE_MODEL=Hy-MT2-30B-A3B-Q4_K_M`、`PROOFREAD_PROVIDER=deepseek`、`PROOFREAD_MODEL=deepseek-v4-flash`；术语知识库也默认使用 DeepSeek V4 Flash。显存不足时可先用 `.\start-hy-mt2.ps1 -ContextSize 4096 -GpuLayers 60`。
+
+首轮翻译和二轮校对都会检查 ASR、歧义、双关/谐音、meme/外网梗、文化引用、俗语、笑话、潜台词、风格和术语表遵从度。无法可靠判断时不会把标记塞进字幕，而是写入 `<name>.human-review.json`，供人工逐条确认。
 
 glossary tool 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；finalizer 首选返回 `{"markdown": "..."}` JSON object，若 provider 无法稳定输出 JSON，可返回 `<GLOSSARY_MARKDOWN>...</GLOSSARY_MARKDOWN>` 标签块。普通散文和伪 tool call 文本都会被拒绝并重试。
 
 Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 query / `topic_hints`、metadata 与 `tavily_domains.json` 中的全局百科域名、题材关键词和站点执行 `include_domains` 搜索；如果结果不足，再执行普通 Tavily 搜索；最终合并去重时会优先保留百科/知识库域名结果。`tavily_domains.json` 由 `tavily_domains.example.json` 初始化，用户可以自行添加题材、关键词和站点。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会额外保存 `glossary.md` 项目知识、`web_evidence.json` 网页证据、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签；`web_evidence:*` chunk 来自 `<name>.web_evidence.json` 中的规范化 Tavily 结果，保留 query、域名、标题、URL 和证据摘要。索引会自动按 Markdown 标题切分 glossary；transcript chunk 使用干净字幕文本建向量，但返回给 LLM 的 retrieved context 会带 segment 时间码，并按末尾时间窗口自动 overlap，避免长视频上下文断裂。重建索引前会清理当前项目旧 chunk，避免残留结果污染检索。
+`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt。即使 `EMBEDDING_ENABLED=0`，脚本也会针对当前字幕从 glossary 和 `web_evidence.json` 做本地关键词召回，把精确专名及网页证据作为 `retrieved_context` 注入，不需要额外 embedding API。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引还会保存源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk，并用语义检索替代关键词回退。校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签；`web_evidence:*` chunk 来自 `<name>.web_evidence.json` 中的规范化 Tavily 结果，保留 query、域名、标题、URL 和证据摘要。索引会自动按 Markdown 标题切分 glossary；transcript chunk 使用干净字幕文本建向量，但返回给 LLM 的 retrieved context 会带 segment 时间码，并按末尾时间窗口自动 overlap，避免长视频上下文断裂。重建索引前会清理当前项目旧 chunk，避免残留结果污染检索。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 

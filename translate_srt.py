@@ -12,6 +12,7 @@ sentences back onto the timeline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, Protocol
 from urllib.parse import urlparse
 
 import langcodes
@@ -118,6 +119,8 @@ class SplitEvent:
     end: float
     en: str
     zh: str
+    review: dict = field(default_factory=dict)
+    original_en: str = ""
 
     @staticmethod
     def from_json(data: dict) -> "SplitEvent":
@@ -126,15 +129,22 @@ class SplitEvent:
             end=float(data.get("end", 0.0)),
             en=str(data.get("en", "")),
             zh=str(data.get("zh", "")),
+            review=normalize_review_metadata(data.get("review", {})),
+            original_en=str(data.get("original_en", "")).strip(),
         )
 
     def to_json(self) -> dict:
-        return {
+        data = {
             "start": round(self.start, 3),
             "end": round(self.end, 3),
             "en": self.en,
             "zh": self.zh,
         }
+        if self.review:
+            data["review"] = self.review
+        if self.original_en and self.original_en != self.en:
+            data["original_en"] = self.original_en
+        return data
 
 
 @dataclass
@@ -152,6 +162,7 @@ class TranscriptSegment:
     split_reason_detail: str = ""
     original_start: Optional[float] = None
     original_end: Optional[float] = None
+    review: dict = field(default_factory=dict)
 
     @staticmethod
     def from_json(index: int, data: dict) -> "TranscriptSegment":
@@ -173,6 +184,7 @@ class TranscriptSegment:
             words=words,
             proofread_text=str(data.get("proofread_text", "")).strip(),
             translation=str(data.get("translation", "")).strip(),
+            review=normalize_review_metadata(data.get("review", {})),
             split_events=events,
             split_status=SplitStatus.normalize(str(data.get("split_status", ""))),
             split_reason=SplitReason.normalize(str(data.get("split_reason", ""))),
@@ -203,6 +215,8 @@ class TranscriptSegment:
             data["proofread_text"] = self.proofread_text
         if self.translation:
             data["translation"] = self.translation
+        if self.review:
+            data["review"] = self.review
         if self.split_events:
             data["split_events"] = [e.to_json() for e in self.split_events]
         if self.split_status:
@@ -267,6 +281,8 @@ class TranscriptContext:
     scenes_json: str
     scenechange_txt: str
     web_evidence_json: str
+    glossary_cache_json: str
+    review_json: str
 
     @staticmethod
     def from_json(
@@ -303,6 +319,8 @@ class TranscriptContext:
             scenes_json=os.path.join(directory, f"{base}.scenes.json"),
             scenechange_txt=os.path.join(directory, f"{base}.scenechange.txt"),
             web_evidence_json=os.path.join(directory, f"{base}.web_evidence.json"),
+            glossary_cache_json=os.path.join(directory, f"{base}.glossary-cache.json"),
+            review_json=os.path.join(directory, f"{base}.human-review.json"),
         )
 
 
@@ -612,6 +630,93 @@ class EmbeddingRetriever:
             documents_to_retrieved_context(self.vector_store.similarity_search(text, k=limit))
             for text in clean_texts
         ]
+
+
+class ContextRetriever(Protocol):
+    def retrieve_texts(self, texts: list[str], top_k: Optional[int] = None) -> list[list[dict]]:
+        ...
+
+
+def lexical_terms(text: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    stopwords = {
+        "the", "and", "for", "that", "this", "with", "from", "into", "your", "you", "are", "was",
+        "were", "have", "has", "had", "can", "could", "would", "should", "will", "just", "some",
+        "something", "thing", "things", "what", "when", "where", "which", "while", "about", "after",
+        "before", "through", "then", "than", "them", "they", "their", "there", "here", "also", "only",
+        "more", "most", "much", "very", "really", "attempt", "enough", "find", "make", "made",
+    }
+    latin = {
+        token
+        for token in re.findall(r"[\w'-]+", normalized, flags=re.UNICODE)
+        if len(token) >= 3 and token not in stopwords
+    }
+    cjk_runs = re.findall(r"[\u3400-\u9fff]+", normalized)
+    cjk = {
+        run[start : start + size]
+        for run in cjk_runs
+        for size in (2, 3, 4)
+        for start in range(0, max(0, len(run) - size + 1))
+    }
+    return latin | cjk
+
+
+class LexicalEvidenceRetriever:
+    """Dependency-free fallback for exact terms when embeddings are disabled."""
+
+    def __init__(self, chunks: list[EmbeddingChunk], top_k: int = 3):
+        self.chunks = list(chunks)
+        self.top_k = max(1, int(top_k or 1))
+        self._terms = [lexical_terms(chunk.text + "\n" + (chunk.context_text or "")) for chunk in chunks]
+        self._document_frequency: dict[str, int] = {}
+        for terms in self._terms:
+            for term in terms:
+                self._document_frequency[term] = self._document_frequency.get(term, 0) + 1
+
+    def retrieve_texts(self, texts: list[str], top_k: Optional[int] = None) -> list[list[dict]]:
+        limit = max(1, int(top_k or self.top_k))
+        results: list[list[dict]] = []
+        for query in texts:
+            query_clean = unicodedata.normalize("NFKC", str(query or "")).casefold().strip()
+            query_terms = lexical_terms(query_clean)
+            ranked: list[tuple[float, int, EmbeddingChunk]] = []
+            for position, (chunk, chunk_terms) in enumerate(zip(self.chunks, self._terms)):
+                overlap = query_terms & chunk_terms
+                if not overlap:
+                    continue
+                score = 0.0
+                for term in overlap:
+                    rarity = math.log((len(self.chunks) + 1) / (self._document_frequency.get(term, 0) + 1)) + 1.0
+                    score += (1.0 + min(len(term), 20) / 4.0) * rarity
+                    if len(term) >= 8:
+                        score += (len(term) / 2.0) * rarity
+                haystack = unicodedata.normalize(
+                    "NFKC", chunk.text + "\n" + (chunk.context_text or "")
+                ).casefold()
+                exact_terms = [term for term in query_terms if len(term) >= 4 and term in haystack]
+                score += sum(min(len(term), 20) / 2.0 for term in exact_terms)
+                if chunk.source == "glossary":
+                    score += 4.0
+                    for term in exact_terms:
+                        if re.search(rf"\|\s*{re.escape(term)}\s*\|", haystack, flags=re.IGNORECASE):
+                            score += 30.0
+                if query_clean and len(query_clean) >= 4 and query_clean in haystack:
+                    score += 8.0
+                ranked.append((score, position, chunk))
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            results.append(
+                documents_to_retrieved_context([chunk.to_document() for _, _, chunk in ranked[:limit]])
+            )
+        return results
+
+
+def build_local_evidence_retriever(
+    ctx: TranscriptContext,
+    chunk_chars: int = 800,
+    top_k: int = 3,
+) -> LexicalEvidenceRetriever | None:
+    chunks = [*build_glossary_chunks(ctx, chunk_chars), *build_web_evidence_chunks(ctx, chunk_chars)]
+    return LexicalEvidenceRetriever(chunks, top_k=top_k) if chunks else None
 
 
 def documents_to_retrieved_context(documents: list[Document]) -> list[dict]:
@@ -935,7 +1040,7 @@ def build_web_evidence_chunks(ctx: TranscriptContext, chunk_chars: int) -> list[
                     "query": record.query,
                     "search_stage": record.search_stage,
                 },
-                context_text=context_text,
+                context_text=context_text[: max_chars * 2].rstrip(),
             )
         )
     return chunks
@@ -1294,6 +1399,13 @@ _BUILTIN_PROVIDERS = {
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},
     },
+    "hy-mt2-local": {
+        "url": "http://127.0.0.1:8080/v1",
+        "default_model": "Hy-MT2-30B-A3B-Q4_K_M",
+        "env_key": "OLLAMA_API_KEY",
+        "auth_header": "Bearer {api_key}",
+        "extra_headers": {},
+    },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1",
         "default_model": "anthropic/claude-sonnet-4-6",
@@ -1306,7 +1418,7 @@ _BUILTIN_PROVIDERS = {
     },
     "deepseek": {
         "url": "https://api.deepseek.com",
-        "default_model": "deepseek-v4-pro",
+        "default_model": "deepseek-v4-flash",
         "env_key": "DEEPSEEK_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},
@@ -1338,32 +1450,50 @@ _BUILTIN_PROVIDERS = {
 
 _providers_cache = None
 
-_TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
+_TRANSLATE_PROMPT_FALLBACK = """You are the first-pass translator in a high-precision subtitle pipeline. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
 
-Rules:
-- The user message is a JSON object with an "items" array of transcript segment objects.
-- Translate each item object to natural, fluent ${TARGET_LANG} subtitles.
-- The input items are complete transcript sentences/segments, not subtitle fragments.
-- Preserve meaning and tone. Do not omit, merge, split, or add items.
-- Keep proper nouns, brand names, and technical terms in original form unless a standard ${TARGET_LANG} translation exists.
-- Follow natural subtitle formatting for ${TARGET_LANG}."""
+The input contains transcript segments. A segment may be a complete sentence or a clause continuing into a neighbor. Translate the speaker's meaning, intent, register, humor, and implied meaning — not the source-language word order or syntax. If the current item is syntactically unfinished, keep the target naturally unfinished so it joins the next subtitle; never invent a conclusion to make one item self-contained. The target must sound like something a native ${TARGET_LANG} speaker would actually say in subtitles.
 
-_PROOFREAD_PROMPT_FALLBACK = """You are a bilingual subtitle proofreader. Review each already-split ${SOURCE_LANG}/${TARGET_LANG} subtitle event and fix both languages.
+Continuation example: current `I think to joke about these things`, context_after `carries...` -> translate only the unfinished idea (`我觉得 拿这些事开玩笑` in Chinese), never an invented conclusion such as `挺好`.
 
-Step 1 - Check the source-language text for ASR errors:
-- Homophone confusion, garbled terms, missing negation, obvious grammar breaks.
-- If the glossary or retrieved_context explicitly identifies a source-language ASR error, apply that correction to the source-language text.
-- Treat glossary corrections for proper names, titles, quotes, and terminology as stronger evidence than the WhisperX ASR text.
-- Fix only errors that affect correctness or readability.
-- Keep the original source-language sentence structure and word order. Do not rewrite, paraphrase, merge, split, or reorder source text.
-- Source-language edits should normally be single-word or short-phrase ASR corrections so word-level timing remains traceable.
+Translation priorities:
+1. Preserve factual meaning, scope, negation, agency, tense, modality, and relationships.
+2. Prefer natural ${TARGET_LANG} syntax and idiomatic phrasing over a word-for-word or source-shaped translation. Do not preserve source syntax when it creates translationese.
+3. Preserve voice, register, sarcasm, deadpan delivery, profanity level, irony, jokes, and subtext.
+4. Follow the glossary exactly for approved names, terminology, recurring translations, and style decisions. If a glossary entry conflicts with clear context, keep the best translation and flag the conflict.
+4a. Preserve on-screen UI labels, skill checks, status messages, menu text, and title cards as compact functional text; do not rewrite them as spoken dialogue.
+5. Investigate mentally whether a phrase contains ambiguity, a pun, wordplay, homophone, rhyme, meme, internet slang, cultural reference, idiom, proverb, quotation, proper-name allusion, or joke. Do not flatten these into a literal translation.
+6. For wordplay that cannot survive in ${TARGET_LANG}, choose the closest functional effect. Keep the meaning and comedic/rhetorical function, and flag the trade-off for a human.
+7. Use surrounding transcript items and retrieved_context only as context. Never invent facts or silently resolve an uncertainty that materially changes interpretation.
 
-Step 2 - Check the ${TARGET_LANG} translation against the corrected source:
-- Fix mistranslations, omissions, added content, awkward phrasing, and tone mismatches.
-- Follow the glossary if provided.
-- Follow natural subtitle formatting for ${TARGET_LANG}.
+Human-review policy:
+- Mark review.needs_human=true whenever two or more interpretations remain plausible, a pun/meme/cultural reference may be missed, the source may contain an ASR error, the glossary is insufficient or conflicting, a joke/subtext depends on outside knowledge, or the translation requires a meaningful localization trade-off.
+- In review.categories use concise labels such as ambiguous_semantics, wordplay, pun, homophone, meme, cultural_reference, idiom, joke, subtext, style, terminology, source_ASR, or other.
+- In review.reasons explain the concrete risk in ${TARGET_LANG}; in review.alternatives give up to two plausible alternatives when useful; in review.note record the decision or missing context. Do not flag routine, clear lines.
+- Review metadata is for a human sidecar and must never be appended to the subtitle text.
 
-Do not merge, split, reorder, add, or remove events. Timing has already been aligned and must not be changed."""
+Do not omit, merge, split, reorder, or add transcript items. Preserve every item id. Follow natural subtitle punctuation and formatting for ${TARGET_LANG}; for Simplified Chinese, avoid sentence-final full stops/commas, avoid English-shaped syntax, and use native Chinese spacing and punctuation."""
+
+_PROOFREAD_PROMPT_FALLBACK = """You are the independent second-pass bilingual subtitle editor. Audit each already-split ${SOURCE_LANG}/${TARGET_LANG} event against the source, glossary, context, and any first-pass translation_review. Do not assume the first translation is correct.
+
+Source-language audit:
+- Correct only clear WhisperX/ASR problems: homophones, garbled words, wrong word boundaries, missing negation, proper names, quotations, brands, and technical terms.
+- Use glossary and retrieved_context as evidence, but do not invent a correction. If the source remains uncertain, keep the least-invasive readable source and flag it.
+- Preserve the source event's words, order, and approximate structure; do not rewrite, paraphrase, merge, split, or reorder events because timing is already aligned.
+
+Target-language audit:
+- Compare meaning and pragmatics, not surface word alignment. Catch mistranslation, omission, addition, scope/negation errors, wrong agency, tense/modality, and incorrect referents.
+- Remove translationese: rewrite into natural ${TARGET_LANG} syntax and spoken subtitle phrasing instead of copying source syntax.
+- Check puns, wordplay, homophones, rhyme, memes, internet slang, cultural references, idioms, proverbs, jokes, sarcasm, irony, subtext, and multiple plausible readings. Preserve the intended effect when possible; never silently replace an uncertain interpretation.
+- Check voice, register, humor, profanity, politeness, rhythm, and style consistency. Follow the glossary exactly unless it conflicts with clear context, then flag the conflict.
+- Preserve on-screen UI labels, skill checks, status messages, menu text, and title cards as compact functional text rather than dialogue.
+- For Simplified Chinese, use native Chinese collocation and punctuation; do not use English-shaped sentence-final periods/commas or stiff literal phrasing.
+
+Human-review policy:
+- Preserve a first-pass review concern if it is still relevant. Add review.needs_human=true for unresolved ambiguity or any material trade-off involving wordplay, memes, culture, jokes, subtext, ASR, terminology, or style.
+- Give concise review.categories, review.reasons, review.alternatives (up to two), and review.note. Do not put review text inside the subtitle.
+
+Do not merge, split, reorder, add, or remove events. Timing must not change."""
 
 _SPLIT_PROMPT_FALLBACK = r"""Style preference:
 - Split only at natural pause points such as commas, clause boundaries, conjunctions, and breath groups.
@@ -1401,6 +1531,11 @@ Some input items may include a "retrieved_context" array from the same project m
 Use it only for terminology, names, recurring concepts, tone, and local consistency.
 Do not output, translate, proofread, split, merge, or return retrieved_context items themselves."""
 
+_NEIGHBOR_CONTEXT_RULES = """NEIGHBOR CONTEXT:
+Input items may include "context_before" and "context_after" arrays in chronological order.
+Use them to resolve references, speaker intent, register, running jokes, terminology, and discourse continuity.
+Translate or proofread only the current item's own language fields. Never emit, renumber, merge, or rewrite context items."""
+
 _PROOFREAD_ASR_CONTEXT_RULES = """PROOFREAD ASR CORRECTION PRIORITY:
 If the glossary or retrieved_context identifies a source-language ASR error, you must apply that correction to the source-language field.
 This applies especially to proper names, work titles, technical terms, quotes, and domain-specific terminology.
@@ -1409,13 +1544,14 @@ Keep the source sentence structure and timing-aligned event count unchanged; cor
 
 _TRANSLATE_FORMAT = """
 TRANSLATION RESPONSE FORMAT:
-Return exactly these keys in each "items" object: "id", "${TARGET_LANG_CODE}".
+Return exactly these keys in each "items" object: "id", "${TARGET_LANG_CODE}", "review".
 "${TARGET_LANG_CODE}" is the ${TARGET_LANG} translation string.
+"review" is an object with "needs_human" (boolean), "categories" (array), "reasons" (array), "alternatives" (array), and "note" (string). Use empty arrays/string and false when no review is needed.
 
 GOOD:
 {"items": [
-  {"id": 1, "${TARGET_LANG_CODE}": "<target translation>"},
-  {"id": 2, "${TARGET_LANG_CODE}": "<target translation>"}
+  {"id": 1, "${TARGET_LANG_CODE}": "<target translation>", "review": {"needs_human": false, "categories": [], "reasons": [], "alternatives": [], "note": ""}},
+  {"id": 2, "${TARGET_LANG_CODE}": "<target translation>", "review": {"needs_human": true, "categories": ["wordplay"], "reasons": ["The source pun has two plausible readings"], "alternatives": ["<alternative>"], "note": "Human should verify the intended joke"}}
 ]}
 
 The placeholder values above are format markers only. In your actual response, replace them with translated text."""
@@ -1530,6 +1666,7 @@ Rules:
 - If a correction is uncertain, prefer a broader canonical concept query over the dubious ASR wording; include only one uncertain correction at most.
 - Compress long spoken ideas into search keywords. Do not copy full transcript sentences, subtitle lines, filler speech, or rhetorical questions as queries.
 - Prefer concrete concepts, named entities, works, quotes, technical terms, and distinctive claims.
+- If source_term_candidates is present, inspect it for rare source terms whose canonical target-language name or domain-specific translation needs verification. Do not blindly search every candidate.
 - Each query should normally contain 2 to 6 important words or named entities, not a complete sentence.
 - Each query should cover one distinct search angle: person/work, technical term, historical background, core claim, quote/source, or domain-specific concept.
 - Do not create near-duplicates, paraphrases of the same query, or multiple queries that only change function words.
@@ -1632,10 +1769,11 @@ def glossary_finalizer_system_prompt(ctx: TranscriptContext, retriever: Embeddin
 
 
 _PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
-Return exactly these keys in each "items" object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}".
+Return exactly these keys in each "items" object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}", "review".
+"review" is an object with "needs_human" (boolean), "categories" (array), "reasons" (array), "alternatives" (array), and "note" (string). Preserve relevant first-pass concerns and add unresolved issues; use false/empty values when no human review is needed.
 {"items": [
-  {"id": 1, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>"},
-  {"id": 2, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>"}
+  {"id": 1, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>", "review": {"needs_human": false, "categories": [], "reasons": [], "alternatives": [], "note": ""}},
+  {"id": 2, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>", "review": {"needs_human": true, "categories": ["ambiguous_semantics"], "reasons": ["<concrete unresolved issue>"], "alternatives": ["<alternative>"], "note": "<human action>"}}
 ]}
 
 The placeholder values above are format markers only. In your actual response, replace them with corrected text from the provided subtitle events.
@@ -2100,7 +2238,34 @@ def load_glossary(glossary_path: str) -> str:
 
 
 def load_glossary_prompt_context(glossary_path: str, retriever: EmbeddingRetriever | None) -> str:
-    return load_glossary(glossary_path)
+    if retriever is None:
+        return load_glossary(glossary_path)
+    if not glossary_path or not os.path.isfile(glossary_path):
+        return ""
+    try:
+        content = _read_text_file(glossary_path).strip()
+    except OSError:
+        return ""
+    if not content:
+        return ""
+    if len(content) <= 5000:
+        return load_glossary(glossary_path)
+    priority_terms = ("视频元信息", "背景", "态度基调", "风格", "关键论点", "人物", "受众")
+    sections = [
+        "\n".join(lines).strip()
+        for heading, lines in split_markdown_sections(content)
+        if any(term in heading for term in priority_terms)
+    ]
+    compact = "\n\n".join(section for section in sections if section).strip()
+    if not compact:
+        compact = content[:5000].rstrip()
+    elif len(compact) > 5000:
+        compact = compact[:5000].rstrip()
+    return (
+        "\n\n以下是本视频术语知识库的全局背景与风格摘要。具体术语会按当前字幕通过 retrieved_context 注入；"
+        "两者冲突时优先采用证据更明确的具体术语:\n\n"
+        + compact
+    )
 
 
 def read_video_metadata_fields(ctx: TranscriptContext) -> dict:
@@ -2258,6 +2423,53 @@ def write_glossary_file(ctx: TranscriptContext, glossary: str) -> str:
         f.write(clean_glossary)
         f.write("\n")
     return clean_glossary
+
+
+GLOSSARY_CACHE_VERSION = 3
+
+
+def glossary_cache_fingerprint(
+    transcript: Transcript,
+    ctx: TranscriptContext,
+    metadata_fields: dict,
+    sidecar: WebEvidenceSidecar,
+) -> str:
+    payload = {
+        "version": GLOSSARY_CACHE_VERSION,
+        "source_language": ctx.source_lang_code,
+        "target_language": ctx.target_lang_code,
+        "metadata": metadata_fields,
+        "transcript": [
+            {"id": segment.index, "text": segment.source_text()}
+            for segment in transcript.segments
+        ],
+        "web_evidence": sidecar.to_json_value(),
+        "prompt": load_prompt("glossary_prompt", _GLOSSARY_PROMPT_FALLBACK),
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def load_glossary_cache_metadata(ctx: TranscriptContext) -> dict:
+    if not os.path.isfile(ctx.glossary_cache_json):
+        return {}
+    try:
+        with open(ctx.glossary_cache_json, "r", encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_glossary_cache_metadata(ctx: TranscriptContext, fingerprint: str) -> None:
+    with open(ctx.glossary_cache_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {"version": GLOSSARY_CACHE_VERSION, "fingerprint": fingerprint},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+        f.write("\n")
 
 
 def normalize_tavily_domain(domain: str) -> str:
@@ -2683,6 +2895,40 @@ def merge_source_and_target_tavily_queries(
     return queries
 
 
+def transcript_source_term_candidates(transcript: Transcript, max_terms: int = 40) -> list[str]:
+    common_starts = {
+        "after", "again", "although", "because", "before", "being", "but", "carefully", "during",
+        "even", "every", "finally", "first", "from", "however", "if", "in", "it", "maybe", "often",
+        "once", "one", "only", "otherwise", "people", "second", "something", "sometimes", "that", "the",
+        "then", "there", "these", "they", "this", "those", "through", "to", "ultimately", "we", "what",
+        "when", "where", "while", "with", "you",
+    }
+    candidates: list[str] = []
+    for segment in transcript.segments:
+        text = segment.source_text().strip()
+        words = re.findall(r"[A-Za-z][A-Za-z0-9'’/-]*", text)
+        if not words:
+            continue
+        title_phrases = re.findall(
+            r"\b[A-Z][A-Za-z0-9'’/-]*(?:\s+(?:[A-Z][A-Za-z0-9'’/-]*|de|of|the)){0,4}",
+            text,
+        )
+        for phrase in title_phrases:
+            phrase_words = phrase.split()
+            first_position = next(
+                (index for index, word in enumerate(words) if word.casefold() == phrase_words[0].casefold()),
+                0,
+            )
+            if len(phrase_words) >= 2 or first_position > 0:
+                candidates.append(phrase)
+            elif len(words) <= 5 and phrase.casefold() not in common_starts and len(phrase) >= 5:
+                candidates.append(phrase)
+        candidates.extend(
+            word for word in words if len(word) >= 12 and word.casefold() not in common_starts
+        )
+    return unique_non_empty_strings(candidates, max_terms)
+
+
 def translate_tavily_query_output(
     source_queries: list[str],
     ctx: TranscriptContext,
@@ -2752,11 +2998,12 @@ def build_tavily_search_plan(
         "tags": fields["tags"][:20],
         "source_language": ctx.source_lang_code,
         "target_language": ctx.target_lang_code,
+        "source_term_candidates": transcript_source_term_candidates(transcript),
     }
     if retrieved_context:
         request_fields["retrieved_transcript_context"] = retrieved_context
     else:
-        request_fields["transcript_excerpt"] = "\n".join(transcript.text_lines())[:3000]
+        request_fields["transcript_excerpt"] = representative_transcript_excerpt(transcript, max_chars=3000)
     request = LLMObjectRequest(request_fields)
     try:
         response_obj = llm_json_once(
@@ -2970,6 +3217,37 @@ def is_glossary_tool_call_format_issue(choice, message) -> bool:
     return bool(content and "tool_calls" in content and not content.startswith("{"))
 
 
+def representative_transcript_excerpt(transcript: Transcript, max_chars: int = 16000) -> str:
+    lines = [f"[{seg.index}] {seg.source_text().strip()}" for seg in transcript.segments if seg.source_text().strip()]
+    if not lines or max_chars <= 0:
+        return ""
+    full_text = "\n".join(lines)
+    if len(full_text) <= max_chars:
+        return full_text
+
+    average = max(24, int(sum(len(line) + 1 for line in lines) / len(lines)))
+    target_count = max(3, min(len(lines), max_chars // average))
+    if target_count >= len(lines):
+        selected = lines
+    else:
+        positions = sorted(
+            {round(index * (len(lines) - 1) / (target_count - 1)) for index in range(target_count)}
+        )
+        selected = [lines[position] for position in positions]
+
+    output: list[str] = []
+    used = 0
+    for line in selected:
+        remaining = max_chars - used - (1 if output else 0)
+        if remaining <= 0:
+            break
+        clipped = line if len(line) <= remaining else line[:remaining].rstrip()
+        if clipped:
+            output.append(clipped)
+            used += len(clipped) + (1 if len(output) > 1 else 0)
+    return "\n".join(output)
+
+
 def build_glossary_request_fields(
     transcript: Transcript,
     ctx: TranscriptContext,
@@ -3002,7 +3280,7 @@ def build_glossary_request_fields(
         if retrieved:
             request_fields["retrieved_context"] = retrieved[0]
     if "retrieved_context" not in request_fields:
-        request_fields["transcript_excerpt"] = transcript_text[:8000]
+        request_fields["transcript_excerpt"] = representative_transcript_excerpt(transcript)
     return request_fields
 
 
@@ -3013,14 +3291,60 @@ def build_glossary_finalizer_request_fields(request_fields: dict, sidecar: WebEv
         if key not in {"tavily_domain_preferences", "tool_instructions"}
     }
     if sidecar.has_records():
-        fields["web_evidence"] = sidecar.to_json_value()
+        fields["web_evidence"] = compact_web_evidence_for_prompt(sidecar)
     fields["finalization_instruction"] = (
-        "Search is complete or unavailable. Build the final glossary now; do not request more tools."
+        "Search is complete or unavailable. Build the final glossary now; do not request more tools. "
+        "If existing_glossary is present, preserve its valid decisions but correct or extend it wherever the evidence supports doing so."
     )
     return fields
 
 
+def compact_web_evidence_for_prompt(
+    sidecar: WebEvidenceSidecar,
+    content_chars: int = 700,
+    total_chars: int = 50000,
+) -> dict:
+    records: list[dict] = []
+    for record in sidecar.records:
+        if not record.query or not record.results:
+            continue
+        best = record.results[0]
+        compact_record = {
+            "query": record.query,
+            "topic_hints": record.topic_hints,
+            "preferred_domains": record.preferred_domains,
+            "search_stage": record.search_stage,
+            "results": [
+                {
+                    **best.to_json_value(),
+                    "content": best.content[: max(100, content_chars)].rstrip(),
+                }
+            ],
+        }
+        candidate = {"version": sidecar.version, "records": [*records, compact_record]}
+        if records and len(json.dumps(candidate, ensure_ascii=False)) > total_chars:
+            break
+        records.append(compact_record)
+    return {"version": sidecar.version, "records": records}
+
+
 def local_glossary_markdown_from_evidence(request_fields: dict, sidecar: WebEvidenceSidecar) -> str:
+    existing_glossary = str(request_fields.get("existing_glossary", "") or "").strip()
+    if existing_glossary:
+        lines = [existing_glossary, "", "## 网页证据（自动融合失败，供逐条检索与人工复核）"]
+        for record in sidecar.records:
+            if not record.query or not record.results:
+                continue
+            lines.append(f"- Query: {record.query}")
+            for entry in record.results[:3]:
+                label = entry.title or entry.domain or entry.url
+                summary = re.sub(r"\s+", " ", entry.content).strip()[:300]
+                if entry.url:
+                    lines.append(f"  - {label}: {entry.url}")
+                if summary:
+                    lines.append(f"    - {summary}")
+        return "\n".join(lines).rstrip() + "\n"
+
     title = str(request_fields.get("title", "") or "").strip()
     source_language = str(request_fields.get("source_language", "") or "").strip()
     target_language = str(request_fields.get("target_language", "") or "").strip()
@@ -3062,6 +3386,70 @@ def local_glossary_markdown_from_evidence(request_fields: dict, sidecar: WebEvid
                 if summary:
                     lines.append(f"    - {summary}")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def explicit_web_term_mappings(
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+) -> list[tuple[str, str, str]]:
+    transcript_text = "\n".join(segment.source_text() for segment in transcript.segments).casefold()
+    patterns = [re.compile(
+        r"(?<![A-Za-z])"
+        r"([A-Z][A-Za-z0-9'’/]*(?:\s+(?:[A-Z][A-Za-z0-9'’/]*|de|of|the)){0,5})"
+        r"\s+[-–—]\s+"
+        r"([\u3400-\u9fff]{2,12})"
+    ), re.compile(
+        r"(?<![A-Za-z])"
+        r"([A-Z][A-Za-z0-9'’/]*(?:\s+(?:[A-Z][A-Za-z0-9'’/]*|de|of|the)){0,5})"
+        r"\s*[（(]\s*"
+        r"([\u3400-\u9fff]{2,12})\s*[）)]"
+    )]
+    mappings: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for _, entry in sidecar.unique_entries():
+        for pattern in patterns:
+            for match in pattern.finditer(entry.content):
+                source = re.sub(r"\s+", " ", match.group(1)).strip()
+                target = match.group(2).strip()
+                key = (source.casefold(), target)
+                if source.isupper() or source.casefold() not in transcript_text or key in seen:
+                    continue
+                seen.add(key)
+                mappings.append((source, target, entry.url))
+    return mappings
+
+
+def merge_explicit_web_term_mappings(
+    glossary: str,
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+) -> str:
+    base_glossary = re.sub(
+        r"\n*## 网页证据明确术语映射\s*\n.*?(?=\n##\s|\Z)",
+        "",
+        glossary.strip(),
+        flags=re.DOTALL,
+    ).rstrip()
+    mappings = [
+        mapping
+        for mapping in explicit_web_term_mappings(transcript, sidecar)
+        if not (mapping[0].casefold() in base_glossary.casefold() and mapping[1] in base_glossary)
+    ]
+    if not mappings:
+        return base_glossary
+    lines = [
+        base_glossary,
+        "",
+        "## 网页证据明确术语映射",
+        "| 原文术语 | 推荐译法 | 证据 |",
+        "|---|---|---|",
+    ]
+    for source, target, url in mappings:
+        safe_source = source.replace("|", "\\|")
+        safe_target = target.replace("|", "\\|")
+        safe_url = url.replace("|", "%7C")
+        lines.append(f"| {safe_source} | {safe_target} | {safe_url} |")
+    return "\n".join(lines).strip()
 
 
 def finalize_glossary_from_evidence(
@@ -3301,11 +3689,49 @@ def build_glossary(
     metadata_fields = read_video_metadata_fields(ctx)
     if not options.force and os.path.isfile(ctx.glossary) and os.path.getsize(ctx.glossary) > 0:
         glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(_read_text_file(ctx.glossary), ctx))
-        if options.tavily_key and int(options.tavily_max_queries or 0) > 0 and not load_web_evidence_sidecar(ctx.web_evidence_json).has_records():
+        sidecar = load_web_evidence_sidecar(ctx.web_evidence_json)
+        if options.tavily_key and int(options.tavily_max_queries or 0) > 0 and not sidecar.has_records():
             sidecar = build_tavily_search_evidence(transcript, ctx, llm, metadata_fields, options)
             write_web_evidence_sidecar(ctx, sidecar)
             if sidecar.has_records() and not options.quiet:
                 print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
+        glossary = write_glossary_file(
+            ctx,
+            merge_explicit_web_term_mappings(glossary, transcript, sidecar),
+        ) or glossary
+
+        fingerprint = glossary_cache_fingerprint(transcript, ctx, metadata_fields, sidecar)
+        cache_metadata = load_glossary_cache_metadata(ctx)
+        cache_current = (
+            cache_metadata.get("version") == GLOSSARY_CACHE_VERSION
+            and cache_metadata.get("fingerprint") == fingerprint
+        )
+        if sidecar.has_records() and not cache_current:
+            if not options.quiet:
+                print("Glossary cache: evidence changed; reconciling cached terms", file=sys.stderr)
+            request_fields = build_glossary_request_fields(
+                transcript,
+                ctx,
+                GlossaryRequestArgs(metadata_fields=metadata_fields, retriever=options.retriever),
+            )
+            request_fields["existing_glossary"] = glossary
+            artifact = finalize_glossary_from_evidence(
+                request_fields,
+                sidecar,
+                ctx,
+                llm,
+                options,
+            )
+            refreshed = write_glossary_file(
+                ctx,
+                merge_explicit_web_term_mappings(
+                    ensure_local_metadata_in_glossary(artifact.markdown, ctx),
+                    transcript,
+                    sidecar,
+                ),
+            )
+            glossary = refreshed or glossary
+        write_glossary_cache_metadata(ctx, fingerprint)
         if not options.quiet:
             print(f"Glossary cache: {ctx.glossary}", file=sys.stderr)
         return glossary
@@ -3330,7 +3756,19 @@ def build_glossary(
                 options,
             )
             write_web_evidence_sidecar(ctx, artifact.web_evidence)
-            glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(artifact.markdown, ctx))
+            glossary = write_glossary_file(
+                ctx,
+                merge_explicit_web_term_mappings(
+                    ensure_local_metadata_in_glossary(artifact.markdown, ctx),
+                    transcript,
+                    artifact.web_evidence,
+                ),
+            )
+            if glossary:
+                write_glossary_cache_metadata(
+                    ctx,
+                    glossary_cache_fingerprint(transcript, ctx, metadata_fields, artifact.web_evidence),
+                )
             if not options.quiet:
                 print(f"Glossary: {ctx.glossary}", file=sys.stderr)
                 if artifact.web_evidence.has_records():
@@ -3347,7 +3785,7 @@ def build_glossary(
 
     request_fields = {
         "title": title,
-        "transcript_excerpt": transcript_text[:8000],
+        "transcript_excerpt": representative_transcript_excerpt(transcript),
         "description": desc_text[:1000],
         "tags": tags[:20],
         "search_results": search_text[:4000] if search_text else "",
@@ -3377,7 +3815,15 @@ def build_glossary(
         print(f"Warning: glossary generation failed: {e}", file=sys.stderr)
         return write_glossary_generation_fallback(ctx, options)
 
-    glossary = write_glossary_file(ctx, glossary)
+    glossary = write_glossary_file(
+        ctx,
+        merge_explicit_web_term_mappings(glossary, transcript, sidecar),
+    )
+    if glossary:
+        write_glossary_cache_metadata(
+            ctx,
+            glossary_cache_fingerprint(transcript, ctx, metadata_fields, sidecar),
+        )
     if not options.quiet:
         print(f"Glossary: {ctx.glossary}", file=sys.stderr)
         if sidecar.has_records():
@@ -3443,6 +3889,42 @@ def unique_non_empty_strings(values, max_items: int = 0) -> list[str]:
     return result
 
 
+def normalize_review_metadata(value) -> dict:
+    """Keep model uncertainty annotations structured and safe for sidecar output."""
+    if isinstance(value, str):
+        note = re.sub(r"\s+", " ", value.strip())[:500]
+        return {"needs_human": True, "reasons": [note]} if note else {}
+    if not isinstance(value, dict):
+        return {}
+
+    raw_reasons = value.get("reasons", value.get("reason", []))
+    raw_categories = value.get("categories", value.get("category", []))
+    raw_alternatives = value.get("alternatives", value.get("alternative", []))
+    if isinstance(raw_reasons, str):
+        raw_reasons = [raw_reasons]
+    if isinstance(raw_categories, str):
+        raw_categories = [raw_categories]
+    if isinstance(raw_alternatives, str):
+        raw_alternatives = [raw_alternatives]
+
+    reasons = unique_non_empty_strings(raw_reasons if isinstance(raw_reasons, list) else [], 8)
+    categories = unique_non_empty_strings(raw_categories if isinstance(raw_categories, list) else [], 8)
+    alternatives = unique_non_empty_strings(raw_alternatives if isinstance(raw_alternatives, list) else [], 4)
+    note = re.sub(r"\s+", " ", str(value.get("note", value.get("notes", ""))).strip())[:500]
+    raw_needs_human = value.get("needs_human", value.get("human_review", value.get("uncertain", False)))
+    needs_human = bool(raw_needs_human) or bool(reasons or alternatives or note)
+    result = {
+        "needs_human": needs_human,
+        "categories": categories,
+        "reasons": reasons,
+        "alternatives": alternatives,
+        "note": note,
+    }
+    if not needs_human and not categories and not reasons and not alternatives and not note:
+        return {}
+    return prune_empty_json(result) or {}
+
+
 @dataclass
 class LLMBatchItem:
     id: int
@@ -3467,12 +3949,18 @@ def make_source_item(
     ctx: TranscriptContext,
     source_text: str,
     retrieved_context: Optional[list[dict]] = None,
+    context_before: Optional[list[dict]] = None,
+    context_after: Optional[list[dict]] = None,
 ) -> LLMBatchItem:
     return make_language_item(
         item_id,
         ctx,
         source=source_text,
-        extra={"retrieved_context": retrieved_context or []},
+        extra={
+            "retrieved_context": retrieved_context or [],
+            "context_before": context_before or [],
+            "context_after": context_after or [],
+        },
     )
 
 
@@ -3484,17 +3972,22 @@ def make_pair_item(
     retrieved_context: Optional[list[dict]] = None,
     context_before: Optional[list[dict]] = None,
     context_after: Optional[list[dict]] = None,
+    review_hint: Optional[dict] = None,
 ) -> LLMBatchItem:
+    extra = {
+        "retrieved_context": retrieved_context or [],
+        "context_before": context_before or [],
+        "context_after": context_after or [],
+    }
+    normalized_review = normalize_review_metadata(review_hint or {})
+    if normalized_review:
+        extra["translation_review"] = normalized_review
     return make_language_item(
         item_id,
         ctx,
         source=source_text,
         target=target_text,
-        extra={
-            "retrieved_context": retrieved_context or [],
-            "context_before": context_before or [],
-            "context_after": context_after or [],
-        },
+        extra=extra,
     )
 
 
@@ -3507,11 +4000,92 @@ def make_pair_json(
     return make_pair_item(item_id, ctx, source_text, target_text).to_json_value()
 
 
+def apply_glossary_ui_translation(
+    source_text: str,
+    translated_text: str,
+    retrieved_context: list[dict],
+    ctx: TranscriptContext,
+) -> str:
+    if not ctx.target_lang_code.lower().startswith("zh"):
+        return translated_text
+    match = re.fullmatch(
+        r"\s*([A-Z][A-Za-z0-9'’]*(?:\s+[A-Z][A-Za-z0-9'’]*){0,4})"
+        r"\s*(?:[-:–—]\s*)?"
+        r"(impossible|success|succeeded|failure|failed|easy|medium|hard)\s*[.!]?\s*",
+        source_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return translated_text
+    source_label, raw_status = match.groups()
+    target_label = ""
+    mapping_pattern = re.compile(
+        rf"\|\s*{re.escape(source_label)}\s*\|\s*([^|\n]+)",
+        flags=re.IGNORECASE,
+    )
+    for item in retrieved_context:
+        mapping = mapping_pattern.search(str(item.get("text", "")))
+        if mapping:
+            target_label = mapping.group(1).strip().removesuffix("(?)").strip()
+            break
+    if not target_label:
+        return translated_text
+    statuses = {
+        "impossible": "不可能",
+        "success": "成功",
+        "succeeded": "成功",
+        "failure": "失败",
+        "failed": "失败",
+        "easy": "简单",
+        "medium": "中等",
+        "hard": "困难",
+    }
+    return f"[{target_label}]：{statuses[raw_status.casefold()]}"
+
+
+def merge_retrieval_review_evidence(
+    source_text: str,
+    review: dict,
+    retrieved_context: list[dict],
+) -> dict:
+    normalized_source = tavily_query_dedupe_key(source_text)
+    if not normalized_source:
+        return normalize_review_metadata(review)
+    evidence_hit = False
+    for item in retrieved_context:
+        evidence = str(item.get("text", ""))
+        normalized_evidence = tavily_query_dedupe_key(evidence)
+        if (
+            normalized_source in normalized_evidence
+            and "asr" in evidence.casefold()
+            and any(marker in evidence for marker in ("疑似", "破损", "误听", "需结合", "需确认", "(?)"))
+        ):
+            evidence_hit = True
+            break
+    normalized = normalize_review_metadata(review)
+    if not evidence_hit:
+        return normalized
+    categories = unique_non_empty_strings([*(normalized.get("categories", [])), "source_ASR"], 8)
+    reasons = unique_non_empty_strings(
+        [*(normalized.get("reasons", [])), "项目知识库将当前源文标记为疑似 ASR，需对照音频或画面确认"],
+        8,
+    )
+    return normalize_review_metadata(
+        {
+            **normalized,
+            "needs_human": True,
+            "categories": categories,
+            "reasons": reasons,
+        }
+    )
+
+
 @dataclass
 class LanguageTextResult:
     id: int
     source_text: str
     target_text: str
+    review: dict = field(default_factory=dict)
 
     @staticmethod
     def from_json_value(data: dict, ctx: TranscriptContext, require_source: bool = True) -> "LanguageTextResult":
@@ -3522,6 +4096,7 @@ class LanguageTextResult:
             int(data.get("id")),
             _strip_speaker_labels(str(source_value or "")),
             _strip_speaker_labels(str(target_value or "")),
+            normalize_review_metadata(data.get("review", {})),
         )
 
 
@@ -3810,6 +4385,16 @@ class ChatSession:
             time.sleep(wait)
 
 
+def isolated_batch_session(template: ChatSession) -> ChatSession:
+    """Create a clean batch conversation so prior items never consume later context."""
+    return ChatSession(
+        template.llm,
+        template.system_prompt,
+        temperature=template.temperature,
+        disable_response_format=template.disable_response_format,
+    )
+
+
 def llm_json_once(
     llm: LLMConfig,
     system_prompt: str,
@@ -3895,13 +4480,30 @@ def parse_proofread_response(
     fallback_pairs: list[tuple[str, str]],
     ctx: TranscriptContext,
 ) -> list[tuple[str, str]]:
+    return [
+        (source_text, target_text)
+        for source_text, target_text, _review in parse_proofread_results(
+            data, expected_ids, fallback_pairs, ctx
+        )
+    ]
+
+
+def parse_proofread_results(
+    data: list,
+    expected_ids: list[int],
+    fallback_pairs: list[tuple[str, str]],
+    ctx: TranscriptContext,
+) -> list[tuple[str, str, dict]]:
     if data is not None:
-        by_id: dict[int, tuple[str, str]] = {}
+        by_id: dict[int, tuple[str, str, dict]] = {}
         for parsed in LLMBatchResponse([item for item in data if isinstance(item, dict)]).to_proofread_outputs(ctx):
             if parsed.source_text or parsed.target_text:
-                by_id[parsed.id] = (parsed.source_text, parsed.target_text)
-        return [by_id.get(item_id, fallback_pairs[idx]) for idx, item_id in enumerate(expected_ids)]
-    return fallback_pairs
+                by_id[parsed.id] = (parsed.source_text, parsed.target_text, parsed.review)
+        return [
+            by_id.get(item_id, (fallback_pairs[idx][0], fallback_pairs[idx][1], {}))
+            for idx, item_id in enumerate(expected_ids)
+        ]
+    return [(source, target, {}) for source, target in fallback_pairs]
 
 
 def proofread_retrieval_query(event: SplitEvent) -> str:
@@ -3951,6 +4553,7 @@ def is_context_length_error(error: Exception | str) -> bool:
         for marker in (
             "maximum context length",
             "context length",
+            "exceeds the available context size",
             "too many tokens",
             "reduce the length",
         )
@@ -3963,7 +4566,8 @@ def translate_segments(
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
-    retriever: EmbeddingRetriever | None = None,
+    retriever: ContextRetriever | None = None,
+    context_window: int = 0,
 ) -> bool:
     pending = [s for s in transcript.segments if not s.translation]
     if not pending:
@@ -3979,6 +4583,7 @@ def translate_segments(
         llm,
         system_prompt
         + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
+        + ("\n\n" + _NEIGHBOR_CONTEXT_RULES if context_window > 0 else "")
         + "\n\n"
         + _JSON_FORMAT
         + "\n\n"
@@ -3987,6 +4592,102 @@ def translate_segments(
         + render_prompt_template(_TRANSLATE_FORMAT, ctx),
         temperature=0.3,
     )
+    changed = False
+
+    def apply_translation_batch(
+        batch: list[TranscriptSegment],
+        contexts: list[list[dict]],
+        include_neighbors: bool = True,
+    ) -> bool:
+        request = LLMBatchRequest(
+            [
+                make_source_item(
+                    segment.index,
+                    ctx,
+                    segment.en_text(),
+                    retrieved_context=contexts[index],
+                    context_before=(
+                        segment_context_items(
+                            transcript, segment, ctx, context_window, before=True, include_target=False
+                        )
+                        if include_neighbors
+                        else []
+                    ),
+                    context_after=(
+                        segment_context_items(
+                            transcript, segment, ctx, context_window, before=False, include_target=False
+                        )
+                        if include_neighbors
+                        else []
+                    ),
+                )
+                for index, segment in enumerate(batch)
+            ]
+        )
+        try:
+            batch_session = isolated_batch_session(session)
+            try:
+                response_items = llm_numbered_batch(
+                    request,
+                    batch_session,
+                    quiet,
+                    raise_on_failure=True,
+                )
+            except TypeError as error:
+                if "raise_on_failure" not in str(error):
+                    raise
+                response_items = llm_numbered_batch(request, batch_session, quiet)
+        except Exception as error:
+            if len(batch) > 1:
+                middle = len(batch) // 2
+                if not quiet:
+                    reason = "too large" if is_context_length_error(error) else "failed validation"
+                    print(
+                        f"  Translate batch {reason}; splitting ids {batch[0].index}-{batch[-1].index}",
+                        file=sys.stderr,
+                    )
+                left_changed = apply_translation_batch(batch[:middle], contexts[:middle], include_neighbors)
+                right_changed = apply_translation_batch(batch[middle:], contexts[middle:], include_neighbors)
+                return left_changed or right_changed
+            if is_context_length_error(error) and any(contexts):
+                if not quiet:
+                    print(
+                        f"  Translate id {batch[0].index} too large with retrieved context; retrying without it",
+                        file=sys.stderr,
+                    )
+                return apply_translation_batch(batch, [[] for _ in batch], include_neighbors)
+            if is_context_length_error(error) and include_neighbors:
+                if not quiet:
+                    print(
+                        f"  Translate id {batch[0].index} too large with neighbor context; retrying without it",
+                        file=sys.stderr,
+                    )
+                return apply_translation_batch(batch, contexts, False)
+            print(f"Warning: translation batch failed: {error}", file=sys.stderr)
+            return False
+
+        by_id = {
+            parsed.id: parsed
+            for parsed in LLMBatchResponse(response_items).to_translate_outputs(ctx)
+        }
+        batch_changed = False
+        for index, segment in enumerate(batch):
+            parsed = by_id.get(segment.index)
+            translated = parsed.target_text.strip() if parsed else ""
+            if not translated:
+                print(f"Warning: translation missing for segment id {segment.index}", file=sys.stderr)
+                continue
+            translated = apply_glossary_ui_translation(
+                segment.en_text(), translated, contexts[index], ctx
+            )
+            segment.translation = translated
+            segment.review = merge_retrieval_review_evidence(
+                segment.en_text(), parsed.review, contexts[index]
+            )
+            segment.split_events = []
+            batch_changed = True
+        return batch_changed
+
     for start in range(0, len(pending), llm.batch_size):
         batch = pending[start : start + llm.batch_size]
         if not quiet:
@@ -3996,29 +4697,8 @@ def translate_segments(
                 file=sys.stderr,
             )
         contexts = retriever.retrieve_texts([seg.en_text() for seg in batch]) if retriever is not None else [[] for _ in batch]
-        request = LLMBatchRequest(
-            [
-                make_source_item(s.index, ctx, s.en_text(), retrieved_context=contexts[idx])
-                for idx, s in enumerate(batch)
-            ]
-        )
-        response_items = llm_numbered_batch(
-            request,
-            session,
-            quiet,
-        )
-        by_id = {
-            parsed.id: parsed.target_text
-            for parsed in LLMBatchResponse(response_items).to_translate_outputs(ctx)
-        }
-        translations = [
-            by_id.get(seg.index, "")
-            for seg in batch
-        ]
-        for seg, zh in zip(batch, translations):
-            seg.translation = zh.strip()
-            seg.split_events = []
-    return True
+        changed = apply_translation_batch(batch, contexts) or changed
+    return changed
 
 
 def proofread_split_events(
@@ -4027,12 +4707,18 @@ def proofread_split_events(
     llm: LLMConfig,
     system_prompt: str,
     quiet: bool,
-    retriever: EmbeddingRetriever | None = None,
+    retriever: ContextRetriever | None = None,
     proofread_retrieval_top_k: int = 1,
+    context_window: int = 0,
 ) -> bool:
     events: list[SplitEvent] = []
+    review_hints: list[dict] = []
     for seg in transcript.segments:
-        events.extend(seg.split_events or [whole_segment_split_event(seg)])
+        if not seg.split_events:
+            seg.split_events = [whole_segment_split_event(seg)]
+        segment_events = seg.split_events
+        events.extend(segment_events)
+        review_hints.extend([seg.review for _ in segment_events])
     if not events:
         return False
 
@@ -4047,6 +4733,7 @@ def proofread_split_events(
         pr_llm,
         system_prompt
         + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
+        + ("\n\n" + _NEIGHBOR_CONTEXT_RULES if context_window > 0 else "")
         + "\n\n"
         + _PROOFREAD_ASR_CONTEXT_RULES
         + "\n\n"
@@ -4063,6 +4750,7 @@ def proofread_split_events(
         batch_events: list[SplitEvent],
         item_offset: int,
         batch_contexts: list[list[dict]],
+        batch_review_hints: list[dict],
     ) -> bool:
         request = LLMBatchRequest(
             [
@@ -4072,6 +4760,13 @@ def proofread_split_events(
                     event.en,
                     event.zh,
                     retrieved_context=batch_contexts[idx],
+                    context_before=event_context_items(
+                        events, item_offset + idx, ctx, context_window, before=True
+                    ),
+                    context_after=event_context_items(
+                        events, item_offset + idx, ctx, context_window, before=False
+                    ),
+                    review_hint=batch_review_hints[idx],
                 )
                 for idx, event in enumerate(batch_events)
             ]
@@ -4079,7 +4774,7 @@ def proofread_split_events(
         try:
             response_items = llm_numbered_batch(
                 request,
-                session,
+                isolated_batch_session(session),
                 quiet,
                 raise_on_failure=True,
             )
@@ -4096,11 +4791,13 @@ def proofread_split_events(
                     batch_events[:mid],
                     item_offset,
                     batch_contexts[:mid],
+                    batch_review_hints[:mid],
                 )
                 right_changed = apply_proofread_batch(
                     batch_events[mid:],
                     item_offset + mid,
                     batch_contexts[mid:],
+                    batch_review_hints[mid:],
                 )
                 return left_changed or right_changed
             if is_context_length_error(e) and any(batch_contexts):
@@ -4109,29 +4806,49 @@ def proofread_split_events(
                         f"  Proofread item {item_offset + 1} too large with retrieved context; retrying without RAG context",
                         file=sys.stderr,
                     )
-                return apply_proofread_batch(batch_events, item_offset, [[] for _ in batch_events])
+                return apply_proofread_batch(
+                    batch_events,
+                    item_offset,
+                    [[] for _ in batch_events],
+                    batch_review_hints,
+                )
             print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
             response_items = []
 
         fallback_pairs = [(event.en, event.zh) for event in batch_events]
-        parsed_pairs = parse_proofread_response(
+        parsed_results = parse_proofread_results(
             response_items,
             [item.id for item in request.items],
             fallback_pairs,
             ctx,
         )
         batch_changed = False
-        for event, (en, zh) in zip(batch_events, parsed_pairs):
+        for index, (event, (en, zh, review)) in enumerate(zip(batch_events, parsed_results)):
             new_en = en.strip() or event.en
             new_zh = zh.strip() or event.zh
-            if new_en != event.en or new_zh != event.zh:
+            new_zh = apply_glossary_ui_translation(
+                new_en,
+                new_zh,
+                batch_contexts[index],
+                ctx,
+            )
+            normalized_review = merge_retrieval_review_evidence(
+                new_en,
+                review,
+                batch_contexts[index],
+            )
+            if new_en != event.en or new_zh != event.zh or normalized_review != event.review:
                 batch_changed = True
+            if new_en != event.en and not event.original_en:
+                event.original_en = event.en
             event.en = new_en
             event.zh = new_zh
+            event.review = normalized_review
         return batch_changed
 
     for start in range(0, len(events), pr_llm.batch_size):
         batch = events[start : start + pr_llm.batch_size]
+        batch_review_hints = review_hints[start : start + pr_llm.batch_size]
         contexts = (
             retriever.retrieve_texts(
                 [proofread_retrieval_query(event) for event in batch],
@@ -4146,7 +4863,7 @@ def proofread_split_events(
                 f"proofreading split events {start + 1}-{start + len(batch)}",
                 file=sys.stderr,
             )
-        changed = apply_proofread_batch(batch, start, contexts) or changed
+        changed = apply_proofread_batch(batch, start, contexts, batch_review_hints) or changed
     return changed
 
 
@@ -4403,12 +5120,13 @@ def split_reason_message(reason: str, detail: str = "") -> str:
     return f"{base}: {detail}" if detail else base
 
 
-def split_context_items(
+def segment_context_items(
     transcript: Transcript,
     segment: TranscriptSegment,
     ctx: TranscriptContext,
     window: int,
     before: bool,
+    include_target: bool = True,
 ) -> list[dict]:
     if window <= 0:
         return []
@@ -4420,7 +5138,38 @@ def split_context_items(
         candidates = transcript.segments[max(0, pos - window) : pos]
     else:
         candidates = transcript.segments[pos + 1 : pos + 1 + window]
-    return [make_pair_json(seg.index, ctx, seg.source_text(), seg.translation) for seg in candidates]
+    if include_target:
+        return [make_pair_json(seg.index, ctx, seg.source_text(), seg.translation) for seg in candidates]
+    return [make_source_item(seg.index, ctx, seg.source_text()).to_json_value() for seg in candidates]
+
+
+def split_context_items(
+    transcript: Transcript,
+    segment: TranscriptSegment,
+    ctx: TranscriptContext,
+    window: int,
+    before: bool,
+) -> list[dict]:
+    return segment_context_items(transcript, segment, ctx, window, before, include_target=True)
+
+
+def event_context_items(
+    events: list[SplitEvent],
+    position: int,
+    ctx: TranscriptContext,
+    window: int,
+    before: bool,
+) -> list[dict]:
+    if window <= 0 or position < 0 or position >= len(events):
+        return []
+    if before:
+        positions = range(max(0, position - window), position)
+    else:
+        positions = range(position + 1, min(len(events), position + 1 + window))
+    return [
+        make_pair_json(index + 1, ctx, events[index].en, events[index].zh)
+        for index in positions
+    ]
 
 
 def validated_split_events(
@@ -4536,7 +5285,7 @@ def split_segments(
                 print(request.to_json_text(), file=sys.stderr)
             response_items = llm_numbered_batch(
                 request,
-                session,
+                isolated_batch_session(session),
                 quiet,
             )
             if not quiet:
@@ -4653,8 +5402,53 @@ def all_events(transcript: Transcript) -> list[SplitEvent]:
         if seg.split_events:
             events.extend(seg.split_events)
         else:
-            events.append(SplitEvent(seg.start, seg.end, seg.source_text(), seg.translation))
+            events.append(SplitEvent(seg.start, seg.end, seg.source_text(), seg.translation, seg.review))
     return events
+
+
+def write_human_review_sidecar(ctx: TranscriptContext, transcript: Transcript) -> str:
+    """Write uncertainty flags without polluting the rendered subtitle text."""
+    items: list[dict] = []
+    for segment in transcript.segments:
+        translation_review = normalize_review_metadata(segment.review)
+        event_reviews = []
+        for event in segment.split_events:
+            review = normalize_review_metadata(event.review)
+            if not review:
+                continue
+            event_reviews.append(
+                {
+                    "start": round(event.start, 3),
+                    "end": round(event.end, 3),
+                    "source": event.en,
+                    "translation": event.zh,
+                    "proofread_review": review,
+                }
+            )
+        if not translation_review and not event_reviews:
+            continue
+        item = {
+            "segment_id": segment.index,
+            "start": round(segment.start, 3),
+            "end": round(segment.end, 3),
+            "source": segment.source_text(),
+            "translation": segment.translation,
+        }
+        if translation_review:
+            item["translation_review"] = translation_review
+        if event_reviews:
+            item["event_reviews"] = event_reviews
+        items.append(item)
+
+    payload = {
+        "format": "subtitle-human-review",
+        "instructions": "人工检查 translation_review / event_reviews；这些标记不会写入 ASS 或 SRT 字幕。",
+        "items": items,
+    }
+    with open(ctx.review_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return ctx.review_json
 
 
 @dataclass(frozen=True)
@@ -4829,7 +5623,11 @@ def main() -> None:
     parser.add_argument("--source-lang", help="Source language name/tag for prompts and ISO 639 output suffix")
     parser.add_argument("--target-lang", help="Target language name/tag for prompts and ISO 639 output suffix (default: zh)")
     parser.add_argument("--print-output-path", action="store_true", help="Print computed bilingual ASS path and exit")
-    parser.add_argument("--batch-size", type=int, default=50)
+    default_batch_size = env_int(
+        env.get("TRANSLATE_BATCH_SIZE", ""),
+        8 if env.get("TRANSLATE_PROVIDER", "").strip() == "hy-mt2-local" else 50,
+    )
+    parser.add_argument("--batch-size", type=int, default=default_batch_size)
     parser.add_argument("--only-beautify", action="store_true")
     parser.add_argument("--only-glossary", action="store_true")
     parser.add_argument("--skip-beautify", action="store_true")
@@ -4839,6 +5637,18 @@ def main() -> None:
     parser.add_argument("--split-max-chars", type=int, default=DEFAULT_SPLIT_MAX_CHARS)
     parser.add_argument("--split-max-duration", type=float, default=DEFAULT_SPLIT_MAX_DURATION)
     parser.add_argument("--split-context-window", type=int, default=1, help="Neighbor segment count included as split-only context")
+    parser.add_argument(
+        "--translate-context-window",
+        type=int,
+        default=env_int(env.get("TRANSLATE_CONTEXT_WINDOW", ""), 2),
+        help="Neighbor segment count included as source-only translation context",
+    )
+    parser.add_argument(
+        "--proofread-context-window",
+        type=int,
+        default=env_int(env.get("PROOFREAD_CONTEXT_WINDOW", ""), 2),
+        help="Neighbor event count included as bilingual proofreading context",
+    )
     parser.add_argument("--proofread", action="store_true", default=True)
     parser.add_argument("--no-proofread", action="store_true")
     parser.add_argument("--glossary", metavar="PATH")
@@ -4956,6 +5766,15 @@ def main() -> None:
         print(f"OUTPUT_GLOSSARY={os.path.abspath(ctx.glossary)}")
         return
 
+    if retriever is None:
+        retriever = build_local_evidence_retriever(
+            ctx,
+            chunk_chars=embedding_config.chunk_chars,
+            top_k=env_int(env.get("LOCAL_EVIDENCE_TOP_K", ""), 3),
+        )
+        if retriever is not None and not args.quiet:
+            print("Evidence retrieval: local lexical fallback", file=sys.stderr)
+
     if llm is None:
         print(
             f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
@@ -4981,7 +5800,15 @@ def main() -> None:
         system_prompt += glossary_text
         proofread_prompt += glossary_text
 
-    changed = translate_segments(transcript, ctx, llm, system_prompt, args.quiet, retriever)
+    changed = translate_segments(
+        transcript,
+        ctx,
+        llm,
+        system_prompt,
+        args.quiet,
+        retriever,
+        context_window=max(0, args.translate_context_window),
+    )
     changed = split_segments(
         transcript,
         ctx,
@@ -5014,9 +5841,12 @@ def main() -> None:
             args.quiet,
             retriever,
             proofread_retrieval_top_k=proofread_retrieval_top_k_from_env(env),
+            context_window=max(0, args.proofread_context_window),
         ) or changed
     if changed:
         save_transcript(transcript, ctx.beautified_json)
+
+    review_path = write_human_review_sidecar(ctx, transcript)
 
     if not os.path.isfile(template_path):
         print(f"Error: template.ass not found: {template_path}", file=sys.stderr)
@@ -5038,10 +5868,12 @@ def main() -> None:
         print(f"ASS:      {ctx.proofread_ass}")
         print(f"          {ctx.target_ass}")
         print(f"          {ctx.bilingual_ass}")
+        print(f"Human review: {review_path}")
         print(f"Events:   {len(events)}")
     else:
         print(ctx.bilingual_ass)
     print(f"OUTPUT_ASS={os.path.abspath(ctx.bilingual_ass)}")
+    print(f"HUMAN_REVIEW={os.path.abspath(review_path)}")
 
 
 if __name__ == "__main__":
