@@ -10,12 +10,14 @@ dependencies = [
     "langchain-chroma>=0.2.0",
     "langchain-openai>=0.2.0",
     "chromadb>=0.5.0",
-    "tavily-python>=0.5.0",
 ]
 
 [project.optional-dependencies]
 asr = [
     "whisperx @ git+https://github.com/m-bain/whisperx.git",
+]
+search = [
+    "tavily-python>=0.5.0",
 ]
 
 [tool.uv]

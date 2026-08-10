@@ -1943,7 +1943,7 @@ class JsonProtocolTests(unittest.TestCase):
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
-        self.assertEqual(deepseek["default_model"], "deepseek-v4-flash")
+        self.assertEqual(deepseek["default_model"], "deepseek-v4-pro")
         self.assertNotIn("response_format", deepseek)
         self.assertEqual(
             deepseek["request_kwargs"]["response_format"],
@@ -1955,7 +1955,6 @@ class JsonProtocolTests(unittest.TestCase):
             gemini["request_kwargs"]["extra_body"]["extra_body"]["google"]["tools"],
             [{"google_search": {}}],
         )
-        self.assertEqual(providers["hy-mt2-local"]["url"], "http://127.0.0.1:8080/v1")
 
     def test_chat_session_empty_content_error_includes_provider_details(self):
         class FakeUsageDetails:

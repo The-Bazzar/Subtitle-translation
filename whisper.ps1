@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory, Position = 0, HelpMessage = "Video file path")]
     [string]$VideoPath,
 
@@ -16,14 +16,10 @@
     [switch]$Help
 )
 
-$Utf8 = [System.Text.UTF8Encoding]::new($false)
-[Console]::InputEncoding = $Utf8
-[Console]::OutputEncoding = $Utf8
-$OutputEncoding = $Utf8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ── 读取 .env 配置 (优先级: CLI 参数 > .env > 硬编码默认) ──────────────────
 . "$PSScriptRoot\.env.ps1"
-$Ffmpeg                  = Get-EnvValue 'FFMPEG_PATH_WIN'                     'ffmpeg'
 $Model                   = Merge-EnvDefault 'WHISPER_MODEL'                    $Model                   'large-v3-turbo'
 $AlignModel              = Merge-EnvDefault 'WHISPER_ALIGN_MODEL'              $AlignModel              ''
 $Device                  = Merge-EnvDefault 'WHISPER_DEVICE'                   $Device                  ''
@@ -53,16 +49,6 @@ if ($HfToken) {
     if (-not $env:HUGGING_FACE_HUB_TOKEN) {
         $env:HUGGING_FACE_HUB_TOKEN = $HfToken
     }
-}
-$FfmpegItem = Get-Item -LiteralPath $Ffmpeg -ErrorAction SilentlyContinue
-if ($FfmpegItem) {
-    $env:Path = "$(Split-Path -Parent $FfmpegItem.FullName);$env:Path"
-}
-$HfProxy = Get-EnvValue 'HF_PROXY' (Get-EnvValue 'YTDLP_PROXY' '')
-if ($HfProxy) {
-    $env:HTTP_PROXY = $HfProxy
-    $env:HTTPS_PROXY = $HfProxy
-    Write-Host "Hugging Face proxy: $HfProxy" -ForegroundColor Gray
 }
 
 if ($Help -or (-not $VideoPath)) {
@@ -126,17 +112,12 @@ Write-Host "语言:        $VideoLang" -ForegroundColor Gray
 Write-Host "模型:        $Model" -ForegroundColor Gray
 Write-Host "设备:        $Device" -ForegroundColor Gray
 if ($AlignModel) { Write-Host "对齐:        $AlignModel" -ForegroundColor Gray }
-Write-Host "FFmpeg:      $Ffmpeg" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Cyan
 
 # 提取音频为 WAV (避免长视频时间码漂移)
 $WavPath = Join-Path $VideoDir "$VideoName.wav"
 Write-Host "提取音频..." -ForegroundColor Gray
-& $Ffmpeg -i $VideoAbs -vn -acodec pcm_s16le -ar 16000 -ac 1 $WavPath -y -loglevel error
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Error: audio extraction failed (exit code: $LASTEXITCODE)" -ForegroundColor Red
-    exit $LASTEXITCODE
-}
+& ffmpeg -i $VideoAbs -vn -acodec pcm_s16le -ar 16000 -ac 1 $WavPath -y -loglevel error
 
 $WhisperArgs = @(
     $WavPath,

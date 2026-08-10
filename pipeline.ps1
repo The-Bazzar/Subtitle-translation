@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Alias("u")]
     [Parameter(Position = 0, HelpMessage = "YouTube video URL")]
     [string]$Url,
@@ -61,10 +61,7 @@
     [string[]]$FfmpegExtra
 )
 
-$Utf8 = [System.Text.UTF8Encoding]::new($false)
-[Console]::InputEncoding = $Utf8
-[Console]::OutputEncoding = $Utf8
-$OutputEncoding = $Utf8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $ScriptDir = Split-Path $PSCommandPath -Parent
 . "$PSScriptRoot\.env.ps1"

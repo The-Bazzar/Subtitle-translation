@@ -13,13 +13,6 @@
         "auth_header": "Bearer {api_key}",
         "extra_headers": {}
     },
-    "hy-mt2-local": {
-        "url": "http://127.0.0.1:8080/v1",
-        "default_model": "Hy-MT2-30B-A3B-Q4_K_M",
-        "env_key": "OLLAMA_API_KEY",
-        "auth_header": "Bearer {api_key}",
-        "extra_headers": {}
-    },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1",
         "default_model": "anthropic/claude-sonnet-4-6",
@@ -32,7 +25,7 @@
     },
     "deepseek": {
         "url": "https://api.deepseek.com",
-        "default_model": "deepseek-v4-flash",
+        "default_model": "deepseek-v4-pro",
         "env_key": "DEEPSEEK_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},

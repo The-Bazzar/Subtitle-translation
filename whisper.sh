@@ -40,13 +40,6 @@ if [ -z "${1:-}" ]; then
     exit 1
 fi
 
-HF_PROXY="${HF_PROXY:-${YTDLP_PROXY:-}}"
-if [ -n "$HF_PROXY" ]; then
-    export HTTP_PROXY="$HF_PROXY"
-    export HTTPS_PROXY="$HF_PROXY"
-    echo "Hugging Face proxy: $HF_PROXY"
-fi
-
 VIDEO_PATH="$1"
 if [ ! -f "$VIDEO_PATH" ]; then
     echo "错误: 视频文件不存在: $VIDEO_PATH" >&2
@@ -102,13 +95,12 @@ echo "视频:      $VIDEO_PATH"
 echo "语言:      $VIDEO_LANG"
 echo "模型:      ${WHISPER_MODEL:-large-v3-turbo}"
 echo "设备:      $DEVICE"
-echo "FFmpeg:    ${FFMPEG_PATH_LINUX:-ffmpeg}"
 [ -n "${WHISPER_ALIGN_MODEL:-}" ] && echo "对齐:      $WHISPER_ALIGN_MODEL"
 echo "============================================="
 
 cd "$VIDEO_DIR"
 echo "提取音频..."
-"${FFMPEG_PATH_LINUX:-ffmpeg}" -i "$VIDEO_NAME" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$WAV_NAME" -y -loglevel error
+ffmpeg -i "$VIDEO_NAME" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$WAV_NAME" -y -loglevel error
 
 WHISPER_ARGS=(
     "$WAV_NAME"

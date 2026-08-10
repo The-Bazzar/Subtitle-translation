@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Alias("u")]
     [Parameter(Position = 0, HelpMessage = "YouTube video URL")]
     [string]$Url,
@@ -8,10 +8,7 @@
     [switch]$Help
 )
 
-$Utf8 = [System.Text.UTF8Encoding]::new($false)
-[Console]::InputEncoding = $Utf8
-[Console]::OutputEncoding = $Utf8
-$OutputEncoding = $Utf8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 if ($Help -or (-not $Url)) {
     @"
@@ -35,12 +32,6 @@ download.ps1 — 下载 YouTube 视频 + 元数据 (不含字幕生成)
 . "$PSScriptRoot\.env.ps1"
 $Ytdlp = Get-EnvValue 'YTDLP_PATH_WIN' 'yt-dlp'
 $Ffmpeg = Get-EnvValue 'FFMPEG_PATH_WIN' 'ffmpeg'
-$YtdlpProxy = Get-EnvValue 'YTDLP_PROXY' ''
-$YtdlpCommonArgs = @()
-if ($YtdlpProxy) {
-    $YtdlpCommonArgs = @('--proxy', $YtdlpProxy)
-    Write-Host "yt-dlp proxy: $YtdlpProxy" -ForegroundColor Gray
-}
 
 function Resolve-AbsolutePath {
     param([Parameter(Mandatory)][string]$Path)
@@ -63,26 +54,6 @@ function Format-NativeCommand {
     }
 
     return ((@($FilePath) + @($quoted)) -join ' ').Trim()
-}
-
-function Invoke-NativeProcess {
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [Parameter(Mandatory)][string[]]$Arguments
-    )
-
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $FilePath
-    $startInfo.UseShellExecute = $false
-    foreach ($arg in $Arguments) {
-        [void]$startInfo.ArgumentList.Add([string]$arg)
-    }
-
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    [void]$process.Start()
-    $process.WaitForExit()
-    return $process.ExitCode
 }
 
 function Test-FfmpegEncoder {
@@ -192,7 +163,8 @@ function Invoke-EditVideoReencode {
 
         Write-Host "尝试: $($attempt.Name)" -ForegroundColor DarkGray
         [Console]::Error.WriteLine("ffmpeg cmd: $(Format-NativeCommand -FilePath $Ffmpeg -Arguments $attempt.Args)")
-        $lastExitCode = Invoke-NativeProcess -FilePath $Ffmpeg -Arguments $attempt.Args
+        & $Ffmpeg @($attempt.Args)
+        $lastExitCode = $LASTEXITCODE
         if ($lastExitCode -eq 0 -and (Test-Path $OutputPath)) {
             return
         }
@@ -219,7 +191,7 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "步骤 1: 抓取视频标题并创建独立文件夹" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 
-$VideoTitle = & $Ytdlp @YtdlpCommonArgs --get-title $Url 2>&1
+$VideoTitle = & $Ytdlp --get-title $Url 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Error: Failed to get video title." -ForegroundColor Red
     exit 1
@@ -289,7 +261,7 @@ if ($HasExistingOriginalMkv) {
     )
 }
 
-& $Ytdlp @YtdlpCommonArgs @YtdlArgs
+& $Ytdlp @YtdlArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Error: yt-dlp download failed." -ForegroundColor Red
     exit $LASTEXITCODE

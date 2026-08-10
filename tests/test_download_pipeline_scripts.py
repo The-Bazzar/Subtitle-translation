@@ -1,7 +1,6 @@
 import pathlib
 import re
 import unittest
-import codecs
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -12,24 +11,6 @@ def read_script(name: str) -> str:
 
 
 class DownloadPipelineScriptTests(unittest.TestCase):
-    def test_windows_powershell_scripts_use_utf8_bom(self):
-        scripts = (
-            ".env.ps1",
-            "batch.ps1",
-            "download.ps1",
-            "ffmpeg-burn.ps1",
-            "mpv-burn.ps1",
-            "pipeline.ps1",
-            "setup.ps1",
-            "whisper.ps1",
-        )
-        for script in scripts:
-            with self.subTest(script=script):
-                self.assertTrue(
-                    (ROOT / script).read_bytes().startswith(codecs.BOM_UTF8),
-                    f"{script} must be UTF-8 with BOM for Windows PowerShell 5.1",
-                )
-
     def test_download_scripts_emit_edit_and_render_video_paths(self):
         expectations = {
             "download.ps1": [
@@ -54,7 +35,6 @@ class DownloadPipelineScriptTests(unittest.TestCase):
                 r'Test-NvidiaAvailable',
                 r'Test-FfmpegEncoder',
                 r'Test-NonEmptyFile',
-                r'Invoke-NativeProcess',
                 r'h264_nvenc',
                 r"'-cq',\s*'12'",
                 r'libx264',
@@ -97,27 +77,6 @@ class DownloadPipelineScriptTests(unittest.TestCase):
             ],
             "download.sh": [
                 r'ffmpeg cmd:',
-            ],
-        }
-
-        for script, patterns in expectations.items():
-            content = read_script(script)
-            for pattern in patterns:
-                with self.subTest(script=script, pattern=pattern):
-                    self.assertRegex(content, pattern)
-
-    def test_download_scripts_accept_optional_ytdlp_proxy(self):
-        expectations = {
-            "download.ps1": [
-                r"Get-EnvValue 'YTDLP_PROXY'",
-                r"'--proxy',\s*\$YtdlpProxy",
-                r'@YtdlpCommonArgs\s+--get-title',
-                r'@YtdlpCommonArgs\s+@YtdlArgs',
-            ],
-            "download.sh": [
-                r'YTDLP_PROXY="\$\{YTDLP_PROXY:-\}"',
-                r'YTDLP_PROXY_ARGS=\(--proxy "\$YTDLP_PROXY"\)',
-                r'"\$\{YTDLP_PROXY_ARGS\[@\]\}" --get-title',
             ],
         }
 

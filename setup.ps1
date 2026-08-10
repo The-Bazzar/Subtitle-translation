@@ -1,12 +1,9 @@
-﻿# =============================================================================
+# =============================================================================
 # setup.ps1 — 安装字幕流水线全部依赖 (Windows PowerShell)
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
-$Utf8 = [System.Text.UTF8Encoding]::new($false)
-[Console]::InputEncoding = $Utf8
-[Console]::OutputEncoding = $Utf8
-$OutputEncoding = $Utf8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ScriptDir = Split-Path $PSCommandPath -Parent
 
 function Copy-ConfigIfMissing {
