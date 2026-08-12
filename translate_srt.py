@@ -3147,47 +3147,118 @@ class WebSearchRuntime:
     used_queries: int = 0
     unresolved_searches: dict[int, list[str]] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    _inflight: dict[str, concurrent.futures.Future] = field(default_factory=dict, repr=False, compare=False)
+    _inflight_item_ids: dict[str, set[int]] = field(default_factory=dict, repr=False, compare=False)
+    _query_cache: dict[str, dict] = field(default_factory=dict, repr=False, compare=False)
+    _reserved_queries: int = field(default=0, repr=False, compare=False)
+    cache_reuses: int = 0
+    singleflight_reuses: int = 0
+    _work_item_ordinals: dict[int, int] = field(default_factory=dict, repr=False, compare=False)
+    _work_ordinals: set[int] = field(default_factory=set, repr=False, compare=False)
+    _completed_work_ordinals: set[int] = field(default_factory=set, repr=False, compare=False)
+    _condition: threading.Condition = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._condition = threading.Condition(self._lock)
+
+    def configure_work_units(self, work_units: list[tuple[int, list[int]]]) -> None:
+        """Define deterministic search priority without reserving any query budget."""
+        with self._condition:
+            self._work_item_ordinals = {
+                int(item_id): int(ordinal)
+                for ordinal, item_ids in work_units for item_id in item_ids
+            }
+            self._work_ordinals = {int(ordinal) for ordinal, _item_ids in work_units}
+            self._completed_work_ordinals.clear()
+
+    def mark_work_unit_done(self, ordinal: int) -> None:
+        with self._condition:
+            self._completed_work_ordinals.add(int(ordinal))
+            self._condition.notify_all()
+
+    def _wait_for_search_turn(self, item_ids: list[int]) -> None:
+        ordinals = [self._work_item_ordinals[item_id] for item_id in item_ids
+                    if item_id in self._work_item_ordinals]
+        if not ordinals:
+            return
+        ordinal = min(ordinals)
+        with self._condition:
+            while any(
+                candidate < ordinal and candidate not in self._completed_work_ordinals
+                for candidate in self._work_ordinals
+            ):
+                self._condition.wait()
 
     @property
     def unresolved_item_ids(self) -> set[int]:
-        return {item_id for item_id, reasons in self.unresolved_searches.items() if reasons}
+        with self._lock:
+            return {item_id for item_id, reasons in self.unresolved_searches.items() if reasons}
 
     def record_unresolved(self, item_ids: list[int], query: str, reason: str) -> None:
         clean_query = re.sub(r"\s+", " ", str(query or "web search").strip())
         detail = re.sub(r"\s+", " ", f"[{clean_query}] {reason}".strip())[:500]
         if not detail:
             return
-        for item_id in item_ids:
-            if int(item_id) <= 0:
-                continue
-            self.unresolved_searches[int(item_id)] = unique_non_empty_strings(
-                [*self.unresolved_searches.get(int(item_id), []), detail], 6
-            )
+        with self._lock:
+            for item_id in item_ids:
+                if int(item_id) <= 0:
+                    continue
+                self.unresolved_searches[int(item_id)] = unique_non_empty_strings(
+                    [*self.unresolved_searches.get(int(item_id), []), detail], 6
+                )
 
     def clear_unresolved(self, item_ids: list[int], query: str) -> None:
         query_key = tavily_query_dedupe_key(query)
-        for item_id in item_ids:
-            remaining = [
-                reason
-                for reason in self.unresolved_searches.get(int(item_id), [])
-                if not (
-                    (match := re.match(r"^\[(.*?)\]", reason))
-                    and tavily_query_dedupe_key(match.group(1)) == query_key
-                )
-            ]
-            if remaining:
-                self.unresolved_searches[int(item_id)] = remaining
-            else:
-                self.unresolved_searches.pop(int(item_id), None)
+        with self._lock:
+            for item_id in item_ids:
+                remaining = [
+                    reason
+                    for reason in self.unresolved_searches.get(int(item_id), [])
+                    if not (
+                        (match := re.match(r"^\[(.*?)\]", reason))
+                        and tavily_query_dedupe_key(match.group(1)) == query_key
+                    )
+                ]
+                if remaining:
+                    self.unresolved_searches[int(item_id)] = remaining
+                else:
+                    self.unresolved_searches.pop(int(item_id), None)
 
     def unresolved_reasons(self, item_id: int) -> list[str]:
-        return list(self.unresolved_searches.get(int(item_id), []))
+        with self._lock:
+            return list(self.unresolved_searches.get(int(item_id), []))
 
     def has_capability(self) -> bool:
-        return bool(self.settings.configured_providers() or self.sidecar.has_records())
+        with self._lock:
+            return bool(self.settings.configured_providers() or self.sidecar.has_records())
 
     def remaining_queries(self) -> int:
-        return max(0, int(self.max_queries or 0) - self.used_queries)
+        with self._lock:
+            return max(0, int(self.max_queries or 0) - self.used_queries - self._reserved_queries)
+
+    def sidecar_snapshot(self) -> WebEvidenceSidecar:
+        with self._lock:
+            return copy.deepcopy(self.sidecar)
+
+    def search_metrics(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "web_searches": self.used_queries,
+                "web_cache_reuses": self.cache_reuses,
+                "web_singleflight_reuses": self.singleflight_reuses,
+            }
+
+    def _reserve_query(self) -> bool:
+        with self._lock:
+            if self.used_queries + self._reserved_queries >= int(self.max_queries or 0):
+                return False
+            self._reserved_queries += 1
+            return True
+
+    def _complete_reserved_query(self) -> None:
+        with self._lock:
+            self._reserved_queries = max(0, self._reserved_queries - 1)
+            self.used_queries += 1
 
     def _search_provider(
         self,
@@ -3214,12 +3285,6 @@ class WebSearchRuntime:
         return []
 
     def execute_search(self, args: dict, search_stage: str = "tool") -> dict:
-        # Provider calls may run concurrently, but the shared evidence budget and
-        # sidecar are updated serially so results remain deterministic and race-free.
-        with self._lock:
-            return self._execute_search_unlocked(args, search_stage)
-
-    def _execute_search_unlocked(self, args: dict, search_stage: str = "tool") -> dict:
         query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())
         topic_hints = unique_non_empty_strings(json_string_list(args.get("topic_hints", [])), 24)
         requested_domains = unique_tavily_domains(json_string_list(args.get("preferred_domains", [])))
@@ -3233,6 +3298,75 @@ class WebSearchRuntime:
         if not query:
             self.record_unresolved(item_ids, "web search", "missing query")
             return {"error": "missing query", "query": "", "records": [], "results": []}
+        self._wait_for_search_turn(item_ids)
+        query_key = tavily_query_dedupe_key(query)
+        with self._lock:
+            cached_response = self._query_cache.get(query_key)
+            if cached_response is not None:
+                self.cache_reuses += 1
+                response = copy.deepcopy(cached_response)
+                cached_ids = sorted({*response.get("item_ids", []), *item_ids})
+                response["item_ids"] = cached_ids
+                for record in self.sidecar.records:
+                    if tavily_query_dedupe_key(record.query) == query_key:
+                        record.item_ids = sorted({*record.item_ids, *item_ids})
+                if response.get("results"):
+                    self.clear_unresolved(item_ids, query)
+                elif response.get("error"):
+                    self.record_unresolved(item_ids, query, str(response["error"]))
+                response["reused_evidence"] = True
+                response["remaining_queries"] = self.remaining_queries()
+                return response
+            future = self._inflight.get(query_key)
+            if future is not None:
+                self.singleflight_reuses += 1
+                self._inflight_item_ids[query_key].update(item_ids)
+                owner = False
+            else:
+                future = concurrent.futures.Future()
+                self._inflight[query_key] = future
+                self._inflight_item_ids[query_key] = set(item_ids)
+                owner = True
+        if not owner:
+            response = copy.deepcopy(future.result())
+            response["item_ids"] = sorted({*response.get("item_ids", []), *item_ids})
+            response["reused_evidence"] = True
+            response["remaining_queries"] = self.remaining_queries()
+            return response
+        try:
+            response = self._execute_search_owner(
+                query, query_key, topic_hints, requested_domains, item_ids, args, search_stage
+            )
+            with self._lock:
+                all_item_ids = sorted(self._inflight_item_ids.get(query_key, set(item_ids)))
+                response["item_ids"] = all_item_ids
+                for record in self.sidecar.records:
+                    if tavily_query_dedupe_key(record.query) == query_key:
+                        record.item_ids = sorted({*record.item_ids, *all_item_ids})
+                if response.get("results"):
+                    self.clear_unresolved(all_item_ids, query)
+                else:
+                    self.record_unresolved(
+                        all_item_ids, query, str(response.get("error", "no valid search results"))
+                    )
+                self._query_cache[query_key] = copy.deepcopy(response)
+                self._inflight.pop(query_key, None)
+                self._inflight_item_ids.pop(query_key, None)
+                future.set_result(copy.deepcopy(response))
+            return copy.deepcopy(response)
+        except BaseException as error:
+            with self._lock:
+                future.set_exception(error)
+            raise
+        finally:
+            with self._lock:
+                self._inflight.pop(query_key, None)
+                self._inflight_item_ids.pop(query_key, None)
+
+    def _execute_search_owner(
+        self, query: str, query_key: str, topic_hints: list[str],
+        requested_domains: list[str], item_ids: list[int], args: dict, search_stage: str,
+    ) -> dict:
         preferred_domains = unique_tavily_domains(
             [
                 *select_tavily_preferred_domains(
@@ -3244,15 +3378,14 @@ class WebSearchRuntime:
                 *requested_domains,
             ]
         )
-        cached_records = [
-            record
-            for record in self.sidecar.records
-            if record.results and tavily_query_dedupe_key(record.query) == tavily_query_dedupe_key(query)
-        ]
+        with self._lock:
+            cached_records = [
+                copy.deepcopy(record) for record in self.sidecar.records
+                if record.results and tavily_query_dedupe_key(record.query) == query_key
+            ]
         if cached_records:
             flattened = []
             for record in cached_records:
-                record.item_ids = sorted({*record.item_ids, *item_ids})
                 for entry in record.results:
                     flattened.append(
                         {
@@ -3263,7 +3396,8 @@ class WebSearchRuntime:
                             "preferred_domain_hit": entry.preferred_domain_hit,
                         }
                     )
-            self.clear_unresolved(item_ids, query)
+            with self._lock:
+                self.cache_reuses += 1
             return {
                 "query": query,
                 "topic_hints": topic_hints,
@@ -3277,10 +3411,9 @@ class WebSearchRuntime:
         provider_errors: list[str] = []
         providers = self.settings.configured_providers()
         for provider in providers:
-            if self.remaining_queries() <= 0:
+            if not self._reserve_query():
                 provider_errors.append("search query budget exhausted")
                 break
-            self.used_queries += 1
             provider_limit = (
                 self.settings.tavily_max_results if provider == "tavily" else self.settings.exa_max_results
             )
@@ -3294,6 +3427,8 @@ class WebSearchRuntime:
             except Exception as e:
                 results = []
                 provider_errors.append(f"{provider} failed: {e}")
+            finally:
+                self._complete_reserved_query()
             record = build_web_evidence_record(
                 query,
                 results,
@@ -3304,9 +3439,10 @@ class WebSearchRuntime:
                 item_ids=item_ids,
             )
             if record.results:
-                self.sidecar = merge_web_evidence_sidecars(
-                    self.sidecar, WebEvidenceSidecar(records=[record])
-                )
+                with self._lock:
+                    self.sidecar = merge_web_evidence_sidecars(
+                        self.sidecar, WebEvidenceSidecar(records=[record])
+                    )
                 records.append(record)
                 if self.settings.provider == "auto":
                     break
@@ -3339,14 +3475,6 @@ class WebSearchRuntime:
         }
         if provider_errors and not flattened:
             response["error"] = "; ".join(unique_non_empty_strings(provider_errors, 4))
-        if flattened:
-            self.clear_unresolved(item_ids, query)
-        else:
-            self.record_unresolved(
-                item_ids,
-                query,
-                str(response.get("error", "no valid search results")),
-            )
         return response
 
 
@@ -5318,7 +5446,11 @@ class ChatSession:
                 return self._create_once(extra_kwargs)
             except Exception as e:
                 last_error = e
-                if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
+                if (
+                    attempt >= template.normalized_attempts() - 1
+                    or is_context_length_error(e)
+                    or is_output_length_error(e)
+                ):
                     raise
                 self.provider_retry_count += 1
                 self._wait_before_retry(template, attempt, e)
@@ -5373,7 +5505,11 @@ class ChatSession:
                 return answer, parsed
             except Exception as e:
                 last_error = e
-                if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
+                if (
+                    attempt >= template.normalized_attempts() - 1
+                    or is_context_length_error(e)
+                    or is_output_length_error(e)
+                ):
                     raise
                 self.provider_retry_count += 1
                 if retry_feedback is not None and answer is not None:
@@ -6022,7 +6158,11 @@ def write_proofread_report(
         "",
         f"- Provider retries: {int((metrics or {}).get('provider_retries', 0) or 0)}",
         f"- Safety retries: {sum(1 for record in records if record.get('retry_attempted'))}",
-        f"- Output length exhaustions: {output_length_exhaustions}",
+        f"- Output length exhaustions: {int((metrics or {}).get('output_length_exhaustions', output_length_exhaustions) or 0)}",
+        f"- Web searches: {int((metrics or {}).get('web_searches', 0) or 0)}",
+        f"- Web cache reuses: {int((metrics or {}).get('web_cache_reuses', 0) or 0)}",
+        f"- Web single-flight reuses: {int((metrics or {}).get('web_singleflight_reuses', 0) or 0)}",
+        f"- Length group splits recovered: {int((metrics or {}).get('length_group_splits', 0) or 0)}",
         "",
         "| Item | Time | Initial | Retry | Final | Gate reasons |",
         "|---:|---|---|---|---|---|",
@@ -6461,26 +6601,15 @@ def proofread_split_events(
         full_target = str(sentence_contexts[start].get("full_target", "")) if start < end else ""
         groups.append(ProofreadSentenceGroup(segment.index, snapshots, full_target))
     tasks = pack_proofread_sentence_groups(groups, pr_llm.batch_size)
+    if enhanced and search_runtime is not None:
+        search_runtime.configure_work_units([
+            (task.ordinal, [item.item_id for item in task.items]) for task in tasks
+        ])
 
     term_context = {
         item.item_id: relevant_term_evidence(item.source, evidence_sidecar)
         for group in groups for item in group.items
     }
-    task_search_runtimes: dict[int, WebSearchRuntime] = {}
-    if enhanced and search_runtime is not None:
-        remaining_budget = search_runtime.remaining_queries()
-        task_count = len(tasks)
-        for task in tasks:
-            quota = remaining_budget // task_count + (1 if task.ordinal < remaining_budget % task_count else 0)
-            task_search_runtimes[task.ordinal] = WebSearchRuntime(
-                settings=search_runtime.settings,
-                metadata_fields=copy.deepcopy(search_runtime.metadata_fields),
-                preferences=copy.deepcopy(search_runtime.preferences),
-                max_queries=quota,
-                sidecar=copy.deepcopy(evidence_sidecar),
-                quiet=quiet,
-            )
-
     def build_request(items: tuple[ProofreadEventSnapshot, ...], without_rag: bool = False) -> LLMBatchRequest:
         return LLMBatchRequest([
             make_pair_item(
@@ -6507,14 +6636,99 @@ def proofread_split_events(
             response_items, expected, [(item.source, item.target) for item in items], ctx
         )
 
-    def execute_task(task: ProofreadBatchTask) -> dict:
+    def evaluate_candidate(
+        item: ProofreadEventSnapshot,
+        group: ProofreadSentenceGroup,
+        candidate_source: str,
+        candidate_target: str,
+        review: dict,
+        legacy_edit: Optional[dict],
+    ) -> dict:
+        """Apply the one deterministic candidate path used by initial and retry proposals."""
+        candidate_source = candidate_source.strip() or item.source
+        candidate_target = candidate_target.strip() or item.target
+        if search_runtime is not None:
+            constraints, conflicts = relevant_term_evidence(
+                item.source, search_runtime.sidecar_snapshot()
+            )
+        else:
+            constraints, conflicts = term_context[item.item_id]
+        evidence_edit = legacy_edit
+        if candidate_source != item.source and source_matches_retrieved_asr_replacement(
+            item.source, candidate_source, list(item.retrieved_context)
+        ):
+            evidence_edit = {
+                "source_changed": True,
+                "target_changed": candidate_target != item.target,
+                "categories": ["source_ASR"],
+                "reasons": ["explicit retrieved ASR replacement"],
+            }
+            constraints = [
+                *constraints,
+                {"source": candidate_source, "target": candidate_target,
+                 "source_variants": [item.source]},
+            ]
+        safety_events: list[str] = []
+        guarded_review = merge_review_metadata(persistent_event_review(item.review), review)
+        new_source, new_target, guarded_review = apply_proofread_safety_constraints(
+            item.source, item.target, candidate_source, candidate_target, evidence_edit,
+            guarded_review, constraints, conflicts, safety_mode=safety_mode_enabled,
+            safety_events=safety_events,
+        )
+        if breaks_cross_event_sentence_boundary(
+            new_source, item.target, new_target, item.sentence_context
+        ):
+            new_target = item.target
+            safety_events.append("cross_event_sentence_closure")
+        if sentence_group_repeats_full_target(
+            candidate_target, item.target, group.full_target, len(group.items)
+        ):
+            new_source, new_target = item.source, item.target
+            safety_events.append("sentence_group_full_target_repeated")
+        ui_target = apply_glossary_ui_translation(
+            new_source, new_target, list(item.retrieved_context), ctx
+        )
+        if ui_target != new_target:
+            _unused, new_target, guarded_review = apply_proofread_safety_constraints(
+                new_source, new_target, new_source, ui_target, None, guarded_review,
+                constraints, conflicts, safety_mode=safety_mode_enabled,
+                safety_events=safety_events,
+            )
+        unresolved = search_runtime.unresolved_reasons(item.item_id) if search_runtime is not None else []
+        if unresolved:
+            new_source, new_target = item.source, item.target
+            safety_events.append("unresolved_external_evidence")
+        guarded_review = add_unresolved_search_human_review(guarded_review, unresolved)
+        guarded_review = merge_retrieval_review_evidence(
+            new_source, guarded_review, list(item.retrieved_context)
+        )
+        decision, reasons = proofread_decision_diagnostic(
+            item.source, item.target, candidate_source, candidate_target,
+            new_source, new_target, guarded_review, safety_events,
+        )
+        return {
+            "item": item,
+            "candidate_source": candidate_source,
+            "candidate_target": candidate_target,
+            "source": new_source,
+            "target": new_target,
+            "review": guarded_review,
+            "decision": decision,
+            "reasons": reasons,
+        }
+
+    def execute_task(task: ProofreadBatchTask, mark_work_done: bool = True) -> dict:
         items = task.items
         request = build_request(items)
-        task_metrics: dict = {"provider_retries": 0}
+        task_metrics: dict = {
+            "provider_retries": 0,
+            "output_length_exhaustions": 0,
+            "length_group_splits": 0,
+        }
         recorded_session_retries = 0
         task_session: Optional[ChatSession] = None
         try:
-            task_runtime = task_search_runtimes.get(task.ordinal)
+            task_runtime = search_runtime if enhanced else None
             if task_runtime is not None and task_runtime.has_capability():
                 try:
                     task_session = ChatSession(
@@ -6549,16 +6763,24 @@ def proofread_split_events(
                 task_metrics["provider_retries"] += task_session.provider_retry_count
                 recorded_session_retries = task_session.provider_retry_count
             return {"task": task, "results": validate_complete_response(response, items), "error": "",
-                    "metrics": task_metrics, "search_runtime": task_runtime}
+                    "metrics": task_metrics}
         except Exception as error:
             if task_session is not None:
                 task_metrics["provider_retries"] += max(
                     0, task_session.provider_retry_count - recorded_session_retries
                 )
-            if is_context_length_error(error) and len(task.groups) > 1:
+            if is_output_length_error(error):
+                task_metrics["output_length_exhaustions"] += 1
+            if (is_context_length_error(error) or is_output_length_error(error)) and len(task.groups) > 1:
+                if is_output_length_error(error):
+                    task_metrics["length_group_splits"] += 1
                 mid = len(task.groups) // 2
-                left = execute_task(ProofreadBatchTask(task.ordinal, task.groups[:mid]))
-                right = execute_task(ProofreadBatchTask(task.ordinal, task.groups[mid:]))
+                left = execute_task(
+                    ProofreadBatchTask(task.ordinal, task.groups[:mid]), mark_work_done=False
+                )
+                right = execute_task(
+                    ProofreadBatchTask(task.ordinal, task.groups[mid:]), mark_work_done=False
+                )
                 return {"task": task, "parts": [left, right], "error": "", "metrics": task_metrics}
             if is_context_length_error(error) and any(item.retrieved_context for item in items):
                 try:
@@ -6571,23 +6793,26 @@ def proofread_split_events(
                     task_metrics["provider_retries"] += task_session.provider_retry_count
                     recorded_session_retries = task_session.provider_retry_count
                     return {"task": task, "results": validate_complete_response(response, items), "error": "",
-                            "metrics": task_metrics, "search_runtime": task_search_runtimes.get(task.ordinal)}
+                            "metrics": task_metrics}
                 except Exception as retry_error:
                     task_metrics["provider_retries"] += max(
                         0, task_session.provider_retry_count - recorded_session_retries
                     )
                     error = retry_error
             return {"task": task, "results": [], "error": str(error), "length_error": is_output_length_error(error),
-                    "metrics": task_metrics, "search_runtime": task_search_runtimes.get(task.ordinal)}
+                    "metrics": task_metrics}
+        finally:
+            if mark_work_done and enhanced and search_runtime is not None:
+                search_runtime.mark_work_unit_done(task.ordinal)
 
     def flatten_task_result(result: dict) -> list[dict]:
         if "parts" in result:
             return [leaf for part in result["parts"] for leaf in flatten_task_result(part)]
         return [result]
 
-    def task_result_provider_retries(result: dict) -> int:
-        own = int(result.get("metrics", {}).get("provider_retries", 0) or 0)
-        return own + sum(task_result_provider_retries(part) for part in result.get("parts", []))
+    def task_result_metric(result: dict, key: str) -> int:
+        own = int(result.get("metrics", {}).get(key, 0) or 0)
+        return own + sum(task_result_metric(part, key) for part in result.get("parts", []))
 
     completed: dict[int, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -6597,27 +6822,22 @@ def proofread_split_events(
 
     # Restore deterministic task/group order regardless of worker completion order.
     provider_retries = 0
-    merged_task_runtimes: set[int] = set()
-    if search_runtime is not None:
-        for ordinal in sorted(completed):
-            provider_retries += task_result_provider_retries(completed[ordinal])
-            for leaf in flatten_task_result(completed[ordinal]):
-                task_runtime = leaf.get("search_runtime")
-                if task_runtime is None or id(task_runtime) in merged_task_runtimes:
-                    continue
-                merged_task_runtimes.add(id(task_runtime))
-                search_runtime.used_queries += task_runtime.used_queries
-                search_runtime.sidecar = merge_web_evidence_sidecars(
-                    search_runtime.sidecar, task_runtime.sidecar
-                )
-                for item_id in sorted(task_runtime.unresolved_searches):
-                    for reason in task_runtime.unresolved_searches[item_id]:
-                        search_runtime.record_unresolved([item_id], "worker", reason)
-    else:
-        for ordinal in sorted(completed):
-            provider_retries += task_result_provider_retries(completed[ordinal])
+    output_length_exhaustions = 0
+    length_group_splits = 0
+    for ordinal in sorted(completed):
+        provider_retries += task_result_metric(completed[ordinal], "provider_retries")
+        output_length_exhaustions += task_result_metric(
+            completed[ordinal], "output_length_exhaustions"
+        )
+        length_group_splits += task_result_metric(completed[ordinal], "length_group_splits")
     if metrics is not None:
         metrics["provider_retries"] = metrics.get("provider_retries", 0) + provider_retries
+        metrics["output_length_exhaustions"] = (
+            metrics.get("output_length_exhaustions", 0) + output_length_exhaustions
+        )
+        metrics["length_group_splits"] = metrics.get("length_group_splits", 0) + length_group_splits
+        if search_runtime is not None:
+            metrics.update(search_runtime.search_metrics())
 
     raw_by_id: dict[int, tuple[str, str, dict, Optional[dict]]] = {}
     errors_by_id: dict[int, tuple[str, bool]] = {}
@@ -6653,59 +6873,13 @@ def proofread_split_events(
                 group_failed = True
                 continue
             candidate_source, candidate_target, review, legacy_edit = raw_by_id[item.item_id]
-            candidate_source = candidate_source.strip() or item.source
-            candidate_target = candidate_target.strip() or item.target
-            safety_events: list[str] = []
-            merged_review = merge_review_metadata(persistent_event_review(item.review), review)
-            evidence_edit = legacy_edit
-            if candidate_source != item.source and source_matches_retrieved_asr_replacement(
-                item.source, candidate_source, list(item.retrieved_context)
-            ):
-                evidence_edit = {
-                    "source_changed": True,
-                    "target_changed": candidate_target != item.target,
-                    "categories": ["source_ASR"],
-                    "reasons": ["explicit retrieved ASR replacement"],
-                }
-                constraints, conflicts = term_context[item.item_id]
-                constraints = [
-                    *constraints,
-                    {"source": candidate_source, "target": candidate_target,
-                     "source_variants": [item.source]},
-                ]
-            else:
-                constraints, conflicts = term_context[item.item_id]
-            new_source, new_target, guarded_review = apply_proofread_safety_constraints(
-                item.source, item.target, candidate_source, candidate_target, evidence_edit,
-                merged_review, constraints, conflicts, safety_mode=safety_mode_enabled,
-                safety_events=safety_events,
+            row = evaluate_candidate(
+                item, group, candidate_source, candidate_target, review, legacy_edit
             )
-            if breaks_cross_event_sentence_boundary(new_source, item.target, new_target, item.sentence_context):
-                new_target = item.target
-                safety_events.append("cross_event_sentence_closure")
-            if sentence_group_repeats_full_target(candidate_target, item.target, group.full_target, len(group.items)):
-                new_source, new_target = item.source, item.target
-                safety_events.append("sentence_group_full_target_repeated")
-            ui_target = apply_glossary_ui_translation(new_source, new_target, list(item.retrieved_context), ctx)
-            if ui_target != new_target:
-                _unused, new_target, guarded_review = apply_proofread_safety_constraints(
-                    new_source, new_target, new_source, ui_target, None, guarded_review,
-                    *term_context[item.item_id], safety_mode=safety_mode_enabled, safety_events=safety_events,
-                )
-            unresolved = search_runtime.unresolved_reasons(item.item_id) if search_runtime is not None else []
-            if unresolved:
-                new_source, new_target = item.source, item.target
-                safety_events.append("unresolved_external_evidence")
-            guarded_review = add_unresolved_search_human_review(guarded_review, unresolved)
-            normalized_review = merge_retrieval_review_evidence(new_source, guarded_review, list(item.retrieved_context))
-            decision, reasons = proofread_decision_diagnostic(
-                item.source, item.target, candidate_source, candidate_target,
-                new_source, new_target, normalized_review, safety_events,
-            )
-            group_failed = group_failed or decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}
-            staged.append({"item": item, "candidate_source": candidate_source, "candidate_target": candidate_target,
-                           "source": new_source, "target": new_target, "review": normalized_review,
-                           "decision": decision, "reasons": reasons})
+            group_failed = group_failed or row["decision"] in {
+                "EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"
+            }
+            staged.append(row)
 
         retry_results: dict[int, tuple[str, str, dict, Optional[dict]]] = {}
         retry_error = ""
@@ -6740,7 +6914,11 @@ def proofread_split_events(
                 parsed = validate_complete_response(response, group.items)
                 retry_results = {item.item_id: result for item, result in zip(group.items, parsed)}
             except Exception as error:
+                if metrics is not None:
+                    metrics["provider_retries"] = metrics.get("provider_retries", 0) + retry_session.provider_retry_count
                 retry_error = str(error)
+                if metrics is not None and is_output_length_error(error):
+                    metrics["output_length_exhaustions"] = metrics.get("output_length_exhaustions", 0) + 1
 
         final_rows = staged
         if retry_results:
@@ -6749,46 +6927,46 @@ def proofread_split_events(
             for row in staged:
                 item = row["item"]
                 source, target, review, legacy_edit = retry_results[item.item_id]
-                source, target = source.strip() or item.source, target.strip() or item.target
-                safety_events: list[str] = []
-                new_source, new_target, guarded_review = apply_proofread_safety_constraints(
-                    item.source, item.target, source, target, legacy_edit,
-                    merge_review_metadata(persistent_event_review(item.review), review),
-                    *term_context[item.item_id], safety_mode=safety_mode_enabled, safety_events=safety_events,
-                )
-                if breaks_cross_event_sentence_boundary(new_source, item.target, new_target, item.sentence_context):
-                    new_target = item.target; safety_events.append("cross_event_sentence_closure")
-                if sentence_group_repeats_full_target(target, item.target, group.full_target, len(group.items)):
-                    new_source, new_target = item.source, item.target
-                    safety_events.append("sentence_group_full_target_repeated")
-                unresolved = search_runtime.unresolved_reasons(item.item_id) if search_runtime is not None else []
-                if unresolved:
-                    new_source, new_target = item.source, item.target
-                    safety_events.append("unresolved_external_evidence")
-                guarded_review = add_unresolved_search_human_review(guarded_review, unresolved)
-                guarded_review = merge_retrieval_review_evidence(
-                    new_source, guarded_review, list(item.retrieved_context)
-                )
-                decision, reasons = proofread_decision_diagnostic(
-                    item.source, item.target, source, target, new_source, new_target,
-                    guarded_review, safety_events,
-                )
-                retry_failed = retry_failed or decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}
-                final_rows.append({**row, "source": new_source, "target": new_target,
-                                   "review": guarded_review, "retry_source": source,
-                                   "retry_target": target, "retry_decision": decision,
-                                   "retry_reasons": reasons})
+                evaluated = evaluate_candidate(item, group, source, target, review, legacy_edit)
+                retry_failed = retry_failed or evaluated["decision"] in {
+                    "EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"
+                }
+                final_rows.append({
+                    **row,
+                    "source": evaluated["source"], "target": evaluated["target"],
+                    "review": evaluated["review"],
+                    "retry_source": evaluated["candidate_source"],
+                    "retry_target": evaluated["candidate_target"],
+                    "retry_decision": evaluated["decision"],
+                    "retry_reasons": evaluated["reasons"],
+                })
             if retry_failed:
                 retry_error = "sentence group safety retry failed"
 
         if group_failed and (not retry_results or retry_error):
             for row in final_rows:
                 row["source"], row["target"] = row["item"].source, row["item"].target
+                row["group_rolled_back"] = True
+                row["group_rollback_reason"] = (
+                    "output_length_exhausted" if is_output_length_error(retry_error)
+                    else "sentence_group_rollback"
+                )
                 if retry_error and retry_error != "sentence group safety retry failed":
+                    length_retry_error = is_output_length_error(retry_error)
                     row["review"] = merge_review_metadata(row["review"], {
                         "needs_human": True, "categories": ["proofread_safety_retry"],
-                        "reasons": ["整句组安全重试失败，已逐条恢复原字幕"], "note": retry_error[:300],
+                        "reasons": [
+                            "整句组安全重试输出耗尽，已逐条恢复原字幕"
+                            if length_retry_error else "整句组安全重试失败，已逐条恢复原字幕"
+                        ],
+                        "note": retry_error[:300],
                     })
+                    if length_retry_error:
+                        row["review"] = merge_review_metadata(row["review"], {
+                            "needs_human": True,
+                            "categories": ["proofread_output_length"],
+                            "reasons": ["校对安全重试输出耗尽，未采用空结果"],
+                        })
 
         for row in final_rows:
             item = row["item"]
@@ -6807,6 +6985,23 @@ def proofread_split_events(
                     retry_error=retry_error,
                 )
                 record.update({"group_id": group.group_id, "group_item_ids": list(item.group_item_ids)})
+                if row.get("group_rolled_back"):
+                    record["group_final_decision"] = "GROUP_ROLLED_BACK"
+                    record["group_rollback_reason"] = row.get("group_rollback_reason", "")
+                    proposal_changed = (
+                        row["candidate_source"] != item.source
+                        or row["candidate_target"] != item.target
+                        or row.get("retry_source", item.source) != item.source
+                        or row.get("retry_target", item.target) != item.target
+                    )
+                    if proposal_changed:
+                        record["final_decision"] = "EDIT_ROLLED_BACK"
+                    elif normalize_review_metadata(event.review).get("needs_human"):
+                        record["final_decision"] = "REVIEW_BY_MODEL"
+                    else:
+                        record["final_decision"] = "KEEP_BY_MODEL"
+                else:
+                    record["group_final_decision"] = "GROUP_APPLIED"
                 decision_records.append(record)
             if not quiet:
                 final_decision = record["final_decision"] if decision_records is not None else (

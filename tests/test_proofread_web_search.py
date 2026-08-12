@@ -2,6 +2,8 @@ import copy
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from urllib import error as urllib_error
 from types import SimpleNamespace
@@ -67,6 +69,91 @@ def web_tool_call(query="official name", item_ids=None):
 
 
 class ProofreadWebSearchTests(unittest.TestCase):
+    def test_shared_runtime_singleflights_equivalent_concurrent_queries(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=2,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def search(*_args, **_kwargs):
+            calls.append(1)
+            entered.set()
+            release.wait(1)
+            return [{"url": "https://official.example/a", "title": "A", "content": "evidence"}]
+
+        results = {}
+        with patch.object(t, "tavily_search", side_effect=search):
+            first = threading.Thread(target=lambda: results.setdefault(
+                1, runtime.execute_search({"query": "Official   Name", "item_ids": [1]})
+            ))
+            second = threading.Thread(target=lambda: results.setdefault(
+                2, runtime.execute_search({"query": "official name", "item_ids": [2]})
+            ))
+            first.start(); entered.wait(1); second.start(); time.sleep(0.02); release.set()
+            first.join(1); second.join(1)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(runtime.used_queries, 1)
+        self.assertEqual(runtime.singleflight_reuses, 1)
+        self.assertEqual(runtime.sidecar.records[0].item_ids, [1, 2])
+        self.assertTrue(results[1]["results"] and results[2]["results"])
+
+    def test_cached_query_reuses_evidence_after_budget_is_exhausted(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=1,
+        )
+        evidence = [{"url": "https://official.example/a", "title": "A", "content": "evidence"}]
+        with patch.object(t, "tavily_search", return_value=evidence) as search:
+            runtime.execute_search({"query": "official name", "item_ids": [1]})
+            result = runtime.execute_search({"query": "OFFICIAL NAME", "item_ids": [2]})
+
+        search.assert_called_once()
+        self.assertTrue(result["reused_evidence"])
+        self.assertEqual(runtime.used_queries, 1)
+        self.assertEqual(runtime.sidecar.records[0].item_ids, [1, 2])
+
+    def test_failed_singleflight_marks_all_waiters_unresolved_without_deadlock(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=1,
+        )
+        entered = threading.Event(); release = threading.Event(); calls = []
+
+        def empty_search(*_args, **_kwargs):
+            calls.append(1); entered.set(); release.wait(1); return []
+
+        results = {}
+        with patch.object(t, "tavily_search", side_effect=empty_search):
+            first = threading.Thread(target=lambda: results.setdefault(
+                1, runtime.execute_search({"query": "Unknown Name", "item_ids": [1]})
+            ))
+            second = threading.Thread(target=lambda: results.setdefault(
+                2, runtime.execute_search({"query": "unknown name", "item_ids": [2]})
+            ))
+            first.start(); entered.wait(1); second.start(); time.sleep(0.02); release.set()
+            first.join(1); second.join(1)
+
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(runtime.used_queries, 1)
+        self.assertEqual(runtime.unresolved_item_ids, {1, 2})
+        self.assertTrue(results[1].get("error") and results[2].get("error"))
+
+    def test_dynamic_budget_is_consumed_only_by_tasks_that_search(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=1,
+        )
+        runtime.configure_work_units([(0, [1]), (1, [2])])
+        runtime.mark_work_unit_done(0)  # task 0 needed no search; its budget remains global.
+        evidence = [{"url": "https://official.example/a", "title": "A", "content": "evidence"}]
+        with patch.object(t, "tavily_search", return_value=evidence) as search:
+            result = runtime.execute_search({"query": "needed later", "item_ids": [2]})
+
+        search.assert_called_once()
+        self.assertTrue(result["results"])
+        self.assertEqual(runtime.used_queries, 1)
+
     def test_enhanced_proofread_requires_explicit_model_not_provider(self):
         self.assertFalse(t.explicit_proofread_model_configured({}))
         self.assertFalse(t.explicit_proofread_model_configured({"PROOFREAD_PROVIDER": "custom"}))

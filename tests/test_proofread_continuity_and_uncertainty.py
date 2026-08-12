@@ -816,7 +816,135 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertEqual(records[0]["first_decision"], "REVIEW_BY_MODEL")
         self.assertIn("output_length_exhausted", records[0]["first_gate_reasons"])
 
-    def test_enhanced_concurrency_uses_isolated_search_runtimes_and_merges_in_order(self):
+    def test_output_length_exhaustion_splits_only_between_sentence_groups(self):
+        first = t.SplitEvent(0.0, 1.0, "source one", "译文一")
+        second = t.SplitEvent(1.0, 2.0, "source two", "译文二")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 1.0, first.en, split_events=[first]),
+            t.TranscriptSegment(2, 1.0, 2.0, second.en, split_events=[second]),
+        ])
+        llm = FakeLLM(); llm.batch_size = 2
+        calls = []
+
+        def length_then_edit(request, *_args, **_kwargs):
+            ids = [item.id for item in request.items]
+            calls.append(ids)
+            if len(ids) > 1:
+                raise t.LLMOutputLengthError("finish_reason=length")
+            return [{"id": ids[0], "en": request.items[0].fields["en"],
+                     "zh": request.items[0].fields["zh"] + "改", "review": {}}]
+
+        with patch.object(t, "llm_numbered_batch", side_effect=length_then_edit):
+            t.proofread_split_events(transcript, self.ctx, llm, "system", True)
+
+        self.assertEqual(calls, [[1, 2], [1], [2]])
+        self.assertEqual([first.zh, second.zh], ["译文一改", "译文二改"])
+
+    def test_output_length_split_never_splits_sibling_events(self):
+        first = t.SplitEvent(0.0, 1.0, "part one", "甲")
+        second = t.SplitEvent(1.0, 2.0, "part two", "乙")
+        third = t.SplitEvent(2.0, 3.0, "other", "丙")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 2.0, "part one part two", translation="甲乙",
+                                split_events=[first, second]),
+            t.TranscriptSegment(2, 2.0, 3.0, third.en, split_events=[third]),
+        ])
+        llm = FakeLLM(); llm.batch_size = 3
+        calls = []
+
+        def length_then_edit(request, *_args, **_kwargs):
+            ids = [item.id for item in request.items]; calls.append(ids)
+            if ids == [1, 2, 3]:
+                raise t.LLMOutputLengthError("finish_reason=length")
+            return [{"id": item.id, "en": item.fields["en"],
+                     "zh": item.fields["zh"] + "改", "review": {}} for item in request.items]
+
+        metrics = {}
+        with patch.object(t, "llm_numbered_batch", side_effect=length_then_edit):
+            t.proofread_split_events(transcript, self.ctx, llm, "system", True, metrics=metrics)
+
+        self.assertEqual(calls, [[1, 2, 3], [1, 2], [3]])
+        self.assertFalse(any(ids in ([1], [2]) for ids in calls))
+        self.assertEqual(metrics["length_group_splits"], 1)
+
+    def test_group_provider_failure_rolls_back_sibling_report_state(self):
+        first = t.SplitEvent(0.0, 1.0, "first", "甲")
+        second = t.SplitEvent(1.0, 2.0, "second", "乙")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 2.0, "first second", translation="甲乙",
+                                split_events=[first, second])
+        ])
+
+        def partial_response(*_args, **_kwargs):
+            raise t.LLMOutputLengthError("finish_reason=length")
+
+        records = []
+        with patch.object(t, "llm_numbered_batch", side_effect=partial_response):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", True,
+                                     decision_records=records)
+
+        self.assertEqual([first.zh, second.zh], ["甲", "乙"])
+        self.assertTrue(all(row["final_target"] == original for row, original in zip(records, ["甲", "乙"])))
+        self.assertTrue(all(row["final_decision"] != "EDIT_APPLIED" for row in records))
+
+    def test_group_rollback_report_never_leaves_safe_sibling_final_edit_applied(self):
+        first = t.SplitEvent(0.0, 1.0, "plain", "甲")
+        second = t.SplitEvent(1.0, 2.0, "Only him", "只有他")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 2.0, "plain Only him", translation="甲只有他",
+                                split_events=[first, second])
+        ])
+        calls = 0
+
+        def proposals(request, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return [
+                {"id": item.id, "en": item.fields["en"],
+                 "zh": "甲改" if item.id == 1 else "他", "review": {}}
+                for item in request.items
+            ]
+
+        records = []
+        with patch.object(t, "llm_numbered_batch", side_effect=proposals):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", True,
+                                     decision_records=records)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual([first.zh, second.zh], ["甲", "只有他"])
+        self.assertEqual(records[0]["first_decision"], "EDIT_APPLIED")
+        self.assertEqual(records[0]["final_decision"], "EDIT_ROLLED_BACK")
+        self.assertTrue(all(row["group_final_decision"] == "GROUP_ROLLED_BACK" for row in records))
+
+    def test_safety_retry_length_exhaustion_is_explicit_group_rollback(self):
+        first = t.SplitEvent(0.0, 1.0, "Only", "只有")
+        second = t.SplitEvent(1.0, 2.0, "him.", "他。")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 2.0, "Only him.", translation="只有他。",
+                                split_events=[first, second])
+        ])
+        calls = 0
+
+        def first_then_length(request, *_args, **_kwargs):
+            nonlocal calls; calls += 1
+            if calls == 2:
+                raise t.LLMOutputLengthError("finish_reason=length")
+            return [{"id": item.id, "en": item.fields["en"], "zh": "他", "review": {}}
+                    for item in request.items]
+
+        records, metrics = [], {}
+        with patch.object(t, "llm_numbered_batch", side_effect=first_then_length):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", True,
+                                     decision_records=records, metrics=metrics)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual([first.zh, second.zh], ["只有", "他。"])
+        self.assertEqual(metrics["output_length_exhaustions"], 1)
+        self.assertTrue(all("proofread_output_length" in event.review["categories"]
+                            for event in [first, second]))
+        self.assertTrue(all(row["group_final_decision"] == "GROUP_ROLLED_BACK" for row in records))
+
+    def test_enhanced_concurrency_shares_search_runtime_and_global_budget(self):
         events = [t.SplitEvent(float(i), float(i + 1), f"name {i}", f"名字{i}") for i in range(2)]
         transcript = t.Transcript("x.json", "en", [
             t.TranscriptSegment(i + 1, float(i), float(i + 1), event.en, split_events=[event])
@@ -844,7 +972,7 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
                 search_runtime=runtime, concurrency=2,
             )
 
-        self.assertEqual(len(set(runtime_ids)), 2)
+        self.assertEqual(len(set(runtime_ids)), 1)
         self.assertEqual(runtime.used_queries, 2)
         self.assertEqual(sorted(runtime.unresolved_item_ids), [1, 2])
         self.assertTrue(all(event.review["needs_human"] for event in events))
