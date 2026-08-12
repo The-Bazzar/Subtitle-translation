@@ -160,7 +160,7 @@ DEEPSEEK_API_KEY=
 | `TAVILY_MAX_QUERIES` | 向后兼容的 glossary 搜索预算；`GLOSSARY_SEARCH_MAX_QUERIES` 优先 |
 | `EXA_API_KEY` / `EXA_MAX_RESULTS` | 可选 Exa 搜索来源及结果上限 |
 | `GLOSSARY_SEARCH_MAX_QUERIES` | glossary 阶段所有搜索来源共享的请求预算，默认 `15` |
-| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对阶段所有搜索来源共享的请求预算，默认 `5`；`0` 禁用联网校对 |
+| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对阶段所有搜索来源共享的请求预算，默认 `40`；`0` 禁用联网校对 |
 | `WEB_SEARCH_TIMEOUT` | 单次搜索超时秒数，默认 `20` |
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |

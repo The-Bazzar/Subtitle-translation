@@ -34,6 +34,27 @@ function Get-EnvFlag([string]$Key, [bool]$Default = $false) {
     }
 }
 
+# Export optional proxy settings from .env so yt-dlp, FFmpeg-adjacent tools,
+# Python HTTP clients, and child processes use the same Clash Verge proxy.
+foreach ($ProxyKey in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY')) {
+    $ProxyValue = Get-EnvValue $ProxyKey ''
+    if ($ProxyValue) {
+        Set-Item -Path "Env:$ProxyKey" -Value $ProxyValue
+        Set-Item -Path "Env:$($ProxyKey.ToLowerInvariant())" -Value $ProxyValue
+    }
+}
+
+$ToolPaths = @(
+    (Get-EnvValue 'FFMPEG_PATH_WIN' ''),
+    (Get-EnvValue 'DENO_PATH_WIN' '')
+)
+foreach ($ToolPath in $ToolPaths) {
+    if ($ToolPath -and (Test-Path -LiteralPath $ToolPath -PathType Leaf)) {
+        $ToolDir = Split-Path -Parent $ToolPath
+        if ($env:Path -notlike "*$ToolDir*") { $env:Path = "$ToolDir;$env:Path" }
+    }
+}
+
 # ── 批量覆盖未由 CLI 显式传参的变量 ──────────────────────────────────────────
 # 用法:
 #   Invoke-EnvDefaults -ParamRef ([ref]$Model) -EnvKey 'WHISPER_MODEL' -Default 'large-v3-turbo'
