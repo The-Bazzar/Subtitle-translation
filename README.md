@@ -106,7 +106,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名，例如 `en`、`en-US`、`Japanese`、`Chinese Simplified`。输出文件后缀会通过 `langcodes` 规范为 ISO 639 代码，例如 `English -> en`、`Japanese -> ja`。未显式设置 `SOURCE_LANG` 时，脚本使用 WhisperX JSON 中的 `language`；`TARGET_LANG` 默认 `zh`。
 
-翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON object，顶层包含 `items` array，返回也必须是同形态 JSON object；`items` 内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。`proofread_prompt.md` 是 KEEP / EDIT / REVIEW 阈值以及中文自然度、翻译腔、本地化、人物声音、语气、节奏、修辞和改写幅度的唯一语言策略控制面；调整它不会再被代码追加的第二套保守策略抵消。Prompt 要求依次扫描语义、上下文、中文句法、搭配/翻译腔、人物声音和主体指代，并在 EDIT 后把整句放回 `sentence_context` 复读。校对响应使用 `edit` 声明字段修改、问题类别和简要收益，但它是审计信息而不是语言修改的硬性准入证明。本地代码只回滚可明确检测的源文支持语义锚点丢失、确认术语漂移、证据冲突、ASR 越界或跨事件断裂。只有首次 `EDIT_ROLLED_BACK` 的 event 会进行一次单 item 定向 retry，不重跑 batch、不增加搜索；第二次仍触发安全约束则保留 original target。非 quiet 运行会逐条区分模型 KEEP、模型 REVIEW、已应用 EDIT 和安全回滚，`<name>.proofread-report.md` 同时记录首次候选、gate 原因、retry 及最终版本。源文/ASR 修改仍须有准确性、术语或 source_ASR 声明，或可靠术语证据。每个 split event 无论邻居窗口大小，都会收到同一原始 segment 的完整 `sentence_context`，因此跨 batch 也能按完整句处理语法、指代和逻辑；本地还会阻止非末尾分句被润色成提前闭合的句子。首译默认给每条 pending segment 附带前后各 2 条只读源文上下文，校对默认给每条 event 附带前后各 2 条双语上下文；分别可用 `TRANSLATE_CONTEXT_WINDOW` / `--translate-context-window` 和 `PROOFREAD_CONTEXT_WINDOW` / `--proofread-context-window` 调整。分割阶段默认给 pending segment 附带前后各 1 条 `context_before` / `context_after`，仅用于理解语义和节奏，远端只返回 pending item 本身；可用 `--split-context-window` 调整。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。`.beautified.json` 会用 `split_status` 记录状态：`ok` 为有效分割，`fallback` 为分割失败后整句回退且可重试，`unsplit` 为低于阈值或合法保留整句；`split_reason` 保存原因码，`split_reason_detail` 保存具体诊断文本。校对若有充分证据修正源文，会把修正前文本保存在 event 的 `original_en`，原始 WhisperX segment `text` 始终不变。
+翻译、分割、校对按顺序执行。校对主模型采用 editor-only 协议：只返回最终 source/target 和真正知识性不确定项的 `review`，不输出 KEEP/EDIT、类别、严重度、置信度或净收益判断；程序比较新旧文本生成 `KEEP_BY_MODEL` / `EDIT_APPLIED`，并由固定 safety gate 拦截语义锚点、确认术语、证据冲突、ASR 越界和跨 event 回归。完整 `TranscriptSegment` 是最小原子 sentence group：batch、context fallback、安全 retry、rollback 和提交都不会拆散 siblings；任一 child 触发 gate 时整组重试一次，二次失败逐 child 恢复各自快照，绝不恢复 parent 整句 target。`PROOFREAD_BATCH_SIZE` 控制每个任务的目标 event 数，`PROOFREAD_CONCURRENCY` 控制同时在途任务数；worker 只执行模型请求，主线程按原 event 顺序确定性提交并写 report/review/evidence。`PROOFREAD_THINKING`、`PROOFREAD_REASONING_EFFORT` 和 `PROOFREAD_MAX_TOKENS` 仅覆盖校对模型且彼此独立。`finish_reason=length` 且正文为空会进入明确 error/review 路径，不会被记为 KEEP 或写入空字幕。
 
 默认模板以 1080p 双语观看为基准：`bi-zh` / `bg-bi-zh` 字号为 68，`bi-en` / `bg-bi-en` 字号为 44；AI 分割默认在源文超过 72 字符或 3.8 秒时触发。beautify 只负责词级时间轴吸附和边界修复，不再提供本地硬截整句参数。
 
@@ -149,6 +149,9 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型；显式设置后才启用增强二次校对和按需联网核验 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
+| `PROOFREAD_CONCURRENCY` | 同时在途的校对任务数，默认 `1`；完整 sentence group 不会为满足 batch size 被拆散 |
+| `PROOFREAD_THINKING` / `PROOFREAD_REASONING_EFFORT` | 校对专用 thinking 与 reasoning effort 覆盖，不影响翻译或 glossary |
+| `PROOFREAD_MAX_TOKENS` | 校对专用输出 token 上限，与 reasoning effort 分开配置 |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PROOFREAD_CONTEXT_WINDOW` | 校对每条字幕前后注入的双语事件数，默认 `2` |
 | `WEB_SEARCH_PROVIDER` | `auto` / `all` / `tavily` / `exa`；默认 `auto`，Tavily 无结果时回退 Exa |

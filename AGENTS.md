@@ -144,11 +144,12 @@ winget install Microsoft.PowerShell
 - 默认 ASS 模板按 1080p 双语观看调校：`bi-zh` / `bg-bi-zh` 字号 68，`bi-en` / `bg-bi-en` 字号 44；默认 AI 分割阈值是源文超过 72 字符或 3.8 秒
 - 翻译、分割、校对的 user prompt 都是 JSON object，顶层包含 `items` array；glossary 和 description 的 user prompt 也是 JSON object；远端 LLM 必须只返回 JSON
 - 翻译、分割、校对返回严格 JSON object，顶层 `items` array 使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `id`, `en`, `zh`
-- 校对返回还包含 `edit`，逐字段声明是否修改、收益类别和简要理由；Prompt 负责判断是否存在实际质量收益，`edit` 用于审计而不是逐次准入审批
-- `proofread_prompt.md` 是 KEEP / EDIT / REVIEW 阈值、中文自然度、翻译腔、本地化、人物声音、语气、节奏、修辞和改写幅度的唯一控制面；运行时代码不得再叠加第二套语言编辑策略
-- 主流水线对目标译文采用明确回归拦截：普通自然度、本地化、搭配、语气和表达优化默认生效，仅在可确定检测到源文支持的否定、排他性、程度、情态等语义锚点丢失，或术语、证据、跨事件连续性回归时回滚；源文/ASR 修改仍要求声明准确性、术语或 source_ASR 依据
+- 校对返回只包含最终 source/target 与真正不确定项的 `review`；旧 Provider 多余返回的 `edit` 仅在兼容解析层忽略，不参与修改准入
+- `proofread_prompt.md` 是中文自然度、翻译腔、本地化、人物声音、语气、节奏、修辞和改写幅度的唯一控制面；主模型只返回最终文本与真正不确定项的 review，KEEP/EDIT 状态由程序比较生成
+- 主流水线对目标译文采用明确回归拦截：普通自然度、本地化、搭配、语气和表达优化默认生效，仅在可确定检测到源文支持的否定、排他性、程度、情态等语义锚点丢失，或术语、证据、跨事件连续性回归时回滚；源文/ASR 修改仍要求结构化术语或 retrieved ASR 证据
 - 非 quiet 运行逐 item 输出 `KEEP_BY_MODEL`、`REVIEW_BY_MODEL`、`EDIT_APPLIED`、`EDIT_PARTIALLY_APPLIED` 或 `EDIT_ROLLED_BACK`；安全回滚同时列出 semantic anchor、confirmed term、evidence conflict、ASR 范围或跨 event 等原因
-- 仅首次结果为 `EDIT_ROLLED_BACK` 的 event 会以单 item、无新搜索方式定向 retry 一次；retry 复用原 sentence_context、术语/证据和同一 safety gate，仍触发任何安全回滚时最终保留 original target，不重跑整个 batch
+- sentence group 是 batch、retry、rollback 和提交的最小原子单位；任一 child 被 safety gate 回滚时整组无新搜索 retry 一次，仍失败则逐 child 恢复自身 snapshot，禁止恢复 parent 整句 target
+- `PROOFREAD_BATCH_SIZE` 与 `PROOFREAD_CONCURRENCY` 独立；worker 不写 transcript/report/review/evidence，主线程按原 event 顺序确定性合并
 - 每次运行确定性输出 `<base>.proofread-report.md`，记录首次 proposal/decision/gate reason、可选 retry proposal/result 及 final target；报告不进入 transcript cache 或 human-review sidecar
 - 每个 split event 都注入同一原始 segment 的完整 `sentence_context`，不受邻居窗口或 batch 边界影响；本地拒绝在非末尾事件中无依据新增句末闭合标点
 - 当前字幕命中 `confirmed_terms` 时，校对请求注入高优先级 `terminology_constraints`，本地后处理禁止模型用新音译、同义词或风格变体覆盖已确认译名；冲突项不选边，进入 human review
@@ -215,6 +216,8 @@ ${TARGET_LANG_CODE}
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型；仅显式设置时启用增强校对和按需联网 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
+| `PROOFREAD_CONCURRENCY` | 校对并发任务数，默认 `1`；worker 只收集模型结果，主线程按序提交 |
+| `PROOFREAD_THINKING` / `PROOFREAD_REASONING_EFFORT` / `PROOFREAD_MAX_TOKENS` | 校对专用推理与 token 参数，不影响其它阶段 |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |

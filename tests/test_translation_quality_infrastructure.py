@@ -132,8 +132,9 @@ class TranslationQualityInfrastructureTests(unittest.TestCase):
 
         self.assertTrue(first_changed)
         self.assertTrue(second_changed)
-        self.assertEqual(event.en, "second correction")
-        self.assertEqual(event.original_en, "ASR source")
+        self.assertEqual(event.en, "ASR source")
+        self.assertFalse(event.original_en)
+        self.assertTrue(event.review["needs_human"])
 
     def test_glossary_cache_reconciles_evidence_once_then_reuses_metadata(self):
         sidecar = t.WebEvidenceSidecar(

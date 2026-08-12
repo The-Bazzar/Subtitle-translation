@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -20,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -648,6 +650,7 @@ class LLMConfig:
     model: str = ""
     api_key: Optional[str] = None
     batch_size: int = 50
+    request_overrides: dict = field(default_factory=dict)
 
     def resolve_key(self) -> str:
         if self.api_key is None:
@@ -694,12 +697,30 @@ def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_
         model = ""
     else:
         model = translate_llm.model
+    request_overrides: dict = {}
+    thinking = env.get("PROOFREAD_THINKING", "").strip()
+    if thinking:
+        request_overrides = deep_merge_dicts(
+            request_overrides,
+            {"extra_body": {"thinking": {"type": thinking}}},
+        )
+    reasoning_effort = env.get("PROOFREAD_REASONING_EFFORT", "").strip()
+    if reasoning_effort:
+        request_overrides["reasoning_effort"] = reasoning_effort
+    max_tokens = env_int(env.get("PROOFREAD_MAX_TOKENS", ""), 0)
+    if max_tokens > 0:
+        request_overrides["max_tokens"] = max_tokens
     return LLMConfig(
         provider=provider,
         model=model,
         api_key=translate_llm.api_key if provider == translate_llm.provider else None,
         batch_size=env_int(env.get("PROOFREAD_BATCH_SIZE", ""), max(1, batch_size // 2)),
+        request_overrides=request_overrides,
     )
+
+
+def proofread_concurrency_from_env(env: dict[str, str]) -> int:
+    return max(1, env_int(env.get("PROOFREAD_CONCURRENCY", ""), 1))
 
 
 def explicit_proofread_model_configured(env: dict[str, str]) -> bool:
@@ -1654,7 +1675,7 @@ Human-review policy:
 Do not omit, merge, split, reorder, or add transcript items. Preserve every item id. Follow natural subtitle punctuation and formatting for ${TARGET_LANG}; for Simplified Chinese, avoid sentence-final full stops/commas, avoid English-shaped syntax, and use native Chinese spacing and punctuation."""
 
 _PROOFREAD_PROMPT_FALLBACK = """You are the independent second-pass bilingual subtitle editor for ${SOURCE_LANG}/${TARGET_LANG} subtitles.
-Independently assess the source meaning, complete sentence, context, evidence, and existing translation, then choose KEEP, EDIT, or REVIEW for each item. The editable proofread_prompt.md or proofread_prompt.example.md is the sole source of language-quality policy and editing aggressiveness."""
+Understand the source, complete sentence, context, evidence, and existing translation, then output the final text that should be used. Return the existing target unchanged when it already works; otherwise edit it directly. Do not classify the edit or decide a KEEP/EDIT status. Use human review only for genuinely unresolved factual, referential, ASR, name, term, pun, or cultural uncertainty. The editable proofread_prompt.md or proofread_prompt.example.md is the sole source of language-quality policy and editing aggressiveness."""
 
 _SPLIT_PROMPT_FALLBACK = r"""Style preference:
 - Split only at natural pause points such as commas, clause boundaries, conjunctions, and breath groups.
@@ -1694,16 +1715,15 @@ Do not output, translate, proofread, split, merge, or return retrieved_context i
 
 _TERMINOLOGY_CONSTRAINT_RULES = """HIGH-PRIORITY TERMINOLOGY EVIDENCE:
 Input `terminology_constraints` is a deterministic subset of confirmed web-backed names, entities, and terms relevant to the current subtitle. It outranks model preference, ad-hoc transliteration, and raw retrieved text. Preserve the exact target mapping throughout the proofreading pass.
-Input `evidence_conflicts` means multiple web-backed target forms remain in conflict. Do not choose one without sufficient evidence. Keep the least-assumptive existing text and set review.needs_human=true with category terminology."""
+Input `evidence_conflicts` means multiple web-backed target forms remain in conflict. Do not choose one without sufficient evidence. Keep the least-assumptive existing text and set review.needs_human=true with a concrete reason."""
 
 _PROOFREAD_SAFETY_CONSTRAINTS = """PROOFREAD SAFETY CONSTRAINTS:
 These fixed rules prevent programmatically detectable regressions; they do not decide whether target-language wording deserves editing.
 - Return exactly one item for every input id. Do not add, remove, merge, split, reorder, renumber, or retime subtitle events.
 - Do not remove or reverse source-backed negation, exclusivity, degree, modality, condition, or other explicitly constrained meaning.
 - Preserve every applicable `terminology_constraints` target exactly. When `evidence_conflicts` is present, do not choose a new form without evidence; retain the current source/target and request human review.
-- A source-language change must be a declared, local ASR/accuracy/terminology correction supported by the supplied evidence or bounded context. Never rewrite the source sentence broadly.
+- A source-language change must be a local ASR/accuracy/terminology correction supported by the supplied evidence. Never rewrite the source sentence broadly.
 - Do not make the current event grammatically or semantically incompatible with its `sentence_context` siblings.
-- Set `edit.source_changed` and `edit.target_changed` to match the language fields actually changed, and use only the allowed categories in the response schema.
 Target-language changes for naturalness, context, localization, voice, rhythm, collocation, translationese, or expression are not rejected merely because they are not hard mistranslations. Language-quality policy comes only from the editable proofread prompt above."""
 
 _SENTENCE_CONTINUITY_RULES = """COMPLETE-SENTENCE CONTINUITY:
@@ -1730,8 +1750,8 @@ _PROOFREAD_WEB_SEARCH_PROTOCOL = """PROOFREAD WEB SEARCH PROTOCOL:
 - Preserve every event id, event count, order, and timing. Return only the existing JSON protocol."""
 
 _PROOFREAD_SAFETY_RETRY_PROTOCOL = """SAFETY-ROLLBACK RETRY:
-This request contains exactly one event whose first edit proposal triggered deterministic safety constraints. Input `safety_retry` provides the first proposal and gate reasons.
-Submit at most one new safe result for this event. Preserve any valid language improvement from the first proposal, but repair every listed safety violation and reread the complete event in `sentence_context`.
+This request contains one complete sentence group whose first proposed final texts triggered deterministic safety constraints. Each input `safety_retry` provides the first proposal, group ids, and gate reasons.
+Submit at most one new safe result for every supplied sibling event. Preserve valid language improvements, repair every listed safety violation, and reread the complete group in `sentence_context`.
 Do not mechanically delete all improvements merely to evade the gate. If a safe improved version cannot be determined, return the original source/target and use human review where uncertainty remains. Do not request new web searches."""
 
 _TRANSLATE_FORMAT = """
@@ -1968,14 +1988,13 @@ def glossary_finalizer_system_prompt(ctx: TranscriptContext, retriever: Embeddin
     return glossary_base_prompt(ctx, retriever) + "\n\n" + render_prompt_template(_GLOSSARY_FINALIZER_FORMAT, ctx)
 
 
-_PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
-Return exactly these keys in each "items" object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}", "edit", "review".
-"edit" is an object with "source_changed" (boolean), "target_changed" (boolean), "categories" (array), and "reasons" (array).
-Allowed edit categories are accuracy, naturalness, context, terminology, expression, and source_ASR. Mark changed fields accurately and briefly identify the relevant category. This metadata supports review and debugging; target edits are not accepted or rejected based on how elaborate the reason is. Source-language changes must be limited to evidence-backed ASR, accuracy, or terminology corrections.
-"review" is an object with "needs_human" (boolean), "categories" (array), "reasons" (array), "alternatives" (array), and "note" (string). Preserve relevant first-pass concerns and add unresolved issues; use false/empty values when no human review is needed.
+_PROOFREAD_FORMAT = """PROOFREAD EDITOR-ONLY RESPONSE FORMAT:
+Return exactly these keys in each "items" object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}", "review".
+Return the final source and target text that should be used. Do not output KEEP, EDIT, category, severity, confidence, benefit, or other edit-decision metadata; the program derives the outcome by comparing text.
+"review" is an object with "needs_human" (boolean), "reasons" (array), "alternatives" (array), and "note" (string). Use it only for genuinely unresolved ASR, proper-name, terminology, pun, cultural, external-fact, or referential uncertainty. Preserve relevant first-pass concerns; use false/empty values when no human review is needed.
 {"items": [
-  {"id": 1, "${SOURCE_LANG_CODE}": "<unchanged or corrected source text>", "${TARGET_LANG_CODE}": "<unchanged or corrected target translation>", "edit": {"source_changed": false, "target_changed": true, "categories": ["naturalness"], "reasons": ["<problem fixed or quality benefit>"]}, "review": {"needs_human": false, "categories": [], "reasons": [], "alternatives": [], "note": ""}},
-  {"id": 2, "${SOURCE_LANG_CODE}": "<unchanged source text>", "${TARGET_LANG_CODE}": "<unchanged target translation>", "edit": {"source_changed": false, "target_changed": false, "categories": [], "reasons": []}, "review": {"needs_human": true, "categories": ["ambiguous_semantics"], "reasons": ["<concrete unresolved issue>"], "alternatives": ["<alternative>"], "note": "<human action>"}}
+  {"id": 1, "${SOURCE_LANG_CODE}": "<unchanged or evidence-corrected source text>", "${TARGET_LANG_CODE}": "<final target translation>", "review": {"needs_human": false, "reasons": [], "alternatives": [], "note": ""}},
+  {"id": 2, "${SOURCE_LANG_CODE}": "<unchanged source text>", "${TARGET_LANG_CODE}": "<final target translation>", "review": {"needs_human": true, "reasons": ["<concrete unresolved knowledge issue>"], "alternatives": ["<alternative>"], "note": "<human action>"}}
 ]}
 
 The placeholder values above are format markers only. In your actual response, replace them with corrected text from the provided subtitle events.
@@ -3127,6 +3146,7 @@ class WebSearchRuntime:
     quiet: bool = False
     used_queries: int = 0
     unresolved_searches: dict[int, list[str]] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     @property
     def unresolved_item_ids(self) -> set[int]:
@@ -3194,6 +3214,12 @@ class WebSearchRuntime:
         return []
 
     def execute_search(self, args: dict, search_stage: str = "tool") -> dict:
+        # Provider calls may run concurrently, but the shared evidence budget and
+        # sidecar are updated serially so results remain deterministic and race-free.
+        with self._lock:
+            return self._execute_search_unlocked(args, search_stage)
+
+    def _execute_search_unlocked(self, args: dict, search_stage: str = "tool") -> dict:
         query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())
         topic_hints = unique_non_empty_strings(json_string_list(args.get("topic_hints", [])), 24)
         requested_domains = unique_tavily_domains(json_string_list(args.get("preferred_domains", [])))
@@ -3816,6 +3842,12 @@ def assistant_message_to_json_value(message) -> dict:
         "role": str(get_message_value(message, "role", "assistant") or "assistant"),
         "content": get_message_value(message, "content", None),
     }
+    # DeepSeek thinking mode requires reasoning_content to be replayed when
+    # an assistant turn contains tool calls. Without it, the next tool-result
+    # turn may be rejected or lose the reasoning/tool-call context.
+    reasoning_content = get_message_value(message, "reasoning_content", None)
+    if reasoning_content is not None:
+        data["reasoning_content"] = reasoning_content
     tool_calls = get_message_value(message, "tool_calls", None) or []
     if tool_calls:
         data["tool_calls"] = [tool_call_to_message_value(call) for call in tool_calls]
@@ -4833,6 +4865,27 @@ def source_matches_confirmed_term_replacement(
     return False
 
 
+def source_matches_retrieved_asr_replacement(
+    original_source: str,
+    candidate_source: str,
+    retrieved_context: list[dict],
+) -> bool:
+    """Accept only an exact old -> new replacement explicitly stated in retrieval evidence."""
+    normalized_candidate = " ".join(str(candidate_source or "").split())
+    for entry in retrieved_context or []:
+        text = str(entry.get("text", "") if isinstance(entry, dict) else entry)
+        for old, new in re.findall(r"([^\n;]{1,80}?)\s*(?:->|→)\s*([^\n;]{1,80})", text):
+            old, new = old.strip(" :-"), new.strip(" .,:;-\t")
+            if ":" in old:
+                old = old.rsplit(":", 1)[-1].strip()
+            if not old or not new or not term_form_in_text(original_source, old):
+                continue
+            replaced = _replace_term_form(original_source, old, new)
+            if " ".join(replaced.split()) == normalized_candidate:
+                return True
+    return False
+
+
 @dataclass
 class LLMBatchItem:
     id: int
@@ -5185,7 +5238,28 @@ class CompletionRetryTemplate:
         return max(0.0, float(self.base_delay or 0.0) * float(attempt_index + 1))
 
 
+class LLMOutputLengthError(RuntimeError):
+    """The provider exhausted output tokens before producing usable content."""
+
+
+def is_output_length_error(error: Exception | str) -> bool:
+    text = str(error or "").casefold()
+    return isinstance(error, LLMOutputLengthError) or (
+        "finish_reason=length" in text or "finish_reason=max_tokens" in text
+    )
+
+
 _REMOVED_PROVIDER_SEARCH = object()
+
+
+def deep_merge_dicts(base: dict, override: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
 
 
 def strip_provider_search_options(value, *, _root: bool = True):
@@ -5231,6 +5305,7 @@ class ChatSession:
     disable_response_format: bool = False
     disable_provider_search: bool = False
     messages: list[dict] = field(default_factory=list)
+    provider_retry_count: int = 0
 
     def __post_init__(self) -> None:
         self.messages.append({"role": "system", "content": self.system_prompt})
@@ -5245,6 +5320,7 @@ class ChatSession:
                 last_error = e
                 if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
                     raise
+                self.provider_retry_count += 1
                 self._wait_before_retry(template, attempt, e)
         raise RuntimeError(f"LLM completion failed: {last_error}")
 
@@ -5259,7 +5335,10 @@ class ChatSession:
         if request_kwargs is not None:
             if not isinstance(request_kwargs, dict):
                 raise ValueError("provider request_kwargs must be a JSON object")
-            kwargs.update(copy.deepcopy(request_kwargs))
+            kwargs = deep_merge_dicts(kwargs, request_kwargs)
+        request_overrides = getattr(self.llm, "request_overrides", {}) or {}
+        if request_overrides:
+            kwargs = deep_merge_dicts(kwargs, request_overrides)
         response_format = provider_cfg.get("response_format")
         if response_format and "response_format" not in kwargs:
             kwargs["response_format"] = response_format
@@ -5296,6 +5375,7 @@ class ChatSession:
                 last_error = e
                 if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
                     raise
+                self.provider_retry_count += 1
                 if retry_feedback is not None and answer is not None:
                     self.messages.append({"role": "assistant", "content": answer})
                     self.messages.append(
@@ -5334,7 +5414,10 @@ class ChatSession:
                     reasoning_tokens = getattr(completion_details, "reasoning_tokens", None)
                     if reasoning_tokens is not None:
                         details.append(f"reasoning_tokens={reasoning_tokens}")
-            raise RuntimeError(f"LLM returned empty message.content ({', '.join(details)})")
+            error_type = LLMOutputLengthError if str(getattr(choice, "finish_reason", "")).casefold() in {
+                "length", "max_tokens"
+            } else RuntimeError
+            raise error_type(f"LLM returned empty message.content ({', '.join(details)})")
         return answer
 
     def _wait_before_retry(self, template: CompletionRetryTemplate, attempt_index: int, error: Exception) -> None:
@@ -5356,6 +5439,8 @@ def isolated_batch_session(template: ChatSession) -> ChatSession:
         template.system_prompt,
         temperature=template.temperature,
         disable_response_format=template.disable_response_format,
+        disable_provider_search=template.disable_provider_search,
+        provider_retry_count=0,
     )
 
 
@@ -5648,14 +5733,8 @@ def apply_proofread_safety_constraints(
         for item in constraints
     )
     source_edit_supported = edit_supports_change(normalized_edit, "source")
-    if safety_mode_enabled and source_edit_supported:
-        declared_source_basis = bool(
-            {str(category).casefold() for category in normalized_edit.get("categories", [])}
-            & {"accuracy", "terminology", "source_asr"}
-        )
-        source_edit_supported = declared_source_basis and (
-            evidence_supports_source
-        )
+    if safety_mode_enabled:
+        source_edit_supported = evidence_supports_source
     source_has_regression = bool(
         safety_mode_enabled
         and new_source != original_source
@@ -5668,10 +5747,6 @@ def apply_proofread_safety_constraints(
         if safety_mode_enabled
         else edit_supports_change(normalized_edit, "target", strict_preservation)
     )
-    if safety_mode_enabled and normalized_edit is not None and new_target != original_target:
-        if not normalized_edit.get("target_changed") or not normalized_edit.get("categories"):
-            target_edit_supported = False
-            safety_events.append("target_edit_misclassified")
     if safety_mode_enabled and new_target != original_target:
         target_anchor_regressions = semantic_anchor_regressions(
             original_source, original_target, new_target
@@ -5843,16 +5918,111 @@ def proofread_decision_record(
     }
 
 
+@dataclass(frozen=True)
+class ProofreadEventSnapshot:
+    item_id: int
+    group_id: int
+    group_item_ids: tuple[int, ...]
+    event: SplitEvent
+    source: str
+    target: str
+    review: dict
+    review_hint: dict
+    sentence_context: dict
+    context_before: tuple[dict, ...]
+    context_after: tuple[dict, ...]
+    retrieved_context: tuple[dict, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProofreadSentenceGroup:
+    group_id: int
+    items: tuple[ProofreadEventSnapshot, ...]
+    full_target: str
+
+
+@dataclass(frozen=True)
+class ProofreadBatchTask:
+    ordinal: int
+    groups: tuple[ProofreadSentenceGroup, ...]
+
+    @property
+    def items(self) -> tuple[ProofreadEventSnapshot, ...]:
+        return tuple(item for group in self.groups for item in group.items)
+
+
+def pack_proofread_sentence_groups(
+    groups: list[ProofreadSentenceGroup], batch_size: int
+) -> list[ProofreadBatchTask]:
+    """Greedily pack complete sentence groups without ever splitting siblings."""
+    limit = max(1, int(batch_size or 1))
+    packed: list[ProofreadBatchTask] = []
+    current: list[ProofreadSentenceGroup] = []
+    current_size = 0
+    for group in groups:
+        group_size = len(group.items)
+        if current and current_size + group_size > limit:
+            packed.append(ProofreadBatchTask(len(packed), tuple(current)))
+            current = []
+            current_size = 0
+        current.append(group)
+        current_size += group_size
+        if current_size >= limit:
+            packed.append(ProofreadBatchTask(len(packed), tuple(current)))
+            current = []
+            current_size = 0
+    if current:
+        packed.append(ProofreadBatchTask(len(packed), tuple(current)))
+    return packed
+
+
+def sentence_group_repeats_full_target(
+    candidate_target: str,
+    original_target: str,
+    full_target: str,
+    part_count: int,
+) -> bool:
+    if part_count <= 1:
+        return False
+    def normalized(value: str) -> str:
+        return "".join(
+            char for char in str(value or "")
+            if not char.isspace() and not unicodedata.category(char).startswith("P")
+        )
+    normalized_candidate = normalized(candidate_target)
+    normalized_original = normalized(original_target)
+    normalized_full = normalized(full_target)
+    return bool(
+        normalized_full
+        and normalized_candidate == normalized_full
+        and normalized_original != normalized_full
+    )
+
+
 def markdown_cell(value) -> str:
     return str(value or "").replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
 
 
-def write_proofread_report(ctx: TranscriptContext, records: list[dict]) -> str:
+def write_proofread_report(
+    ctx: TranscriptContext,
+    records: list[dict],
+    metrics: Optional[dict] = None,
+) -> str:
     """Write deterministic proofreading decisions without changing subtitle caches."""
+    output_length_exhaustions = sum(
+        1
+        for record in records
+        if "output_length_exhausted" in record.get("first_gate_reasons", [])
+        or is_output_length_error(record.get("retry_error", ""))
+    )
     lines = [
         f"# Proofread report: {ctx.base}",
         "",
         "This report distinguishes model decisions from deterministic safety-gate outcomes.",
+        "",
+        f"- Provider retries: {int((metrics or {}).get('provider_retries', 0) or 0)}",
+        f"- Safety retries: {sum(1 for record in records if record.get('retry_attempted'))}",
+        f"- Output length exhaustions: {output_length_exhaustions}",
         "",
         "| Item | Time | Initial | Retry | Final | Gate reasons |",
         "|---:|---|---|---|---|---|",
@@ -5920,6 +6090,7 @@ def llm_numbered_batch(
     quiet: bool,
     retries: int = 3,
     raise_on_failure: bool = False,
+    metrics: Optional[dict] = None,
 ) -> list:
     prompt = request.to_json_text()
     try:
@@ -5933,9 +6104,13 @@ def llm_numbered_batch(
                 label="LLM batch",
             ),
         )
+        if metrics is not None:
+            metrics["provider_retries"] = metrics.get("provider_retries", 0) + session.provider_retry_count
         return data.to_items()
     except Exception as e:
-        if raise_on_failure and is_context_length_error(e):
+        if metrics is not None:
+            metrics["provider_retries"] = metrics.get("provider_retries", 0) + session.provider_retry_count
+        if raise_on_failure and (is_context_length_error(e) or is_output_length_error(e)):
             raise
         message = f"LLM batch failed after {retries} attempts: {e}"
         if raise_on_failure:
@@ -5949,6 +6124,7 @@ def llm_numbered_batch_with_web_search(
     session: ChatSession,
     search_runtime: WebSearchRuntime,
     quiet: bool,
+    metrics: Optional[dict] = None,
 ) -> list:
     """Run one isolated proofread batch with a bounded, fail-soft tool loop."""
     allowed_ids = {item.id for item in request.items}
@@ -5969,8 +6145,18 @@ def llm_numbered_batch_with_web_search(
             tools=tools,
             tool_choice="auto" if allow_tools else "none",
         )
+        if metrics is not None:
+            metrics["provider_retries"] = metrics.get("provider_retries", 0) + session.provider_retry_count
+            session.provider_retry_count = 0
         choice = response.choices[0]
         message = choice.message
+        content = str(get_message_value(message, "content", "") or "")
+        finish_reason = str(get_message_value(choice, "finish_reason", "") or "").casefold()
+        if not content.strip() and finish_reason in {"length", "max_tokens"}:
+            raise LLMOutputLengthError(
+                f"LLM returned empty message.content (provider={getattr(session.llm, 'provider', 'unknown')}, "
+                f"model={session.llm.model_name()}, finish_reason={finish_reason})"
+            )
         tool_calls = get_message_value(message, "tool_calls", None) or []
         if tool_calls:
             session.messages.append(assistant_message_to_json_value(message))
@@ -6196,429 +6382,444 @@ def proofread_split_events(
     conservative: bool = False,
     safety_mode: Optional[bool] = None,
     decision_records: Optional[list[dict]] = None,
+    concurrency: int = 1,
+    metrics: Optional[dict] = None,
 ) -> bool:
-    safety_mode_enabled = conservative if safety_mode is None else safety_mode
+    # Proofreading is editor-only: language edits never require model-supplied
+    # approval metadata, while deterministic safety checks are always active.
+    safety_mode_enabled = True if safety_mode is None else safety_mode
+    pr_llm = llm
+    worker_count = max(1, int(concurrency or 1))
+    retrieval_top_k = max(1, int(proofread_retrieval_top_k or 1))
     events: list[SplitEvent] = []
-    review_hints: list[dict] = []
-    for seg in transcript.segments:
-        if not seg.split_events:
-            seg.split_events = [whole_segment_split_event(seg)]
-        segment_events = seg.split_events
-        events.extend(segment_events)
-        review_hints.extend(
-            [merge_review_metadata(seg.review, event.review) for event in segment_events]
-        )
+    group_ranges: list[tuple[TranscriptSegment, int, int]] = []
+    for segment in transcript.segments:
+        if not segment.split_events:
+            segment.split_events = [whole_segment_split_event(segment)]
+        start = len(events)
+        events.extend(segment.split_events)
+        group_ranges.append((segment, start, len(events)))
     if not events:
         return False
 
-    pr_llm = llm
-    retrieval_top_k = max(1, int(proofread_retrieval_top_k or 1))
     if not quiet:
         print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}", file=sys.stderr)
-        print(f"Total split events: {len(events)}", file=sys.stderr)
+        print(f"Total split events: {len(events)}; concurrency: {worker_count}", file=sys.stderr)
 
-    proofread_format = render_prompt_template(_PROOFREAD_FORMAT, ctx)
     proofread_system_prompt = (
         system_prompt
         + ("\n\n" + _PROOFREAD_WEB_SEARCH_PROTOCOL if enhanced else "")
         + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
         + ("\n\n" + _NEIGHBOR_CONTEXT_RULES if context_window > 0 else "")
-        + "\n\n"
-        + _PROOFREAD_ASR_CONTEXT_RULES
-        + "\n\n"
-        + _TERMINOLOGY_CONSTRAINT_RULES
-        + "\n\n"
-        + _PROOFREAD_SAFETY_CONSTRAINTS
-        + "\n\n"
-        + _SENTENCE_CONTINUITY_RULES
-        + "\n\n"
-        + _JSON_FORMAT
-        + "\n\n"
-        + _JSON_BATCH_FORMAT
-        + "\n\n"
-        + proofread_format
+        + "\n\n" + _PROOFREAD_ASR_CONTEXT_RULES
+        + "\n\n" + _TERMINOLOGY_CONSTRAINT_RULES
+        + "\n\n" + _PROOFREAD_SAFETY_CONSTRAINTS
+        + "\n\n" + _SENTENCE_CONTINUITY_RULES
+        + "\n\n" + _JSON_FORMAT
+        + "\n\n" + _JSON_BATCH_FORMAT
+        + "\n\n" + render_prompt_template(_PROOFREAD_FORMAT, ctx)
     )
-    evidence_sidecar = (
-        search_runtime.sidecar
-        if search_runtime is not None
-        else load_web_evidence_sidecar(ctx.web_evidence_json)
+    retry_system_prompt = proofread_system_prompt + "\n\n" + _PROOFREAD_SAFETY_RETRY_PROTOCOL
+    evidence_sidecar = enrich_confirmed_term_evidence(
+        transcript,
+        search_runtime.sidecar if search_runtime is not None else load_web_evidence_sidecar(ctx.web_evidence_json),
     )
-    evidence_sidecar = enrich_confirmed_term_evidence(transcript, evidence_sidecar)
     if search_runtime is not None:
         search_runtime.sidecar = evidence_sidecar
     if evidence_sidecar.has_evidence():
         write_web_evidence_sidecar(ctx, evidence_sidecar)
-    session = ChatSession(
-        pr_llm,
-        proofread_system_prompt,
-        temperature=0.2,
+
+    # Freeze every input before any worker runs or any event is committed.
+    sentence_contexts = proofread_sentence_contexts(transcript, ctx)
+    retrieved = (
+        retriever.retrieve_texts(
+            [proofread_retrieval_query(event) for event in events], top_k=retrieval_top_k
+        )
+        if retriever is not None
+        else [[] for _ in events]
     )
-    retry_system_prompt = proofread_system_prompt + "\n\n" + _PROOFREAD_SAFETY_RETRY_PROTOCOL
-    changed = False
-
-    def apply_proofread_batch(
-        batch_events: list[SplitEvent],
-        item_offset: int,
-        batch_contexts: list[list[dict]],
-        batch_review_hints: list[dict],
-    ) -> bool:
-        nonlocal evidence_sidecar
-        if search_runtime is not None:
-            evidence_sidecar = enrich_confirmed_term_evidence(transcript, search_runtime.sidecar)
-            search_runtime.sidecar = evidence_sidecar
-        sentence_contexts = proofread_sentence_contexts(transcript, ctx)
-        batch_term_context = [
-            relevant_term_evidence(event.en, evidence_sidecar)
-            for event in batch_events
-        ]
-        request = LLMBatchRequest(
-            [
-                make_pair_item(
-                    item_offset + idx + 1,
-                    ctx,
-                    event.en,
-                    event.zh,
-                    retrieved_context=batch_contexts[idx],
-                    context_before=event_context_items(
-                        events, item_offset + idx, ctx, context_window, before=True
-                    ),
-                    context_after=event_context_items(
-                        events, item_offset + idx, ctx, context_window, before=False
-                    ),
-                    review_hint=batch_review_hints[idx],
-                    terminology_constraints=batch_term_context[idx][0],
-                    evidence_conflicts=batch_term_context[idx][1],
-                    sentence_context=sentence_contexts[item_offset + idx],
-                )
-                for idx, event in enumerate(batch_events)
-            ]
+    groups: list[ProofreadSentenceGroup] = []
+    for segment, start, end in group_ranges:
+        ids = tuple(range(start + 1, end + 1))
+        snapshots = tuple(
+            ProofreadEventSnapshot(
+                item_id=index + 1,
+                group_id=segment.index,
+                group_item_ids=ids,
+                event=events[index],
+                source=events[index].en,
+                target=events[index].zh,
+                review=copy.deepcopy(events[index].review),
+                review_hint=merge_review_metadata(segment.review, events[index].review),
+                sentence_context=copy.deepcopy(sentence_contexts[index]),
+                context_before=tuple(copy.deepcopy(event_context_items(events, index, ctx, context_window, True))),
+                context_after=tuple(copy.deepcopy(event_context_items(events, index, ctx, context_window, False))),
+                retrieved_context=tuple(copy.deepcopy(retrieved[index])),
+            )
+            for index in range(start, end)
         )
+        full_target = str(sentence_contexts[start].get("full_target", "")) if start < end else ""
+        groups.append(ProofreadSentenceGroup(segment.index, snapshots, full_target))
+    tasks = pack_proofread_sentence_groups(groups, pr_llm.batch_size)
+
+    term_context = {
+        item.item_id: relevant_term_evidence(item.source, evidence_sidecar)
+        for group in groups for item in group.items
+    }
+    task_search_runtimes: dict[int, WebSearchRuntime] = {}
+    if enhanced and search_runtime is not None:
+        remaining_budget = search_runtime.remaining_queries()
+        task_count = len(tasks)
+        for task in tasks:
+            quota = remaining_budget // task_count + (1 if task.ordinal < remaining_budget % task_count else 0)
+            task_search_runtimes[task.ordinal] = WebSearchRuntime(
+                settings=search_runtime.settings,
+                metadata_fields=copy.deepcopy(search_runtime.metadata_fields),
+                preferences=copy.deepcopy(search_runtime.preferences),
+                max_queries=quota,
+                sidecar=copy.deepcopy(evidence_sidecar),
+                quiet=quiet,
+            )
+
+    def build_request(items: tuple[ProofreadEventSnapshot, ...], without_rag: bool = False) -> LLMBatchRequest:
+        return LLMBatchRequest([
+            make_pair_item(
+                item.item_id, ctx, item.source, item.target,
+                retrieved_context=[] if without_rag else list(item.retrieved_context),
+                context_before=list(item.context_before), context_after=list(item.context_after),
+                review_hint=item.review_hint,
+                terminology_constraints=term_context[item.item_id][0],
+                evidence_conflicts=term_context[item.item_id][1],
+                sentence_context=item.sentence_context,
+            ) for item in items
+        ])
+
+    def validate_complete_response(response_items: list, items: tuple[ProofreadEventSnapshot, ...]) -> list:
+        expected = [item.item_id for item in items]
+        actual = [int(value.get("id")) for value in response_items if isinstance(value, dict) and str(value.get("id", "")).isdigit()]
+        if sorted(actual) != sorted(expected) or len(actual) != len(expected):
+            raise ValueError(f"proofread response ids {actual} do not exactly match {expected}")
+        fields = LanguageFields.from_ctx(ctx)
+        for value in response_items:
+            if not isinstance(value, dict) or not str(fields.get_target(value) or "").strip():
+                raise ValueError("proofread response contains an empty target")
+        return parse_proofread_results(
+            response_items, expected, [(item.source, item.target) for item in items], ctx
+        )
+
+    def execute_task(task: ProofreadBatchTask) -> dict:
+        items = task.items
+        request = build_request(items)
+        task_metrics: dict = {"provider_retries": 0}
+        recorded_session_retries = 0
+        task_session: Optional[ChatSession] = None
         try:
-            if enhanced and search_runtime is not None and search_runtime.has_capability():
-                response_items = llm_numbered_batch_with_web_search(
-                    request,
-                    ChatSession(
-                        pr_llm,
-                        proofread_system_prompt,
-                        temperature=0.2,
-                        disable_response_format=True,
-                    ),
-                    search_runtime,
-                    quiet,
-                )
-            else:
-                response_items = llm_numbered_batch(
-                    request,
-                    isolated_batch_session(session),
-                    quiet,
-                    raise_on_failure=True,
-                )
-        except Exception as e:
-            if enhanced and search_runtime is not None and not is_context_length_error(e):
-                if not quiet:
-                    print(f"  Proofread web search unavailable; retrying without tools: {e}", file=sys.stderr)
+            task_runtime = task_search_runtimes.get(task.ordinal)
+            if task_runtime is not None and task_runtime.has_capability():
                 try:
-                    response_items = llm_numbered_batch(
+                    task_session = ChatSession(
+                        pr_llm, proofread_system_prompt, 0.2, disable_response_format=True
+                    )
+                    response = llm_numbered_batch_with_web_search(
                         request,
-                        isolated_batch_session(session),
-                        quiet,
-                        raise_on_failure=True,
+                        task_session,
+                        task_runtime, quiet,
                     )
-                except Exception as fallback_error:
-                    e = fallback_error
-                else:
-                    e = None
-            if e is None:
-                pass
-            elif len(batch_events) > 1 and is_context_length_error(e):
-                mid = len(batch_events) // 2
-                if not quiet:
-                    print(
-                        f"  Proofread batch too large; splitting {item_offset + 1}-"
-                        f"{item_offset + len(batch_events)}",
-                        file=sys.stderr,
+                    task_metrics["provider_retries"] += task_session.provider_retry_count
+                    recorded_session_retries = task_session.provider_retry_count
+                except Exception as tool_error:
+                    task_metrics["provider_retries"] += max(
+                        0, task_session.provider_retry_count - recorded_session_retries
                     )
-                left_changed = apply_proofread_batch(
-                    batch_events[:mid],
-                    item_offset,
-                    batch_contexts[:mid],
-                    batch_review_hints[:mid],
-                )
-                right_changed = apply_proofread_batch(
-                    batch_events[mid:],
-                    item_offset + mid,
-                    batch_contexts[mid:],
-                    batch_review_hints[mid:],
-                )
-                return left_changed or right_changed
-            elif is_context_length_error(e) and any(batch_contexts):
-                if not quiet:
-                    print(
-                        f"  Proofread item {item_offset + 1} too large with retrieved context; retrying without RAG context",
-                        file=sys.stderr,
+                    recorded_session_retries = task_session.provider_retry_count
+                    if is_context_length_error(tool_error) or is_output_length_error(tool_error):
+                        raise
+                    task_session = ChatSession(pr_llm, proofread_system_prompt, 0.2)
+                    recorded_session_retries = 0
+                    response = llm_numbered_batch(
+                        request, task_session, quiet, raise_on_failure=True
                     )
-                return apply_proofread_batch(
-                    batch_events,
-                    item_offset,
-                    [[] for _ in batch_events],
-                    batch_review_hints,
+                    task_metrics["provider_retries"] += task_session.provider_retry_count
+                    recorded_session_retries = task_session.provider_retry_count
+            else:
+                task_session = ChatSession(pr_llm, proofread_system_prompt, 0.2)
+                response = llm_numbered_batch(
+                    request, task_session, quiet, raise_on_failure=True,
                 )
-            elif e is not None:
-                print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
-                response_items = []
+                task_metrics["provider_retries"] += task_session.provider_retry_count
+                recorded_session_retries = task_session.provider_retry_count
+            return {"task": task, "results": validate_complete_response(response, items), "error": "",
+                    "metrics": task_metrics, "search_runtime": task_runtime}
+        except Exception as error:
+            if task_session is not None:
+                task_metrics["provider_retries"] += max(
+                    0, task_session.provider_retry_count - recorded_session_retries
+                )
+            if is_context_length_error(error) and len(task.groups) > 1:
+                mid = len(task.groups) // 2
+                left = execute_task(ProofreadBatchTask(task.ordinal, task.groups[:mid]))
+                right = execute_task(ProofreadBatchTask(task.ordinal, task.groups[mid:]))
+                return {"task": task, "parts": [left, right], "error": "", "metrics": task_metrics}
+            if is_context_length_error(error) and any(item.retrieved_context for item in items):
+                try:
+                    task_session = ChatSession(pr_llm, proofread_system_prompt, 0.2)
+                    recorded_session_retries = 0
+                    response = llm_numbered_batch(
+                        build_request(items, without_rag=True),
+                        task_session, quiet, raise_on_failure=True,
+                    )
+                    task_metrics["provider_retries"] += task_session.provider_retry_count
+                    recorded_session_retries = task_session.provider_retry_count
+                    return {"task": task, "results": validate_complete_response(response, items), "error": "",
+                            "metrics": task_metrics, "search_runtime": task_search_runtimes.get(task.ordinal)}
+                except Exception as retry_error:
+                    task_metrics["provider_retries"] += max(
+                        0, task_session.provider_retry_count - recorded_session_retries
+                    )
+                    error = retry_error
+            return {"task": task, "results": [], "error": str(error), "length_error": is_output_length_error(error),
+                    "metrics": task_metrics, "search_runtime": task_search_runtimes.get(task.ordinal)}
 
-        fallback_pairs = [(event.en, event.zh) for event in batch_events]
-        parsed_results = parse_proofread_results(
-            response_items,
-            [item.id for item in request.items],
-            fallback_pairs,
-            ctx,
-        )
-        batch_changed = False
-        for index, (event, (en, zh, review, edit)) in enumerate(zip(batch_events, parsed_results)):
-            original_en = event.en
-            original_zh = event.zh
-            original_review = event.review
-            global_item_id = item_offset + index + 1
+    def flatten_task_result(result: dict) -> list[dict]:
+        if "parts" in result:
+            return [leaf for part in result["parts"] for leaf in flatten_task_result(part)]
+        return [result]
 
-            def evaluate_candidate(
-                candidate_source: str,
-                candidate_target: str,
-                candidate_review: dict,
-                candidate_edit: Optional[dict],
-            ) -> tuple[str, str, dict, str, list[str]]:
-                candidate_en = candidate_source.strip() or original_en
-                candidate_zh = candidate_target.strip() or original_zh
+    def task_result_provider_retries(result: dict) -> int:
+        own = int(result.get("metrics", {}).get("provider_retries", 0) or 0)
+        return own + sum(task_result_provider_retries(part) for part in result.get("parts", []))
+
+    completed: dict[int, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {executor.submit(execute_task, task): task.ordinal for task in tasks}
+        for future in concurrent.futures.as_completed(future_map):
+            completed[future_map[future]] = future.result()
+
+    # Restore deterministic task/group order regardless of worker completion order.
+    provider_retries = 0
+    merged_task_runtimes: set[int] = set()
+    if search_runtime is not None:
+        for ordinal in sorted(completed):
+            provider_retries += task_result_provider_retries(completed[ordinal])
+            for leaf in flatten_task_result(completed[ordinal]):
+                task_runtime = leaf.get("search_runtime")
+                if task_runtime is None or id(task_runtime) in merged_task_runtimes:
+                    continue
+                merged_task_runtimes.add(id(task_runtime))
+                search_runtime.used_queries += task_runtime.used_queries
+                search_runtime.sidecar = merge_web_evidence_sidecars(
+                    search_runtime.sidecar, task_runtime.sidecar
+                )
+                for item_id in sorted(task_runtime.unresolved_searches):
+                    for reason in task_runtime.unresolved_searches[item_id]:
+                        search_runtime.record_unresolved([item_id], "worker", reason)
+    else:
+        for ordinal in sorted(completed):
+            provider_retries += task_result_provider_retries(completed[ordinal])
+    if metrics is not None:
+        metrics["provider_retries"] = metrics.get("provider_retries", 0) + provider_retries
+
+    raw_by_id: dict[int, tuple[str, str, dict, Optional[dict]]] = {}
+    errors_by_id: dict[int, tuple[str, bool]] = {}
+    for ordinal in sorted(completed):
+        for leaf in flatten_task_result(completed[ordinal]):
+            if leaf.get("error"):
+                for item in leaf["task"].items:
+                    errors_by_id[item.item_id] = (leaf["error"], bool(leaf.get("length_error")))
+                continue
+            for item, result in zip(leaf["task"].items, leaf["results"]):
+                raw_by_id[item.item_id] = result
+    for group in groups:
+        for item in group.items:
+            if item.item_id not in raw_by_id and item.item_id not in errors_by_id:
+                errors_by_id[item.item_id] = ("proofread response missing requested item", False)
+
+    changed = False
+    for group in groups:
+        staged: list[dict] = []
+        group_failed = False
+        for item in group.items:
+            if item.item_id in errors_by_id:
+                error, length_error = errors_by_id[item.item_id]
+                review = merge_review_metadata(item.review, {
+                    "needs_human": True,
+                    "categories": ["proofread_output_length" if length_error else "proofread_provider_error"],
+                    "reasons": ["校对模型输出耗尽，已保留原字幕" if length_error else "校对请求失败，已保留原字幕"],
+                    "note": error[:300],
+                })
+                staged.append({"item": item, "candidate_source": item.source, "candidate_target": item.target,
+                               "source": item.source, "target": item.target, "review": review,
+                               "decision": "REVIEW_BY_MODEL", "reasons": ["output_length_exhausted"] if length_error else ["provider_error"]})
+                group_failed = True
+                continue
+            candidate_source, candidate_target, review, legacy_edit = raw_by_id[item.item_id]
+            candidate_source = candidate_source.strip() or item.source
+            candidate_target = candidate_target.strip() or item.target
+            safety_events: list[str] = []
+            merged_review = merge_review_metadata(persistent_event_review(item.review), review)
+            evidence_edit = legacy_edit
+            if candidate_source != item.source and source_matches_retrieved_asr_replacement(
+                item.source, candidate_source, list(item.retrieved_context)
+            ):
+                evidence_edit = {
+                    "source_changed": True,
+                    "target_changed": candidate_target != item.target,
+                    "categories": ["source_ASR"],
+                    "reasons": ["explicit retrieved ASR replacement"],
+                }
+                constraints, conflicts = term_context[item.item_id]
+                constraints = [
+                    *constraints,
+                    {"source": candidate_source, "target": candidate_target,
+                     "source_variants": [item.source]},
+                ]
+            else:
+                constraints, conflicts = term_context[item.item_id]
+            new_source, new_target, guarded_review = apply_proofread_safety_constraints(
+                item.source, item.target, candidate_source, candidate_target, evidence_edit,
+                merged_review, constraints, conflicts, safety_mode=safety_mode_enabled,
+                safety_events=safety_events,
+            )
+            if breaks_cross_event_sentence_boundary(new_source, item.target, new_target, item.sentence_context):
+                new_target = item.target
+                safety_events.append("cross_event_sentence_closure")
+            if sentence_group_repeats_full_target(candidate_target, item.target, group.full_target, len(group.items)):
+                new_source, new_target = item.source, item.target
+                safety_events.append("sentence_group_full_target_repeated")
+            ui_target = apply_glossary_ui_translation(new_source, new_target, list(item.retrieved_context), ctx)
+            if ui_target != new_target:
+                _unused, new_target, guarded_review = apply_proofread_safety_constraints(
+                    new_source, new_target, new_source, ui_target, None, guarded_review,
+                    *term_context[item.item_id], safety_mode=safety_mode_enabled, safety_events=safety_events,
+                )
+            unresolved = search_runtime.unresolved_reasons(item.item_id) if search_runtime is not None else []
+            if unresolved:
+                new_source, new_target = item.source, item.target
+                safety_events.append("unresolved_external_evidence")
+            guarded_review = add_unresolved_search_human_review(guarded_review, unresolved)
+            normalized_review = merge_retrieval_review_evidence(new_source, guarded_review, list(item.retrieved_context))
+            decision, reasons = proofread_decision_diagnostic(
+                item.source, item.target, candidate_source, candidate_target,
+                new_source, new_target, normalized_review, safety_events,
+            )
+            group_failed = group_failed or decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}
+            staged.append({"item": item, "candidate_source": candidate_source, "candidate_target": candidate_target,
+                           "source": new_source, "target": new_target, "review": normalized_review,
+                           "decision": decision, "reasons": reasons})
+
+        retry_results: dict[int, tuple[str, str, dict, Optional[dict]]] = {}
+        retry_error = ""
+        if group_failed and not errors_by_id.keys() & set(group.items[0].group_item_ids):
+            retry_request = LLMBatchRequest([
+                make_pair_item(
+                    row["item"].item_id, ctx, row["item"].source, row["item"].target,
+                    retrieved_context=list(row["item"].retrieved_context),
+                    context_before=list(row["item"].context_before), context_after=list(row["item"].context_after),
+                    review_hint=row["item"].review_hint,
+                    terminology_constraints=term_context[row["item"].item_id][0],
+                    evidence_conflicts=term_context[row["item"].item_id][1],
+                    sentence_context=row["item"].sentence_context,
+                    safety_retry={"attempt": 1, "group_id": group.group_id,
+                                  "group_item_ids": list(row["item"].group_item_ids),
+                                  "first_proposal": LanguageFields.from_ctx(ctx).build(
+                                      source=row["candidate_source"], target=row["candidate_target"]),
+                                  "gate_reasons": row["reasons"]},
+                ) for row in staged
+            ])
+            try:
+                retry_session = ChatSession(
+                    pr_llm, retry_system_prompt, 0.2, disable_provider_search=True
+                )
+                response = llm_numbered_batch(
+                    retry_request,
+                    retry_session,
+                    quiet, retries=1, raise_on_failure=True,
+                )
+                if metrics is not None:
+                    metrics["provider_retries"] = metrics.get("provider_retries", 0) + retry_session.provider_retry_count
+                parsed = validate_complete_response(response, group.items)
+                retry_results = {item.item_id: result for item, result in zip(group.items, parsed)}
+            except Exception as error:
+                retry_error = str(error)
+
+        final_rows = staged
+        if retry_results:
+            final_rows = []
+            retry_failed = False
+            for row in staged:
+                item = row["item"]
+                source, target, review, legacy_edit = retry_results[item.item_id]
+                source, target = source.strip() or item.source, target.strip() or item.target
                 safety_events: list[str] = []
-                merged_review = merge_review_metadata(
-                    persistent_event_review(original_review), candidate_review
+                new_source, new_target, guarded_review = apply_proofread_safety_constraints(
+                    item.source, item.target, source, target, legacy_edit,
+                    merge_review_metadata(persistent_event_review(item.review), review),
+                    *term_context[item.item_id], safety_mode=safety_mode_enabled, safety_events=safety_events,
                 )
-                effective_edit = candidate_edit
-                if not safety_mode_enabled and effective_edit is None:
-                    effective_edit = {
-                        "source_changed": candidate_en != original_en,
-                        "target_changed": candidate_zh != original_zh,
-                        "categories": ["accuracy"],
-                        "reasons": ["legacy proofread response compatibility"],
-                    }
-                new_en, new_zh, guarded_review = apply_proofread_safety_constraints(
-                    original_en,
-                    original_zh,
-                    candidate_en,
-                    candidate_zh,
-                    effective_edit,
-                    merged_review,
-                    batch_term_context[index][0],
-                    batch_term_context[index][1],
-                    safety_mode=safety_mode_enabled,
-                    safety_events=safety_events,
-                )
-                if breaks_cross_event_sentence_boundary(
-                    new_en,
-                    original_zh,
-                    new_zh,
-                    sentence_contexts[item_offset + index],
-                ):
-                    new_zh = original_zh
-                    safety_events.append("cross_event_sentence_closure")
-                ui_target = apply_glossary_ui_translation(
-                    new_en, new_zh, batch_contexts[index], ctx
-                )
-                if ui_target != new_zh:
-                    _ui_source, new_zh, guarded_review = apply_proofread_safety_constraints(
-                        new_en,
-                        new_zh,
-                        new_en,
-                        ui_target,
-                        {
-                            "source_changed": False,
-                            "target_changed": True,
-                            "categories": ["terminology"],
-                            "reasons": ["deterministic glossary UI mapping"],
-                        },
-                        guarded_review,
-                        batch_term_context[index][0],
-                        batch_term_context[index][1],
-                        safety_mode=safety_mode_enabled,
-                        safety_events=safety_events,
-                    )
-                if search_runtime is not None:
-                    unresolved_reasons = search_runtime.unresolved_reasons(global_item_id)
-                    if unresolved_reasons:
-                        new_en = original_en
-                        new_zh = original_zh
-                        safety_events.append("unresolved_external_evidence")
-                    guarded_review = add_unresolved_search_human_review(
-                        guarded_review, unresolved_reasons
-                    )
-                normalized_review = merge_retrieval_review_evidence(
-                    new_en, guarded_review, batch_contexts[index]
+                if breaks_cross_event_sentence_boundary(new_source, item.target, new_target, item.sentence_context):
+                    new_target = item.target; safety_events.append("cross_event_sentence_closure")
+                if sentence_group_repeats_full_target(target, item.target, group.full_target, len(group.items)):
+                    new_source, new_target = item.source, item.target
+                    safety_events.append("sentence_group_full_target_repeated")
+                unresolved = search_runtime.unresolved_reasons(item.item_id) if search_runtime is not None else []
+                if unresolved:
+                    new_source, new_target = item.source, item.target
+                    safety_events.append("unresolved_external_evidence")
+                guarded_review = add_unresolved_search_human_review(guarded_review, unresolved)
+                guarded_review = merge_retrieval_review_evidence(
+                    new_source, guarded_review, list(item.retrieved_context)
                 )
                 decision, reasons = proofread_decision_diagnostic(
-                    original_en,
-                    original_zh,
-                    candidate_en,
-                    candidate_zh,
-                    new_en,
-                    new_zh,
-                    normalized_review,
-                    safety_events,
+                    item.source, item.target, source, target, new_source, new_target,
+                    guarded_review, safety_events,
                 )
-                return new_en, new_zh, normalized_review, decision, reasons
+                retry_failed = retry_failed or decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}
+                final_rows.append({**row, "source": new_source, "target": new_target,
+                                   "review": guarded_review, "retry_source": source,
+                                   "retry_target": target, "retry_decision": decision,
+                                   "retry_reasons": reasons})
+            if retry_failed:
+                retry_error = "sentence group safety retry failed"
 
-            candidate_en = en.strip() or original_en
-            candidate_zh = zh.strip() or original_zh
-            new_en, new_zh, normalized_review, decision, diagnostic_reasons = evaluate_candidate(
-                candidate_en, candidate_zh, review, edit
-            )
-            retry_source = ""
-            retry_target = ""
-            retry_decision = ""
-            retry_reasons: list[str] = []
-            retry_error = ""
-            if decision == "EDIT_ROLLED_BACK":
-                retry_request = LLMBatchRequest(
-                    [
-                        make_pair_item(
-                            global_item_id,
-                            ctx,
-                            original_en,
-                            original_zh,
-                            retrieved_context=batch_contexts[index],
-                            context_before=event_context_items(
-                                events, item_offset + index, ctx, context_window, before=True
-                            ),
-                            context_after=event_context_items(
-                                events, item_offset + index, ctx, context_window, before=False
-                            ),
-                            review_hint=batch_review_hints[index],
-                            terminology_constraints=batch_term_context[index][0],
-                            evidence_conflicts=batch_term_context[index][1],
-                            sentence_context=sentence_contexts[item_offset + index],
-                            safety_retry={
-                                "attempt": 1,
-                                "first_proposal": LanguageFields.from_ctx(ctx).build(
-                                    source=candidate_en, target=candidate_zh
-                                ),
-                                "gate_reasons": diagnostic_reasons,
-                                "instruction": "Preserve valid language improvements, repair the listed safety regression, reread the complete sentence, and return one safe result.",
-                            },
-                        )
-                    ]
-                )
-                try:
-                    retry_items = llm_numbered_batch(
-                        retry_request,
-                        ChatSession(
-                            pr_llm,
-                            retry_system_prompt,
-                            temperature=0.2,
-                            disable_provider_search=True,
-                        ),
-                        quiet,
-                        retries=1,
-                        raise_on_failure=True,
-                    )
-                    if not retry_items:
-                        raise ValueError("empty retry response")
-                    if not any(
-                        isinstance(item, dict) and item.get("id") == global_item_id
-                        for item in retry_items
-                    ):
-                        raise ValueError("retry response omitted the requested item id")
-                    retry_result = parse_proofread_results(
-                        retry_items,
-                        [global_item_id],
-                        [(original_en, original_zh)],
-                        ctx,
-                    )[0]
-                    retry_source = retry_result[0].strip() or original_en
-                    retry_target = retry_result[1].strip() or original_zh
-                    (
-                        new_en,
-                        new_zh,
-                        normalized_review,
-                        retry_decision,
-                        retry_reasons,
-                    ) = evaluate_candidate(*retry_result)
-                    if retry_decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
-                        new_en = original_en
-                        new_zh = original_zh
-                except Exception as retry_exception:
-                    retry_error = str(retry_exception)
-                    new_en = original_en
-                    new_zh = original_zh
-                    normalized_review = merge_review_metadata(
-                        normalized_review,
-                        {
-                            "needs_human": True,
-                            "categories": ["proofread_safety_retry"],
-                            "reasons": ["定向安全重试失败，已保留原译"],
-                            "note": retry_error[:300],
-                        },
-                    )
-            if not quiet:
-                detail = f" ({', '.join(diagnostic_reasons)})" if diagnostic_reasons else ""
-                print(
-                    f"    Proofread item {global_item_id}: {decision}{detail}",
-                    file=sys.stderr,
-                )
-                if retry_decision:
-                    retry_detail = f" ({', '.join(retry_reasons)})" if retry_reasons else ""
-                    print(
-                        f"      Safety retry: {retry_decision}{retry_detail}",
-                        file=sys.stderr,
-                    )
-                elif retry_error:
-                    print(f"      Safety retry failed: {retry_error}", file=sys.stderr)
+        if group_failed and (not retry_results or retry_error):
+            for row in final_rows:
+                row["source"], row["target"] = row["item"].source, row["item"].target
+                if retry_error and retry_error != "sentence group safety retry failed":
+                    row["review"] = merge_review_metadata(row["review"], {
+                        "needs_human": True, "categories": ["proofread_safety_retry"],
+                        "reasons": ["整句组安全重试失败，已逐条恢复原字幕"], "note": retry_error[:300],
+                    })
+
+        for row in final_rows:
+            item = row["item"]
+            event = item.event
+            if row["source"] != item.source and not event.original_en:
+                event.original_en = item.source
+            event.en, event.zh, event.review = row["source"], row["target"], row["review"]
+            changed = changed or event.en != item.source or event.zh != item.target or event.review != item.review
             if decision_records is not None:
-                decision_records.append(
-                    proofread_decision_record(
-                        global_item_id,
-                        event,
-                        original_en,
-                        original_zh,
-                        candidate_en,
-                        candidate_zh,
-                        decision,
-                        diagnostic_reasons,
-                        new_en,
-                        new_zh,
-                        normalized_review,
-                        retry_source=retry_source,
-                        retry_target=retry_target,
-                        retry_decision=retry_decision,
-                        retry_reasons=retry_reasons,
-                        retry_error=retry_error,
-                    )
+                record = proofread_decision_record(
+                    item.item_id, event, item.source, item.target,
+                    row["candidate_source"], row["candidate_target"], row["decision"], row["reasons"],
+                    event.en, event.zh, event.review,
+                    retry_source=row.get("retry_source", ""), retry_target=row.get("retry_target", ""),
+                    retry_decision=row.get("retry_decision", ""), retry_reasons=row.get("retry_reasons", []),
+                    retry_error=retry_error,
                 )
-            if new_en != original_en or new_zh != original_zh or normalized_review != original_review:
-                batch_changed = True
-            if new_en != original_en and not event.original_en:
-                event.original_en = original_en
-            event.en = new_en
-            event.zh = new_zh
-            event.review = normalized_review
-        return batch_changed
+                record.update({"group_id": group.group_id, "group_item_ids": list(item.group_item_ids)})
+                decision_records.append(record)
+            if not quiet:
+                final_decision = record["final_decision"] if decision_records is not None else (
+                    row.get("retry_decision") or row["decision"]
+                )
+                if row.get("retry_decision"):
+                    print(
+                        f"    Proofread item {item.item_id}: {row['decision']} -> "
+                        f"{row['retry_decision']} -> {final_decision}", file=sys.stderr,
+                    )
+                else:
+                    print(f"    Proofread item {item.item_id}: {final_decision}", file=sys.stderr)
 
-    for start in range(0, len(events), pr_llm.batch_size):
-        batch = events[start : start + pr_llm.batch_size]
-        batch_review_hints = review_hints[start : start + pr_llm.batch_size]
-        contexts = (
-            retriever.retrieve_texts(
-                [proofread_retrieval_query(event) for event in batch],
-                top_k=retrieval_top_k,
-            )
-            if retriever is not None
-            else [[] for _ in batch]
-        )
-        if not quiet:
-            print(
-                f"  Batch {start // pr_llm.batch_size + 1}/{math.ceil(len(events) / pr_llm.batch_size)}: "
-                f"proofreading split events {start + 1}-{start + len(batch)}",
-                file=sys.stderr,
-            )
-        changed = apply_proofread_batch(batch, start, contexts, batch_review_hints) or changed
     if search_runtime is not None and search_runtime.sidecar.has_evidence():
         search_runtime.sidecar = enrich_confirmed_term_evidence(transcript, search_runtime.sidecar)
         write_web_evidence_sidecar(ctx, search_runtime.sidecar)
@@ -7644,6 +7845,7 @@ def main() -> None:
         )
         retriever = updated_retriever or retriever
     proofread_decisions: list[dict] = []
+    proofread_metrics: dict = {"provider_retries": 0}
     if args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0":
         proofread_llm = proofread_llm_from_env(env, llm, args.batch_size)
         enhanced_proofread = explicit_proofread_model_configured(env)
@@ -7675,12 +7877,14 @@ def main() -> None:
             search_runtime=proofread_search_runtime,
             safety_mode=True,
             decision_records=proofread_decisions,
+            concurrency=proofread_concurrency_from_env(env),
+            metrics=proofread_metrics,
         ) or changed
     if changed:
         save_transcript(transcript, ctx.beautified_json)
 
     review_path = write_human_review_sidecar(ctx, transcript)
-    proofread_report_path = write_proofread_report(ctx, proofread_decisions)
+    proofread_report_path = write_proofread_report(ctx, proofread_decisions, proofread_metrics)
 
     if not os.path.isfile(template_path):
         print(f"Error: template.ass not found: {template_path}", file=sys.stderr)

@@ -7,6 +7,8 @@ deterministic fakes.
 
 import os
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -689,6 +691,163 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertIn("semantic_anchor:exclusivity", report)
         self.assertIn("Retry proposal: 只有他才有办法打开。", report)
         self.assertIn("Final target: 只有他才有办法打开。", report)
+
+    def test_proofread_report_counts_output_length_exhaustion_during_safety_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "sample.json"), "", "en", "zh")
+            record = {
+                "item_id": 1, "start": 0.0, "end": 1.0,
+                "first_decision": "EDIT_ROLLED_BACK", "first_gate_reasons": ["semantic_anchor:negation"],
+                "retry_attempted": True, "retry_error": (
+                    "LLM returned empty message.content (finish_reason=length, completion_tokens=16000)"
+                ),
+                "final_decision": "EDIT_ROLLED_BACK",
+            }
+            path = t.write_proofread_report(ctx, [record])
+            with open(path, "r", encoding="utf-8") as f:
+                report = f.read()
+
+        self.assertIn("- Output length exhaustions: 1", report)
+
+    def test_editor_only_response_derives_keep_and_edit_without_metadata(self):
+        first = t.SplitEvent(0.0, 1.0, "That works.", "那个工作")
+        second = t.SplitEvent(1.0, 2.0, "Already fine.", "已经很好")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 1.0, first.en, split_events=[first]),
+            t.TranscriptSegment(2, 1.0, 2.0, second.en, split_events=[second]),
+        ])
+
+        def editor(request, _session, _quiet, retries=3, raise_on_failure=False):
+            return [
+                {"id": item.id, "en": item.fields["en"],
+                 "zh": "这样就行" if item.id == 1 else item.fields["zh"], "review": {}}
+                for item in request.items
+            ]
+
+        records = []
+        with patch.object(t, "llm_numbered_batch", side_effect=editor):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", True,
+                                     decision_records=records)
+
+        self.assertEqual(first.zh, "这样就行")
+        self.assertEqual([row["first_decision"] for row in records],
+                         ["EDIT_APPLIED", "KEEP_BY_MODEL"])
+
+    def test_concurrent_batches_are_in_flight_and_commit_in_event_order(self):
+        events = [t.SplitEvent(float(i), float(i + 1), f"source {i}", f"译文{i}") for i in range(4)]
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(i + 1, float(i), float(i + 1), event.en, split_events=[event])
+            for i, event in enumerate(events)
+        ])
+        llm = FakeLLM()
+        llm.batch_size = 2
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        completed = []
+
+        def concurrent_editor(request, _session, _quiet, retries=3, raise_on_failure=False):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.04 if request.items[0].id == 1 else 0.01)
+            with lock:
+                active -= 1
+                completed.append(request.items[0].id)
+            return [{"id": item.id, "en": item.fields["en"],
+                     "zh": item.fields["zh"] + "改", "review": {}} for item in request.items]
+
+        records = []
+        with patch.object(t, "llm_numbered_batch", side_effect=concurrent_editor):
+            t.proofread_split_events(transcript, self.ctx, llm, "system", True,
+                                     concurrency=2, decision_records=records)
+
+        self.assertGreaterEqual(peak, 2)
+        self.assertEqual(completed, [3, 1])
+        self.assertEqual([row["item_id"] for row in records], [1, 2, 3, 4])
+        self.assertEqual([event.zh for event in events], [f"译文{i}改" for i in range(4)])
+
+    def test_sentence_group_retry_is_atomic_and_never_restores_parent_target(self):
+        first = t.SplitEvent(0.0, 1.0, "Only he", "只有他")
+        second = t.SplitEvent(1.0, 2.0, "can go.", "能去")
+        parent = "只有他能去"
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 2.0, "Only he can go.", translation=parent,
+                                split_events=[first, second])
+        ])
+        calls = []
+
+        def unsafe(request, _session, _quiet, retries=3, raise_on_failure=False):
+            calls.append([item.id for item in request.items])
+            return [
+                {"id": item.id, "en": item.fields["en"],
+                 "zh": parent if item.id == 2 else "他", "review": {}}
+                for item in request.items
+            ]
+
+        records = []
+        with patch.object(t, "llm_numbered_batch", side_effect=unsafe):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", True,
+                                     decision_records=records)
+
+        self.assertEqual(calls, [[1, 2], [1, 2]])
+        self.assertEqual([first.zh, second.zh], ["只有他", "能去"])
+        self.assertNotEqual(second.zh, parent)
+        self.assertTrue(any("sentence_group_full_target_repeated" in row["first_gate_reasons"]
+                            for row in records))
+
+    def test_length_exhaustion_is_review_not_keep_or_empty_subtitle(self):
+        event = t.SplitEvent(0.0, 1.0, "source", "原译")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])
+        ])
+
+        def exhausted(*_args, **_kwargs):
+            raise t.LLMOutputLengthError("finish_reason=length")
+
+        records = []
+        with patch.object(t, "llm_numbered_batch", side_effect=exhausted):
+            t.proofread_split_events(transcript, self.ctx, FakeLLM(), "system", True,
+                                     decision_records=records)
+
+        self.assertEqual(event.zh, "原译")
+        self.assertTrue(event.review["needs_human"])
+        self.assertEqual(records[0]["first_decision"], "REVIEW_BY_MODEL")
+        self.assertIn("output_length_exhausted", records[0]["first_gate_reasons"])
+
+    def test_enhanced_concurrency_uses_isolated_search_runtimes_and_merges_in_order(self):
+        events = [t.SplitEvent(float(i), float(i + 1), f"name {i}", f"名字{i}") for i in range(2)]
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(i + 1, float(i), float(i + 1), event.en, split_events=[event])
+            for i, event in enumerate(events)
+        ])
+        llm = FakeLLM()
+        llm.batch_size = 1
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="key"), max_queries=2,
+        )
+        runtime_ids = []
+        lock = threading.Lock()
+
+        def enhanced(request, _session, task_runtime, _quiet, metrics=None):
+            with lock:
+                runtime_ids.append(id(task_runtime))
+            item = request.items[0]
+            task_runtime.used_queries += 1
+            task_runtime.record_unresolved([item.id], f"query {item.id}", "not found")
+            return [{"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"], "review": {}}]
+
+        with patch.object(t, "llm_numbered_batch_with_web_search", side_effect=enhanced):
+            t.proofread_split_events(
+                transcript, self.ctx, llm, "system", True, enhanced=True,
+                search_runtime=runtime, concurrency=2,
+            )
+
+        self.assertEqual(len(set(runtime_ids)), 2)
+        self.assertEqual(runtime.used_queries, 2)
+        self.assertEqual(sorted(runtime.unresolved_item_ids), [1, 2])
+        self.assertTrue(all(event.review["needs_human"] for event in events))
 
 
 if __name__ == "__main__":
