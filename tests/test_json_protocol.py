@@ -1725,6 +1725,21 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertNotIn("leave it unchanged unless", prompt.casefold())
         self.assertNotIn("more natural", prompt.casefold())
 
+    def test_editable_proofread_prompt_uses_ordered_scan_and_full_reread(self):
+        prompt_path = os.path.join(os.path.dirname(t.__file__), "proofread_prompt.example.md")
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            prompt = f.read()
+
+        self.assertIn("Silent seven-step decision order", prompt)
+        self.assertIn("Semantic relations", prompt)
+        self.assertIn("Context and sentence relations", prompt)
+        self.assertIn("Target-language syntax", prompt)
+        self.assertIn("Collocation, pragmatics, and translationese", prompt)
+        self.assertIn("Voice and expressive function", prompt)
+        self.assertIn("Character agency and referents", prompt)
+        self.assertIn("Full reread after EDIT only", prompt)
+        self.assertNotIn("Giants", prompt)
+
     def test_proofread_retrieval_query_asks_for_asr_corrections(self):
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
@@ -1906,6 +1921,39 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(calls[0]["seed"], 7)
         self.assertEqual(calls[0]["model"], "fake-model")
         self.assertEqual(calls[0]["temperature"], 0.3)
+
+    def test_chat_session_can_disable_provider_native_search_without_mutating_config(self):
+        calls = []
+        cfg = {
+            "request_kwargs": {
+                "extra_body": {
+                    "extra_body": {
+                        "google": {
+                            "tools": [
+                                {"google_search": {}},
+                                {"function_declarations": [{"name": "lookup_local"}]},
+                            ]
+                        }
+                    }
+                },
+                "seed": 7,
+            }
+        }
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg=cfg,
+            responses=[FakeSDKResponse(FakeSDKMessage(content='{"markdown": "ok"}'))],
+        )
+
+        t.ChatSession(llm, "system", disable_provider_search=True).ask("{}")
+
+        tools = calls[0]["extra_body"]["extra_body"]["google"]["tools"]
+        self.assertEqual(tools, [{"function_declarations": [{"name": "lookup_local"}]}])
+        self.assertEqual(calls[0]["seed"], 7)
+        self.assertEqual(
+            cfg["request_kwargs"]["extra_body"]["extra_body"]["google"]["tools"][0],
+            {"google_search": {}},
+        )
 
     def test_chat_session_disable_response_format_wins_after_extra_kwargs(self):
         calls = []

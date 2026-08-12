@@ -148,6 +148,8 @@ winget install Microsoft.PowerShell
 - `proofread_prompt.md` 是 KEEP / EDIT / REVIEW 阈值、中文自然度、翻译腔、本地化、人物声音、语气、节奏、修辞和改写幅度的唯一控制面；运行时代码不得再叠加第二套语言编辑策略
 - 主流水线对目标译文采用明确回归拦截：普通自然度、本地化、搭配、语气和表达优化默认生效，仅在可确定检测到源文支持的否定、排他性、程度、情态等语义锚点丢失，或术语、证据、跨事件连续性回归时回滚；源文/ASR 修改仍要求声明准确性、术语或 source_ASR 依据
 - 非 quiet 运行逐 item 输出 `KEEP_BY_MODEL`、`REVIEW_BY_MODEL`、`EDIT_APPLIED`、`EDIT_PARTIALLY_APPLIED` 或 `EDIT_ROLLED_BACK`；安全回滚同时列出 semantic anchor、confirmed term、evidence conflict、ASR 范围或跨 event 等原因
+- 仅首次结果为 `EDIT_ROLLED_BACK` 的 event 会以单 item、无新搜索方式定向 retry 一次；retry 复用原 sentence_context、术语/证据和同一 safety gate，仍触发任何安全回滚时最终保留 original target，不重跑整个 batch
+- 每次运行确定性输出 `<base>.proofread-report.md`，记录首次 proposal/decision/gate reason、可选 retry proposal/result 及 final target；报告不进入 transcript cache 或 human-review sidecar
 - 每个 split event 都注入同一原始 segment 的完整 `sentence_context`，不受邻居窗口或 batch 边界影响；本地拒绝在非末尾事件中无依据新增句末闭合标点
 - 当前字幕命中 `confirmed_terms` 时，校对请求注入高优先级 `terminology_constraints`，本地后处理禁止模型用新音译、同义词或风格变体覆盖已确认译名；冲突项不选边，进入 human review
 - 自然化必须保留信息、逻辑、语气、程度、指代和修辞；不把所有源语言痕迹视为错误，有表达价值的异质化、文学化、重复或歧义可保留
