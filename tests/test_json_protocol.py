@@ -2095,6 +2095,39 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(calls[0]["model"], "fake-model")
         self.assertEqual(calls[0]["temperature"], 0.3)
 
+    def test_chat_session_can_disable_provider_native_search_without_mutating_config(self):
+        calls = []
+        cfg = {
+            "request_kwargs": {
+                "extra_body": {
+                    "extra_body": {
+                        "google": {
+                            "tools": [
+                                {"google_search": {}},
+                                {"function_declarations": [{"name": "lookup_local"}]},
+                            ]
+                        }
+                    }
+                },
+                "seed": 7,
+            }
+        }
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg=cfg,
+            responses=[FakeSDKResponse(FakeSDKMessage(content='{"markdown": "ok"}'))],
+        )
+
+        t.ChatSession(llm, "system", disable_provider_search=True).ask("{}")
+
+        tools = calls[0]["extra_body"]["extra_body"]["google"]["tools"]
+        self.assertEqual(tools, [{"function_declarations": [{"name": "lookup_local"}]}])
+        self.assertEqual(calls[0]["seed"], 7)
+        self.assertEqual(
+            cfg["request_kwargs"]["extra_body"]["extra_body"]["google"]["tools"][0],
+            {"google_search": {}},
+        )
+
     def test_chat_session_disable_response_format_wins_after_extra_kwargs(self):
         calls = []
         llm = FakeChatLLM(

@@ -5,6 +5,8 @@ call a model or a search backend: the LLM batch and network are replaced with
 deterministic fakes.
 """
 
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -502,6 +504,150 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
 
         self.assertTrue(event.review["needs_human"])
         self.assertIn("专名尚无可靠证据", event.review["reasons"])
+
+    def test_only_rolled_back_event_gets_one_targeted_retry(self):
+        risky = t.SplitEvent(0.0, 1.0, "Only he can open it.", "只有他能打开。")
+        keep = t.SplitEvent(1.0, 2.0, "The door is blue.", "门是蓝色的。")
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [
+                t.TranscriptSegment(1, 0.0, 1.0, risky.en, split_events=[risky]),
+                t.TranscriptSegment(2, 1.0, 2.0, keep.en, split_events=[keep]),
+            ],
+        )
+        calls = []
+
+        def fake_batch(request, _session, _quiet, retries=3, raise_on_failure=False):
+            calls.append([item.id for item in request.items])
+            if len(calls) == 1:
+                return [
+                    {
+                        "id": 1,
+                        "en": risky.en,
+                        "zh": "他才有办法打开。",
+                        "edit": {"source_changed": False, "target_changed": True, "categories": ["naturalness"], "reasons": ["改善表达"]},
+                        "review": {},
+                    },
+                    {"id": 2, "en": keep.en, "zh": keep.zh, "edit": {}, "review": {}},
+                ]
+            self.assertEqual(retries, 1)
+            self.assertTrue(raise_on_failure)
+            self.assertTrue(_session.disable_provider_search)
+            retry = request.items[0]
+            self.assertEqual(retry.fields["safety_retry"]["attempt"], 1)
+            self.assertIn("semantic_anchor:exclusivity", retry.fields["safety_retry"]["gate_reasons"])
+            self.assertEqual(retry.fields["sentence_context"]["full_source"], risky.en)
+            return [
+                {
+                    "id": retry.id,
+                    "en": risky.en,
+                    "zh": "只有他才有办法打开。",
+                    "edit": {"source_changed": False, "target_changed": True, "categories": ["naturalness"], "reasons": ["保留排他关系并改善表达"]},
+                    "review": {},
+                }
+            ]
+
+        records = []
+        original_timing = [(event.start, event.end) for event in (risky, keep)]
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            t.proofread_split_events(
+                transcript,
+                self.ctx,
+                FakeLLM(),
+                "system",
+                quiet=True,
+                safety_mode=True,
+                decision_records=records,
+            )
+
+        self.assertEqual(calls, [[1, 2], [1]])
+        self.assertEqual(len(t.all_events(transcript)), 2)
+        self.assertEqual([(event.start, event.end) for event in (risky, keep)], original_timing)
+        self.assertEqual([record["item_id"] for record in records], [1, 2])
+        self.assertEqual(risky.zh, "只有他才有办法打开。")
+        self.assertEqual(keep.zh, "门是蓝色的。")
+        self.assertEqual(records[0]["first_decision"], "EDIT_ROLLED_BACK")
+        self.assertTrue(records[0]["retry_attempted"])
+        self.assertEqual(records[0]["retry_decision"], "EDIT_APPLIED")
+        self.assertEqual(records[0]["final_target"], "只有他才有办法打开。")
+        self.assertFalse(records[1]["retry_attempted"])
+        self.assertEqual(records[1]["first_decision"], "KEEP_BY_MODEL")
+
+    def test_failed_safety_retry_rolls_back_without_a_third_call(self):
+        event = t.SplitEvent(0.0, 1.0, "Only he can open it.", "只有他能打开。")
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])],
+        )
+        calls = 0
+
+        def unsafe_batch(request, _session, _quiet, retries=3, raise_on_failure=False):
+            nonlocal calls
+            calls += 1
+            return [
+                {
+                    "id": request.items[0].id,
+                    "en": event.en,
+                    "zh": "他可以打开。",
+                    "edit": {"source_changed": False, "target_changed": True, "categories": ["expression"], "reasons": ["调整表达"]},
+                    "review": {},
+                }
+            ]
+
+        records = []
+        with patch.object(t, "llm_numbered_batch", side_effect=unsafe_batch):
+            t.proofread_split_events(
+                transcript,
+                self.ctx,
+                FakeLLM(),
+                "system",
+                quiet=True,
+                safety_mode=True,
+                decision_records=records,
+            )
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(event.zh, "只有他能打开。")
+        self.assertEqual(records[0]["first_decision"], "EDIT_ROLLED_BACK")
+        self.assertEqual(records[0]["retry_decision"], "EDIT_ROLLED_BACK")
+        self.assertEqual(records[0]["final_decision"], "EDIT_ROLLED_BACK")
+        self.assertEqual(records[0]["final_target"], "只有他能打开。")
+
+    def test_proofread_report_records_initial_retry_and_final_versions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "sample.json"), "", "en", "zh")
+            record = {
+                "item_id": 1,
+                "start": 0.0,
+                "end": 1.0,
+                "original_source": "Only he can open it.",
+                "original_target": "只有他能打开。",
+                "first_proposal_source": "Only he can open it.",
+                "first_proposal_target": "他才有办法打开。",
+                "first_decision": "EDIT_ROLLED_BACK",
+                "first_gate_reasons": ["semantic_anchor:exclusivity"],
+                "retry_attempted": True,
+                "retry_proposal_source": "Only he can open it.",
+                "retry_proposal_target": "只有他才有办法打开。",
+                "retry_decision": "EDIT_APPLIED",
+                "retry_gate_reasons": [],
+                "retry_error": "",
+                "final_decision": "EDIT_APPLIED",
+                "final_source": "Only he can open it.",
+                "final_target": "只有他才有办法打开。",
+                "review": {},
+            }
+
+            path = t.write_proofread_report(ctx, [record])
+            with open(path, "r", encoding="utf-8") as f:
+                report = f.read()
+
+        self.assertIn("EDIT_ROLLED_BACK", report)
+        self.assertIn("semantic_anchor:exclusivity", report)
+        self.assertIn("Retry proposal: 只有他才有办法打开。", report)
+        self.assertIn("Final target: 只有他才有办法打开。", report)
 
 
 if __name__ == "__main__":

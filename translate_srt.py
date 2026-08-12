@@ -6325,6 +6325,11 @@ def proofread_split_events(
         + "\n\n"
         + proofread_format
     )
+    retry_system_prompt = proofread_system_prompt + "\n\n" + (
+        "SAFETY RETRY: return one safe revision for the current item only. "
+        "Preserve valid improvements, repair the listed deterministic gate reasons, "
+        "and keep the supplied sentence_context, evidence, and terminology constraints."
+    )
     evidence_sidecar = (
         search_runtime.sidecar
         if search_runtime is not None
@@ -6563,6 +6568,78 @@ def proofread_split_events(
                 normalized_review,
                 safety_events,
             )
+            # One bounded retry is reserved for deterministic safety rollbacks.
+            # It receives the exact same RAG, sentence context, and refreshed
+            # terminology constraints as the rejected candidate.
+            if decision == "EDIT_ROLLED_BACK":
+                retry_request = LLMBatchRequest([
+                    make_pair_item(
+                        item_offset + index + 1,
+                        ctx,
+                        event.en,
+                        event.zh,
+                        retrieved_context=batch_contexts[index],
+                        review_hint=batch_review_hints[index],
+                        terminology_constraints=batch_term_context[index][0],
+                        evidence_conflicts=batch_term_context[index][1],
+                        sentence_context=sentence_contexts[item_offset + index],
+                        safety_retry={
+                            "attempt": 1,
+                            "first_proposal": LanguageFields.from_ctx(ctx).build(
+                                source=candidate_en, target=candidate_zh
+                            ),
+                            "gate_reasons": diagnostic_reasons,
+                        },
+                    )
+                ])
+                try:
+                    retry_items = llm_numbered_batch(
+                        retry_request,
+                        ChatSession(pr_llm, retry_system_prompt, temperature=0.2),
+                        quiet,
+                        retries=1,
+                        raise_on_failure=True,
+                    )
+                    retry_en, retry_zh, retry_review, retry_edit = parse_proofread_results(
+                        retry_items, [item_offset + index + 1], [(event.en, event.zh)], ctx
+                    )[0]
+                    retry_events: list[str] = []
+                    new_en, new_zh, guarded_review = apply_proofread_safety_constraints(
+                        event.en, event.zh,
+                        retry_en.strip() or event.en, retry_zh.strip() or event.zh,
+                        retry_edit, merge_review_metadata(persistent_event_review(event.review), retry_review),
+                        batch_term_context[index][0], batch_term_context[index][1],
+                        safety_mode=safety_mode_enabled, safety_events=retry_events,
+                        semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
+                    )
+                    if breaks_cross_event_sentence_boundary(
+                        new_en, event.zh, new_zh, sentence_contexts[item_offset + index]
+                    ):
+                        new_zh = event.zh
+                        retry_events.append("cross_event_sentence_closure")
+                    normalized_review = merge_retrieval_review_evidence(
+                        new_en, guarded_review, batch_contexts[index]
+                    )
+                    retry_decision, retry_reasons = proofread_decision_diagnostic(
+                        event.en, event.zh,
+                        retry_en.strip() or event.en, retry_zh.strip() or event.zh,
+                        new_en, new_zh, normalized_review, retry_events,
+                    )
+                    if retry_decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
+                        new_en, new_zh = event.en, event.zh
+                    else:
+                        decision, diagnostic_reasons = retry_decision, retry_reasons
+                except Exception as retry_error:
+                    new_en, new_zh = event.en, event.zh
+                    normalized_review = merge_review_metadata(
+                        normalized_review,
+                        {
+                            "needs_human": True,
+                            "categories": ["proofread_safety_retry"],
+                            "reasons": ["定向安全重试失败，已保留原译"],
+                            "note": str(retry_error)[:300],
+                        },
+                    )
             if not quiet:
                 detail = f" ({', '.join(diagnostic_reasons)})" if diagnostic_reasons else ""
                 print(
