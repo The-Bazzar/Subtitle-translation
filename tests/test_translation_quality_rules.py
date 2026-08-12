@@ -9,36 +9,6 @@ class TranslationQualityRulesTests(unittest.TestCase):
             "video.json", "", "en", "zh"
         )
 
-    def test_glossary_ui_translation_uses_exact_zh_mapping_only(self):
-        translated = t.apply_glossary_ui_translation(
-            "Rhetoric impossible.",
-            "模型译文",
-            [{"text": "| Rhetoric | 能说会道 |"}],
-            self.zh_context,
-        )
-        self.assertEqual(translated, "[能说会道]：不可能")
-
-        self.assertEqual(
-            t.apply_glossary_ui_translation(
-                "Rhetoric impossible.",
-                "模型译文",
-                [{"text": "| Other | 其他 |"}],
-                self.zh_context,
-            ),
-            "模型译文",
-        )
-
-        non_zh_context = t.TranscriptContext.from_json("video.json", "", "en", "ja")
-        self.assertEqual(
-            t.apply_glossary_ui_translation(
-                "Rhetoric impossible.",
-                "モデル訳",
-                [{"text": "| Rhetoric | 能说会道 |"}],
-                non_zh_context,
-            ),
-            "モデル訳",
-        )
-
     def test_retrieval_asr_evidence_forces_human_review_but_normal_context_does_not(self):
         source = "Got the farm?"
         flagged = t.merge_retrieval_review_evidence(

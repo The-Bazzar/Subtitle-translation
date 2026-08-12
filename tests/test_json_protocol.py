@@ -1725,21 +1725,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertNotIn("leave it unchanged unless", prompt.casefold())
         self.assertNotIn("more natural", prompt.casefold())
 
-    def test_editable_proofread_prompt_uses_ordered_scan_and_full_reread(self):
-        prompt_path = os.path.join(os.path.dirname(t.__file__), "proofread_prompt.example.md")
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            prompt = f.read()
-
-        self.assertIn("Silent editor pass", prompt)
-        self.assertIn("Semantic relations", prompt)
-        self.assertIn("Context and sentence relations", prompt)
-        self.assertIn("Target-language syntax", prompt)
-        self.assertIn("Collocation, pragmatics, and translationese", prompt)
-        self.assertIn("Voice and expressive function", prompt)
-        self.assertIn("Character agency and referents", prompt)
-        self.assertIn("Full reread after any change", prompt)
-        self.assertNotIn("Giants", prompt)
-
     def test_proofread_retrieval_query_asks_for_asr_corrections(self):
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):

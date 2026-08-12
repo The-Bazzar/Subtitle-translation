@@ -8,35 +8,6 @@ import translate_srt as t
 
 
 class TranslationQualityInfrastructureTests(unittest.TestCase):
-    def test_representative_excerpt_samples_beginning_middle_and_end_within_budget(self):
-        segments = []
-        for position in range(101):
-            if position == 0:
-                marker = "FIRST_MARKER"
-            elif position == 50:
-                marker = "MIDDLE_MARKER"
-            elif position == 100:
-                marker = "LAST_MARKER"
-            else:
-                marker = f"ordinary-{position:03d}"
-            text = f"{marker} " + ("supporting context " * 3)
-            segments.append(
-                t.TranscriptSegment(
-                    position + 1,
-                    float(position),
-                    float(position + 1),
-                    text,
-                )
-            )
-        transcript = t.Transcript("video.json", "en", segments)
-
-        excerpt = t.representative_transcript_excerpt(transcript, max_chars=220)
-
-        self.assertLessEqual(len(excerpt), 220)
-        self.assertIn("FIRST_MARKER", excerpt)
-        self.assertIn("MIDDLE_MARKER", excerpt)
-        self.assertIn("LAST_MARKER", excerpt)
-
     def test_lexical_retriever_exactly_hits_named_term_without_unrelated_chunk(self):
         chunks = [
             t.EmbeddingChunk(

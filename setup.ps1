@@ -78,6 +78,7 @@ Copy-ConfigIfMissing "glossary_prompt.example.md" "glossary_prompt.md"
 Copy-ConfigIfMissing "translate_prompt.example.md" "translate_prompt.md"
 Copy-ConfigIfMissing "proofread_prompt.example.md" "proofread_prompt.md"
 Copy-ConfigIfMissing "split_prompt.example.md" "split_prompt.md"
+Copy-ConfigIfMissing "template.ass.example" "template.ass"
 
 . "$ScriptDir\.env.ps1"
 

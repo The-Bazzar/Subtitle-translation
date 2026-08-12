@@ -209,33 +209,6 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
         self.assertEqual(constraints, [])
         self.assertEqual(set(conflicts[0]["targets"]), {"鲍德里亚", "巴尔·德里尔"})
 
-    def test_proofread_only_terms_do_not_enter_glossary_fingerprint_evidence(self):
-        glossary_url = "https://example.test/glossary"
-        proofread_url = "https://example.test/proofread"
-        sidecar = t.WebEvidenceSidecar(
-            records=[
-                t.WebEvidenceRecord(
-                    query="global",
-                    search_stage="glossary_tool",
-                    results=[t.WebEvidenceEntry(url=glossary_url, content="Global - 全局")],
-                ),
-                t.WebEvidenceRecord(
-                    query="local",
-                    search_stage="proofread_tool",
-                    results=[t.WebEvidenceEntry(url=proofread_url, content="Local - 局部")],
-                ),
-            ],
-            confirmed_terms=[
-                t.ConfirmedTermEvidence("Global", "全局", evidence_urls=[glossary_url]),
-                t.ConfirmedTermEvidence("Local", "局部", evidence_urls=[proofread_url]),
-            ],
-        )
-
-        filtered = t.glossary_web_evidence(sidecar)
-
-        self.assertEqual([record.search_stage for record in filtered.records], ["glossary_tool"])
-        self.assertEqual([term.source for term in filtered.confirmed_terms], ["Global"])
-
     def test_reliable_canonical_translation_cannot_be_overwritten(self):
         constraints = [
             {

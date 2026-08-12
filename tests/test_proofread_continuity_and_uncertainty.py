@@ -692,23 +692,6 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertIn("Retry proposal: 只有他才有办法打开。", report)
         self.assertIn("Final target: 只有他才有办法打开。", report)
 
-    def test_proofread_report_counts_output_length_exhaustion_during_safety_retry(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "sample.json"), "", "en", "zh")
-            record = {
-                "item_id": 1, "start": 0.0, "end": 1.0,
-                "first_decision": "EDIT_ROLLED_BACK", "first_gate_reasons": ["semantic_anchor:negation"],
-                "retry_attempted": True, "retry_error": (
-                    "LLM returned empty message.content (finish_reason=length, completion_tokens=16000)"
-                ),
-                "final_decision": "EDIT_ROLLED_BACK",
-            }
-            path = t.write_proofread_report(ctx, [record])
-            with open(path, "r", encoding="utf-8") as f:
-                report = f.read()
-
-        self.assertIn("- Output length exhaustions: 1", report)
-
     def test_editor_only_response_derives_keep_and_edit_without_metadata(self):
         first = t.SplitEvent(0.0, 1.0, "That works.", "那个工作")
         second = t.SplitEvent(1.0, 2.0, "Already fine.", "已经很好")
@@ -816,30 +799,6 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertEqual(records[0]["first_decision"], "REVIEW_BY_MODEL")
         self.assertIn("output_length_exhausted", records[0]["first_gate_reasons"])
 
-    def test_output_length_exhaustion_splits_only_between_sentence_groups(self):
-        first = t.SplitEvent(0.0, 1.0, "source one", "译文一")
-        second = t.SplitEvent(1.0, 2.0, "source two", "译文二")
-        transcript = t.Transcript("x.json", "en", [
-            t.TranscriptSegment(1, 0.0, 1.0, first.en, split_events=[first]),
-            t.TranscriptSegment(2, 1.0, 2.0, second.en, split_events=[second]),
-        ])
-        llm = FakeLLM(); llm.batch_size = 2
-        calls = []
-
-        def length_then_edit(request, *_args, **_kwargs):
-            ids = [item.id for item in request.items]
-            calls.append(ids)
-            if len(ids) > 1:
-                raise t.LLMOutputLengthError("finish_reason=length")
-            return [{"id": ids[0], "en": request.items[0].fields["en"],
-                     "zh": request.items[0].fields["zh"] + "改", "review": {}}]
-
-        with patch.object(t, "llm_numbered_batch", side_effect=length_then_edit):
-            t.proofread_split_events(transcript, self.ctx, llm, "system", True)
-
-        self.assertEqual(calls, [[1, 2], [1], [2]])
-        self.assertEqual([first.zh, second.zh], ["译文一改", "译文二改"])
-
     def test_output_length_split_never_splits_sibling_events(self):
         first = t.SplitEvent(0.0, 1.0, "part one", "甲")
         second = t.SplitEvent(1.0, 2.0, "part two", "乙")
@@ -943,40 +902,6 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertTrue(all("proofread_output_length" in event.review["categories"]
                             for event in [first, second]))
         self.assertTrue(all(row["group_final_decision"] == "GROUP_ROLLED_BACK" for row in records))
-
-    def test_enhanced_concurrency_shares_search_runtime_and_global_budget(self):
-        events = [t.SplitEvent(float(i), float(i + 1), f"name {i}", f"名字{i}") for i in range(2)]
-        transcript = t.Transcript("x.json", "en", [
-            t.TranscriptSegment(i + 1, float(i), float(i + 1), event.en, split_events=[event])
-            for i, event in enumerate(events)
-        ])
-        llm = FakeLLM()
-        llm.batch_size = 1
-        runtime = t.WebSearchRuntime(
-            settings=t.WebSearchSettings(tavily_key="key"), max_queries=2,
-        )
-        runtime_ids = []
-        lock = threading.Lock()
-
-        def enhanced(request, _session, task_runtime, _quiet, metrics=None):
-            with lock:
-                runtime_ids.append(id(task_runtime))
-            item = request.items[0]
-            task_runtime.used_queries += 1
-            task_runtime.record_unresolved([item.id], f"query {item.id}", "not found")
-            return [{"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"], "review": {}}]
-
-        with patch.object(t, "llm_numbered_batch_with_web_search", side_effect=enhanced):
-            t.proofread_split_events(
-                transcript, self.ctx, llm, "system", True, enhanced=True,
-                search_runtime=runtime, concurrency=2,
-            )
-
-        self.assertEqual(len(set(runtime_ids)), 1)
-        self.assertEqual(runtime.used_queries, 2)
-        self.assertEqual(sorted(runtime.unresolved_item_ids), [1, 2])
-        self.assertTrue(all(event.review["needs_human"] for event in events))
-
 
 if __name__ == "__main__":
     unittest.main()

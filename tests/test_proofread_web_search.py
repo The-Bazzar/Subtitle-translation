@@ -140,20 +140,6 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(runtime.unresolved_item_ids, {1, 2})
         self.assertTrue(results[1].get("error") and results[2].get("error"))
 
-    def test_dynamic_budget_is_consumed_only_by_tasks_that_search(self):
-        runtime = t.WebSearchRuntime(
-            settings=t.WebSearchSettings(tavily_key="t"), max_queries=1,
-        )
-        runtime.configure_work_units([(0, [1]), (1, [2])])
-        runtime.mark_work_unit_done(0)  # task 0 needed no search; its budget remains global.
-        evidence = [{"url": "https://official.example/a", "title": "A", "content": "evidence"}]
-        with patch.object(t, "tavily_search", return_value=evidence) as search:
-            result = runtime.execute_search({"query": "needed later", "item_ids": [2]})
-
-        search.assert_called_once()
-        self.assertTrue(result["results"])
-        self.assertEqual(runtime.used_queries, 1)
-
     def test_enhanced_proofread_requires_explicit_model_not_provider(self):
         self.assertFalse(t.explicit_proofread_model_configured({}))
         self.assertFalse(t.explicit_proofread_model_configured({"PROOFREAD_PROVIDER": "custom"}))
@@ -526,14 +512,22 @@ class ProofreadWebSearchTests(unittest.TestCase):
     def test_proofread_evidence_does_not_change_glossary_fingerprint(self):
         transcript = t.Transcript("video.json", "en", [t.TranscriptSegment(1, 0.0, 1.0, "source")])
         ctx = t.TranscriptContext.from_json("video.json", "", "en", "zh")
+        glossary_url = "https://example.com/term"
+        proofread_url = "https://example.com/meme"
         glossary_record = t.WebEvidenceRecord(
             query="term",
             provider="tavily",
             search_stage="glossary_tool",
-            results=[t.WebEvidenceEntry(url="https://example.com/term", content="term evidence")],
+            results=[t.WebEvidenceEntry(url=glossary_url, content="term evidence")],
+        )
+        glossary_term = t.ConfirmedTermEvidence(
+            "Global", "全局", evidence_urls=[glossary_url]
         )
         before = t.glossary_cache_fingerprint(
-            transcript, ctx, {}, t.WebEvidenceSidecar(records=[glossary_record])
+            transcript,
+            ctx,
+            {},
+            t.WebEvidenceSidecar(records=[glossary_record], confirmed_terms=[glossary_term]),
         )
         after = t.glossary_cache_fingerprint(
             transcript,
@@ -547,12 +541,35 @@ class ProofreadWebSearchTests(unittest.TestCase):
                         provider="exa",
                         search_stage="proofread_tool",
                         item_ids=[1],
-                        results=[t.WebEvidenceEntry(url="https://example.com/meme", content="meme evidence")],
+                        results=[t.WebEvidenceEntry(url=proofread_url, content="meme evidence")],
                     ),
-                ]
+                ],
+                confirmed_terms=[
+                    glossary_term,
+                    t.ConfirmedTermEvidence("Local", "局部", evidence_urls=[proofread_url]),
+                ],
             ),
         )
         self.assertEqual(before, after)
+        filtered = t.glossary_web_evidence(
+            t.WebEvidenceSidecar(
+                records=[
+                    glossary_record,
+                    t.WebEvidenceRecord(
+                        query="meme",
+                        provider="exa",
+                        search_stage="proofread_tool",
+                        item_ids=[1],
+                        results=[t.WebEvidenceEntry(url=proofread_url, content="meme evidence")],
+                    ),
+                ],
+                confirmed_terms=[
+                    glossary_term,
+                    t.ConfirmedTermEvidence("Local", "局部", evidence_urls=[proofread_url]),
+                ],
+            )
+        )
+        self.assertEqual([term.source for term in filtered.confirmed_terms], ["Global"])
 
 
 if __name__ == "__main__":

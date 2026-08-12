@@ -35,7 +35,7 @@ winget install Microsoft.PowerShell
 ├── setup.ps1                 # Windows: 安装依赖
 ├── setup.sh                  # Linux/WSL: 安装依赖
 ├── .env.ps1                  # PowerShell 读取 .env 的共享模块
-├── template.ass              # ASS 模板；保留历史 Style: zh / bi-en / bi-zh
+├── template.ass.example      # ASS 模板示例；setup 时复制为 template.ass
 ├── .env.example              # 环境变量模板
 ├── providers.example.json    # LLM provider 配置模板
 ├── tavily_domains.example.json # Tavily 域名优先配置模板
@@ -54,7 +54,7 @@ winget install Microsoft.PowerShell
     └── whisper/SKILL.md
 ```
 
-本地文件 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和生成产物均不应提交。
+本地文件 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`、`template.ass` 和生成产物均不应提交。
 
 ## Pipeline Flow
 
@@ -194,7 +194,7 @@ ${TARGET_LANG_CODE}
 
 ## Config
 
-`setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md`。旧版本升级时，setup 会把 `.env.example` 中新增但本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
+`setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和 `template.ass`。旧版本升级时，setup 会把 `.env.example` 中新增但本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。PowerShell 入口通过 `.env.ps1` 读取，bash 入口自行读取。
 
 | 变量 | 说明 |
 |------|------|

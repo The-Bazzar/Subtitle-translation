@@ -85,6 +85,7 @@ copy_config_if_missing "glossary_prompt.example.md" "glossary_prompt.md"
 copy_config_if_missing "translate_prompt.example.md" "translate_prompt.md"
 copy_config_if_missing "proofread_prompt.example.md" "proofread_prompt.md"
 copy_config_if_missing "split_prompt.example.md" "split_prompt.md"
+copy_config_if_missing "template.ass.example" "template.ass"
 
 [ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
 
