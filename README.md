@@ -183,6 +183,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 | `chromadb` | 本地持久化向量库 |
 | `langcodes[data]` Python 包 | 语言名/标签规范为 ISO 639 输出后缀 |
 | `tavily-python` | glossary 可选联网搜索 SDK |
+| `exa-py` | Exa 可选联网搜索 SDK |
 | `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |
 
 ## 注意事项
