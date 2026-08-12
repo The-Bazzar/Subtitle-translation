@@ -548,7 +548,8 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("MANDATORY JSON PROTOCOL", captured["system_prompt"])
         self.assertIn("Return a JSON object.", captured["system_prompt"])
         self.assertIn("MANDATORY GLOSSARY JSON PROTOCOL", captured["system_prompt"])
-        self.assertIn('Return exactly one top-level key: "markdown".', captured["system_prompt"])
+        self.assertIn('optional top-level key "confirmed_terms"', captured["system_prompt"])
+        self.assertIn("copy exact evidence URLs", captured["system_prompt"])
         self.assertIn("Treat web search results as the primary evidence", captured["system_prompt"])
         self.assertIn("actively correct likely ASR errors", captured["system_prompt"])
         self.assertIn("Do not copy ASR mistakes into the glossary", captured["system_prompt"])
@@ -1690,6 +1691,39 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("glossary or retrieved_context identifies a source-language ASR error", captured["system_prompt"])
         self.assertIn("must apply that correction to the source-language field", captured["system_prompt"])
         self.assertIn("Baudrillard", transcript.segments[0].split_events[0].en)
+
+    def test_runtime_proofread_prompt_adds_safety_not_language_policy(self):
+        captured = {}
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
+            captured["system_prompt"] = session.system_prompt
+            item = request.items[0]
+            return [{"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"], "edit": {}, "review": {}}]
+
+        event = t.SplitEvent(0.0, 1.0, "source", "译文")
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.proofread_split_events(
+                transcript,
+                self.ctx,
+                FakeBatchLLM(10),
+                "USER LANGUAGE POLICY",
+                quiet=True,
+                enhanced=True,
+                safety_mode=True,
+            )
+
+        prompt = captured["system_prompt"]
+        self.assertIn("USER LANGUAGE POLICY", prompt)
+        self.assertIn("PROOFREAD SAFETY CONSTRAINTS", prompt)
+        self.assertIn("PROOFREAD WEB SEARCH PROTOCOL", prompt)
+        self.assertNotIn("existing translation is the baseline", prompt.casefold())
+        self.assertNotIn("leave it unchanged unless", prompt.casefold())
+        self.assertNotIn("more natural", prompt.casefold())
 
     def test_proofread_retrieval_query_asks_for_asr_corrections(self):
         class FakeRetriever:

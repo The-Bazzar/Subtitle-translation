@@ -125,7 +125,7 @@ winget install Microsoft.PowerShell
 - 配置 `TAVILY_API_KEY` 或 `EXA_API_KEY` 时联网搜索，均未配置时离线总结
 - 联网搜索结果是 glossary 的优先证据来源；远端 LLM 应用搜索结果校正 transcript 中可能的 ASR 人名、标题、引文和术语错误
 - 仅配置 Tavily 时 glossary 保留 `tavily_search` 工具；配置 Exa 或多个来源时使用 provider-neutral 的 `web_search`，规范化结果交给无工具 finalizer
-- 原始网页证据统一写入 `<base>.web_evidence.json`，记录 provider、阶段和关联字幕 id，供 glossary、proofread 与 embedding 复用
+- 网页证据统一写入 `<base>.web_evidence.json`：原始记录保存 provider、阶段和关联字幕 id；经真实证据 URL 校验的标准译名另存为 `confirmed_terms`，供 proofread 确定性约束，不依赖 embedding 命中
 - 第一轮 glossary user JSON 会包含 metadata、transcript/retrieved context 和合并后的 `tavily_domains.json` 域名偏好
 - Tavily tool 本地先按 `tavily_domains.json` 的全局百科域名和题材站点执行 `include_domains` 搜索；结果不足时再执行普通搜索；合并时优先百科/知识库域名
 - 使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 指定术语知识库专用 LLM；空则回退到 `TRANSLATE_PROVIDER` / `TRANSLATE_MODEL`
@@ -144,6 +144,14 @@ winget install Microsoft.PowerShell
 - 默认 ASS 模板按 1080p 双语观看调校：`bi-zh` / `bg-bi-zh` 字号 68，`bi-en` / `bg-bi-en` 字号 44；默认 AI 分割阈值是源文超过 72 字符或 3.8 秒
 - 翻译、分割、校对的 user prompt 都是 JSON object，顶层包含 `items` array；glossary 和 description 的 user prompt 也是 JSON object；远端 LLM 必须只返回 JSON
 - 翻译、分割、校对返回严格 JSON object，顶层 `items` array 使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `id`, `en`, `zh`
+- 校对返回还包含 `edit`，逐字段声明是否修改、收益类别和简要理由；Prompt 负责判断是否存在实际质量收益，`edit` 用于审计而不是逐次准入审批
+- `proofread_prompt.md` 是 KEEP / EDIT / REVIEW 阈值、中文自然度、翻译腔、本地化、人物声音、语气、节奏、修辞和改写幅度的唯一控制面；运行时代码不得再叠加第二套语言编辑策略
+- 主流水线对目标译文采用明确回归拦截：普通自然度、本地化、搭配、语气和表达优化默认生效，仅在可确定检测到源文支持的否定、排他性、程度、情态等语义锚点丢失，或术语、证据、跨事件连续性回归时回滚；源文/ASR 修改仍要求声明准确性、术语或 source_ASR 依据
+- 非 quiet 运行逐 item 输出 `KEEP_BY_MODEL`、`REVIEW_BY_MODEL`、`EDIT_APPLIED`、`EDIT_PARTIALLY_APPLIED` 或 `EDIT_ROLLED_BACK`；安全回滚同时列出 semantic anchor、confirmed term、evidence conflict、ASR 范围或跨 event 等原因
+- 每个 split event 都注入同一原始 segment 的完整 `sentence_context`，不受邻居窗口或 batch 边界影响；本地拒绝在非末尾事件中无依据新增句末闭合标点
+- 当前字幕命中 `confirmed_terms` 时，校对请求注入高优先级 `terminology_constraints`，本地后处理禁止模型用新音译、同义词或风格变体覆盖已确认译名；冲突项不选边，进入 human review
+- 自然化必须保留信息、逻辑、语气、程度、指代和修辞；不把所有源语言痕迹视为错误，有表达价值的异质化、文学化、重复或歧义可保留
+- proofread 联网查询的空结果、Provider 错误和预算耗尽按 item id 保存在运行时未解决状态，并确定性合并到 event review；既有 event review 后续不得被空 review 覆盖
 - 语言代码 key 由 `${SOURCE_LANG_CODE}` / `${TARGET_LANG_CODE}` 注入；本地解析只匹配这些 ISO code，不匹配完整语言名称或 `source` / `target`
 - 对轴时只用源语言 split 的首尾 token 匹配 `words[]`；匹配失败则整句回退到 beautified 时间轴，禁止本地强切
 - token normalize 会忽略词内 dash/hyphen，例如 `non-existent` 与 `nonexistent` 可匹配；带空格的 dash 仍作为分隔
@@ -220,7 +228,7 @@ glossary 搜索使用两段式 tool calling，并支持 Tavily/Exa 任一来源�
 
 glossary tool 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；finalizer 首选返回 `{"markdown": "..."}` JSON object，若 provider 无法稳定输出 JSON，可返回 `<GLOSSARY_MARKDOWN>...</GLOSSARY_MARKDOWN>` 标签块。普通散文和伪 tool call 文本都会被拒绝并重试。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt。`web_evidence:*` 由规范化 Tavily/Exa 结果构建并保留 provider、阶段、字幕 id、query、URL 与摘要；proofread 阶段用源文+译文检索并复用这些证据。
+`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt。`web_evidence.json` 的 `confirmed_terms` 是逐条确定性硬证据层，必须引用 sidecar 中实际存在的 URL；弱证据、不确定项或冲突项不得升级。其余 `web_evidence:*` 由规范化 Tavily/Exa 结果构建并保留 provider、阶段、字幕 id、query、URL 与摘要，继续通过检索复用。
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 

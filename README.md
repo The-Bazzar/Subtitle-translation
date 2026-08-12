@@ -94,7 +94,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 - `<name>.beautified.json`：主缓存，保存 `translation`、`proofread_text`、`split_events`
 - `<name>.scenes.json`：场景切换 sidecar，包含 fps、threshold、frame、timecode 等调试信息
 - `<name>.scenechange.txt`：每行一个秒级场景切换点，例如 `12.345000`
-- `<name>.web_evidence.json`：Tavily/Exa 网页证据 sidecar，保存 provider、阶段、字幕 id、query、域名、URL、标题和证据摘要，供 glossary、校对和检索复用
+- `<name>.web_evidence.json`：Tavily/Exa 网页证据 sidecar；除原始 provider、阶段、字幕 id、query、URL 和摘要外，还保存经现有证据 URL 校验的 `confirmed_terms`，供后续校对确定性约束专名和术语
 - `<name>.split.<source>.srt`：分割后、最终校对后的源语言 SRT 检查稿
 - `<name>.split.<target>.srt`：分割后、最终校对后的目标语言 SRT 检查稿
 - `<name>.<source>.proofread.ass`：最终校对源语言 ASS
@@ -105,11 +105,11 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名，例如 `en`、`en-US`、`Japanese`、`Chinese Simplified`。输出文件后缀会通过 `langcodes` 规范为 ISO 639 代码，例如 `English -> en`、`Japanese -> ja`。未显式设置 `SOURCE_LANG` 时，脚本使用 WhisperX JSON 中的 `language`；`TARGET_LANG` 默认 `zh`。
 
-翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON object，顶层包含 `items` array，返回也必须是同形态 JSON object；`items` 内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。首译默认给每条 pending segment 附带前后各 2 条只读源文上下文，校对默认给每条 event 附带前后各 2 条双语上下文；分别可用 `TRANSLATE_CONTEXT_WINDOW` / `--translate-context-window` 和 `PROOFREAD_CONTEXT_WINDOW` / `--proofread-context-window` 调整。分割阶段默认给 pending segment 附带前后各 1 条 `context_before` / `context_after`，仅用于理解语义和节奏，远端只返回 pending item 本身；可用 `--split-context-window` 调整。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。`.beautified.json` 会用 `split_status` 记录状态：`ok` 为有效分割，`fallback` 为分割失败后整句回退且可重试，`unsplit` 为低于阈值或合法保留整句；`split_reason` 保存原因码，`split_reason_detail` 保存具体诊断文本。校对若有充分证据修正源文，会把修正前文本保存在 event 的 `original_en`，原始 WhisperX segment `text` 始终不变。
+翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON object，顶层包含 `items` array，返回也必须是同形态 JSON object；`items` 内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。`proofread_prompt.md` 是 KEEP / EDIT / REVIEW 阈值以及中文自然度、翻译腔、本地化、人物声音、语气、节奏、修辞和改写幅度的唯一语言策略控制面；调整它不会再被代码追加的第二套保守策略抵消。校对响应使用 `edit` 声明字段修改、问题类别和简要收益，但它是审计信息而不是语言修改的硬性准入证明。本地代码只回滚可明确检测的源文支持语义锚点丢失、确认术语漂移、证据冲突、ASR 越界或跨事件断裂。非 quiet 运行会逐条区分模型 KEEP、模型 REVIEW、已应用 EDIT 和被安全 gate 回滚的 EDIT，并列出回滚原因。源文/ASR 修改仍须有准确性、术语或 source_ASR 声明，或可靠术语证据。每个 split event 无论邻居窗口大小，都会收到同一原始 segment 的完整 `sentence_context`，因此跨 batch 也能按完整句处理语法、指代和逻辑；本地还会阻止非末尾分句被润色成提前闭合的句子。首译默认给每条 pending segment 附带前后各 2 条只读源文上下文，校对默认给每条 event 附带前后各 2 条双语上下文；分别可用 `TRANSLATE_CONTEXT_WINDOW` / `--translate-context-window` 和 `PROOFREAD_CONTEXT_WINDOW` / `--proofread-context-window` 调整。分割阶段默认给 pending segment 附带前后各 1 条 `context_before` / `context_after`，仅用于理解语义和节奏，远端只返回 pending item 本身；可用 `--split-context-window` 调整。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。`.beautified.json` 会用 `split_status` 记录状态：`ok` 为有效分割，`fallback` 为分割失败后整句回退且可重试，`unsplit` 为低于阈值或合法保留整句；`split_reason` 保存原因码，`split_reason_detail` 保存具体诊断文本。校对若有充分证据修正源文，会把修正前文本保存在 event 的 `original_en`，原始 WhisperX segment `text` 始终不变。
 
 默认模板以 1080p 双语观看为基准：`bi-zh` / `bg-bi-zh` 字号为 68，`bi-en` / `bg-bi-en` 字号为 44；AI 分割默认在源文超过 72 字符或 3.8 秒时触发。beautify 只负责词级时间轴吸附和边界修复，不再提供本地硬截整句参数。
 
-`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`glossary_prompt.md` 只用于微调 glossary 内容策略，`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。配置 Tavily 或 Exa 时，glossary 可依据网页证据核验 ASR 中可能误识别的人名、标题、引文和术语；原始证据保存到 `<name>.web_evidence.json`，供后续校对和检索复用。
+`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`glossary_prompt.md` 只用于微调 glossary 内容策略，`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。配置 Tavily 或 Exa 时，glossary 可依据网页证据核验 ASR 中可能误识别的人名、标题、引文和术语；只有引用 sidecar 中真实 URL 且被标记为 confirmed 的标准译名才会升级为结构化高优先级约束，弱证据、不确定项和冲突项不会被自动升级。
 
 ## 配置
 
@@ -173,13 +173,13 @@ DEEPSEEK_API_KEY=
 
 项目仍保持“首译 → 校对”结构，首译和校对模型均由原有 provider/model 配置决定。未显式设置 `PROOFREAD_MODEL` 时，继续执行原有校对路径，不注册新增搜索工具；显式设置后，校对会加强语义、自然度、本地化、人物语气、双关、梗、文化引用、疑似 ASR 等审查。只有专名、官方译名、术语、引用、文化背景、网络梗或疑似 ASR 等可由外部资料核验的问题，模型才应调用 `web_search`；普通语序、口语感和翻译腔不应搜索。
 
-搜索结果只作为证据，不能直接指挥字幕修改。单一弱来源、无关结果或冲突证据不足以改写字幕；失败或无法确认时会保守完成校对，并通过 `<name>.human-review.json` 保留不确定性。每次查询和结果会带 provider、阶段与相关 item id 写回 sidecar，完全相同的有效查询可复用且不再次消耗预算。
+搜索结果只作为证据，不能直接指挥字幕修改。经 URL 校验的确认术语会按当前源文直接匹配并以 `terminology_constraints` 注入，不依赖向量召回是否命中；模型不能用自行音译、同义词或风格变体覆盖已确认译名。单一弱来源、无关结果或冲突证据不足以改写字幕；冲突时保留现有文本。空结果、Provider 失败和预算耗尽会按相关 item id 记录为未解决核验，并由本地强制写入 `<name>.human-review.json`，即使模型遗漏标记也不会生成无依据的高置信答案；已有 event review 在后续校对中也会保留。每次有效查询和结果会带 provider、阶段与相关 item id 写回 sidecar，完全相同的有效查询可复用且不再次消耗预算。
 
 glossary tool 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；finalizer 首选返回 `{"markdown": "..."}` JSON object，若 provider 无法稳定输出 JSON，可返回 `<GLOSSARY_MARKDOWN>...</GLOSSARY_MARKDOWN>` 标签块。普通散文和伪 tool call 文本都会被拒绝并重试。
 
 Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 query / `topic_hints`、metadata 与 `tavily_domains.json` 中的全局百科域名、题材关键词和站点执行 `include_domains` 搜索；如果结果不足，再执行普通 Tavily 搜索；最终合并去重时会优先保留百科/知识库域名结果。`tavily_domains.json` 由 `tavily_domains.example.json` 初始化，用户可以自行添加题材、关键词和站点。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt。即使 `EMBEDDING_ENABLED=0`，脚本也会针对当前字幕从 glossary 和 `web_evidence.json` 做本地关键词召回，把精确专名及网页证据作为 `retrieved_context` 注入，不需要额外 embedding API。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引还会保存源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk，并用语义检索替代关键词回退。校对阶段会用源文+译文一起检索，以保持术语和译风一致。`web_evidence:*` chunk 来自 `<name>.web_evidence.json` 中的规范化 Tavily/Exa 结果，保留 provider、item id、query、域名、标题、URL 和证据摘要。
+`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt。`web_evidence.json` 中的 `confirmed_terms` 是更精确的逐条硬证据层：即使 `EMBEDDING_ENABLED=0`，也会按源文专名/别名确定性注入并做本地结果保护；其余 glossary 和原始网页证据继续通过关键词召回形成 `retrieved_context`。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引还会保存源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk，并用语义检索替代关键词回退。校对阶段会用源文+译文一起检索，以保持术语和译风一致。`web_evidence:*` chunk 来自 `<name>.web_evidence.json` 中的规范化 Tavily/Exa 结果，保留 provider、item id、query、域名、标题、URL 和证据摘要。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 

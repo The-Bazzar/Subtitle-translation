@@ -206,7 +206,7 @@ class TranslationQualityInfrastructureTests(unittest.TestCase):
                     transcript,
                     ctx,
                     t.read_video_metadata_fields(ctx),
-                    sidecar,
+                    t.load_web_evidence_sidecar(ctx.web_evidence_json),
                 ),
             )
 
