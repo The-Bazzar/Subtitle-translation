@@ -615,6 +615,94 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertEqual(records[0]["final_decision"], "EDIT_ROLLED_BACK")
         self.assertEqual(records[0]["final_target"], "只有他能打开。")
 
+    def test_partially_applied_edit_gets_one_retry_with_the_same_evidence(self):
+        event = t.SplitEvent(
+            0.0,
+            1.0,
+            "Only Northwind works.",
+            "只有诺斯风协议有效。",
+        )
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])],
+        )
+        sidecar = t.WebEvidenceSidecar(
+            records=[t.WebEvidenceRecord(
+                query="official name",
+                results=[t.WebEvidenceEntry(
+                    url="https://example.test/official-name",
+                    content="Northwind Protocol - 诺斯风协议",
+                    preferred_domain_hit=True,
+                )],
+            )],
+            confirmed_terms=[t.ConfirmedTermEvidence(
+                source="Northwind Protocol",
+                target="诺斯风协议",
+                source_variants=["Northwind"],
+                evidence_urls=["https://example.test/official-name"],
+            )],
+        )
+        calls = []
+
+        def fake_batch(request, _session, _quiet, retries=3, raise_on_failure=False):
+            item = request.items[0]
+            calls.append(item.fields)
+            if len(calls) == 1:
+                return [{
+                    "id": item.id,
+                    "en": "Only Northwind Protocol works.",
+                    "zh": "诺斯风协议有效。",
+                    "edit": {
+                        "source_changed": True,
+                        "target_changed": True,
+                        "categories": ["source_ASR", "expression"],
+                        "reasons": ["应用已确认名称并调整表达"],
+                    },
+                    "review": {},
+                }]
+            return [{
+                "id": item.id,
+                "en": "Only Northwind Protocol works.",
+                "zh": "只有诺斯风协议有效。",
+                "edit": {
+                    "source_changed": True,
+                    "target_changed": False,
+                    "categories": ["source_ASR"],
+                    "reasons": ["仅应用已确认名称"],
+                },
+                "review": {},
+            }]
+
+        records = []
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(
+                os.path.join(tmp, "sample.json"), "", "en", "zh"
+            )
+            t.write_web_evidence_sidecar(ctx, sidecar)
+            with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+                t.proofread_split_events(
+                    transcript,
+                    ctx,
+                    FakeLLM(),
+                    "system",
+                    quiet=True,
+                    safety_mode=True,
+                    decision_records=records,
+                )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[0]["terminology_constraints"],
+            calls[1]["terminology_constraints"],
+        )
+        self.assertEqual(calls[0]["sentence_context"], calls[1]["sentence_context"])
+        self.assertEqual(records[0]["first_decision"], "EDIT_PARTIALLY_APPLIED")
+        self.assertTrue(records[0]["retry_attempted"])
+        self.assertEqual(records[0]["retry_decision"], "EDIT_APPLIED")
+        self.assertEqual(event.en, "Only Northwind Protocol works.")
+        self.assertEqual(event.zh, "只有诺斯风协议有效。")
+
     def test_proofread_report_records_initial_retry_and_final_versions(self):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = t.TranscriptContext.from_json(os.path.join(tmp, "sample.json"), "", "en", "zh")

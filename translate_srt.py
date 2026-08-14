@@ -6571,7 +6571,7 @@ def proofread_split_events(
             # One bounded retry is reserved for deterministic safety rollbacks.
             # It receives the exact same RAG, sentence context, and refreshed
             # terminology constraints as the rejected candidate.
-            if decision == "EDIT_ROLLED_BACK":
+            if decision in {"EDIT_ROLLED_BACK", "EDIT_PARTIALLY_APPLIED"}:
                 retry_request = LLMBatchRequest([
                     make_pair_item(
                         item_offset + index + 1,
