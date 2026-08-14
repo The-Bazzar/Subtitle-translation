@@ -4068,11 +4068,12 @@ def mark_term_evidence_review(
 def supported_web_term_mappings(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
+    require_transcript_match: bool = True,
 ) -> list[dict]:
     transcript_text = "\n".join(segment.source_text() for segment in transcript.segments)
     grouped: dict[str, list[dict]] = {}
     for candidate in web_term_mapping_candidates(sidecar):
-        if term_form_in_text(transcript_text, candidate["source"]):
+        if not require_transcript_match or term_form_in_text(transcript_text, candidate["source"]):
             grouped.setdefault(normalize_term_key(candidate["source"]), []).append(candidate)
 
     supported: list[dict] = []
@@ -4136,7 +4137,9 @@ def validated_confirmed_terms(
         for entry in record.results
         if tavily_url_key(entry.url)
     }
-    supported = supported_web_term_mappings(transcript, sidecar)
+    supported = supported_web_term_mappings(
+        transcript, sidecar, require_transcript_match=False
+    )
     confirmed: list[ConfirmedTermEvidence] = []
     for raw in raw_terms:
         confidence = str(raw.get("confidence", "")).strip().casefold()
@@ -4145,6 +4148,13 @@ def validated_confirmed_terms(
         try:
             term = ConfirmedTermEvidence.from_json_value(raw)
         except Exception:
+            continue
+        transcript_text = "\n".join(
+            segment.source_text() for segment in transcript.segments
+        )
+        if not any(
+            term_form_in_text(transcript_text, form) for form in term.source_forms()
+        ):
             continue
         cited_keys = {
             url_key
@@ -4162,10 +4172,7 @@ def validated_confirmed_terms(
             None,
         )
         if not term.source or not term.target or matching is None:
-            if term.source and term.target and term_form_in_text(
-                "\n".join(segment.source_text() for segment in transcript.segments),
-                term.source,
-            ):
+            if term.source and term.target:
                 mark_term_evidence_review(
                     transcript,
                     [term.source, *term.source_variants],

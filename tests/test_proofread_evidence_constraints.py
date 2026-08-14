@@ -340,6 +340,35 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
         self.assertEqual({pair[:2] for pair in mappings}, {("Northwind Protocol", "诺斯风协议")})
         self.assertEqual(transcript.segments[0].review, {})
 
+    def test_confirmed_mapping_remains_relevant_through_an_asr_variant(self):
+        transcript = self.transcript("bar Drill spoke about simulation.")
+        sidecar = t.WebEvidenceSidecar(
+            records=[t.WebEvidenceRecord(
+                query="official name",
+                results=[t.WebEvidenceEntry(
+                    url="https://example.test/official-name",
+                    content="Baudrillard - 鲍德里亚",
+                    preferred_domain_hit=True,
+                )],
+            )]
+        )
+
+        confirmed = t.validated_confirmed_terms(
+            [{
+                "source": "Baudrillard",
+                "target": "鲍德里亚",
+                "source_variants": ["bar Drill"],
+                "confidence": "confirmed",
+                "evidence_urls": ["https://example.test/official-name"],
+            }],
+            transcript,
+            sidecar,
+        )
+
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0].source_variants, ["bar Drill"])
+        self.assertEqual(transcript.segments[0].review, {})
+
     def test_shared_asr_variant_with_two_targets_is_a_conflict(self):
         sidecar = self.evidence_sidecar(
             t.ConfirmedTermEvidence(
