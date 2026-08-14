@@ -1877,10 +1877,18 @@ class JsonProtocolTests(unittest.TestCase):
         )
 
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "custom proofread", quiet=True, retriever=FakeRetriever())
+            t.proofread_split_events(
+                transcript,
+                self.ctx,
+                FakeBatchLLM(10),
+                "custom proofread",
+                quiet=True,
+                retriever=FakeRetriever(),
+                safety_mode=True,
+            )
 
-        self.assertIn("glossary or retrieved_context identifies a source-language ASR error", captured["system_prompt"])
-        self.assertIn("must apply that correction to the source-language field", captured["system_prompt"])
+        self.assertIn("explicitly states an exact old-form -> corrected-form replacement", captured["system_prompt"])
+        self.assertIn("Never infer a source correction from fluency", captured["system_prompt"])
         self.assertIn("Baudrillard", transcript.segments[0].split_events[0].en)
 
     def test_runtime_proofread_prompt_adds_safety_not_language_policy(self):
@@ -1975,7 +1983,7 @@ class JsonProtocolTests(unittest.TestCase):
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
             t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
 
-        self.assertEqual(calls, [2, 1])
+        self.assertEqual(calls, [3])
 
     def test_proofread_split_events_splits_batch_on_context_length_error(self):
         calls = []
@@ -2010,9 +2018,10 @@ class JsonProtocolTests(unittest.TestCase):
             changed = t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
 
         self.assertTrue(changed)
-        self.assertEqual(calls, [2, 1, 1])
-        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
-        self.assertEqual(transcript.segments[0].split_events[1].zh, "译文二 fixed")
+        self.assertEqual(calls, [2])
+        self.assertEqual(transcript.segments[0].split_events[0].en, "source one")
+        self.assertEqual(transcript.segments[0].split_events[1].zh, "译文二")
+        self.assertTrue(transcript.segments[0].split_events[0].review["needs_human"])
 
     def test_proofread_split_events_drops_retrieved_context_when_single_item_is_too_large(self):
         class FakeRetriever:
@@ -2054,8 +2063,9 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
         self.assertTrue(changed)
-        self.assertEqual(saw_context, [True, False])
-        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
+        self.assertEqual(saw_context[:2], [True, False])
+        self.assertEqual(transcript.segments[0].split_events[0].en, "source one")
+        self.assertTrue(transcript.segments[0].split_events[0].review["needs_human"])
 
     def test_chat_session_passes_provider_response_format(self):
         calls = []
@@ -2217,6 +2227,22 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("total_tokens=300", message)
         self.assertIn("reasoning_tokens=128", message)
 
+    def test_chat_session_partial_content_with_length_is_output_exhaustion(self):
+        llm = FakeChatLLM(
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(content='{"items": [{"id": 1'),
+                    finish_reason="length",
+                )
+            ]
+        )
+
+        with self.assertRaises(t.LLMOutputLengthError) as raised:
+            t.ChatSession(llm, "system").ask("{}")
+
+        self.assertIn("finish_reason=length", str(raised.exception))
+        self.assertIn("content_chars=19", str(raised.exception))
+
     def test_load_providers_merges_local_config_with_builtins(self):
         with tempfile.TemporaryDirectory() as tmp:
             providers_path = os.path.join(tmp, "providers.json")
@@ -2307,6 +2333,26 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIsNone(proofread_llm.api_key)
         self.assertEqual(proofread_llm.batch_size, 3)
 
+    def test_proofread_reasoning_overrides_are_independent(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="translate", batch_size=12)
+        proofread_llm = t.proofread_llm_from_env(
+            {
+                "PROOFREAD_BATCH_SIZE": "4",
+                "PROOFREAD_CONCURRENCY": "4",
+                "PROOFREAD_THINKING": "enabled",
+                "PROOFREAD_REASONING_EFFORT": "max",
+            },
+            translate_llm,
+            batch_size=12,
+        )
+
+        self.assertEqual(proofread_llm.batch_size, 4)
+        self.assertEqual(t.proofread_concurrency_from_env({"PROOFREAD_CONCURRENCY": "4"}), 4)
+        self.assertEqual(proofread_llm.request_overrides["extra_body"]["thinking"]["type"], "enabled")
+        self.assertEqual(proofread_llm.request_overrides["reasoning_effort"], "max")
+        self.assertNotIn("max_tokens", proofread_llm.request_overrides)
+        self.assertEqual(translate_llm.request_overrides, {})
+
     def test_proofread_llm_from_env_reuses_translate_provider_when_unset(self):
         translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", api_key="shared-key", batch_size=12)
 
@@ -2316,6 +2362,8 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(proofread_llm.model, "deepseek-chat")
         self.assertEqual(proofread_llm.api_key, "shared-key")
         self.assertEqual(proofread_llm.batch_size, 6)
+        self.assertEqual(proofread_llm.request_overrides, {})
+        self.assertEqual(t.proofread_concurrency_from_env({}), 1)
 
     def test_only_glossary_does_not_require_translate_provider(self):
         class Args:

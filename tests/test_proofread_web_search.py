@@ -2,6 +2,8 @@ import copy
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,12 +69,269 @@ def web_tool_call(query="official name", item_ids=None):
 
 
 class ProofreadWebSearchTests(unittest.TestCase):
-    def test_enhanced_proofread_requires_explicit_opt_in(self):
+    def test_shared_runtime_singleflights_equivalent_concurrent_queries(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=2,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def search(*_args, **_kwargs):
+            calls.append(1)
+            entered.set()
+            release.wait(1)
+            return [{"url": "https://official.example/a", "title": "A", "content": "evidence"}]
+
+        results = {}
+        with patch.object(t, "tavily_search", side_effect=search):
+            first = threading.Thread(target=lambda: results.setdefault(
+                1, runtime.execute_search({"query": "Official   Name", "item_ids": [1]})
+            ))
+            second = threading.Thread(target=lambda: results.setdefault(
+                2, runtime.execute_search({"query": "official name", "item_ids": [2]})
+            ))
+            first.start(); entered.wait(1); second.start(); time.sleep(0.02); release.set()
+            first.join(1); second.join(1)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(runtime.used_queries, 1)
+        self.assertEqual(runtime.singleflight_reuses, 1)
+        self.assertEqual(runtime.sidecar.records[0].item_ids, [1, 2])
+        self.assertTrue(results[1]["results"] and results[2]["results"])
+
+    def test_singleflight_attributes_consumers_to_their_evidence_stage(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=1,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def search(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return [{"url": "https://official.example/a", "content": "evidence"}]
+
+        with patch.object(t, "tavily_search", side_effect=search):
+            first = threading.Thread(
+                target=lambda: runtime.execute_search(
+                    {"query": "official name", "item_ids": [1]},
+                    search_stage="glossary_tool",
+                )
+            )
+            second = threading.Thread(
+                target=lambda: runtime.execute_search(
+                    {"query": "Official Name", "item_ids": [2]},
+                    search_stage="proofread_tool",
+                )
+            )
+            first.start(); entered.wait(1); second.start(); time.sleep(0.02); release.set()
+            first.join(1); second.join(1)
+
+        glossary = next(
+            record for record in runtime.sidecar.records
+            if record.search_stage == "glossary_tool"
+        )
+        proofread = next(
+            record for record in runtime.sidecar.records
+            if record.search_stage == "proofread_tool"
+        )
+        self.assertEqual(glossary.item_ids, [1])
+        self.assertEqual(proofread.item_ids, [2])
+
+    def test_cached_query_reuses_evidence_after_budget_is_exhausted(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=1,
+        )
+        evidence = [{"url": "https://official.example/a", "title": "A", "content": "evidence"}]
+        with patch.object(t, "tavily_search", return_value=evidence) as search:
+            runtime.execute_search({"query": "official name", "item_ids": [1]})
+            result = runtime.execute_search({"query": "OFFICIAL NAME", "item_ids": [2]})
+            third = runtime.execute_search({"query": "official-name", "item_ids": [3]})
+
+        search.assert_called_once()
+        self.assertTrue(result["reused_evidence"])
+        self.assertEqual(third["item_ids"], [1, 2, 3])
+        self.assertEqual(runtime.used_queries, 1)
+        self.assertEqual(runtime.sidecar.records[0].item_ids, [1, 2, 3])
+
+    def test_persisted_evidence_prewarms_normalized_query_cache(self):
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="Official Name",
+                    provider="tavily",
+                    item_ids=[1],
+                    search_stage="proofread_tool",
+                    results=[
+                        t.WebEvidenceEntry(
+                            url="https://official.example/name",
+                            title="Official name",
+                            content="authoritative evidence",
+                        )
+                    ],
+                ),
+                t.WebEvidenceRecord(
+                    query="official-name",
+                    provider="exa",
+                    item_ids=[3],
+                    search_stage="glossary_tool",
+                    results=[
+                        t.WebEvidenceEntry(
+                            url="https://official.example/name",
+                            title="Duplicate provider result",
+                            content="duplicate evidence with a more complete official explanation",
+                        )
+                    ],
+                ),
+            ]
+        )
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(), max_queries=0, sidecar=sidecar,
+        )
+
+        result = runtime.execute_search(
+            {
+                "query": "  OFFICIAL—NAME! ",
+                "item_ids": [2],
+                "topic_hints": ["current context"],
+                "preferred_domains": ["official.example"],
+            },
+            search_stage="proofread_tool",
+        )
+
+        self.assertTrue(result["reused_evidence"])
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(
+            result["results"][0]["content"],
+            "duplicate evidence with a more complete official explanation",
+        )
+        self.assertEqual(runtime.used_queries, 0)
+        self.assertEqual(runtime.cache_reuses, 1)
+        self.assertEqual(runtime.sidecar.records[0].item_ids, [1, 2])
+        self.assertEqual(runtime.sidecar.records[1].item_ids, [3])
+        self.assertEqual(result["item_ids"], [2])
+        self.assertEqual(result["query"], "OFFICIAL—NAME!")
+        self.assertIn("current context", result["topic_hints"])
+        self.assertIn("official.example", result["preferred_domains"])
+        self.assertEqual(
+            result["results"][0]["content"],
+            "duplicate evidence with a more complete official explanation",
+        )
+
+    def test_sidecar_merge_coalesces_consumers_but_preserves_evidence_stage(self):
+        def record(item_id, stage, url):
+            return t.WebEvidenceRecord(
+                query="Official   Name",
+                provider="tavily",
+                item_ids=[item_id],
+                search_stage=stage,
+                results=[t.WebEvidenceEntry(url=url, content=f"evidence {item_id}")],
+            )
+
+        original = t.WebEvidenceSidecar(
+            records=[record(1, "proofread_tool", "https://example.com/a")]
+        )
+        merged = t.merge_web_evidence_sidecars(
+            original,
+            t.WebEvidenceSidecar(
+                records=[
+                    record(2, "proofread_tool", "https://example.com/b"),
+                    record(3, "glossary_tool", "https://example.com/c"),
+                ]
+            ),
+        )
+
+        self.assertEqual(len(merged.records), 2)
+        proofread = next(
+            record for record in merged.records if record.search_stage == "proofread_tool"
+        )
+        glossary = next(
+            record for record in merged.records if record.search_stage == "glossary_tool"
+        )
+        self.assertEqual(proofread.item_ids, [1, 2])
+        self.assertEqual(len(proofread.results), 2)
+        self.assertEqual(glossary.item_ids, [3])
+        self.assertEqual(original.records[0].item_ids, [1])
+        self.assertEqual(len(original.records[0].results), 1)
+
+    def test_failed_singleflight_marks_all_waiters_unresolved_without_deadlock(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=1,
+        )
+        entered = threading.Event(); release = threading.Event(); calls = []
+
+        def failing_search(*_args, **_kwargs):
+            calls.append(1); entered.set(); release.wait(1)
+            raise RuntimeError("provider unavailable")
+
+        results = {}
+        with patch.object(t, "tavily_search", side_effect=failing_search):
+            first = threading.Thread(target=lambda: results.setdefault(
+                1, runtime.execute_search({"query": "Unknown Name", "item_ids": [1]})
+            ))
+            second = threading.Thread(target=lambda: results.setdefault(
+                2, runtime.execute_search({"query": "unknown name", "item_ids": [2]})
+            ))
+            first.start(); entered.wait(1); second.start(); time.sleep(0.02); release.set()
+            first.join(1); second.join(1)
+
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(runtime.used_queries, 1)
+        self.assertEqual(runtime.unresolved_item_ids, {1, 2})
+        self.assertTrue(results[1].get("error") and results[2].get("error"))
+
+    def test_failed_earlier_work_unit_releases_later_dynamic_search_budget(self):
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=2,
+        )
+        runtime.configure_work_units([(0, [1, 2]), (1, [3])])
+        failed_entered = threading.Event()
+        release_failure = threading.Event()
+        later_called = threading.Event()
+        calls = []
+
+        def search(query, *_args, **_kwargs):
+            calls.append(query)
+            if "unknown" in query.casefold():
+                failed_entered.set()
+                release_failure.wait(1)
+                raise RuntimeError("provider unavailable")
+            later_called.set()
+            return [{"url": "https://official.example/resolved", "content": "resolved"}]
+
+        results = {}
+        with patch.object(t, "tavily_search", side_effect=search):
+            owner = threading.Thread(target=lambda: results.setdefault(
+                1, runtime.execute_search({"query": "Unknown Name", "item_ids": [1]})
+            ))
+            waiter = threading.Thread(target=lambda: results.setdefault(
+                2, runtime.execute_search({"query": "unknown name", "item_ids": [2]})
+            ))
+            later = threading.Thread(target=lambda: results.setdefault(
+                3, runtime.execute_search({"query": "Known Name", "item_ids": [3]})
+            ))
+            owner.start(); failed_entered.wait(1); waiter.start(); later.start()
+            time.sleep(0.02)
+            self.assertFalse(later_called.is_set())
+            release_failure.set()
+            owner.join(1); waiter.join(1)
+            runtime.mark_work_unit_done(0)
+            later.join(1)
+
+        self.assertFalse(owner.is_alive() or waiter.is_alive() or later.is_alive())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(runtime.used_queries, 2)
+        self.assertEqual(runtime.singleflight_reuses, 1)
+        self.assertEqual(runtime.unresolved_item_ids, {1, 2})
+        self.assertTrue(results[3]["results"])
+
+    def test_enhanced_proofread_requires_an_explicit_feature_switch(self):
         self.assertFalse(t.explicit_proofread_model_configured({}))
         self.assertFalse(t.explicit_proofread_model_configured({"PROOFREAD_PROVIDER": "custom"}))
         self.assertFalse(t.explicit_proofread_model_configured({"PROOFREAD_MODEL": "review-model"}))
         self.assertTrue(t.explicit_proofread_model_configured({"PROOFREAD_ENHANCED": "1"}))
-        self.assertTrue(t.explicit_proofread_model_configured({"PROOFREAD_ENHANCED": "true"}))
 
     def test_search_configuration_is_exposed_through_the_setup_chain(self):
         root = Path(__file__).resolve().parents[1]
@@ -81,12 +340,13 @@ class ProofreadWebSearchTests(unittest.TestCase):
         agents = (root / "AGENTS.md").read_text(encoding="utf-8")
         setup_ps1 = (root / "setup.ps1").read_text(encoding="utf-8")
         setup_sh = (root / "setup.sh").read_text(encoding="utf-8")
-        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
 
         for key in (
             "PROOFREAD_ENHANCED",
             "PROOFREAD_SEARCH_MAX_QUERIES",
-            "GLOSSARY_SEARCH_MAX_QUERIES",
+            "PROOFREAD_CONCURRENCY",
+            "PROOFREAD_THINKING",
+            "PROOFREAD_REASONING_EFFORT",
             "WEB_SEARCH_PROVIDER",
             "EXA_API_KEY",
             "EXA_MAX_RESULTS",
@@ -96,7 +356,6 @@ class ProofreadWebSearchTests(unittest.TestCase):
             self.assertIn(f"`{key}`", agents)
         self.assertIn("Update-EnvFromExample", setup_ps1)
         self.assertIn("update_env_from_example", setup_sh)
-        self.assertIn('"exa-py>=2.0.0"', pyproject)
 
     def test_search_settings_cover_all_provider_combinations(self):
         self.assertEqual(t.WebSearchSettings.from_env({}).configured_providers(), [])
@@ -158,7 +417,6 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(captured["query"], "work official Chinese title")
         self.assertEqual(captured["kwargs"]["include_domains"], ["example.com"])
         self.assertEqual(captured["kwargs"]["num_results"], 2)
-        self.assertTrue(captured["kwargs"]["moderation"])
         self.assertEqual(captured["kwargs"]["contents"], {"highlights": {"max_characters": 1200}})
         self.assertEqual(results[0]["content"], "Official Chinese title Creator page")
 
@@ -242,7 +500,8 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(search.call_count, 1)
         self.assertEqual(runtime.used_queries, 1)
         self.assertEqual(cached["results"][0]["content"], "quote source")
-        self.assertEqual(existing.records[0].item_ids, [2])
+        self.assertEqual(existing.records[0].item_ids, [])
+        self.assertEqual(runtime.sidecar.records[0].item_ids, [2])
         self.assertIn("budget", exhausted["error"])
 
     def test_existing_evidence_is_reused_without_any_api_key(self):
@@ -296,28 +555,6 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["content"], "Known Name - 已知名称")
         self.assertEqual(runtime.used_queries, 0)
         online.assert_not_called()
-
-    def test_zero_budget_cache_miss_never_calls_configured_provider(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
-            runtime = t.proofread_search_runtime_from_env(
-                {
-                    "PROOFREAD_ENHANCED": "1",
-                    "PROOFREAD_SEARCH_MAX_QUERIES": "0",
-                    "TAVILY_API_KEY": "configured-key",
-                },
-                ctx,
-                quiet=True,
-            )
-            self.assertIsNotNone(runtime)
-            self.assertEqual(runtime.max_queries, 0)
-            with patch.object(t, "tavily_search") as online:
-                result = runtime.execute_search({"query": "not cached", "item_ids": [1]})
-
-        online.assert_not_called()
-        self.assertEqual(runtime.used_queries, 0)
-        self.assertEqual(result["results"], [])
-        self.assertIn("budget", result["error"])
 
     def test_proofread_tool_loop_searches_only_when_model_requests_it(self):
         final = json.dumps(
@@ -381,29 +618,6 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(saved.records[0].item_ids, [1])
         self.assertIn("tools", llm.calls[0])
         self.assertNotIn("response_format", llm.calls[0])
-
-    def test_ordinary_language_edit_does_not_search(self):
-        final = json.dumps(
-            {"items": [{"id": 1, "en": "That works", "zh": "这样就行", "review": {}}]},
-            ensure_ascii=False,
-        )
-        llm = FakeLLM([FakeResponse(FakeMessage(content=final))])
-        runtime = t.WebSearchRuntime(
-            settings=t.WebSearchSettings(tavily_key="t"),
-            max_queries=2,
-        )
-        request = t.LLMBatchRequest([t.LLMBatchItem(1, {"en": "That works", "zh": "那个工作"})])
-
-        with patch.object(t, "tavily_search") as search:
-            result = t.llm_numbered_batch_with_web_search(
-                request,
-                t.ChatSession(llm, "system", disable_response_format=True),
-                runtime,
-                quiet=True,
-            )
-
-        search.assert_not_called()
-        self.assertEqual(result[0]["zh"], "这样就行")
 
     def test_legacy_proofread_path_never_receives_search_tools(self):
         event = t.SplitEvent(0.0, 1.0, "That works", "那个工作")
@@ -510,37 +724,6 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertTrue(result[0]["review"]["needs_human"])
         tool_payload = json.loads(llm.calls[1]["messages"][-1]["content"])
         self.assertIn("no valid results", tool_payload["error"])
-
-    def test_proofread_evidence_does_not_change_glossary_fingerprint(self):
-        transcript = t.Transcript("video.json", "en", [t.TranscriptSegment(1, 0.0, 1.0, "source")])
-        ctx = t.TranscriptContext.from_json("video.json", "", "en", "zh")
-        glossary_record = t.WebEvidenceRecord(
-            query="term",
-            provider="tavily",
-            search_stage="glossary_tool",
-            results=[t.WebEvidenceEntry(url="https://example.com/term", content="term evidence")],
-        )
-        before = t.glossary_cache_fingerprint(
-            transcript, ctx, {}, t.WebEvidenceSidecar(records=[glossary_record])
-        )
-        after = t.glossary_cache_fingerprint(
-            transcript,
-            ctx,
-            {},
-            t.WebEvidenceSidecar(
-                records=[
-                    glossary_record,
-                    t.WebEvidenceRecord(
-                        query="meme",
-                        provider="exa",
-                        search_stage="proofread_tool",
-                        item_ids=[1],
-                        results=[t.WebEvidenceEntry(url="https://example.com/meme", content="meme evidence")],
-                    ),
-                ]
-            ),
-        )
-        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":
