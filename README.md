@@ -145,8 +145,12 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD` | `1/0` 控制双语校对 |
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型 |
+| `PROOFREAD_ENHANCED` | `1/0` 显式启用证据增强校对和按需联网搜索，默认 `0`；仅设置 provider/model 不会开启联网 |
+| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；缓存命中不消耗预算 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
+| `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
+| `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa |
 | `TAVILY_API_KEY` | glossary 联网搜索 |
 | `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限 |
 | `TAVILY_MAX_QUERIES` | glossary 联网搜索预算；tool-call 路径下是最大 Tavily tool 查询次数，fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily 搜索 |
@@ -158,6 +162,8 @@ DEEPSEEK_API_KEY=
 配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。
 
 如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且 Tavily 可用，脚本会补建 sidecar 而不重写 glossary。
+
+证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`PROOFREAD_SEARCH_MAX_QUERIES` 只限制实际新搜索，缓存复用不计入预算。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 

@@ -208,12 +208,18 @@ ${TARGET_LANG_CODE}
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
 | `TRANSLATE_CONCURRENCY` | 首译并发请求数，默认 `1`；和 `PROOFREAD_CONCURRENCY`、thinking 完全独立 |
 | `TRANSLATE_CONTEXT_WINDOW` | 首译稳定邻居窗口，默认 `1`；`0` 关闭，正整数表示当前 segment 前后各最多多少条完整 transcript 邻居；与 concurrency、thinking、RAG 独立 |
+| `PROOFREAD_ENHANCED` | `1` 显式启用证据增强校对和按需联网；默认 `0`，选择 provider/model 不会隐式开启 |
+| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；缓存命中不消耗预算 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
 | `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` / `TAVILY_MAX_QUERIES` | glossary 联网搜索配置；`TAVILY_MAX_QUERIES` 在 tool-call 路径下是最大 Tavily tool 查询次数，在 fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily |
+| `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
+| `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa |
+
+proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `PROOFREAD_SEARCH_MAX_QUERIES` 限制实际新搜索次数。
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 

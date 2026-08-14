@@ -599,11 +599,17 @@ def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_
 
 
 def explicit_proofread_model_configured(env: dict[str, str]) -> bool:
-    """Enable enhanced proofreading when either dedicated LLM setting is explicit."""
-    return bool(
-        env.get("PROOFREAD_PROVIDER", "").strip()
-        or env.get("PROOFREAD_MODEL", "").strip()
-    )
+    """Return whether evidence-aware proofreading was explicitly enabled.
+
+    Provider/model settings select the LLM only; they must not silently enable
+    network search or change the proofreading protocol.
+    """
+    return env.get("PROOFREAD_ENHANCED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def glossary_llm_from_env(

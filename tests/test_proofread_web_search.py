@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -66,10 +67,33 @@ def web_tool_call(query="official name", item_ids=None):
 
 
 class ProofreadWebSearchTests(unittest.TestCase):
-    def test_enhanced_proofread_accepts_explicit_provider_or_model(self):
+    def test_enhanced_proofread_requires_explicit_opt_in(self):
         self.assertFalse(t.explicit_proofread_model_configured({}))
-        self.assertTrue(t.explicit_proofread_model_configured({"PROOFREAD_PROVIDER": "custom"}))
-        self.assertTrue(t.explicit_proofread_model_configured({"PROOFREAD_MODEL": "review-model"}))
+        self.assertFalse(t.explicit_proofread_model_configured({"PROOFREAD_PROVIDER": "custom"}))
+        self.assertFalse(t.explicit_proofread_model_configured({"PROOFREAD_MODEL": "review-model"}))
+        self.assertTrue(t.explicit_proofread_model_configured({"PROOFREAD_ENHANCED": "1"}))
+        self.assertTrue(t.explicit_proofread_model_configured({"PROOFREAD_ENHANCED": "true"}))
+
+    def test_search_configuration_is_exposed_through_the_setup_chain(self):
+        root = Path(__file__).resolve().parents[1]
+        env_example = (root / ".env.example").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+        setup_ps1 = (root / "setup.ps1").read_text(encoding="utf-8")
+        setup_sh = (root / "setup.sh").read_text(encoding="utf-8")
+
+        for key in (
+            "PROOFREAD_ENHANCED",
+            "PROOFREAD_SEARCH_MAX_QUERIES",
+            "WEB_SEARCH_PROVIDER",
+            "EXA_API_KEY",
+            "EXA_MAX_RESULTS",
+        ):
+            self.assertIn(f"{key}=", env_example)
+            self.assertIn(f"`{key}`", readme)
+            self.assertIn(f"`{key}`", agents)
+        self.assertIn("Update-EnvFromExample", setup_ps1)
+        self.assertIn("update_env_from_example", setup_sh)
 
     def test_search_settings_cover_all_provider_combinations(self):
         self.assertEqual(t.WebSearchSettings.from_env({}).configured_providers(), [])
