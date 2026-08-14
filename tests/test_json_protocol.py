@@ -2305,6 +2305,8 @@ class JsonProtocolTests(unittest.TestCase):
                 "PROOFREAD_PROVIDER": "openrouter",
                 "PROOFREAD_MODEL": "anthropic/claude-sonnet-4-6",
                 "PROOFREAD_BATCH_SIZE": "3",
+                "PROOFREAD_THINKING": "enabled",
+                "PROOFREAD_REASONING_EFFORT": "high",
             },
             batch_size=12,
         )
@@ -2312,6 +2314,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(llm.provider, "deepseek")
         self.assertEqual(llm.model, "deepseek-chat")
         self.assertEqual(llm.batch_size, 12)
+        self.assertEqual(llm.request_overrides, {})
         self.assertFalse(hasattr(llm, "proofread_provider"))
         self.assertFalse(hasattr(llm, "proofread_model"))
 
@@ -2333,13 +2336,13 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIsNone(proofread_llm.api_key)
         self.assertEqual(proofread_llm.batch_size, 3)
 
-    def test_proofread_reasoning_overrides_are_independent(self):
+    def test_explicit_proofread_reasoning_overrides_replace_provider_defaults(self):
         translate_llm = t.LLMConfig(provider="deepseek", model="translate", batch_size=12)
         proofread_llm = t.proofread_llm_from_env(
             {
                 "PROOFREAD_BATCH_SIZE": "4",
                 "PROOFREAD_CONCURRENCY": "4",
-                "PROOFREAD_THINKING": "enabled",
+                "PROOFREAD_THINKING": "disabled",
                 "PROOFREAD_REASONING_EFFORT": "max",
             },
             translate_llm,
@@ -2348,12 +2351,12 @@ class JsonProtocolTests(unittest.TestCase):
 
         self.assertEqual(proofread_llm.batch_size, 4)
         self.assertEqual(t.proofread_concurrency_from_env({"PROOFREAD_CONCURRENCY": "4"}), 4)
-        self.assertEqual(proofread_llm.request_overrides["extra_body"]["thinking"]["type"], "enabled")
+        self.assertEqual(proofread_llm.request_overrides["extra_body"]["thinking"]["type"], "disabled")
         self.assertEqual(proofread_llm.request_overrides["reasoning_effort"], "max")
         self.assertNotIn("max_tokens", proofread_llm.request_overrides)
         self.assertEqual(translate_llm.request_overrides, {})
 
-    def test_proofread_llm_from_env_reuses_translate_provider_when_unset(self):
+    def test_known_proofread_provider_gets_reasoning_defaults_without_affecting_translation(self):
         translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", api_key="shared-key", batch_size=12)
 
         proofread_llm = t.proofread_llm_from_env({}, translate_llm, batch_size=12)
@@ -2362,8 +2365,33 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(proofread_llm.model, "deepseek-chat")
         self.assertEqual(proofread_llm.api_key, "shared-key")
         self.assertEqual(proofread_llm.batch_size, 6)
-        self.assertEqual(proofread_llm.request_overrides, {})
+        self.assertEqual(
+            proofread_llm.request_overrides,
+            {"extra_body": {"thinking": {"type": "enabled"}}, "reasoning_effort": "high"},
+        )
+        self.assertEqual(translate_llm.request_overrides, {})
         self.assertEqual(t.proofread_concurrency_from_env({}), 1)
+
+    def test_unknown_proofread_provider_does_not_receive_reasoning_parameters(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", batch_size=12)
+
+        proofread_llm = t.proofread_llm_from_env(
+            {"PROOFREAD_PROVIDER": "openrouter", "PROOFREAD_MODEL": "some-model"},
+            translate_llm,
+            batch_size=12,
+        )
+
+        self.assertEqual(proofread_llm.provider, "openrouter")
+        self.assertEqual(proofread_llm.request_overrides, {})
+        self.assertEqual(translate_llm.request_overrides, {})
+
+    def test_proofread_reasoning_defaults_are_limited_to_known_provider_capabilities(self):
+        self.assertEqual(
+            t.proofread_reasoning_defaults_for_provider("DeepSeek"),
+            {"thinking": "enabled", "reasoning_effort": "high"},
+        )
+        self.assertEqual(t.proofread_reasoning_defaults_for_provider("openrouter"), {})
+        self.assertEqual(t.proofread_reasoning_defaults_for_provider("unknown"), {})
 
     def test_only_glossary_does_not_require_translate_provider(self):
         class Args:

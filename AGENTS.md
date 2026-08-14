@@ -211,6 +211,8 @@ ${TARGET_LANG_CODE}
 | `TRANSLATE_CONTEXT_WINDOW` | 首译稳定邻居窗口，默认 `1`；`0` 关闭，正整数表示当前 segment 前后各最多多少条完整 transcript 邻居；与 concurrency、thinking、RAG 独立 |
 | `PROOFREAD_ENHANCED` | `1` 显式启用证据增强校对和按需联网；默认 `0`，选择 provider/model 不会隐式开启 |
 | `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；`0` 禁止新的网络请求，但仍允许读取和复用持久化 exact evidence/cache |
+| `PROOFREAD_CONCURRENCY` | 并发 proofread 请求数，默认 `1`；与 batch size 独立 |
+| `PROOFREAD_THINKING` / `PROOFREAD_REASONING_EFFORT` | 已知支持的 provider（当前为 DeepSeek）留空自动使用 `enabled` / `high`；非空显式值覆盖。能力未知或不支持时不发送专用参数 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
@@ -223,6 +225,8 @@ ${TARGET_LANG_CODE}
 | `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa，当前 `contents` 搜索调用要求 `exa-py>=2.0.0` |
 
 proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `PROOFREAD_SEARCH_MAX_QUERIES` 限制实际新搜索次数；值为 `0` 时只禁止新联网请求，既有 exact cache 仍可离线复用。
+
+`PROOFREAD_BATCH_SIZE` 和 `PROOFREAD_CONCURRENCY` 分别控制单次请求大小与并发在途数；并发默认 `1` 以保持旧行为。未开启 thinking 时，部分模型会明显趋于保守并降低实际校对覆盖；开启 thinking 可提高问题发现与校对覆盖，但会增加 token、延迟和费用。当前仅已知支持这组请求参数的 DeepSeek 在变量留空时自动使用 `thinking=enabled` 与 `reasoning_effort=high`；能力未知或不支持的 provider 保持原默认且不发送专用参数。任一非空显式环境变量逐项覆盖自动值。thinking/reasoning 只深度合并到 proofread 请求，不影响 translate/glossary。报告计数用于可观测性，不得被作为 EDIT 数量或修改率目标。
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 

@@ -714,6 +714,23 @@ def translate_llm_from_env(env: dict[str, str], batch_size: int) -> LLMConfig:
     )
 
 
+_PROOFREAD_REASONING_DEFAULTS_BY_PROVIDER = {
+    # These are the provider-native request fields already supported by the
+    # OpenAI-compatible DeepSeek endpoint. Do not infer support for routing
+    # providers or other compatibility endpoints from a model name alone.
+    "deepseek": {"thinking": "enabled", "reasoning_effort": "high"},
+}
+
+
+def proofread_reasoning_defaults_for_provider(provider: str) -> dict[str, str]:
+    """Return safe proofread-only reasoning defaults for known providers."""
+    return dict(
+        _PROOFREAD_REASONING_DEFAULTS_BY_PROVIDER.get(
+            str(provider or "").strip().casefold(), {}
+        )
+    )
+
+
 def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_size: int) -> LLMConfig:
     configured_provider = env.get("PROOFREAD_PROVIDER", "").strip()
     provider = configured_provider or translate_llm.provider
@@ -724,14 +741,23 @@ def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_
         model = ""
     else:
         model = translate_llm.model
+    reasoning_defaults = proofread_reasoning_defaults_for_provider(provider)
     request_overrides: dict = {}
-    thinking = env.get("PROOFREAD_THINKING", "").strip()
+    # A non-empty explicit environment value wins per field. Empty values use
+    # the conservative capability table, which is intentionally proofread-only.
+    thinking = (
+        env.get("PROOFREAD_THINKING", "").strip()
+        or reasoning_defaults.get("thinking", "")
+    )
     if thinking:
         request_overrides = deep_merge_dicts(
             request_overrides,
             {"extra_body": {"thinking": {"type": thinking}}},
         )
-    reasoning_effort = env.get("PROOFREAD_REASONING_EFFORT", "").strip()
+    reasoning_effort = (
+        env.get("PROOFREAD_REASONING_EFFORT", "").strip()
+        or reasoning_defaults.get("reasoning_effort", "")
+    )
     if reasoning_effort:
         request_overrides["reasoning_effort"] = reasoning_effort
     return LLMConfig(
