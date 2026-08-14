@@ -3985,12 +3985,7 @@ def local_glossary_markdown_from_evidence(request_fields: dict, sidecar: WebEvid
     return "\n".join(lines).rstrip() + "\n"
 
 
-def explicit_web_term_mappings(
-    transcript: Transcript,
-    sidecar: WebEvidenceSidecar,
-) -> list[tuple[str, str, str]]:
-    transcript_text = "\n".join(segment.source_text() for segment in transcript.segments)
-    patterns = [re.compile(
+_WEB_TERM_MAPPING_PATTERNS = [re.compile(
         r"(?<![A-Za-z])"
         r"([A-Z][A-Za-z0-9'’/]*(?:\s+(?:[A-Z][A-Za-z0-9'’/]*|de|of|the)){0,5})"
         r"\s+[-–—]\s+"
@@ -4001,18 +3996,131 @@ def explicit_web_term_mappings(
         r"\s*[（(]\s*"
         r"([\u3400-\u9fff]{2,12})\s*[）)]"
     )]
+
+
+def web_evidence_entry_is_preferred(
+    record: WebEvidenceRecord,
+    entry: WebEvidenceEntry,
+) -> bool:
+    if entry.preferred_domain_hit:
+        return True
+    domain = (entry.domain or tavily_url_host(entry.url)).strip().casefold()
+    return any(
+        domain == preferred.casefold() or domain.endswith(f".{preferred.casefold()}")
+        for preferred in record.preferred_domains
+        if preferred.strip()
+    )
+
+
+def web_term_mapping_candidates(sidecar: WebEvidenceSidecar) -> list[dict]:
+    candidates: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for record in sidecar.records:
+        for entry in record.results:
+            url_key = tavily_url_key(entry.url)
+            if not url_key:
+                continue
+            for pattern in _WEB_TERM_MAPPING_PATTERNS:
+                for match in pattern.finditer(entry.content):
+                    source = re.sub(r"\s+", " ", match.group(1)).strip()
+                    target = match.group(2).strip()
+                    key = (normalize_term_key(source), normalize_term_key(target), url_key)
+                    if not all(key) or key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(
+                        {
+                            "source": source,
+                            "target": target,
+                            "url": entry.url,
+                            "url_key": url_key,
+                            "domain": (entry.domain or tavily_url_host(entry.url)).casefold(),
+                            "preferred": web_evidence_entry_is_preferred(record, entry),
+                        }
+                    )
+    return candidates
+
+
+def mark_term_evidence_review(
+    transcript: Transcript,
+    source_forms: list[str],
+    reason: str,
+    alternatives: Optional[list[str]] = None,
+) -> None:
+    forms = unique_non_empty_strings(source_forms, 12)
+    if not forms:
+        return
+    review = {
+        "needs_human": True,
+        "categories": ["terminology"],
+        "reasons": [reason],
+        "alternatives": unique_non_empty_strings(alternatives or [], 4),
+        "note": "网页证据不足或冲突，未升级为已确认术语；请人工核验。",
+    }
+    for segment in transcript.segments:
+        if any(term_form_in_text(segment.source_text(), form) for form in forms):
+            segment.review = merge_review_metadata(segment.review, review)
+        for event in segment.split_events:
+            if any(term_form_in_text(event.en, form) for form in forms):
+                event.review = merge_review_metadata(event.review, review)
+
+
+def supported_web_term_mappings(
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+) -> list[dict]:
+    transcript_text = "\n".join(segment.source_text() for segment in transcript.segments)
+    grouped: dict[str, list[dict]] = {}
+    for candidate in web_term_mapping_candidates(sidecar):
+        if term_form_in_text(transcript_text, candidate["source"]):
+            grouped.setdefault(normalize_term_key(candidate["source"]), []).append(candidate)
+
+    supported: list[dict] = []
+    for candidates in grouped.values():
+        by_target: dict[str, list[dict]] = {}
+        for candidate in candidates:
+            by_target.setdefault(normalize_term_key(candidate["target"]), []).append(candidate)
+        source = candidates[0]["source"]
+        targets = unique_non_empty_strings([item["target"] for item in candidates], 8)
+        if len(by_target) != 1:
+            mark_term_evidence_review(
+                transcript,
+                [source],
+                f"网页证据为 {source} 给出互相冲突的译名。",
+                targets,
+            )
+            continue
+        target_candidates = next(iter(by_target.values()))
+        domains = {item["domain"] for item in target_candidates if item["domain"]}
+        if not any(item["preferred"] for item in target_candidates) and len(domains) < 2:
+            mark_term_evidence_review(
+                transcript,
+                [source],
+                f"{source} 的译名只有单一非权威网页支持，不能升级为硬性术语约束。",
+                targets,
+            )
+            continue
+        supported.append(
+            {
+                "source": source,
+                "target": target_candidates[0]["target"],
+                "urls": unique_non_empty_strings(
+                    [item["url"] for item in target_candidates], 12
+                ),
+                "url_keys": {item["url_key"] for item in target_candidates},
+            }
+        )
+    return supported
+
+
+def explicit_web_term_mappings(
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+) -> list[tuple[str, str, str]]:
     mappings: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for _, entry in sidecar.unique_entries():
-        for pattern in patterns:
-            for match in pattern.finditer(entry.content):
-                source = re.sub(r"\s+", " ", match.group(1)).strip()
-                target = match.group(2).strip()
-                key = (source.casefold(), target)
-                if not term_form_in_text(transcript_text, source) or key in seen:
-                    continue
-                seen.add(key)
-                mappings.append((source, target, entry.url))
+    for mapping in supported_web_term_mappings(transcript, sidecar):
+        for url in mapping["urls"]:
+            mappings.append((mapping["source"], mapping["target"], url))
     return mappings
 
 
@@ -4021,12 +4129,14 @@ def validated_confirmed_terms(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
 ) -> list[ConfirmedTermEvidence]:
-    """Keep only model claims grounded in URLs actually returned by search."""
+    """Keep only claims whose cited pages explicitly support a reliable mapping."""
     known_urls = {
         tavily_url_key(entry.url): entry.url
-        for _record, entry in sidecar.unique_entries()
+        for record in sidecar.records
+        for entry in record.results
         if tavily_url_key(entry.url)
     }
+    supported = supported_web_term_mappings(transcript, sidecar)
     confirmed: list[ConfirmedTermEvidence] = []
     for raw in raw_terms:
         confidence = str(raw.get("confidence", "")).strip().casefold()
@@ -4036,19 +4146,39 @@ def validated_confirmed_terms(
             term = ConfirmedTermEvidence.from_json_value(raw)
         except Exception:
             continue
-        matched_urls = unique_non_empty_strings(
-            [
-                known_urls[url_key]
-                for url in term.evidence_urls
-                if (url_key := tavily_url_key(url)) in known_urls
-            ],
-            12,
+        cited_keys = {
+            url_key
+            for url in term.evidence_urls
+            if (url_key := tavily_url_key(url)) in known_urls
+        }
+        matching = next(
+            (
+                mapping
+                for mapping in supported
+                if normalize_term_key(mapping["source"]) == normalize_term_key(term.source)
+                and normalize_term_key(mapping["target"]) == normalize_term_key(term.target)
+                and mapping["url_keys"].intersection(cited_keys)
+            ),
+            None,
         )
-        if not term.source or not term.target or not matched_urls:
+        if not term.source or not term.target or matching is None:
+            if term.source and term.target and term_form_in_text(
+                "\n".join(segment.source_text() for segment in transcript.segments),
+                term.source,
+            ):
+                mark_term_evidence_review(
+                    transcript,
+                    [term.source, *term.source_variants],
+                    f"{term.source} → {term.target} 的引用网页未明确支持该映射，或证据强度不足。",
+                    [term.target],
+                )
             continue
         if any(marker in term.target for marker in ("(?)", "？", "待确认", "不确定")):
             continue
-        term.evidence_urls = matched_urls
+        term.evidence_urls = unique_non_empty_strings(
+            [known_urls[url_key] for url_key in matching["url_keys"] if url_key in cited_keys],
+            12,
+        )
         confirmed.append(term)
     return merge_web_evidence_sidecars(
         WebEvidenceSidecar(confirmed_terms=confirmed)
@@ -4064,9 +4194,16 @@ def enrich_confirmed_term_evidence(
         ConfirmedTermEvidence(source=source, target=target, evidence_urls=[url], note="网页正文明确映射")
         for source, target, url in explicit_web_term_mappings(transcript, sidecar)
     ]
-    model_terms = validated_confirmed_terms(raw_terms or [], transcript, sidecar)
+    existing_claims = [
+        {**term.to_json_value(), "confidence": "confirmed"}
+        for term in sidecar.confirmed_terms
+    ]
+    evidence_only = WebEvidenceSidecar(version=sidecar.version, records=sidecar.records)
+    model_terms = validated_confirmed_terms(
+        [*existing_claims, *(raw_terms or [])], transcript, evidence_only
+    )
     return merge_web_evidence_sidecars(
-        sidecar,
+        evidence_only,
         WebEvidenceSidecar(confirmed_terms=[*direct_terms, *model_terms]),
     )
 

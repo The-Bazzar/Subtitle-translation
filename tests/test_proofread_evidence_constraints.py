@@ -21,6 +21,7 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
 
     @staticmethod
     def evidence_sidecar(*terms):
+        mappings = "; ".join(f"{term.source} - {term.target}" for term in terms)
         return t.WebEvidenceSidecar(
             records=[
                 t.WebEvidenceRecord(
@@ -29,7 +30,8 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
                         t.WebEvidenceEntry(
                             url="https://example.test/official-terms",
                             title="Official terms",
-                            content="Official terminology reference.",
+                            content=mappings or "Official terminology reference.",
+                            preferred_domain_hit=True,
                         )
                     ],
                 )
@@ -60,7 +62,21 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
 
     def test_validated_terms_require_existing_url_and_certain_claim(self):
         transcript = self.transcript("Northwind Protocol is deployed.")
-        sidecar = self.evidence_sidecar()
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="official terminology",
+                    results=[
+                        t.WebEvidenceEntry(
+                            url="https://example.test/official-terms",
+                            title="Official terms",
+                            content="Northwind Protocol - 诺斯风协议",
+                            preferred_domain_hit=True,
+                        )
+                    ],
+                )
+            ]
+        )
         raw_terms = [
             {
                 "source": "Northwind Protocol",
@@ -177,6 +193,7 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
                         t.WebEvidenceEntry(
                             url="https://example.test/names",
                             content="NASA - 美国国家航空航天局; Art - 艺术",
+                            preferred_domain_hit=True,
                         )
                     ],
                 )
@@ -187,6 +204,141 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
 
         self.assertIn(("NASA", "美国国家航空航天局"), pairs)
         self.assertNotIn(("Art", "艺术"), pairs)
+
+    def test_real_url_without_mapping_content_is_not_confirmed(self):
+        transcript = self.transcript("Northwind Protocol is deployed.")
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="official terminology",
+                    results=[
+                        t.WebEvidenceEntry(
+                            url="https://example.test/official-terms",
+                            content="This page discusses deployment history only.",
+                            preferred_domain_hit=True,
+                        )
+                    ],
+                )
+            ]
+        )
+
+        confirmed = t.validated_confirmed_terms(
+            [{
+                "source": "Northwind Protocol",
+                "target": "诺斯风协议",
+                "confidence": "confirmed",
+                "evidence_urls": ["https://example.test/official-terms"],
+            }],
+            transcript,
+            sidecar,
+        )
+
+        self.assertEqual(confirmed, [])
+        self.assertTrue(transcript.segments[0].review["needs_human"])
+
+    def test_unrelated_bilingual_pair_is_not_promoted(self):
+        transcript = self.transcript("Northwind Protocol is deployed.")
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="official terminology",
+                    results=[
+                        t.WebEvidenceEntry(
+                            url="https://example.test/official-terms",
+                            content="Southwind Manual - 南风手册",
+                            preferred_domain_hit=True,
+                        )
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(t.explicit_web_term_mappings(transcript, sidecar), [])
+        self.assertEqual(transcript.segments[0].review, {})
+
+    def test_conflicting_authoritative_targets_are_downgraded_to_review(self):
+        transcript = self.transcript("Northwind Protocol is deployed.")
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="official title one",
+                    results=[t.WebEvidenceEntry(
+                        url="https://one.example/terms",
+                        content="Northwind Protocol - 诺斯风协议",
+                        preferred_domain_hit=True,
+                    )],
+                ),
+                t.WebEvidenceRecord(
+                    query="official title two",
+                    results=[t.WebEvidenceEntry(
+                        url="https://two.example/terms",
+                        content="Northwind Protocol - 北风协议",
+                        preferred_domain_hit=True,
+                    )],
+                ),
+            ]
+        )
+
+        self.assertEqual(t.explicit_web_term_mappings(transcript, sidecar), [])
+        review = transcript.segments[0].review
+        self.assertTrue(review["needs_human"])
+        self.assertEqual(set(review["alternatives"]), {"诺斯风协议", "北风协议"})
+
+    def test_forged_url_does_not_validate_an_otherwise_supported_mapping(self):
+        transcript = self.transcript("Northwind Protocol is deployed.")
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="official terminology",
+                    results=[t.WebEvidenceEntry(
+                        url="https://example.test/official-terms",
+                        content="Northwind Protocol - 诺斯风协议",
+                        preferred_domain_hit=True,
+                    )],
+                )
+            ]
+        )
+
+        confirmed = t.validated_confirmed_terms(
+            [{
+                "source": "Northwind Protocol",
+                "target": "诺斯风协议",
+                "confidence": "confirmed",
+                "evidence_urls": ["https://forged.example/claim"],
+            }],
+            transcript,
+            sidecar,
+        )
+
+        self.assertEqual(confirmed, [])
+        self.assertTrue(transcript.segments[0].review["needs_human"])
+
+    def test_two_independent_sources_can_corroborate_a_mapping(self):
+        transcript = self.transcript("Northwind Protocol is deployed.")
+        sidecar = t.WebEvidenceSidecar(
+            records=[
+                t.WebEvidenceRecord(
+                    query="title one",
+                    results=[t.WebEvidenceEntry(
+                        url="https://one.example/terms",
+                        content="Northwind Protocol - 诺斯风协议",
+                    )],
+                ),
+                t.WebEvidenceRecord(
+                    query="title two",
+                    results=[t.WebEvidenceEntry(
+                        url="https://two.example/terms",
+                        content="Northwind Protocol - 诺斯风协议",
+                    )],
+                ),
+            ]
+        )
+
+        mappings = t.explicit_web_term_mappings(transcript, sidecar)
+
+        self.assertEqual(len(mappings), 2)
+        self.assertEqual({pair[:2] for pair in mappings}, {("Northwind Protocol", "诺斯风协议")})
+        self.assertEqual(transcript.segments[0].review, {})
 
     def test_shared_asr_variant_with_two_targets_is_a_conflict(self):
         sidecar = self.evidence_sidecar(
