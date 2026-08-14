@@ -780,6 +780,115 @@ class ProofreadContinuityAndUncertaintyTests(unittest.TestCase):
         self.assertEqual([row["item_id"] for row in records], [1, 2, 3, 4])
         self.assertEqual([event.zh for event in events], [f"译文{i}改" for i in range(4)])
 
+    def test_concurrent_schedule_composes_search_failure_waiter_group_split_and_commits(self):
+        first = t.SplitEvent(0.0, 1.0, "part one", "甲")
+        second = t.SplitEvent(1.0, 2.0, "part two", "乙")
+        third = t.SplitEvent(2.0, 3.0, "third part", "丙")
+        fourth = t.SplitEvent(3.0, 4.0, "later part", "丁")
+        transcript = t.Transcript("x.json", "en", [
+            t.TranscriptSegment(1, 0.0, 2.0, "part one part two", translation="甲乙",
+                                split_events=[first, second]),
+            t.TranscriptSegment(2, 2.0, 3.0, third.en, split_events=[third]),
+            t.TranscriptSegment(3, 3.0, 4.0, fourth.en, split_events=[fourth]),
+        ])
+        llm = FakeLLM()
+        llm.batch_size = 3
+        runtime = t.WebSearchRuntime(
+            settings=t.WebSearchSettings(tavily_key="t"), max_queries=2,
+        )
+        search_calls = []
+        task_calls = []
+        waiter_threads = []
+        waiter_results = {}
+        waiter_started = threading.Event()
+        owner_responses = []
+        later_responses = []
+
+        def search(query, *_args, **_kwargs):
+            search_calls.append(query)
+            if query == "Unknown Name":
+                def wait_for_owner():
+                    waiter_started.set()
+                    waiter_results["response"] = runtime.execute_search(
+                        {"query": "unknown name", "item_ids": [2]},
+                        search_stage="proofread_tool",
+                    )
+
+                waiter = threading.Thread(target=wait_for_owner)
+                waiter_threads.append(waiter)
+                waiter.start()
+                self.assertTrue(waiter_started.wait(1))
+                deadline = time.monotonic() + 1
+                while runtime.singleflight_reuses < 1 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                raise RuntimeError("owner provider unavailable")
+            return [{"url": "https://official.example/resolved", "content": "resolved"}]
+
+        def enhanced_batch(request, _session, active_runtime, _quiet):
+            ids = [item.id for item in request.items]
+            task_calls.append(ids)
+            if ids == [1, 2, 3]:
+                owner_responses.append(active_runtime.execute_search(
+                    {"query": "Unknown Name", "item_ids": [1]},
+                    search_stage="proofread_tool",
+                ))
+                raise t.LLMOutputLengthError("finish_reason=length")
+            if ids == [4]:
+                later_responses.append(active_runtime.execute_search(
+                    {"query": "Known Name", "item_ids": [4]},
+                    search_stage="proofread_tool",
+                ))
+            return [
+                {
+                    "id": item.id,
+                    "en": item.fields["en"],
+                    "zh": item.fields["zh"] + "改" if item.id in {3, 4} else item.fields["zh"],
+                    "review": {},
+                }
+                for item in request.items
+            ]
+
+        records, metrics = [], {}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            t, "tavily_search", side_effect=search
+        ), patch.object(
+            t, "llm_numbered_batch_with_web_search", side_effect=enhanced_batch
+        ):
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "x.json"), "", "en", "zh")
+            changed = t.proofread_split_events(
+                transcript,
+                ctx,
+                llm,
+                "system",
+                quiet=True,
+                enhanced=True,
+                search_runtime=runtime,
+                concurrency=2,
+                decision_records=records,
+                metrics=metrics,
+            )
+
+        for waiter in waiter_threads:
+            waiter.join(1)
+            self.assertFalse(waiter.is_alive())
+
+        self.assertTrue(changed)
+        self.assertEqual(search_calls, ["Unknown Name", "Known Name"])
+        self.assertTrue(owner_responses[0].get("error"))
+        self.assertTrue(waiter_results["response"].get("error"))
+        self.assertTrue(waiter_results["response"]["reused_evidence"])
+        self.assertTrue(later_responses[0]["results"])
+        self.assertEqual(runtime.unresolved_item_ids, {1, 2})
+        self.assertEqual(metrics["web_searches"], 2)
+        self.assertEqual(metrics["web_singleflight_reuses"], 1)
+        self.assertEqual(metrics["output_length_exhaustions"], 1)
+        self.assertEqual(metrics["length_group_splits"], 1)
+        self.assertEqual({tuple(ids) for ids in task_calls}, {(1, 2, 3), (1, 2), (3,), (4,)})
+        self.assertEqual([event.zh for event in [first, second, third, fourth]], ["甲", "乙", "丙改", "丁改"])
+        self.assertEqual([record["item_id"] for record in records], [1, 2, 3, 4])
+        self.assertEqual([record["group_item_ids"] for record in records], [[1, 2], [1, 2], [3], [4]])
+        self.assertTrue(all(record["group_final_decision"] == "GROUP_APPLIED" for record in records))
+
     def test_sentence_group_retry_is_atomic_and_never_restores_parent_target(self):
         first = t.SplitEvent(0.0, 1.0, "Only he", "只有他")
         second = t.SplitEvent(1.0, 2.0, "can go.", "能去")
