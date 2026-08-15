@@ -609,6 +609,12 @@ def merge_web_evidence_sidecars(*sidecars: WebEvidenceSidecar) -> WebEvidenceSid
 
 
 def glossary_web_evidence(sidecar: WebEvidenceSidecar) -> WebEvidenceSidecar:
+    """Select only glossary-stage evidence for the global knowledge authority.
+
+    Proofread-stage records and their confirmed terms remain in the project
+    sidecar as local, persistent safety constraints.  They must not flow back
+    into the glossary cache/fingerprint or silently rewrite global knowledge.
+    """
     retained_records = [
         record
         for record in sidecar.records

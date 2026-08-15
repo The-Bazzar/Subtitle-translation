@@ -230,7 +230,7 @@ proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PR
 
 glossary tool 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；finalizer 首选返回 `{"markdown": "..."}` JSON object，若 provider 无法稳定输出 JSON，可返回 `<GLOSSARY_MARKDOWN>...</GLOSSARY_MARKDOWN>` 标签块。普通散文和伪 tool call 文本都会被拒绝并重试。
 
-`glossary.md` 是完整常驻的全局硬规则；retrieved_context 只能补充。sidecar 的 `confirmed_terms` 经过网页正文、来源质量和冲突检查，作为可追溯局部约束；冲突必须 human review。`web_evidence:*` 由规范化 Tavily/Exa 结果构建，保留 provider、query、域名、标题、URL 和摘要。
+`glossary.md` 是完整常驻的全局硬规则；retrieved_context 只能补充。glossary evidence 可参与构建全局术语，proofread `confirmed_terms` 只在 sidecar 持久化为局部约束，不回写 glossary 缓存；冲突必须 human review。`web_evidence:*` 由规范化 Tavily/Exa 结果构建。
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
