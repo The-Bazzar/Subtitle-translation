@@ -7235,13 +7235,23 @@ def proofread_split_events(
         retry_results: dict[int, tuple[str, str, dict, Optional[dict]]] = {}
         retry_error = ""
         if group_failed and not errors_by_id.keys() & set(group.items[0].group_item_ids):
+            # The tool phase may have enriched terms after `term_context` was
+            # frozen for the outgoing work units.  Retry is a fresh request and
+            # must receive the same latest sidecar constraints as its safety
+            # evaluation, rather than that stale pre-search snapshot.
+            retry_term_context = {
+                row["item"].item_id: relevant_term_evidence(
+                    row["item"].source, search_runtime.sidecar_snapshot()
+                ) if search_runtime is not None else term_context[row["item"].item_id]
+                for row in staged
+            }
             retry_request = LLMBatchRequest([
                 make_pair_item(
                     row["item"].item_id, ctx, row["item"].source, row["item"].target,
                     retrieved_context=list(row["item"].retrieved_context),
                     review_hint=row["item"].review_hint,
-                    terminology_constraints=term_context[row["item"].item_id][0],
-                    evidence_conflicts=term_context[row["item"].item_id][1],
+                    terminology_constraints=retry_term_context[row["item"].item_id][0],
+                    evidence_conflicts=retry_term_context[row["item"].item_id][1],
                     sentence_context=row["item"].sentence_context,
                     safety_retry={"attempt": 1, "group_id": group.group_id,
                                   "group_item_ids": list(row["item"].group_item_ids),

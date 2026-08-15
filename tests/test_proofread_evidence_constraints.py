@@ -228,6 +228,33 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
         self.assertEqual(event.zh, "我今天看见了鲍德里亚。")
         self.assertEqual(saved.confirmed_terms[0].source_variants, ["bar Drill"])
 
+    def test_same_round_terms_are_reused_by_safety_retry(self):
+        class FakeLLM:
+            provider = "fake"
+            batch_size = 1
+            def model_name(self): return "fake"
+            def cfg(self): return {}
+
+        event = t.SplitEvent(0.0, 1.0, "Only bar Drill spoke.", "只有巴尔·德里尔说话。")
+        transcript = t.Transcript("sample.json", "en", [t.TranscriptSegment(1, 0, 1, event.en, split_events=[event])])
+        captured = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "sample.json"), "", "en", "zh")
+            runtime = t.WebSearchRuntime(settings=t.WebSearchSettings(tavily_key="test"), max_queries=1)
+            def tool_batch(_request, _session, runtime_arg, _quiet):
+                runtime_arg.replace_sidecar(t.WebEvidenceSidecar(records=[t.WebEvidenceRecord(
+                    query="name", provider="tavily", search_stage="proofread_tool",
+                    results=[t.WebEvidenceEntry(url="https://example.test/name", content="Baudrillard - 鲍德里亚", preferred_domain_hit=True)],
+                )]))
+                return [{"id": 1, "en": "Only Baudrillard spoke.", "zh": "鲍德里亚说话。"}]
+            def retry_batch(request, _session, _quiet, **_kwargs):
+                captured.update(request.to_json_value()["items"][0])
+                return [{"id": 1, "en": "Only Baudrillard spoke.", "zh": "只有鲍德里亚说话。"}]
+            with patch.object(t, "llm_numbered_batch_with_web_search", side_effect=tool_batch), patch.object(t, "llm_numbered_batch", side_effect=retry_batch):
+                self.assertTrue(t.proofread_split_events(transcript, ctx, FakeLLM(), "system", quiet=True, enhanced=True, search_runtime=runtime, safety_mode=True))
+        self.assertEqual(captured["terminology_constraints"][0]["target"], "鲍德里亚")
+        self.assertEqual(event.zh, "只有鲍德里亚说话。")
+
     def test_explicit_mapping_keeps_acronyms_and_avoids_substring_false_hits(self):
         transcript = self.transcript("NASA launched the probe near the party venue.")
         sidecar = t.WebEvidenceSidecar(

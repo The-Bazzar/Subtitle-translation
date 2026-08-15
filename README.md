@@ -171,7 +171,7 @@ DEEPSEEK_API_KEY=
 
 校对 safety 分为语言无关和语言专用两层：ID 完整性、时间轴不变、术语约束、sentence-group 原子性与证据冲突处理始终启用；当前语义锚点词表仅覆盖 English→Chinese，其他语言方向会显式跳过该语言专用 gate，仍保留全部通用检查。
 
-`PROOFREAD_BATCH_SIZE` 控制单次请求包含多少字幕，`PROOFREAD_CONCURRENCY` 控制同时在途的请求数，两者互不替代。默认并发为 `1`，保持串行兼容。未开启 thinking 时，部分模型的校对会明显趋于保守，可能大幅减少实际修改覆盖；开启 thinking 可显著提高问题发现与校对覆盖，但会增加 token、延迟和费用。当前仅对已知支持这组请求参数的 DeepSeek 校对自动使用 `PROOFREAD_THINKING=enabled` 与 `PROOFREAD_REASONING_EFFORT=high`；能力未知或不支持的 provider 保持其原有默认，不发送专用参数。任一非空显式环境变量始终覆盖对应自动值。thinking/reasoning 只作用于 proofreading，不影响首译或 glossary。proofread report 中的 KEEP / EDIT / REVIEW / ROLLBACK 计数仅用于诊断，不是 EDIT 数量或修改率目标。
+`PROOFREAD_BATCH_SIZE` 控制单次请求包含多少字幕，`PROOFREAD_CONCURRENCY` 控制同时在途的请求数，两者互不替代。默认并发为 `1`，保持串行兼容。未开启 thinking 时，部分模型的校对会明显趋于保守，可能大幅减少实际修改覆盖；开启 thinking 可显著提高问题发现与校对覆盖，但会增加 token、延迟和费用。thinking 与并发不绑定；启用 thinking 时建议从适度 `PROOFREAD_CONCURRENCY`（例如 `2-4`，并按 provider 限流调整）开始。当前仅对已知支持这组请求参数的 DeepSeek 校对自动使用 `PROOFREAD_THINKING=enabled` 与 `PROOFREAD_REASONING_EFFORT=high`；能力未知或不支持的 provider 保持其原有默认，不发送专用参数。任一非空显式环境变量始终覆盖对应自动值。thinking/reasoning 只作用于 proofreading，不影响首译或 glossary。proofread report 中的 KEEP / EDIT / REVIEW / ROLLBACK 计数仅用于诊断，不是 EDIT 数量或修改率目标。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 
