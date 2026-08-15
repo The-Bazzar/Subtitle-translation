@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import copy
 import concurrent.futures
+import difflib
 import hashlib
 import json
 import math
@@ -2497,34 +2498,9 @@ def load_glossary(glossary_path: str) -> str:
 
 
 def load_glossary_prompt_context(glossary_path: str, retriever: EmbeddingRetriever | None) -> str:
-    if retriever is None:
-        return load_glossary(glossary_path)
-    if not glossary_path or not os.path.isfile(glossary_path):
-        return ""
-    try:
-        content = _read_text_file(glossary_path).strip()
-    except OSError:
-        return ""
-    if not content:
-        return ""
-    if len(content) <= 5000:
-        return load_glossary(glossary_path)
-    priority_terms = ("视频元信息", "背景", "态度基调", "风格", "关键论点", "人物", "受众")
-    sections = [
-        "\n".join(lines).strip()
-        for heading, lines in split_markdown_sections(content)
-        if any(term in heading for term in priority_terms)
-    ]
-    compact = "\n\n".join(section for section in sections if section).strip()
-    if not compact:
-        compact = content[:5000].rstrip()
-    elif len(compact) > 5000:
-        compact = compact[:5000].rstrip()
-    return (
-        "\n\n以下是本视频术语知识库的全局背景与风格摘要。具体术语会按当前字幕通过 retrieved_context 注入；"
-        "两者冲突时优先采用证据更明确的具体术语:\n\n"
-        + compact
-    )
+    # Retrieval is per-item supplementary evidence, never a lossy replacement
+    # for the resident glossary authority.
+    return load_glossary(glossary_path)
 
 
 def read_video_metadata_fields(ctx: TranscriptContext) -> dict:
@@ -4513,6 +4489,39 @@ def enrich_confirmed_term_evidence(
     )
 
 
+def translate_concurrency_from_env(env: dict[str, str]) -> int:
+    return max(1, env_int(env.get("TRANSLATE_CONCURRENCY", ""), 1))
+
+
+def enrich_candidate_asr_term_evidence(
+    transcript: Transcript,
+    sidecar: WebEvidenceSidecar,
+    candidate_pairs: list[tuple[str, str]],
+) -> WebEvidenceSidecar:
+    """Promote a verified webpage mapping when a candidate exposes an ASR form."""
+    raw_terms: list[dict] = []
+    mappings = supported_web_term_mappings(transcript, sidecar, require_transcript_match=False)
+    for original, candidate in candidate_pairs:
+        if not original or not candidate or original == candidate:
+            continue
+        original_words, candidate_words = original.split(), candidate.split()
+        for mapping in mappings:
+            canonical, target = str(mapping.get("source", "")).strip(), str(mapping.get("target", "")).strip()
+            if not canonical or not target or not term_form_in_text(candidate, canonical):
+                continue
+            for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                None, original_words, candidate_words, autojunk=False
+            ).get_opcodes():
+                old, new = " ".join(original_words[i1:i2]).strip(), " ".join(candidate_words[j1:j2]).strip()
+                if tag in {"replace", "insert"} and old and term_form_in_text(new, canonical):
+                    raw_terms.append({
+                        "source": canonical, "target": target, "source_variants": [old],
+                        "confidence": "confirmed", "evidence_urls": list(mapping.get("urls", [])),
+                        "note": "proofread candidate ASR replacement backed by webpage mapping",
+                    })
+    return enrich_confirmed_term_evidence(transcript, sidecar, raw_terms)
+
+
 def transcript_from_request_fields(request_fields: dict) -> Transcript:
     text_parts = []
     for key in ("transcript", "transcript_excerpt"):
@@ -5216,6 +5225,10 @@ def semantic_anchor_regressions(
     return regressions
 
 
+def supports_en_zh_semantic_anchor_gate(ctx: TranscriptContext) -> bool:
+    return ctx.source_lang_code.casefold().startswith("en") and ctx.target_lang_code.casefold().startswith("zh")
+
+
 def _replace_term_form(text: str, old_form: str, new_form: str) -> str:
     old_form = str(old_form or "").strip()
     if not old_form:
@@ -5289,6 +5302,7 @@ def make_source_item(
     ctx: TranscriptContext,
     source_text: str,
     retrieved_context: Optional[list[dict]] = None,
+    sentence_context: Optional[dict] = None,
 ) -> LLMBatchItem:
     return make_language_item(
         item_id,
@@ -5296,6 +5310,7 @@ def make_source_item(
         source=source_text,
         extra={
             "retrieved_context": retrieved_context or [],
+            "sentence_context": sentence_context or {},
         },
     )
 
@@ -6103,6 +6118,7 @@ def apply_proofread_safety_constraints(
     regression_only: bool = False,
     safety_mode: Optional[bool] = None,
     safety_events: Optional[list[str]] = None,
+    semantic_anchor_enabled: bool = True,
 ) -> tuple[str, str, dict]:
     """Apply edits while blocking deterministic semantic and terminology regressions."""
     safety_events = safety_events if safety_events is not None else []
@@ -6128,6 +6144,7 @@ def apply_proofread_safety_constraints(
         source_edit_supported = evidence_supports_source
     source_has_regression = bool(
         safety_mode_enabled
+        and semantic_anchor_enabled
         and new_source != original_source
         and semantic_anchor_regressions(original_source, original_source, new_source)
     )
@@ -6138,7 +6155,7 @@ def apply_proofread_safety_constraints(
         if safety_mode_enabled
         else edit_supports_change(normalized_edit, "target", strict_preservation)
     )
-    if safety_mode_enabled and new_target != original_target:
+    if safety_mode_enabled and semantic_anchor_enabled and new_target != original_target:
         target_anchor_regressions = semantic_anchor_regressions(
             original_source, original_target, new_target
         )
@@ -6647,6 +6664,7 @@ def translate_segments(
     system_prompt: str,
     quiet: bool,
     retriever: ContextRetriever | None = None,
+    concurrency: int = 1,
 ) -> bool:
     pending = [s for s in transcript.segments if not s.translation]
     if not pending:
@@ -6671,11 +6689,21 @@ def translate_segments(
         temperature=0.3,
     )
     changed = False
+    ordered = list(transcript.segments)
+    adjacent = {
+        seg.index: {
+            "previous": (LanguageFields.from_ctx(ctx).build(source=ordered[pos - 1].en_text()) | {"id": ordered[pos - 1].index}) if pos else {},
+            "next": (LanguageFields.from_ctx(ctx).build(source=ordered[pos + 1].en_text()) | {"id": ordered[pos + 1].index}) if pos + 1 < len(ordered) else {},
+            "instruction": "Neighbors are understanding-only; return only this item's id and translation.",
+        } for pos, seg in enumerate(ordered)
+    }
 
     def apply_translation_batch(
         batch: list[TranscriptSegment],
         contexts: list[list[dict]],
+        adjacent_contexts: list[dict],
     ) -> bool:
+        active_session = session if max(1, int(concurrency or 1)) == 1 else ChatSession(llm, session.system_prompt, temperature=0.3)
         request = LLMBatchRequest(
             [
                 make_source_item(
@@ -6683,6 +6711,7 @@ def translate_segments(
                     ctx,
                     segment.en_text(),
                     retrieved_context=contexts[index],
+                    sentence_context=adjacent_contexts[index],
                 )
                 for index, segment in enumerate(batch)
             ]
@@ -6691,14 +6720,14 @@ def translate_segments(
             try:
                 response_items = llm_numbered_batch(
                     request,
-                    session,
+                    active_session,
                     quiet,
                     raise_on_failure=True,
                 )
             except TypeError as error:
                 if "raise_on_failure" not in str(error):
                     raise
-                response_items = llm_numbered_batch(request, session, quiet)
+                response_items = llm_numbered_batch(request, active_session, quiet)
         except Exception as error:
             if len(batch) > 1:
                 middle = len(batch) // 2
@@ -6708,8 +6737,8 @@ def translate_segments(
                         f"  Translate batch {reason}; splitting ids {batch[0].index}-{batch[-1].index}",
                         file=sys.stderr,
                     )
-                left_changed = apply_translation_batch(batch[:middle], contexts[:middle])
-                right_changed = apply_translation_batch(batch[middle:], contexts[middle:])
+                left_changed = apply_translation_batch(batch[:middle], contexts[:middle], adjacent_contexts[:middle])
+                right_changed = apply_translation_batch(batch[middle:], contexts[middle:], adjacent_contexts[middle:])
                 return left_changed or right_changed
             if is_context_length_error(error) and any(contexts):
                 if not quiet:
@@ -6717,7 +6746,7 @@ def translate_segments(
                         f"  Translate id {batch[0].index} too large with retrieved context; retrying without it",
                         file=sys.stderr,
                     )
-                return apply_translation_batch(batch, [[] for _ in batch])
+                return apply_translation_batch(batch, [[] for _ in batch], adjacent_contexts)
             print(f"Warning: translation batch failed: {error}", file=sys.stderr)
             return False
 
@@ -6743,6 +6772,7 @@ def translate_segments(
             batch_changed = True
         return batch_changed
 
+    work_units: list[tuple[list[TranscriptSegment], list[list[dict]], list[dict]]] = []
     for start in range(0, len(pending), llm.batch_size):
         batch = pending[start : start + llm.batch_size]
         if not quiet:
@@ -6978,6 +7008,7 @@ def proofread_split_events(
             item.source, item.target, candidate_source, candidate_target, evidence_edit,
             guarded_review, constraints, conflicts, safety_mode=safety_mode_enabled,
             safety_events=safety_events,
+            semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
         )
         if breaks_cross_event_sentence_boundary(
             new_source, item.target, new_target, item.sentence_context
@@ -6997,6 +7028,7 @@ def proofread_split_events(
                 new_source, new_target, new_source, ui_target, None, guarded_review,
                 constraints, conflicts, safety_mode=safety_mode_enabled,
                 safety_events=safety_events,
+                semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
             )
         unresolved = search_runtime.unresolved_reasons(item.item_id) if search_runtime is not None else []
         if unresolved:
@@ -7157,6 +7189,21 @@ def proofread_split_events(
         for item in group.items:
             if item.item_id not in raw_by_id and item.item_id not in errors_by_id:
                 errors_by_id[item.item_id] = ("proofread response missing requested item", False)
+
+    # All tool work has completed. Promote validated evidence from this round
+    # before any initial candidate (or its retry) enters the safety gate.
+    if search_runtime is not None and raw_by_id:
+        search_runtime.replace_sidecar(enrich_candidate_asr_term_evidence(
+            transcript,
+            search_runtime.sidecar_snapshot(),
+            [
+                (item.source, (raw_by_id[item.item_id][0] or item.source).strip())
+                for group in groups for item in group.items
+                if item.item_id in raw_by_id
+            ],
+        ))
+        if search_runtime.sidecar.has_evidence():
+            write_web_evidence_sidecar(ctx, search_runtime.sidecar)
 
     changed = False
     for group in groups:
@@ -8061,6 +8108,22 @@ def infer_video_path(ctx: TranscriptContext) -> str:
     return ""
 
 
+def proofread_search_runtime_from_env(
+    env: dict[str, str], ctx: TranscriptContext, quiet: bool = False
+) -> WebSearchRuntime | None:
+    if not explicit_proofread_model_configured(env):
+        return None
+    runtime = WebSearchRuntime(
+        settings=WebSearchSettings.from_env(env),
+        metadata_fields=read_video_metadata_fields(ctx),
+        preferences=load_tavily_domain_preferences(),
+        max_queries=max(0, env_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5)),
+        sidecar=load_web_evidence_sidecar(ctx.web_evidence_json),
+        quiet=quiet,
+    )
+    return runtime if runtime.has_capability() else None
+
+
 def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     env = load_env(script_dir)
@@ -8212,7 +8275,7 @@ def main() -> None:
         print(f"OUTPUT_GLOSSARY={os.path.abspath(ctx.glossary)}")
         return
 
-    if retriever is None:
+    if retriever is None and env_flag(env.get("LOCAL_EVIDENCE_RETRIEVAL_ENABLED", "0")):
         retriever = build_local_evidence_retriever(
             ctx,
             chunk_chars=embedding_config.chunk_chars,
@@ -8253,6 +8316,7 @@ def main() -> None:
         system_prompt,
         args.quiet,
         retriever,
+        concurrency=translate_concurrency_from_env(env),
     )
     changed = split_segments(
         transcript,
@@ -8280,21 +8344,7 @@ def main() -> None:
     if args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0":
         proofread_llm = proofread_llm_from_env(env, llm, args.batch_size)
         enhanced_proofread = explicit_proofread_model_configured(env)
-        proofread_search_runtime = None
-        if enhanced_proofread:
-            search_settings = WebSearchSettings.from_env(env)
-            search_budget = max(0, env_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5))
-            existing_evidence = load_web_evidence_sidecar(ctx.web_evidence_json)
-            candidate_runtime = WebSearchRuntime(
-                settings=search_settings,
-                metadata_fields=read_video_metadata_fields(ctx),
-                preferences=load_tavily_domain_preferences(),
-                max_queries=search_budget,
-                sidecar=existing_evidence,
-                quiet=args.quiet,
-            )
-            if search_budget > 0 and candidate_runtime.has_capability():
-                proofread_search_runtime = candidate_runtime
+        proofread_search_runtime = proofread_search_runtime_from_env(env, ctx, args.quiet)
         changed = proofread_split_events(
             transcript,
             ctx,
