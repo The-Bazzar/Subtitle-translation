@@ -266,6 +266,33 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["provider"], "exa")
         self.assertEqual(runtime.used_queries, 0)
 
+    def test_zero_budget_config_keeps_persisted_exact_cache_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+            t.write_web_evidence_sidecar(
+                ctx,
+                t.WebEvidenceSidecar(records=[t.WebEvidenceRecord(
+                    query="known name",
+                    provider="tavily",
+                    results=[t.WebEvidenceEntry(
+                        url="https://example.com/name", content="Known Name - 已知名称"
+                    )],
+                )]),
+            )
+            runtime = t.proofread_search_runtime_from_env(
+                {"PROOFREAD_ENHANCED": "1", "PROOFREAD_SEARCH_MAX_QUERIES": "0"},
+                ctx,
+                quiet=True,
+            )
+            self.assertIsNotNone(runtime)
+            with patch.object(t, "tavily_search") as online:
+                result = runtime.execute_search({"query": "Known   Name", "item_ids": [1]})
+
+        self.assertTrue(result["reused_evidence"])
+        self.assertEqual(result["results"][0]["content"], "Known Name - 已知名称")
+        self.assertEqual(runtime.used_queries, 0)
+        online.assert_not_called()
+
     def test_proofread_tool_loop_searches_only_when_model_requests_it(self):
         final = json.dumps(
             {

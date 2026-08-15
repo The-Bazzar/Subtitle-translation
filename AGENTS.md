@@ -203,6 +203,7 @@ ${TARGET_LANG_CODE}
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding provider 和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
 | `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前仅支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
 | `EMBEDDING_TOP_K` / `EMBEDDING_CHUNK_CHARS` / `EMBEDDING_BATCH_SIZE` | embedding 检索、切块和批量调用参数 |
+| `LOCAL_EVIDENCE_RETRIEVAL_ENABLED` / `LOCAL_EVIDENCE_TOP_K` | 显式可选的无 embedding lexical evidence 检索，默认 `0`；关闭时不得注入该动态 `retrieved_context` |
 | `PROOFREAD` | `1` / `0` 控制 split event 校对 |
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
@@ -219,7 +220,7 @@ ${TARGET_LANG_CODE}
 | `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
 | `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa |
 
-proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `PROOFREAD_SEARCH_MAX_QUERIES` 限制实际新搜索次数。
+proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `PROOFREAD_SEARCH_MAX_QUERIES` 限制实际新搜索次数；值为 `0` 时只禁止新联网请求，既有 exact cache 仍可离线复用。
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 

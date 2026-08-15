@@ -3115,6 +3115,27 @@ class WebSearchRuntime:
         return response
 
 
+def proofread_search_runtime_from_env(
+    env: dict[str, str], ctx: TranscriptContext, quiet: bool = False
+) -> WebSearchRuntime | None:
+    """Build enhanced-proofread search from the user-facing configuration chain.
+
+    A cached sidecar is sufficient at a zero query budget; it is an offline
+    exact-query source, while new provider calls remain budget-gated.
+    """
+    if not explicit_proofread_model_configured(env):
+        return None
+    runtime = WebSearchRuntime(
+        settings=WebSearchSettings.from_env(env),
+        metadata_fields=read_video_metadata_fields(ctx),
+        preferences=load_tavily_domain_preferences(),
+        max_queries=max(0, env_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5)),
+        sidecar=load_web_evidence_sidecar(ctx.web_evidence_json),
+        quiet=quiet,
+    )
+    return runtime if runtime.has_capability() else None
+
+
 def web_search_tool_schema(stage: str = "proofread") -> dict:
     purpose = (
         "Verify proper nouns, official translations, quotations, cultural references, internet memes, "
@@ -6287,7 +6308,7 @@ def main() -> None:
         print(f"OUTPUT_GLOSSARY={os.path.abspath(ctx.glossary)}")
         return
 
-    if retriever is None:
+    if retriever is None and env_flag(env.get("LOCAL_EVIDENCE_RETRIEVAL_ENABLED", "0")):
         retriever = build_local_evidence_retriever(
             ctx,
             chunk_chars=embedding_config.chunk_chars,
@@ -6355,21 +6376,7 @@ def main() -> None:
     if args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0":
         proofread_llm = proofread_llm_from_env(env, llm, args.batch_size)
         enhanced_proofread = explicit_proofread_model_configured(env)
-        proofread_search_runtime = None
-        if enhanced_proofread:
-            search_settings = WebSearchSettings.from_env(env)
-            search_budget = max(0, env_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5))
-            existing_evidence = load_web_evidence_sidecar(ctx.web_evidence_json)
-            candidate_runtime = WebSearchRuntime(
-                settings=search_settings,
-                metadata_fields=read_video_metadata_fields(ctx),
-                preferences=load_tavily_domain_preferences(),
-                max_queries=search_budget,
-                sidecar=existing_evidence,
-                quiet=args.quiet,
-            )
-            if search_budget > 0 and candidate_runtime.has_capability():
-                proofread_search_runtime = candidate_runtime
+        proofread_search_runtime = proofread_search_runtime_from_env(env, ctx, args.quiet)
         changed = proofread_split_events(
             transcript,
             ctx,

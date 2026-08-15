@@ -142,6 +142,7 @@ DEEPSEEK_API_KEY=
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding 后端和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
 | `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
 | `EMBEDDING_TOP_K` / `EMBEDDING_CHUNK_CHARS` / `EMBEDDING_BATCH_SIZE` | embedding 检索、切块和批量调用参数 |
+| `LOCAL_EVIDENCE_RETRIEVAL_ENABLED` / `LOCAL_EVIDENCE_TOP_K` | 可选的本地 lexical evidence 检索，默认 `0`；与 embedding 分开，设为 `0` 时不会注入这类动态 `retrieved_context` |
 | `PROOFREAD` | `1/0` 控制双语校对 |
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型 |
@@ -163,7 +164,7 @@ DEEPSEEK_API_KEY=
 
 如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且 Tavily 可用，脚本会补建 sidecar 而不重写 glossary。
 
-证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`PROOFREAD_SEARCH_MAX_QUERIES` 只限制实际新搜索，缓存复用不计入预算。
+证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`PROOFREAD_SEARCH_MAX_QUERIES` 只限制实际新搜索，设为 `0` 时仍可离线复用 `<name>.web_evidence.json` 的 exact cache，缓存复用不计入预算。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 
