@@ -1578,6 +1578,18 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("# 术语知识库", fallback)
         self.assertEqual(resident, fallback)
 
+    def test_glossary_prompt_context_never_truncates_for_retrieval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            glossary = os.path.join(tmp, "glossary.md")
+            content = "# 术语知识库\n\n" + ("- Stable term: 稳定译名\n" * 700)
+            with open(glossary, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            self.assertEqual(
+                t.load_glossary_prompt_context(glossary, retriever=object()),
+                t.load_glossary(glossary),
+            )
+
     def test_translate_segments_omits_retrieved_context_without_retriever(self):
         captured = {}
 

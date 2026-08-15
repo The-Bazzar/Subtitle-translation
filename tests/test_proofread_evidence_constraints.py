@@ -183,6 +183,51 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(event.zh, "诺斯风协议失败了。")
 
+    def test_same_round_web_mapping_is_enriched_before_candidate_safety(self):
+        class FakeLLM:
+            provider = "fake"
+            batch_size = 1
+
+            def model_name(self):
+                return "fake"
+
+            def cfg(self):
+                return {}
+
+        event = t.SplitEvent(0.0, 1.0, "I saw bar Drill today.", "我今天看见了巴尔·德里尔。")
+        transcript = t.Transcript(
+            "sample.json", "en", [
+                t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "sample.json"), "", "en", "zh")
+            runtime = t.WebSearchRuntime(settings=t.WebSearchSettings(tavily_key="test"), max_queries=1)
+
+            def same_round_search(_request, _session, runtime_arg, _quiet):
+                runtime_arg.sidecar = t.WebEvidenceSidecar(records=[t.WebEvidenceRecord(
+                    query="Baudrillard Chinese name",
+                    provider="tavily",
+                    search_stage="proofread_tool",
+                    results=[t.WebEvidenceEntry(
+                        url="https://example.test/official-name",
+                        content="Baudrillard - 鲍德里亚",
+                        preferred_domain_hit=True,
+                    )],
+                )])
+                return [{"id": 1, "en": "I saw Baudrillard today.", "zh": "我今天看见了鲍德里亚。"}]
+
+            with patch.object(t, "llm_numbered_batch_with_web_search", side_effect=same_round_search):
+                self.assertTrue(t.proofread_split_events(
+                    transcript, ctx, FakeLLM(), "system", quiet=True,
+                    enhanced=True, search_runtime=runtime, safety_mode=True,
+                ))
+            saved = t.load_web_evidence_sidecar(ctx.web_evidence_json)
+
+        self.assertEqual(event.en, "I saw Baudrillard today.")
+        self.assertEqual(event.zh, "我今天看见了鲍德里亚。")
+        self.assertEqual(saved.confirmed_terms[0].source_variants, ["bar Drill"])
+
     def test_explicit_mapping_keeps_acronyms_and_avoids_substring_false_hits(self):
         transcript = self.transcript("NASA launched the probe near the party venue.")
         sidecar = t.WebEvidenceSidecar(
@@ -438,6 +483,25 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
 
         self.assertEqual(source, "The Northwind Protocol failed.")
         self.assertEqual(target, "诺斯风协议失败了。")
+        self.assertEqual(review, {})
+
+    def test_non_en_zh_disables_only_semantic_anchor_and_keeps_term_safety(self):
+        ctx = t.TranscriptContext.from_json("video.json", "", "ja", "ko")
+        self.assertFalse(t.supports_en_zh_semantic_anchor_gate(ctx))
+        source, target, review = t.apply_proofread_safety_constraints(
+            "東京だけだ。",
+            "도쿄뿐이다.",
+            "東京だけだ。",
+            "다른 곳도 있다.",
+            {"target_changed": True, "categories": ["accuracy"], "reasons": ["test"]},
+            {},
+            terminology_constraints=[{"source": "東京", "target": "도쿄", "source_variants": []}],
+            safety_mode=True,
+            semantic_anchor_enabled=t.supports_en_zh_semantic_anchor_gate(ctx),
+        )
+
+        self.assertEqual(source, "東京だけだ。")
+        self.assertEqual(target, "도쿄뿐이다.")
         self.assertEqual(review, {})
 
     def test_unjustified_rewrite_is_reverted(self):

@@ -165,7 +165,9 @@ DEEPSEEK_API_KEY=
 
 如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且已配置 Tavily 或 Exa，脚本会补建 sidecar 而不重写 glossary。
 
-证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`PROOFREAD_SEARCH_MAX_QUERIES` 只限制实际新搜索，设为 `0` 时仍可离线复用 `<name>.web_evidence.json` 的 exact cache，缓存复用不计入预算。
+证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`PROOFREAD_SEARCH_MAX_QUERIES` 只限制实际新搜索，设为 `0` 时仍可离线复用 `<name>.web_evidence.json` 的 exact cache，缓存复用不计入预算。glossary 是主要研究阶段，但 proofread 保留针对候选 ASR/术语疑点的按需联网核验；当轮新证据会先 enrich 后再进入 candidate safety evaluation。
+
+校对 safety 分为语言无关和语言专用两层：ID 完整性、时间轴不变、术语约束、sentence-group 原子性与证据冲突处理始终启用；当前语义锚点词表仅覆盖 English→Chinese，其他语言方向会显式跳过该语言专用 gate，仍保留全部通用检查。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 
@@ -173,7 +175,7 @@ glossary tool 阶段会强制移除 provider `request_kwargs.response_format` �
 
 Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 query / `topic_hints`、metadata 与 `tavily_domains.json` 中的全局百科域名、题材关键词和站点执行 `include_domains` 搜索；如果结果不足，再执行普通 Tavily 搜索；最终合并去重时会优先保留百科/知识库域名结果。`tavily_domains.json` 由 `tavily_domains.example.json` 初始化，用户可以自行添加题材、关键词和站点。
 
-`glossary.md` 是全局硬规则；retrieved context 只能补充。`web_evidence:*` chunk 来自 sidecar 中的规范化 Tavily/Exa 结果，保留 provider、query、域名、标题、URL 和证据摘要。
+`glossary.md` 是完整常驻的全局硬规则；retrieved context 只能补充。sidecar 的 `confirmed_terms` 经过网页正文、来源质量和冲突检查，作为可追溯局部约束；冲突降级 human review。`web_evidence:*` chunk 来自规范化 Tavily/Exa 结果，保留 provider、query、域名、标题、URL 和证据摘要。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
