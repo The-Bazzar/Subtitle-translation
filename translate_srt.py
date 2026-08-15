@@ -5105,12 +5105,14 @@ def make_pair_item(
     terminology_constraints: Optional[list[dict]] = None,
     evidence_conflicts: Optional[list[dict]] = None,
     sentence_context: Optional[dict] = None,
+    safety_retry: Optional[dict] = None,
 ) -> LLMBatchItem:
     extra = {
         "retrieved_context": retrieved_context or [],
         "terminology_constraints": terminology_constraints or [],
         "evidence_conflicts": evidence_conflicts or [],
         "sentence_context": sentence_context or {},
+        "safety_retry": safety_retry or {},
     }
     normalized_review = normalize_review_metadata(review_hint or {})
     if normalized_review:
