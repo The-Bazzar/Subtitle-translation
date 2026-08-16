@@ -79,6 +79,11 @@ Copy-ConfigIfMissing "translate_prompt.example.md" "translate_prompt.md"
 Copy-ConfigIfMissing "proofread_prompt.example.md" "proofread_prompt.md"
 Copy-ConfigIfMissing "split_prompt.example.md" "split_prompt.md"
 Copy-ConfigIfMissing "template.ass.example" "template.ass"
+foreach ($Prompt in @("translate_prompt", "proofread_prompt")) {
+    if (Test-Path (Join-Path $ScriptDir "$Prompt.md")) {
+        Write-Host "  note: existing $Prompt.md was preserved; compare $Prompt.example.md and migrate new quality rules if desired" -ForegroundColor Yellow
+    }
+}
 
 . "$ScriptDir\.env.ps1"
 
