@@ -1425,6 +1425,15 @@ def env_int(value: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def env_nonnegative_int(value: str, default: int) -> int:
+    """Parse settings where zero is meaningful instead of falling back."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def embedding_enabled_for_stage(only_beautify: bool, only_glossary: bool) -> bool:
     return not only_beautify
 
@@ -1704,7 +1713,7 @@ _providers_cache = None
 
 _TRANSLATE_PROMPT_FALLBACK = """You are the first-pass translator in a high-precision subtitle pipeline. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
 
-The input contains transcript segments. A segment may be a complete sentence or a clause continuing into a neighbor. Translate the speaker's meaning, intent, register, humor, and implied meaning — not the source-language word order or syntax. If the current item is syntactically unfinished, keep the target naturally unfinished so it joins the next subtitle; never invent a conclusion to make one item self-contained. The target must sound like something a native ${TARGET_LANG} speaker would actually say in subtitles.
+The input contains transcript segments. A segment may be a complete sentence or a clause continuing into a neighbor. `sentence_context.previous` and `sentence_context.next` are ordered arrays frozen from the complete transcript; use them only to understand the current item and never return, translate, merge, or alter a neighbor. Translate the speaker's meaning, intent, register, humor, and implied meaning — not the source-language word order or syntax. If the current item is syntactically unfinished, keep the target naturally unfinished so it joins the next subtitle; never invent a conclusion to make one item self-contained. The target must sound like something a native ${TARGET_LANG} speaker would actually say in subtitles.
 
 Translation priorities:
 1. Preserve factual meaning, scope, negation, agency, tense, modality, and relationships.
@@ -3888,7 +3897,7 @@ class GlossaryBuildOptions:
         return GlossaryBuildOptions(
             tavily_key=settings.tavily_key,
             tavily_max_results=settings.tavily_max_results,
-            tavily_max_queries=env_int(
+            tavily_max_queries=env_nonnegative_int(
                 env.get("GLOSSARY_SEARCH_MAX_QUERIES", "").strip()
                 or env.get("TAVILY_MAX_QUERIES", ""),
                 15,
@@ -4269,7 +4278,17 @@ _WEB_TERM_MAPPING_PATTERNS = [re.compile(
         r"([A-Z][A-Za-z0-9'’/]*(?:\s+(?:[A-Z][A-Za-z0-9'’/]*|de|of|the)){0,5})"
         r"\s*[（(]\s*"
         r"([\u3400-\u9fff]{2,12})\s*[）)]"
-    )]
+)]
+
+
+def supports_structured_web_term_promotion(source_lang: str, target_lang: str) -> bool:
+    """Current body mapping extractor supports Latin-script source to Chinese."""
+    try:
+        source = langcodes.Language.get(str(source_lang or "en")).maximize()
+        target = langcodes.Language.get(str(target_lang or "zh")).maximize()
+        return source.script == "Latn" and target.language == "zh"
+    except Exception:
+        return False
 
 
 def web_evidence_entry_is_preferred(
@@ -4391,7 +4410,11 @@ def supported_web_term_mappings(
 def explicit_web_term_mappings(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> list[tuple[str, str, str]]:
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        return []
     mappings: list[tuple[str, str, str]] = []
     for mapping in supported_web_term_mappings(transcript, sidecar):
         for url in mapping["urls"]:
@@ -4403,8 +4426,22 @@ def validated_confirmed_terms(
     raw_terms: list[dict],
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> list[ConfirmedTermEvidence]:
     """Keep only claims whose cited pages explicitly support a reliable mapping."""
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        for raw in raw_terms:
+            source = str(raw.get("source", "")).strip() if isinstance(raw, dict) else ""
+            target = str(raw.get("target", "")).strip() if isinstance(raw, dict) else ""
+            if source and target:
+                mark_term_evidence_review(
+                    transcript,
+                    [source, *json_string_list(raw.get("source_variants", []))],
+                    "当前语言方向不支持把网页正文自动升级为结构化硬术语约束。",
+                    [target],
+                )
+        return []
     known_urls = {
         tavily_url_key(entry.url): entry.url
         for record in sidecar.records
@@ -4470,10 +4507,26 @@ def enrich_confirmed_term_evidence(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
     raw_terms: Optional[list[dict]] = None,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> WebEvidenceSidecar:
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        validated_confirmed_terms(
+            [
+                *[{**term.to_json_value(), "confidence": "confirmed"} for term in sidecar.confirmed_terms],
+                *(raw_terms or []),
+            ],
+            transcript,
+            WebEvidenceSidecar(version=sidecar.version, records=sidecar.records),
+            source_lang,
+            target_lang,
+        )
+        return WebEvidenceSidecar(version=sidecar.version, records=list(sidecar.records))
     direct_terms = [
         ConfirmedTermEvidence(source=source, target=target, evidence_urls=[url], note="网页正文明确映射")
-        for source, target, url in explicit_web_term_mappings(transcript, sidecar)
+        for source, target, url in explicit_web_term_mappings(
+            transcript, sidecar, source_lang, target_lang
+        )
     ]
     existing_claims = [
         {**term.to_json_value(), "confidence": "confirmed"}
@@ -4481,7 +4534,8 @@ def enrich_confirmed_term_evidence(
     ]
     evidence_only = WebEvidenceSidecar(version=sidecar.version, records=sidecar.records)
     model_terms = validated_confirmed_terms(
-        [*existing_claims, *(raw_terms or [])], transcript, evidence_only
+        [*existing_claims, *(raw_terms or [])], transcript, evidence_only,
+        source_lang, target_lang,
     )
     return merge_web_evidence_sidecars(
         evidence_only,
@@ -4493,12 +4547,23 @@ def translate_concurrency_from_env(env: dict[str, str]) -> int:
     return max(1, env_int(env.get("TRANSLATE_CONCURRENCY", ""), 1))
 
 
+def translate_context_window_from_env(env: dict[str, str]) -> int:
+    """Return the number of stable transcript neighbors on each side."""
+    return env_nonnegative_int(env.get("TRANSLATE_CONTEXT_WINDOW", ""), 1)
+
+
 def enrich_candidate_asr_term_evidence(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
     candidate_pairs: list[tuple[str, str]],
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> WebEvidenceSidecar:
     """Promote a verified webpage mapping when a candidate exposes an ASR form."""
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        return enrich_confirmed_term_evidence(
+            transcript, sidecar, source_lang=source_lang, target_lang=target_lang
+        )
     raw_terms: list[dict] = []
     mappings = supported_web_term_mappings(transcript, sidecar, require_transcript_match=False)
     for original, candidate in candidate_pairs:
@@ -4519,7 +4584,9 @@ def enrich_candidate_asr_term_evidence(
                         "confidence": "confirmed", "evidence_urls": list(mapping.get("urls", [])),
                         "note": "proofread candidate ASR replacement backed by webpage mapping",
                     })
-    return enrich_confirmed_term_evidence(transcript, sidecar, raw_terms)
+    return enrich_confirmed_term_evidence(
+        transcript, sidecar, raw_terms, source_lang, target_lang
+    )
 
 
 def transcript_from_request_fields(request_fields: dict) -> Transcript:
@@ -4543,6 +4610,8 @@ def merge_explicit_web_term_mappings(
     glossary: str,
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> str:
     base_glossary = re.sub(
         r"\n*## 网页证据明确术语映射\s*\n.*?(?=\n##\s|\Z)",
@@ -4552,7 +4621,9 @@ def merge_explicit_web_term_mappings(
     ).rstrip()
     mappings = [
         mapping
-        for mapping in explicit_web_term_mappings(transcript, sidecar)
+        for mapping in explicit_web_term_mappings(
+            transcript, sidecar, source_lang, target_lang
+        )
         if not (mapping[0].casefold() in base_glossary.casefold() and mapping[1] in base_glossary)
     ]
     if not mappings:
@@ -4610,7 +4681,10 @@ def finalize_glossary_from_evidence(
         if not options.quiet:
             print(f"Warning: glossary finalizer failed; using local web-evidence draft: {e}", file=sys.stderr)
         validation_transcript = transcript or transcript_from_request_fields(request_fields)
-        enriched_sidecar = enrich_confirmed_term_evidence(validation_transcript, sidecar)
+        enriched_sidecar = enrich_confirmed_term_evidence(
+            validation_transcript, sidecar,
+            source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+        )
         return GlossaryBuildArtifact(
             markdown=local_glossary_markdown_from_evidence(request_fields, sidecar),
             web_evidence=enriched_sidecar,
@@ -4623,6 +4697,8 @@ def finalize_glossary_from_evidence(
         validation_transcript,
         sidecar,
         glossary_output.confirmed_terms,
+        ctx.source_lang_code,
+        ctx.target_lang_code,
     )
     return GlossaryBuildArtifact(markdown=glossary_output.markdown, web_evidence=enriched_sidecar)
 
@@ -4850,13 +4926,18 @@ def build_glossary(
             write_web_evidence_sidecar(ctx, all_evidence)
             if sidecar.has_records() and not options.quiet:
                 print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
-        sidecar = enrich_confirmed_term_evidence(transcript, sidecar)
+        sidecar = enrich_confirmed_term_evidence(
+            transcript, sidecar,
+            source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+        )
         all_evidence = merge_web_evidence_sidecars(all_evidence, sidecar)
         if all_evidence.has_evidence():
             write_web_evidence_sidecar(ctx, all_evidence)
         glossary = write_glossary_file(
             ctx,
-            merge_explicit_web_term_mappings(glossary, transcript, sidecar),
+            merge_explicit_web_term_mappings(
+                glossary, transcript, sidecar, ctx.source_lang_code, ctx.target_lang_code
+            ),
         ) or glossary
 
         fingerprint = glossary_cache_fingerprint(transcript, ctx, metadata_fields, sidecar)
@@ -4890,6 +4971,8 @@ def build_glossary(
                     ensure_local_metadata_in_glossary(artifact.markdown, ctx),
                     transcript,
                     sidecar,
+                    ctx.source_lang_code,
+                    ctx.target_lang_code,
                 ),
             )
             glossary = refreshed or glossary
@@ -4921,6 +5004,8 @@ def build_glossary(
             artifact.web_evidence = enrich_confirmed_term_evidence(
                 transcript,
                 artifact.web_evidence,
+                source_lang=ctx.source_lang_code,
+                target_lang=ctx.target_lang_code,
             )
             all_evidence = merge_web_evidence_sidecars(
                 load_web_evidence_sidecar(ctx.web_evidence_json), artifact.web_evidence
@@ -4932,6 +5017,8 @@ def build_glossary(
                     ensure_local_metadata_in_glossary(artifact.markdown, ctx),
                     transcript,
                     artifact.web_evidence,
+                    ctx.source_lang_code,
+                    ctx.target_lang_code,
                 ),
             )
             if glossary:
@@ -4984,7 +5071,10 @@ def build_glossary(
         )
         glossary_output = GlossaryOutput.from_json_value(response_obj)
         glossary = ensure_local_metadata_in_glossary(glossary_output.markdown, ctx)
-        sidecar = enrich_confirmed_term_evidence(transcript, sidecar, glossary_output.confirmed_terms)
+        sidecar = enrich_confirmed_term_evidence(
+            transcript, sidecar, glossary_output.confirmed_terms,
+            ctx.source_lang_code, ctx.target_lang_code,
+        )
         write_web_evidence_sidecar(
             ctx,
             merge_web_evidence_sidecars(load_web_evidence_sidecar(ctx.web_evidence_json), sidecar),
@@ -4995,7 +5085,9 @@ def build_glossary(
 
     glossary = write_glossary_file(
         ctx,
-        merge_explicit_web_term_mappings(glossary, transcript, sidecar),
+        merge_explicit_web_term_mappings(
+            glossary, transcript, sidecar, ctx.source_lang_code, ctx.target_lang_code
+        ),
     )
     if glossary:
         write_glossary_cache_metadata(
@@ -5751,35 +5843,42 @@ class ChatSession:
         retry_feedback=None,
     ):
         template = retry_template or CompletionRetryTemplate(attempts=1)
+        request_history_start = len(self.messages)
         self.messages.append({"role": "user", "content": content})
         last_error: Exception | None = None
-        for attempt in range(template.normalized_attempts()):
-            answer: str | None = None
-            try:
-                resp = self._create_once({})
-                answer = self._answer_from_response(resp)
-                parsed = validator(answer) if validator is not None else answer
-                self.messages.append({"role": "assistant", "content": answer})
-                return answer, parsed
-            except Exception as e:
-                last_error = e
-                if (
-                    attempt >= template.normalized_attempts() - 1
-                    or is_context_length_error(e)
-                    or is_output_length_error(e)
-                ):
-                    raise
-                self.provider_retry_count += 1
-                if retry_feedback is not None and answer is not None:
+        try:
+            for attempt in range(template.normalized_attempts()):
+                answer: str | None = None
+                try:
+                    resp = self._create_once({})
+                    answer = self._answer_from_response(resp)
+                    parsed = validator(answer) if validator is not None else answer
                     self.messages.append({"role": "assistant", "content": answer})
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": str(retry_feedback(answer, e, attempt)),
-                        }
-                    )
-                self._wait_before_retry(template, attempt, e)
-        raise RuntimeError(f"LLM completion failed: {last_error}")
+                    return answer, parsed
+                except Exception as e:
+                    last_error = e
+                    if (
+                        attempt >= template.normalized_attempts() - 1
+                        or is_context_length_error(e)
+                        or is_output_length_error(e)
+                    ):
+                        raise
+                    self.provider_retry_count += 1
+                    if retry_feedback is not None and answer is not None:
+                        self.messages.append({"role": "assistant", "content": answer})
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": str(retry_feedback(answer, e, attempt)),
+                            }
+                        )
+                    self._wait_before_retry(template, attempt, e)
+            raise RuntimeError(f"LLM completion failed: {last_error}")
+        except BaseException:
+            # Failed requests are not conversation history. Recursive batch
+            # recovery starts from the last successful turn.
+            del self.messages[request_history_start:]
+            raise
 
     def _answer_from_response(self, resp) -> str:
         choice = resp.choices[0]
@@ -6665,6 +6764,7 @@ def translate_segments(
     quiet: bool,
     retriever: ContextRetriever | None = None,
     concurrency: int = 1,
+    context_window: int = 1,
 ) -> bool:
     pending = [s for s in transcript.segments if not s.translation]
     if not pending:
@@ -6685,29 +6785,32 @@ def translate_segments(
         + "\n\n"
         + _JSON_BATCH_FORMAT
         + "\n\n"
-        + render_prompt_template(_TRANSLATE_FORMAT, ctx),
+        + render_prompt_template(_TRANSLATE_FORMAT, ctx)
     )
     # Derive context from the complete transcript, not request-batch edges, so
     # recursive recovery preserves the same neighbors.  This is intentionally
     # sentence_context rather than the removed split context fields.
     changed = False
     ordered_segments = list(transcript.segments)
-    translation_contexts = {
-        segment.index: {
-            "previous": (
-                LanguageFields.from_ctx(ctx).build(
-                    source=ordered_segments[position - 1].en_text()
-                ) | {"id": ordered_segments[position - 1].index}
-            ) if position else {},
-            "next": (
-                LanguageFields.from_ctx(ctx).build(
-                    source=ordered_segments[position + 1].en_text()
-                ) | {"id": ordered_segments[position + 1].index}
-            ) if position + 1 < len(ordered_segments) else {},
-            "instruction": "Neighbors are understanding-only; return only this item's id and translation.",
-        }
-        for position, segment in enumerate(ordered_segments)
-    }
+    neighbor_window = max(0, int(context_window or 0))
+
+    def context_item(segment: TranscriptSegment) -> dict:
+        return LanguageFields.from_ctx(ctx).build(source=segment.en_text()) | {"id": segment.index}
+
+    translation_contexts: dict[int, dict] = {}
+    for position, segment in enumerate(ordered_segments):
+        if neighbor_window == 0:
+            translation_contexts[segment.index] = {}
+            continue
+        previous = ordered_segments[max(0, position - neighbor_window) : position]
+        following = ordered_segments[position + 1 : position + 1 + neighbor_window]
+        translation_contexts[segment.index] = prune_empty_json(
+            {
+                "previous": [context_item(item) for item in previous],
+                "next": [context_item(item) for item in following],
+                "instruction": "Neighbors are understanding-only; return only this item's id and translation.",
+            }
+        ) or {}
     shared_session = ChatSession(llm, translate_system_prompt, temperature=0.3) if worker_count == 1 else None
 
     def apply_translation_batch(
@@ -6918,6 +7021,8 @@ def proofread_split_events(
     evidence_sidecar = enrich_confirmed_term_evidence(
         transcript,
         search_runtime.sidecar if search_runtime is not None else load_web_evidence_sidecar(ctx.web_evidence_json),
+        source_lang=ctx.source_lang_code,
+        target_lang=ctx.target_lang_code,
     )
     if search_runtime is not None:
         search_runtime.replace_sidecar(evidence_sidecar)
@@ -7219,6 +7324,8 @@ def proofread_split_events(
                 for group in groups for item in group.items
                 if item.item_id in raw_by_id
             ],
+            ctx.source_lang_code,
+            ctx.target_lang_code,
         ))
         if search_runtime.sidecar.has_evidence():
             write_web_evidence_sidecar(ctx, search_runtime.sidecar)
@@ -7395,7 +7502,10 @@ def proofread_split_events(
 
     if search_runtime is not None and search_runtime.sidecar.has_evidence():
         search_runtime.replace_sidecar(
-            enrich_confirmed_term_evidence(transcript, search_runtime.sidecar_snapshot())
+            enrich_confirmed_term_evidence(
+                transcript, search_runtime.sidecar_snapshot(),
+                source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+            )
         )
         write_web_evidence_sidecar(ctx, search_runtime.sidecar)
     return changed
@@ -8145,7 +8255,7 @@ def proofread_search_runtime_from_env(
         settings=WebSearchSettings.from_env(env),
         metadata_fields=read_video_metadata_fields(ctx),
         preferences=load_tavily_domain_preferences(),
-        max_queries=max(0, env_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5)),
+        max_queries=env_nonnegative_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5),
         sidecar=load_web_evidence_sidecar(ctx.web_evidence_json),
         quiet=quiet,
     )
@@ -8345,6 +8455,7 @@ def main() -> None:
         args.quiet,
         retriever,
         concurrency=translate_concurrency_from_env(env),
+        context_window=translate_context_window_from_env(env),
     )
     changed = split_segments(
         transcript,
