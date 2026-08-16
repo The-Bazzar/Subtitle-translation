@@ -1,0 +1,3 @@
+# Global code owners: all repository content is owned by oculr.
+# Ruleset "main branch lock" requires code owner review on main.
+* @oculr
