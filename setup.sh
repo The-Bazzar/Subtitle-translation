@@ -86,6 +86,11 @@ copy_config_if_missing "translate_prompt.example.md" "translate_prompt.md"
 copy_config_if_missing "proofread_prompt.example.md" "proofread_prompt.md"
 copy_config_if_missing "split_prompt.example.md" "split_prompt.md"
 copy_config_if_missing "template.ass.example" "template.ass"
+for prompt in translate_prompt proofread_prompt; do
+    if [ -f "$SCRIPT_DIR/$prompt.md" ]; then
+        echo "  note: existing $prompt.md was preserved; compare $prompt.example.md and migrate new quality rules if desired"
+    fi
+done
 
 [ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
 

@@ -3,6 +3,7 @@ import json
 import io
 import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -204,18 +205,10 @@ class JsonProtocolTests(unittest.TestCase):
                 "en": "source",
                 "zh": "",
                 "retrieved_context": [],
-                "context_before": [{"id": 6, "en": "", "zh": "上文"}],
             },
         )
 
-        self.assertEqual(
-            item.to_json_value(),
-            {
-                "id": 7,
-                "en": "source",
-                "context_before": [{"id": 6, "zh": "上文"}],
-            },
-        )
+        self.assertEqual(item.to_json_value(), {"id": 7, "en": "source"})
 
     def test_typed_translate_item_serializes_language_key(self):
         item = t.make_source_item(7, self.ctx, "source text")
@@ -246,23 +239,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(result.source_parts, ["a", "b"])
         self.assertEqual(result.target_parts, ["甲", "乙"])
 
-    def test_typed_split_input_serializes_context(self):
-        item = t.make_pair_item(
-            12,
-            self.ctx,
-            "current source",
-            "current target",
-            context_before=[t.make_pair_json(11, self.ctx, "before source", "before target")],
-            context_after=[t.make_pair_json(13, self.ctx, "after source", "after target")],
-        )
-
-        data = item.to_json_value()
-        self.assertEqual(data["id"], 12)
-        self.assertEqual(data["en"], "current source")
-        self.assertEqual(data["zh"], "current target")
-        self.assertEqual(data["context_before"], [{"id": 11, "en": "before source", "zh": "before target"}])
-        self.assertEqual(data["context_after"], [{"id": 13, "en": "after source", "zh": "after target"}])
-
     def test_typed_proofread_result_parses_language_values(self):
         result = t.LanguageTextResult.from_json_value(
             {"id": 3, "en": "corrected source", "zh": "corrected target"},
@@ -270,6 +246,26 @@ class JsonProtocolTests(unittest.TestCase):
         )
         self.assertEqual(result.source_text, "corrected source")
         self.assertEqual(result.target_text, "corrected target")
+
+    def test_typed_translation_result_preserves_human_review_metadata(self):
+        result = t.LanguageTextResult.from_json_value(
+            {
+                "id": 3,
+                "zh": "自然译文",
+                "review": {
+                    "needs_human": True,
+                    "categories": ["pun"],
+                    "reasons": ["双关有两种合理解释"],
+                    "alternatives": ["备选译法"],
+                    "note": "确认笑点语境",
+                },
+            },
+            self.ctx,
+            require_source=False,
+        )
+        self.assertEqual(result.target_text, "自然译文")
+        self.assertEqual(result.review["categories"], ["pun"])
+        self.assertTrue(result.review["needs_human"])
 
     def test_typed_proofread_item_serializes_retrieved_context(self):
         item = t.make_pair_item(
@@ -288,6 +284,40 @@ class JsonProtocolTests(unittest.TestCase):
                 "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
             },
         )
+
+    def test_human_review_sidecar_contains_translation_and_proofread_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "video.beautified.json")
+            ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
+            transcript = t.Transcript(
+                path=json_path,
+                language="en",
+                segments=[
+                    t.TranscriptSegment(
+                        1,
+                        0.0,
+                        2.0,
+                        "source pun",
+                        translation="译文",
+                        review={"needs_human": True, "categories": ["pun"], "reasons": ["需确认双关"]},
+                        split_events=[
+                            t.SplitEvent(
+                                0.0,
+                                2.0,
+                                "source pun",
+                                "译文",
+                                {"needs_human": True, "categories": ["subtext"], "reasons": ["潜台词不确定"]},
+                            )
+                        ],
+                    )
+                ],
+            )
+            t.write_human_review_sidecar(ctx, transcript)
+            with open(ctx.review_json, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertEqual(payload["format"], "subtitle-human-review")
+            self.assertEqual(payload["items"][0]["translation_review"]["categories"], ["pun"])
+            self.assertEqual(payload["items"][0]["event_reviews"][0]["proofread_review"]["categories"], ["subtext"])
 
     def test_build_glossary_adds_retrieved_context(self):
         class FakeRetriever:
@@ -592,6 +622,31 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(options.tavily_max_queries, 4)
         self.assertTrue(options.use_tool_session())
         self.assertFalse(hasattr(options, deprecated_attr))
+
+    def test_glossary_search_budgets_accept_zero_without_enabling_network(self):
+        for env in (
+            {"TAVILY_API_KEY": "tk", "GLOSSARY_SEARCH_MAX_QUERIES": "0"},
+            {"TAVILY_API_KEY": "tk", "TAVILY_MAX_QUERIES": "0"},
+        ):
+            with self.subTest(env=env):
+                options = t.GlossaryBuildOptions.from_env(env, quiet=True)
+                self.assertEqual(options.tavily_max_queries, 0)
+                self.assertFalse(options.use_tool_session())
+
+        transcript = t.Transcript(
+            path="video.json", language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "Source")],
+        )
+        options = t.GlossaryBuildOptions.from_env(
+            {"TAVILY_API_KEY": "tk", "GLOSSARY_SEARCH_MAX_QUERIES": "0"},
+            quiet=True,
+        )
+        with patch.object(t, "tavily_search") as online:
+            sidecar = t.build_tavily_search_evidence(
+                transcript, self.ctx, FakeProviderLLM(), {}, options
+            )
+        online.assert_not_called()
+        self.assertFalse(sidecar.has_records())
 
     def test_build_glossary_tool_session_retries_malformed_tool_call_message(self):
         calls = []
@@ -1568,6 +1623,184 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "translation memory"}])
         self.assertEqual(retriever.texts, ["source text"])
 
+    def test_translate_sentence_context_is_stable_across_batch_boundaries_and_concurrency(self):
+        requests = []
+
+        def fake_batch(request, session, quiet, **_kwargs):
+            item = request.to_json_value()["items"][0]
+            requests.append((item, id(session)))
+            return [{"id": item["id"], "zh": f"译文{item['id']}"}]
+
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "First unfinished"),
+                t.TranscriptSegment(2, 1.0, 2.0, "continues here"),
+                t.TranscriptSegment(3, 2.0, 3.0, "Final sentence."),
+            ],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            t.translate_segments(
+                transcript, self.ctx, FakeBatchLLM(1), "system", quiet=True,
+                concurrency=2,
+            )
+
+        by_id = {item["id"]: item for item, _session_id in requests}
+        self.assertEqual(by_id[1]["sentence_context"]["next"][0]["id"], 2)
+        self.assertNotIn("previous", by_id[1]["sentence_context"])
+        self.assertEqual(by_id[2]["sentence_context"]["previous"][0]["id"], 1)
+        self.assertEqual(by_id[2]["sentence_context"]["next"][0]["id"], 3)
+        self.assertEqual(by_id[3]["sentence_context"]["previous"][0]["id"], 2)
+        self.assertNotIn("next", by_id[3]["sentence_context"])
+        self.assertEqual(len({session_id for _item, session_id in requests}), 3)
+
+    def test_translate_context_window_zero_one_and_two_use_full_transcript_snapshot(self):
+        def capture(window):
+            captured = {}
+
+            def fake_batch(request, _session, _quiet, **_kwargs):
+                for item in request.to_json_value()["items"]:
+                    captured[item["id"]] = item
+                return [
+                    {"id": item["id"], "zh": f"译文{item['id']}"}
+                    for item in request.to_json_value()["items"]
+                ]
+
+            transcript = t.Transcript(
+                path="video.json", language="en", segments=[
+                    t.TranscriptSegment(index, float(index - 1), float(index), f"Segment {index}")
+                    for index in range(1, 5)
+                ],
+            )
+            with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+                t.translate_segments(
+                    transcript, self.ctx, FakeBatchLLM(1), "system", quiet=True,
+                    concurrency=2, context_window=window,
+                )
+            return captured
+
+        disabled = capture(0)
+        self.assertNotIn("sentence_context", disabled[2])
+
+        one = capture(1)
+        self.assertEqual([item["id"] for item in one[2]["sentence_context"]["previous"]], [1])
+        self.assertEqual([item["id"] for item in one[2]["sentence_context"]["next"]], [3])
+
+        two = capture(2)
+        self.assertEqual([item["id"] for item in two[1]["sentence_context"]["next"]], [2, 3])
+        self.assertEqual([item["id"] for item in two[2]["sentence_context"]["previous"]], [1])
+        self.assertEqual([item["id"] for item in two[2]["sentence_context"]["next"]], [3, 4])
+        self.assertEqual([item["id"] for item in two[4]["sentence_context"]["previous"]], [2, 3])
+
+        self.assertEqual(t.translate_context_window_from_env({}), 1)
+        self.assertEqual(t.translate_context_window_from_env({"TRANSLATE_CONTEXT_WINDOW": "0"}), 0)
+        self.assertEqual(t.translate_context_window_from_env({"TRANSLATE_CONTEXT_WINDOW": "2"}), 2)
+
+    def test_translate_sentence_context_survives_recursive_batch_recovery(self):
+        requests = []
+
+        def fake_batch(request, session, quiet, **_kwargs):
+            items = request.to_json_value()["items"]
+            requests.append(items)
+            if len(items) > 1:
+                raise RuntimeError("response validation failed")
+            return [{"id": items[0]["id"], "zh": "译文"}]
+
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "First"),
+                t.TranscriptSegment(2, 1.0, 2.0, "Middle"),
+                t.TranscriptSegment(3, 2.0, 3.0, "Last"),
+            ],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            self.assertTrue(t.translate_segments(transcript, self.ctx, FakeBatchLLM(3), "system", quiet=True))
+
+        recovered_middle = next(items[0] for items in requests if len(items) == 1 and items[0]["id"] == 2)
+        self.assertEqual(recovered_middle["sentence_context"]["previous"][0]["id"], 1)
+        self.assertEqual(recovered_middle["sentence_context"]["next"][0]["id"], 3)
+
+    def test_real_chat_session_rolls_back_failed_batch_before_recursive_recovery(self):
+        calls = []
+
+        def respond(kwargs):
+            user_payloads = [
+                json.loads(message["content"])
+                for message in kwargs["messages"]
+                if message["role"] == "user"
+            ]
+            current_items = user_payloads[-1]["items"]
+            if len(current_items) > 1:
+                raise RuntimeError("maximum context length exceeded")
+            failed_id_set = {1, 2}
+            self.assertNotIn(
+                failed_id_set,
+                [{item["id"] for item in payload["items"]} for payload in user_payloads[:-1]],
+            )
+            item_id = current_items[0]["id"]
+            return FakeSDKResponse(
+                FakeSDKMessage(content=json.dumps({"items": [{"id": item_id, "zh": f"译文{item_id}"}]}))
+            )
+
+        llm = FakeChatLLM(calls=calls, responses=[respond] * 8)
+        llm.batch_size = 2
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "First"),
+                t.TranscriptSegment(2, 1.0, 2.0, "Second"),
+            ],
+        )
+
+        self.assertTrue(t.translate_segments(transcript, self.ctx, llm, "system", quiet=True))
+        self.assertEqual([segment.translation for segment in transcript.segments], ["译文1", "译文2"])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(isinstance(call["messages"][0]["content"], str) for call in calls))
+
+    def test_translate_system_message_reaches_openai_compatible_client_as_string(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(content='{"items": [{"id": 1, "zh": "译文"}]}')
+                )
+            ],
+        )
+        llm.batch_size = 1
+        transcript = t.Transcript(
+            path="video.json", language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "Source")],
+        )
+
+        self.assertTrue(t.translate_segments(transcript, self.ctx, llm, "editable prompt", quiet=True))
+        self.assertIsInstance(calls[0]["messages"][0]["content"], str)
+
+    def test_translate_concurrency_consumes_all_worker_failures(self):
+        calls = []
+
+        def fake_batch(request, _session, _quiet, **_kwargs):
+            item_id = request.to_json_value()["items"][0]["id"]
+            calls.append(item_id)
+            if item_id == 1:
+                return [{"id": 1, "zh": "first"}]
+            time.sleep(0.05 if item_id == 2 else 0.1)
+            raise SystemExit("late worker failure")
+
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "first"),
+                t.TranscriptSegment(2, 1.0, 2.0, "second"),
+                t.TranscriptSegment(3, 2.0, 3.0, "third"),
+            ],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+            with self.assertRaisesRegex(RuntimeError, "2 concurrent translation work unit\\(s\\) failed"):
+                t.translate_segments(
+                    transcript, self.ctx, FakeBatchLLM(1), "system", quiet=True,
+                    concurrency=3,
+                )
+
+        self.assertEqual(set(calls), {1, 2, 3})
+
     def test_proofread_split_events_adds_retrieved_context(self):
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
@@ -1889,6 +2122,7 @@ class JsonProtocolTests(unittest.TestCase):
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
+        self.assertEqual(deepseek["default_model"], "deepseek-v4-pro")
         self.assertNotIn("response_format", deepseek)
         self.assertEqual(
             deepseek["request_kwargs"]["response_format"],
@@ -2794,7 +3028,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("discipline: 定译为自律", captured["system_prompt"])
 
     def test_write_ass_uses_named_output_modes(self):
-        template = os.path.abspath("template.ass")
+        template = os.path.join(os.path.dirname(t.__file__), "template.ass.example")
         event = t.SplitEvent(1.0, 2.0, "source line", "目标行")
 
         with tempfile.TemporaryDirectory() as tmp:

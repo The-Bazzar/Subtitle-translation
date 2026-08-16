@@ -37,8 +37,8 @@ platform: Win + Linux
 1. 读取 WhisperX JSON 到 dataclass transcript
 2. 词源级时间轴美化，输出 `.beautified.json`
 3. 若 `glossary.md` 不存在，读取整句 transcript 和元数据生成 glossary
-4. 使用 JSON 整句 segment 翻译
-5. 对未校对整句源/目标语言文本同步分割；显式 `--no-split` 时跳过分割但继续导出 ASS
+4. 使用 JSON 整句 segment 翻译；每个 item 的 `sentence_context.previous` / `sentence_context.next` 从完整 transcript 冻结，只用于理解当前 item
+5. 对当前已经翻译完成的完整双语 segment 同步分割；显式 `--no-split` 时跳过分割但继续导出 ASS
 6. 用每个源语言分割片段的首尾 word 顺序匹配美化后的 `words[]`，回填 split event 起止时间
 7. 对已分割、已对轴的 split events 做最终双语校对，不改变时间轴或事件数量
 8. 输出 split 级 `.split.<source>.srt`、`.split.<target>.srt` 和最终 `.<source>.proofread.ass`、`.<target>.ass`、`.<source>-<target>.ass`
@@ -55,6 +55,8 @@ platform: Win + Linux
 
 - 不再读取或生成 SRT 缓存
 - `.beautified.json` 是主缓存，保存 `translation` / `proofread_text` / `split_events`
+- `TRANSLATE_CONTEXT_WINDOW` 控制首译稳定邻居窗口：默认 `1`，`0` 关闭，正整数表示当前 segment 前后各最多多少条。窗口与 batch、并发、thinking、RAG 独立，递归缩批和 context-length recovery 不改变邻居集合
+- split 阶段不再接收旧 `context_before` / `context_after`，`--split-context-window` 已移除；跨 segment 语义理解移到首译，split 只处理当前完整双语 segment。升级方法见 `MIGRATION.md`
 - `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名；输出文件语种后缀通过 `langcodes` 规范为 ISO 639 代码
 - `.<source>-<target>.ass` 使用校对后的源语言文本
 - AI 分割结果必须保留 `id` 和源/目标 ISO 639 语言代码 key，例如 `id/en/zh`。源/目标段数必须一致，并且源语言片段能还原未校对整句、首尾 word 能对齐 `words[]`；否则整句回退到 beautified 时间轴
