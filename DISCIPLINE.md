@@ -108,12 +108,8 @@
 uv run python -m unittest discover -s tests
 ```
 
-**测试基线（v1.7.9）：**
-当前 main 基线存在 3 个已知失败/错误，PR 不得新增第 4 个问题：
-- 2 个 download 脚本断言仍期待 `-crf 19`，而 `download.ps1`/`download.sh` 实际使用 `-crf 12`；
-- 1 个 `test_write_ass_uses_named_output_modes` 因根目录缺少运行时 `template.ass` 报错（测试自身基线问题）。
-
-这些基线问题应另开 `fix/` 或 `test/` PR 修复；修复前，任何 PR 描述都必须给出“基线 3 个已知问题之外，新增 0 失败/错误”的说明。
+**测试基线：**
+历史 `v1.7.9` 基线存在 3 个测试问题（2 个 `-crf 19` 断言、1 个 `template.ass` 路径错误），已由 `test/align-baseline-tests`（PR #8）修复。该 PR 合入后，`main` 全量测试必须为 `OK`，**不再保留任何基线豁免**；任何 PR 出现失败/错误即为阻断项。
 
 **其他强制要求：**
 - 修改 `translate_srt.py`：必须跑全量 unittest，且至少有一个新增/调整的测试直接覆盖改动行为。
@@ -147,7 +143,7 @@ uv run python -m unittest discover -s tests
 
 ## Validation
 - 命令：`.venv/bin/python -m unittest discover -s tests`
-- 结果：Ran N tests；新增失败/错误 0；已知基线失败 3 个（v1.7.9）
+- 结果：Ran N tests；新增失败/错误 0
 - 新增测试名称及覆盖点
 - 人工验证步骤（涉及脚本/CLI 时）
 
@@ -361,7 +357,7 @@ git diff --cached --name-only | grep -E '(\.env$|providers\.json$|cookies\.txt$|
 
 - [ ] 分支命名符合第 2 章
 - [ ] 单个 PR 一个逻辑变更，粒度符合 3.1
-- [ ] 全量 unittest 通过，未新增失败（允许 v1.7.9 已知基线 3 项）
+- [ ] 全量 unittest 通过，未新增失败（`main` 基线必须为 OK）
 - [ ] 新增行为有测试，脚本/平台变更有 parity 测试
 - [ ] PR 描述按 3.3 模板完整填写
 - [ ] 未触碰 design-invariant；或已提交 Design Change Report 并获 maintainer 批准
