@@ -3980,6 +3980,16 @@ _WEB_TERM_MAPPING_PATTERNS = [re.compile(
     )]
 
 
+def supports_structured_web_term_promotion(source_lang: str, target_lang: str) -> bool:
+    """Current body mapping extractor supports Latin-script source to Chinese."""
+    try:
+        source = langcodes.Language.get(str(source_lang or "en")).maximize()
+        target = langcodes.Language.get(str(target_lang or "zh")).maximize()
+        return source.script == "Latn" and target.language == "zh"
+    except Exception:
+        return False
+
+
 def web_evidence_entry_is_preferred(
     record: WebEvidenceRecord,
     entry: WebEvidenceEntry,
@@ -4099,7 +4109,11 @@ def supported_web_term_mappings(
 def explicit_web_term_mappings(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> list[tuple[str, str, str]]:
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        return []
     mappings: list[tuple[str, str, str]] = []
     for mapping in supported_web_term_mappings(transcript, sidecar):
         for url in mapping["urls"]:
@@ -4111,8 +4125,22 @@ def validated_confirmed_terms(
     raw_terms: list[dict],
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> list[ConfirmedTermEvidence]:
     """Keep only claims whose cited pages explicitly support a reliable mapping."""
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        for raw in raw_terms:
+            source = str(raw.get("source", "")).strip() if isinstance(raw, dict) else ""
+            target = str(raw.get("target", "")).strip() if isinstance(raw, dict) else ""
+            if source and target:
+                mark_term_evidence_review(
+                    transcript,
+                    [source, *json_string_list(raw.get("source_variants", []))],
+                    "当前语言方向不支持把网页正文自动升级为结构化硬术语约束。",
+                    [target],
+                )
+        return []
     known_urls = {
         tavily_url_key(entry.url): entry.url
         for record in sidecar.records
@@ -4178,10 +4206,26 @@ def enrich_confirmed_term_evidence(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
     raw_terms: Optional[list[dict]] = None,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> WebEvidenceSidecar:
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        validated_confirmed_terms(
+            [
+                *[{**term.to_json_value(), "confidence": "confirmed"} for term in sidecar.confirmed_terms],
+                *(raw_terms or []),
+            ],
+            transcript,
+            WebEvidenceSidecar(version=sidecar.version, records=sidecar.records),
+            source_lang,
+            target_lang,
+        )
+        return WebEvidenceSidecar(version=sidecar.version, records=list(sidecar.records))
     direct_terms = [
         ConfirmedTermEvidence(source=source, target=target, evidence_urls=[url], note="网页正文明确映射")
-        for source, target, url in explicit_web_term_mappings(transcript, sidecar)
+        for source, target, url in explicit_web_term_mappings(
+            transcript, sidecar, source_lang, target_lang
+        )
     ]
     existing_claims = [
         {**term.to_json_value(), "confidence": "confirmed"}
@@ -4189,7 +4233,8 @@ def enrich_confirmed_term_evidence(
     ]
     evidence_only = WebEvidenceSidecar(version=sidecar.version, records=sidecar.records)
     model_terms = validated_confirmed_terms(
-        [*existing_claims, *(raw_terms or [])], transcript, evidence_only
+        [*existing_claims, *(raw_terms or [])], transcript, evidence_only,
+        source_lang, target_lang,
     )
     return merge_web_evidence_sidecars(
         evidence_only,
@@ -4201,6 +4246,8 @@ def enrich_candidate_asr_term_evidence(
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
     candidate_pairs: list[tuple[str, str]],
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> WebEvidenceSidecar:
     """Promote a verified web mapping when this candidate exposes its ASR form.
 
@@ -4208,6 +4255,10 @@ def enrich_candidate_asr_term_evidence(
     infer the old spelling from a bounded token replacement that produced the
     canonical source form already present in the candidate.
     """
+    if not supports_structured_web_term_promotion(source_lang, target_lang):
+        return enrich_confirmed_term_evidence(
+            transcript, sidecar, source_lang=source_lang, target_lang=target_lang
+        )
     raw_terms: list[dict] = []
     mappings = supported_web_term_mappings(
         transcript, sidecar, require_transcript_match=False
@@ -4238,7 +4289,9 @@ def enrich_candidate_asr_term_evidence(
                             "note": "proofread candidate ASR replacement backed by webpage mapping",
                         }
                     )
-    return enrich_confirmed_term_evidence(transcript, sidecar, raw_terms)
+    return enrich_confirmed_term_evidence(
+        transcript, sidecar, raw_terms, source_lang, target_lang
+    )
 
 
 def transcript_from_request_fields(request_fields: dict) -> Transcript:
@@ -4262,6 +4315,8 @@ def merge_explicit_web_term_mappings(
     glossary: str,
     transcript: Transcript,
     sidecar: WebEvidenceSidecar,
+    source_lang: str = "en",
+    target_lang: str = "zh",
 ) -> str:
     base_glossary = re.sub(
         r"\n*## 网页证据明确术语映射\s*\n.*?(?=\n##\s|\Z)",
@@ -4271,7 +4326,9 @@ def merge_explicit_web_term_mappings(
     ).rstrip()
     mappings = [
         mapping
-        for mapping in explicit_web_term_mappings(transcript, sidecar)
+        for mapping in explicit_web_term_mappings(
+            transcript, sidecar, source_lang, target_lang
+        )
         if not (mapping[0].casefold() in base_glossary.casefold() and mapping[1] in base_glossary)
     ]
     if not mappings:
@@ -4329,7 +4386,10 @@ def finalize_glossary_from_evidence(
         if not options.quiet:
             print(f"Warning: glossary finalizer failed; using local web-evidence draft: {e}", file=sys.stderr)
         validation_transcript = transcript or transcript_from_request_fields(request_fields)
-        enriched_sidecar = enrich_confirmed_term_evidence(validation_transcript, sidecar)
+        enriched_sidecar = enrich_confirmed_term_evidence(
+            validation_transcript, sidecar,
+            source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+        )
         return GlossaryBuildArtifact(
             markdown=local_glossary_markdown_from_evidence(request_fields, sidecar),
             web_evidence=enriched_sidecar,
@@ -4342,6 +4402,8 @@ def finalize_glossary_from_evidence(
         validation_transcript,
         sidecar,
         glossary_output.confirmed_terms,
+        ctx.source_lang_code,
+        ctx.target_lang_code,
     )
     return GlossaryBuildArtifact(markdown=glossary_output.markdown, web_evidence=enriched_sidecar)
 
@@ -4569,13 +4631,18 @@ def build_glossary(
             write_web_evidence_sidecar(ctx, all_evidence)
             if sidecar.has_records() and not options.quiet:
                 print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
-        sidecar = enrich_confirmed_term_evidence(transcript, sidecar)
+        sidecar = enrich_confirmed_term_evidence(
+            transcript, sidecar,
+            source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+        )
         all_evidence = merge_web_evidence_sidecars(all_evidence, sidecar)
         if all_evidence.has_evidence():
             write_web_evidence_sidecar(ctx, all_evidence)
         glossary = write_glossary_file(
             ctx,
-            merge_explicit_web_term_mappings(glossary, transcript, sidecar),
+            merge_explicit_web_term_mappings(
+                glossary, transcript, sidecar, ctx.source_lang_code, ctx.target_lang_code
+            ),
         ) or glossary
 
         fingerprint = glossary_cache_fingerprint(transcript, ctx, metadata_fields, sidecar)
@@ -4609,6 +4676,8 @@ def build_glossary(
                     ensure_local_metadata_in_glossary(artifact.markdown, ctx),
                     transcript,
                     sidecar,
+                    ctx.source_lang_code,
+                    ctx.target_lang_code,
                 ),
             )
             glossary = refreshed or glossary
@@ -4640,6 +4709,8 @@ def build_glossary(
             artifact.web_evidence = enrich_confirmed_term_evidence(
                 transcript,
                 artifact.web_evidence,
+                source_lang=ctx.source_lang_code,
+                target_lang=ctx.target_lang_code,
             )
             all_evidence = merge_web_evidence_sidecars(
                 load_web_evidence_sidecar(ctx.web_evidence_json), artifact.web_evidence
@@ -4651,6 +4722,8 @@ def build_glossary(
                     ensure_local_metadata_in_glossary(artifact.markdown, ctx),
                     transcript,
                     artifact.web_evidence,
+                    ctx.source_lang_code,
+                    ctx.target_lang_code,
                 ),
             )
             if glossary:
@@ -4703,7 +4776,10 @@ def build_glossary(
         )
         glossary_output = GlossaryOutput.from_json_value(response_obj)
         glossary = ensure_local_metadata_in_glossary(glossary_output.markdown, ctx)
-        sidecar = enrich_confirmed_term_evidence(transcript, sidecar, glossary_output.confirmed_terms)
+        sidecar = enrich_confirmed_term_evidence(
+            transcript, sidecar, glossary_output.confirmed_terms,
+            ctx.source_lang_code, ctx.target_lang_code,
+        )
         write_web_evidence_sidecar(
             ctx,
             merge_web_evidence_sidecars(load_web_evidence_sidecar(ctx.web_evidence_json), sidecar),
@@ -4714,7 +4790,9 @@ def build_glossary(
 
     glossary = write_glossary_file(
         ctx,
-        merge_explicit_web_term_mappings(glossary, transcript, sidecar),
+        merge_explicit_web_term_mappings(
+            glossary, transcript, sidecar, ctx.source_lang_code, ctx.target_lang_code
+        ),
     )
     if glossary:
         write_glossary_cache_metadata(
@@ -6252,7 +6330,10 @@ def proofread_split_events(
         if search_runtime is not None
         else load_web_evidence_sidecar(ctx.web_evidence_json)
     )
-    evidence_sidecar = enrich_confirmed_term_evidence(transcript, evidence_sidecar)
+    evidence_sidecar = enrich_confirmed_term_evidence(
+        transcript, evidence_sidecar,
+        source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+    )
     if search_runtime is not None:
         search_runtime.sidecar = evidence_sidecar
     if evidence_sidecar.has_evidence():
@@ -6272,7 +6353,10 @@ def proofread_split_events(
     ) -> bool:
         nonlocal evidence_sidecar
         if search_runtime is not None:
-            evidence_sidecar = enrich_confirmed_term_evidence(transcript, search_runtime.sidecar)
+            evidence_sidecar = enrich_confirmed_term_evidence(
+                transcript, search_runtime.sidecar,
+                source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+            )
             search_runtime.sidecar = evidence_sidecar
         sentence_contexts = proofread_sentence_contexts(transcript, ctx)
         batch_term_context = [
@@ -6387,6 +6471,8 @@ def proofread_split_events(
                     (event.en, (parsed[0] or event.en).strip())
                     for event, parsed in zip(batch_events, parsed_results)
                 ],
+                ctx.source_lang_code,
+                ctx.target_lang_code,
             )
             search_runtime.sidecar = evidence_sidecar
             if evidence_sidecar.has_evidence():
@@ -6511,7 +6597,10 @@ def proofread_split_events(
             )
         changed = apply_proofread_batch(batch, start, contexts, batch_review_hints) or changed
     if search_runtime is not None and search_runtime.sidecar.has_evidence():
-        search_runtime.sidecar = enrich_confirmed_term_evidence(transcript, search_runtime.sidecar)
+        search_runtime.sidecar = enrich_confirmed_term_evidence(
+            transcript, search_runtime.sidecar,
+            source_lang=ctx.source_lang_code, target_lang=ctx.target_lang_code,
+        )
         write_web_evidence_sidecar(ctx, search_runtime.sidecar)
     return changed
 

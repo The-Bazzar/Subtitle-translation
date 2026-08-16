@@ -6,7 +6,7 @@ Step 1 — Check the ${SOURCE_LANG} text for ASR errors:
 - Missing or extra negation
 - Obvious grammar breaks that distort meaning
 - If the glossary or retrieved_context explicitly identifies a source-language ASR error, apply that correction to the ${SOURCE_LANG} text
-- `confirmed_terms` are validated, traceable local constraints. Follow them when they match; if they conflict with the full glossary or evidence_conflicts, keep the existing wording and request human review rather than guessing
+- When supplied, `confirmed_terms` are validated, traceable local constraints for a supported language direction. Follow them when they match; unsupported directions keep raw web evidence instead of fabricating this field. If terms conflict with the full glossary or evidence_conflicts, keep the existing wording and request human review rather than guessing
 - Treat glossary corrections for proper names, titles, quotes, and terminology as stronger evidence than the WhisperX ASR text
 - Keep the original source-language sentence structure and word order
 - Do not rewrite, paraphrase, merge, split, or reorder the source-language text

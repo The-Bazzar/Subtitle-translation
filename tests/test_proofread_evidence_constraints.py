@@ -385,6 +385,40 @@ class ProofreadEvidenceConstraintTests(unittest.TestCase):
         self.assertEqual({pair[:2] for pair in mappings}, {("Northwind Protocol", "诺斯风协议")})
         self.assertEqual(transcript.segments[0].review, {})
 
+    def test_unsupported_target_language_keeps_raw_evidence_without_hard_term(self):
+        transcript = self.transcript("Northwind Protocol is deployed.")
+        url = "https://example.test/japanese-title"
+        sidecar = t.WebEvidenceSidecar(
+            records=[t.WebEvidenceRecord(
+                query="official Japanese title",
+                results=[t.WebEvidenceEntry(
+                    url=url,
+                    content="Northwind Protocol（ノースウィンド・プロトコル）",
+                    preferred_domain_hit=True,
+                )],
+            )],
+        )
+
+        enriched = t.enrich_confirmed_term_evidence(
+            transcript,
+            sidecar,
+            [{
+                "source": "Northwind Protocol",
+                "target": "ノースウィンド・プロトコル",
+                "confidence": "confirmed",
+                "evidence_urls": [url],
+            }],
+            source_lang="en",
+            target_lang="ja",
+        )
+
+        self.assertFalse(t.supports_structured_web_term_promotion("en", "ja"))
+        self.assertFalse(t.supports_structured_web_term_promotion("ja", "zh"))
+        self.assertTrue(t.supports_structured_web_term_promotion("en", "zh"))
+        self.assertEqual(enriched.confirmed_terms, [])
+        self.assertEqual(enriched.records[0].results[0].content, sidecar.records[0].results[0].content)
+        self.assertTrue(transcript.segments[0].review["needs_human"])
+
     def test_confirmed_mapping_remains_relevant_through_an_asr_variant(self):
         transcript = self.transcript("bar Drill spoke about simulation.")
         sidecar = t.WebEvidenceSidecar(

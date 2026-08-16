@@ -175,7 +175,7 @@ glossary tool 阶段会强制移除 provider `request_kwargs.response_format` �
 
 Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 query / `topic_hints`、metadata 与 `tavily_domains.json` 中的全局百科域名、题材关键词和站点执行 `include_domains` 搜索；如果结果不足，再执行普通 Tavily 搜索；最终合并去重时会优先保留百科/知识库域名结果。`tavily_domains.json` 由 `tavily_domains.example.json` 初始化，用户可以自行添加题材、关键词和站点。
 
-`glossary.md` 是完整常驻的全局硬规则；retrieved context 只能补充。glossary 阶段 evidence 可参与构建全局术语，proofread 阶段的 `confirmed_terms` 只在 sidecar 持久化为局部约束，不回写 glossary 缓存；冲突降级 human review。`web_evidence:*` 来自规范化 Tavily/Exa 结果，保留 provider、query、域名、标题、URL 和摘要。
+`glossary.md` 是完整常驻的全局硬规则；retrieved context 只能补充。glossary evidence 可参与构建全局术语，proofread `confirmed_terms` 只在 sidecar 持久化为局部约束。当前自动 evidence→structured hard promotion 仅支持拉丁字母源语言到中文目标语言；其他方向保留 raw web evidence、模型判断和 human review，不生成伪确定性 hard constraint。`web_evidence:*` 来自规范化 Tavily/Exa 结果。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
