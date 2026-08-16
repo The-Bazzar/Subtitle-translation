@@ -81,10 +81,12 @@ class ProofreadWebSearchTests(unittest.TestCase):
         agents = (root / "AGENTS.md").read_text(encoding="utf-8")
         setup_ps1 = (root / "setup.ps1").read_text(encoding="utf-8")
         setup_sh = (root / "setup.sh").read_text(encoding="utf-8")
+        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
 
         for key in (
             "PROOFREAD_ENHANCED",
             "PROOFREAD_SEARCH_MAX_QUERIES",
+            "GLOSSARY_SEARCH_MAX_QUERIES",
             "WEB_SEARCH_PROVIDER",
             "EXA_API_KEY",
             "EXA_MAX_RESULTS",
@@ -94,6 +96,7 @@ class ProofreadWebSearchTests(unittest.TestCase):
             self.assertIn(f"`{key}`", agents)
         self.assertIn("Update-EnvFromExample", setup_ps1)
         self.assertIn("update_env_from_example", setup_sh)
+        self.assertIn('"exa-py>=2.0.0"', pyproject)
 
     def test_search_settings_cover_all_provider_combinations(self):
         self.assertEqual(t.WebSearchSettings.from_env({}).configured_providers(), [])
@@ -155,6 +158,7 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(captured["query"], "work official Chinese title")
         self.assertEqual(captured["kwargs"]["include_domains"], ["example.com"])
         self.assertEqual(captured["kwargs"]["num_results"], 2)
+        self.assertTrue(captured["kwargs"]["moderation"])
         self.assertEqual(captured["kwargs"]["contents"], {"highlights": {"max_characters": 1200}})
         self.assertEqual(results[0]["content"], "Official Chinese title Creator page")
 
@@ -292,6 +296,28 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["content"], "Known Name - 已知名称")
         self.assertEqual(runtime.used_queries, 0)
         online.assert_not_called()
+
+    def test_zero_budget_cache_miss_never_calls_configured_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+            runtime = t.proofread_search_runtime_from_env(
+                {
+                    "PROOFREAD_ENHANCED": "1",
+                    "PROOFREAD_SEARCH_MAX_QUERIES": "0",
+                    "TAVILY_API_KEY": "configured-key",
+                },
+                ctx,
+                quiet=True,
+            )
+            self.assertIsNotNone(runtime)
+            self.assertEqual(runtime.max_queries, 0)
+            with patch.object(t, "tavily_search") as online:
+                result = runtime.execute_search({"query": "not cached", "item_ids": [1]})
+
+        online.assert_not_called()
+        self.assertEqual(runtime.used_queries, 0)
+        self.assertEqual(result["results"], [])
+        self.assertIn("budget", result["error"])
 
     def test_proofread_tool_loop_searches_only_when_model_requests_it(self):
         final = json.dumps(

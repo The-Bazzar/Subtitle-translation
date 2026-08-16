@@ -3129,7 +3129,7 @@ def proofread_search_runtime_from_env(
         settings=WebSearchSettings.from_env(env),
         metadata_fields=read_video_metadata_fields(ctx),
         preferences=load_tavily_domain_preferences(),
-        max_queries=max(0, env_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5)),
+        max_queries=env_nonnegative_int(env.get("PROOFREAD_SEARCH_MAX_QUERIES", ""), 5),
         sidecar=load_web_evidence_sidecar(ctx.web_evidence_json),
         quiet=quiet,
     )
@@ -3460,7 +3460,7 @@ class GlossaryBuildOptions:
         return GlossaryBuildOptions(
             tavily_key=settings.tavily_key,
             tavily_max_results=settings.tavily_max_results,
-            tavily_max_queries=env_int(
+            tavily_max_queries=env_nonnegative_int(
                 env.get("GLOSSARY_SEARCH_MAX_QUERIES", "").strip()
                 or env.get("TAVILY_MAX_QUERIES", ""),
                 15,

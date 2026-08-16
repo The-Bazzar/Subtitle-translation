@@ -147,20 +147,21 @@ DEEPSEEK_API_KEY=
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型 |
 | `PROOFREAD_ENHANCED` | `1/0` 显式启用证据增强校对和按需联网搜索，默认 `0`；仅设置 provider/model 不会开启联网 |
-| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；缓存命中不消耗预算 |
+| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；`0` 禁止新的网络请求，但仍允许读取和复用持久化 exact evidence/cache |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
-| `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa |
+| `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa，当前 `contents` 搜索调用要求 `exa-py>=2.0.0` |
 | `TAVILY_API_KEY` | glossary 联网搜索 |
 | `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限 |
-| `TAVILY_MAX_QUERIES` | glossary 联网搜索预算；tool-call 路径下是最大 Tavily tool 查询次数，fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily 搜索 |
+| `GLOSSARY_SEARCH_MAX_QUERIES` | glossary 新网络查询预算，默认 `15`，优先于兼容变量 `TAVILY_MAX_QUERIES`；`0` 禁止新的网络请求，已有 sidecar evidence 仍可读取 |
+| `TAVILY_MAX_QUERIES` | 兼容旧配置；仅当 `GLOSSARY_SEARCH_MAX_QUERIES` 为空时作为 glossary 查询预算，`0` 同样禁止新请求 |
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 
 `BURN_OVCOPTS=source-bitrate` 会用 `ffprobe` 读取源视频码率，并用 VBR 的 `b/maxrate/bufsize` 让硬字幕输出尽量接近源码率；显式设置 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
-配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。
+配置联网 provider 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求搜索，脚本执行后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。`GLOSSARY_SEARCH_MAX_QUERIES` 控制新网络查询预算，并优先于兼容变量 `TAVILY_MAX_QUERIES`；设为 `0` 时不发起新请求，但已有 sidecar evidence 仍可供 glossary 和后续阶段读取。
 
 如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且 Tavily 可用，脚本会补建 sidecar 而不重写 glossary。
 
@@ -190,7 +191,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 | `chromadb` | 本地持久化向量库 |
 | `langcodes[data]` Python 包 | 语言名/标签规范为 ISO 639 输出后缀 |
 | `tavily-python` | glossary 可选联网搜索 SDK |
-| `exa-py` | Exa 可选联网搜索 SDK |
+| `exa-py>=2.0.0` | Exa 可选联网搜索 SDK；2.0.0 起 `search(..., contents=...)` 支持当前调用协议 |
 | `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |
 
 ## 注意事项

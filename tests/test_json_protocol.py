@@ -623,6 +623,31 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertTrue(options.use_tool_session())
         self.assertFalse(hasattr(options, deprecated_attr))
 
+    def test_glossary_search_budgets_accept_zero_without_enabling_network(self):
+        for env in (
+            {"TAVILY_API_KEY": "tk", "GLOSSARY_SEARCH_MAX_QUERIES": "0"},
+            {"TAVILY_API_KEY": "tk", "TAVILY_MAX_QUERIES": "0"},
+        ):
+            with self.subTest(env=env):
+                options = t.GlossaryBuildOptions.from_env(env, quiet=True)
+                self.assertEqual(options.tavily_max_queries, 0)
+                self.assertFalse(options.use_tool_session())
+
+        transcript = t.Transcript(
+            path="video.json", language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "Source")],
+        )
+        options = t.GlossaryBuildOptions.from_env(
+            {"TAVILY_API_KEY": "tk", "GLOSSARY_SEARCH_MAX_QUERIES": "0"},
+            quiet=True,
+        )
+        with patch.object(t, "tavily_search") as online:
+            sidecar = t.build_tavily_search_evidence(
+                transcript, self.ctx, FakeProviderLLM(), {}, options
+            )
+        online.assert_not_called()
+        self.assertFalse(sidecar.has_records())
+
     def test_build_glossary_tool_session_retries_malformed_tool_call_message(self):
         calls = []
         searched = []
