@@ -417,6 +417,7 @@ class ProofreadWebSearchTests(unittest.TestCase):
         self.assertEqual(captured["query"], "work official Chinese title")
         self.assertEqual(captured["kwargs"]["include_domains"], ["example.com"])
         self.assertEqual(captured["kwargs"]["num_results"], 2)
+        self.assertTrue(captured["kwargs"]["moderation"])
         self.assertEqual(captured["kwargs"]["contents"], {"highlights": {"max_characters": 1200}})
         self.assertEqual(results[0]["content"], "Official Chinese title Creator page")
 
