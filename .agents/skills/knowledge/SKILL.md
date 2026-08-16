@@ -33,7 +33,7 @@ platform: Agent + Script
 
 模型配置：
 
-- `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 专用于 glossary agent、Tavily tool calling 和最终术语定稿
+- `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 专用于 glossary agent、Tavily/Exa tool calling 和最终术语定稿
 - 留空则回退到 `TRANSLATE_PROVIDER` / `TRANSLATE_MODEL`
 - 术语知识库会影响后续翻译和校对记忆，用户应使用可用范围内最顶级模型，不要用弱模型省成本
 
