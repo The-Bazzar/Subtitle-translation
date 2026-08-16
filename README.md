@@ -94,7 +94,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 - `<name>.beautified.json`：主缓存，保存 `translation`、`proofread_text`、`split_events`
 - `<name>.scenes.json`：场景切换 sidecar，包含 fps、threshold、frame、timecode 等调试信息
 - `<name>.scenechange.txt`：每行一个秒级场景切换点，例如 `12.345000`
-- `<name>.web_evidence.json`：Tavily 网页证据 sidecar，保存规范化 query、域名、URL、标题和证据摘要，用于 embedding 检索
+- `<name>.web_evidence.json`：联网证据 sidecar，保存规范化 query、provider、域名、URL、标题和证据摘要，用于 embedding 检索
 - `<name>.split.<source>.srt`：分割后、最终校对后的源语言 SRT 检查稿
 - `<name>.split.<target>.srt`：分割后、最终校对后的目标语言 SRT 检查稿
 - `<name>.<source>.proofread.ass`：最终校对源语言 ASS
@@ -104,15 +104,15 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名，例如 `en`、`en-US`、`Japanese`、`Chinese Simplified`。输出文件后缀会通过 `langcodes` 规范为 ISO 639 代码，例如 `English -> en`、`Japanese -> ja`。未显式设置 `SOURCE_LANG` 时，脚本使用 WhisperX JSON 中的 `language`；`TARGET_LANG` 默认 `zh`。
 
-翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON object，顶层包含 `items` array，返回也必须是同形态 JSON object；`items` 内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。分割阶段默认给 pending segment 附带前后各 1 条 `context_before` / `context_after`，仅用于理解语义和节奏，远端只返回 pending item 本身；可用 `--split-context-window` 调整。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。`.beautified.json` 会用 `split_status` 记录状态：`ok` 为有效分割，`fallback` 为分割失败后整句回退且可重试，`unsplit` 为低于阈值或合法保留整句；`split_reason` 保存原因码，`split_reason_detail` 保存具体诊断文本。
+翻译、分割、校对按顺序执行：先用整句 JSON 翻译保留语义，再用未校对源语言文本分割并对齐词源时间轴，最后对已分割的 subtitle events 做双语校对。所有批量 LLM 阶段的 user prompt 都是 JSON object，顶层包含 `items` array，返回也必须是同形态 JSON object；`items` 内只使用 `id` 和源/目标 ISO 639 语言代码 key，例如 `en`、`zh`。首译每个 item 会收到稳定的 `sentence_context.previous` / `sentence_context.next` 邻接字幕数组，只供理解语义，模型仍只能返回当前 item。邻居从完整 transcript 一次性冻结，`TRANSLATE_CONTEXT_WINDOW` 控制当前 segment 前后各最多多少条（默认 `1`，`0` 关闭）；batch 边界、递归缩批、context-length recovery 和并发调度都不会改变已确定的邻居集合。`TRANSLATE_CONTEXT_WINDOW` 与 `TRANSLATE_CONCURRENCY`、thinking 和 RAG 相互独立；并发 work unit 使用隔离 session，不依赖 shared session 提供跨 unit 上下文。分割不再发送已废弃的 `context_before` / `context_after` 或 `--split-context-window` 契约。分割完成后，脚本用每个源语言 split 的首尾 word 顺序匹配美化后的 `words[]`，对齐每条显示字幕的起止时间。如果缺标号、源/目标段数不齐、源语言片段无法还原未校对整句或首尾 word 无法对齐词级时间轴，脚本会丢弃该分割结果并回退到整句 beautified 时间轴，不做本地强切。`.beautified.json` 会用 `split_status` 记录状态：`ok` 为有效分割，`fallback` 为分割失败后整句回退且可重试，`unsplit` 为低于阈值或合法保留整句；`split_reason` 保存原因码，`split_reason_detail` 保存具体诊断文本。升级自旧 split context contract 时请参阅 [MIGRATION.md](MIGRATION.md)。
 
 默认模板以 1080p 双语观看为基准：`bi-zh` / `bg-bi-zh` 字号为 68，`bi-en` / `bg-bi-en` 字号为 44；AI 分割默认在源文超过 72 字符或 3.8 秒时触发。beautify 只负责词级时间轴吸附和边界修复，不再提供本地硬截整句参数。
 
-`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量；加载时由 `translate_srt.py` 替换。`glossary_prompt.md` 只用于微调 glossary 内容策略，`split_prompt.md` 只用于微调分割风格，输出格式由 `translate_srt.py` 固定注入。配置 Tavily 搜索时，glossary 会优先依据网页搜索结果校正 ASR 中可能误识别的人名、标题、引文和术语；原始网页证据会另外保存到 `<name>.web_evidence.json`，供后续 embedding 检索使用，而不是直接常驻注入 prompt。
+`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 可以使用语言模板变量。配置 Tavily 或 Exa 时，glossary 会依据网页结果校正疑似 ASR、专名和术语；原始证据另存到 `<name>.web_evidence.json`，供后续检索和人工复核。
 
 ## 配置
 
-运行 `setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和 `template.ass`。旧版本升级时，setup 会把 `.env.example` 中新增但你本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置。
+运行 `setup.ps1` / `setup.sh` 会自动从 example 创建缺失的 `.env`、`providers.json`、`tavily_domains.json`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 和 `template.ass`。旧版本升级时，setup 会把 `.env.example` 中新增但你本地 `.env` 缺失的变量追加到 `.env` 末尾，不覆盖已有配置；已有本地 prompt 也不会被覆盖，setup 会提示你对照对应 `*.example.md` 迁移新的质量规则。
 
 setup 后至少配置：
 
@@ -134,28 +134,44 @@ DEEPSEEK_API_KEY=
 | `TARGET_LANG` | 目标语言标签，默认 `zh` |
 | `TRANSLATE_PROVIDER` | 翻译后端，必填；可用 `openai` / `llama` / `openrouter` / `deepseek` / `gemini` |
 | `TRANSLATE_MODEL` | 翻译模型，空则用 provider 默认 |
+| `TRANSLATE_CONCURRENCY` | 首译并发请求数，默认 `1`；与校对并发、thinking 独立 |
+| `TRANSLATE_CONTEXT_WINDOW` | 首译稳定邻居窗口，默认 `1`；`0` 关闭，`1/2/...` 表示当前 segment 前后各最多 1/2/... 条完整 transcript 邻居；与并发、thinking、RAG 独立 |
 | `GLOSSARY_PROVIDER` | 术语知识库构建后端；强烈建议使用可用范围内最顶级模型，空则复用翻译 provider |
 | `GLOSSARY_MODEL` | 术语知识库构建模型；负责搜索意图、ASR 纠错、背景归纳和译名决策，空则复用翻译模型或 provider 默认 |
 | `EMBEDDING_ENABLED` | `1/0` 控制是否用 LangChain + Chroma 构建 embedding 索引，为 glossary/description/translate/proofread 提供动态 `retrieved_context` |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding 后端和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
 | `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
 | `EMBEDDING_TOP_K` / `EMBEDDING_CHUNK_CHARS` / `EMBEDDING_BATCH_SIZE` | embedding 检索、切块和批量调用参数 |
+| `LOCAL_EVIDENCE_RETRIEVAL_ENABLED` / `LOCAL_EVIDENCE_TOP_K` | 可选的本地 lexical evidence 检索，默认 `0`；与 embedding 分开，设为 `0` 时不会注入这类动态 `retrieved_context` |
 | `PROOFREAD` | `1/0` 控制双语校对 |
 | `PROOFREAD_PROVIDER` | 校对专用 provider |
 | `PROOFREAD_MODEL` | 校对专用模型 |
+| `PROOFREAD_ENHANCED` | `1/0` 显式启用证据增强校对和按需联网搜索，默认 `0`；仅设置 provider/model 不会开启联网 |
+| `PROOFREAD_SEARCH_MAX_QUERIES` | 增强校对的全局实际搜索预算，默认 `5`；`0` 禁止新的网络请求，但仍允许读取和复用持久化 exact evidence/cache |
+| `PROOFREAD_CONCURRENCY` | 并发校对请求数，默认 `1`；与 `PROOFREAD_BATCH_SIZE` 独立 |
+| `PROOFREAD_THINKING` / `PROOFREAD_REASONING_EFFORT` | 已知支持的 provider（当前为 DeepSeek）留空自动使用 `enabled` / `high`；非空显式值始终覆盖。能力未知或不支持的 provider 不发送专用参数 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
+| `WEB_SEARCH_PROVIDER` | 搜索后端：`auto` / `tavily` / `exa`，默认 `auto` |
+| `EXA_API_KEY` / `EXA_MAX_RESULTS` | Exa 搜索凭据与单次结果上限；key 为空时禁用 Exa，当前 `contents` 搜索调用要求 `exa-py>=2.0.0` |
 | `TAVILY_API_KEY` | glossary 联网搜索 |
 | `TAVILY_MAX_RESULTS` | Tavily 搜索结果上限 |
-| `TAVILY_MAX_QUERIES` | glossary 联网搜索预算；tool-call 路径下是最大 Tavily tool 查询次数，fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily 搜索 |
+| `GLOSSARY_SEARCH_MAX_QUERIES` | glossary 新网络查询预算，默认 `15`，优先于兼容变量 `TAVILY_MAX_QUERIES`；`0` 禁止新的网络请求，已有 sidecar evidence 仍可读取 |
+| `TAVILY_MAX_QUERIES` | 兼容旧配置；仅当 `GLOSSARY_SEARCH_MAX_QUERIES` 为空时作为 glossary 查询预算，`0` 同样禁止新请求 |
 | `PIPELINE_SKIP_*` | 流水线阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 
 `BURN_OVCOPTS=source-bitrate` 会用 `ffprobe` 读取源视频码率，并用 VBR 的 `b/maxrate/bufsize` 让硬字幕输出尽量接近源码率；显式设置 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
-配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。
+配置联网 provider 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求搜索，脚本执行后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。`GLOSSARY_SEARCH_MAX_QUERIES` 控制新网络查询预算，并优先于兼容变量 `TAVILY_MAX_QUERIES`；设为 `0` 时不发起新请求，但已有 sidecar evidence 仍可供 glossary 和后续阶段读取。
 
-如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且 Tavily 可用，脚本会补建 sidecar 而不重写 glossary。
+如果 `glossary.md` 已缓存但 `<name>.web_evidence.json` 缺失，且已配置 Tavily 或 Exa，脚本会补建 sidecar 而不重写 glossary。
+
+证据增强校对必须通过 `PROOFREAD_ENHANCED=1` 明确开启。`PROOFREAD_PROVIDER` 和 `PROOFREAD_MODEL` 只选择校对模型，不会改变联网能力。启用后可使用 Tavily、Exa 或已有的 web evidence 缓存；`PROOFREAD_SEARCH_MAX_QUERIES` 只限制实际新搜索，设为 `0` 时仍可离线复用 `<name>.web_evidence.json` 的 exact cache，缓存复用不计入预算。glossary 是主要研究阶段，但 proofread 保留针对候选 ASR/术语疑点的按需联网核验；当轮新证据会先 enrich 后再进入 candidate safety evaluation。
+
+校对 safety 分为语言无关和语言专用两层：ID 完整性、时间轴不变、术语约束、sentence-group 原子性与证据冲突处理始终启用；当前语义锚点词表仅覆盖 English→Chinese，其他语言方向会显式跳过该语言专用 gate，仍保留全部通用检查。
+
+`PROOFREAD_BATCH_SIZE` 控制单次请求包含多少字幕，`PROOFREAD_CONCURRENCY` 控制同时在途的请求数，两者互不替代。默认并发为 `1`，保持串行兼容。未开启 thinking 时，部分模型的校对会明显趋于保守，可能大幅减少实际修改覆盖；开启 thinking 可显著提高问题发现与校对覆盖，但会增加 token、延迟和费用。thinking 与并发不绑定；启用 thinking 时建议从适度 `PROOFREAD_CONCURRENCY`（例如 `2-4`，并按 provider 限流调整）开始。当前仅对已知支持这组请求参数的 DeepSeek 校对自动使用 `PROOFREAD_THINKING=enabled` 与 `PROOFREAD_REASONING_EFFORT=high`；能力未知或不支持的 provider 保持其原有默认，不发送专用参数。任一非空显式环境变量始终覆盖对应自动值。thinking/reasoning 只作用于 proofreading，不影响首译或 glossary。proofread report 中的 KEEP / EDIT / REVIEW / ROLLBACK 计数仅用于诊断，不是 EDIT 数量或修改率目标。
 
 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 独立控制术语知识库阶段使用的 LLM；这个阶段会决定搜索什么、相信哪些网页证据、如何修正 ASR 错误、核心术语如何定译，并会影响后续翻译和校对记忆。请优先给它配置当前可用的最强、最顶级模型，而不是为了省成本使用小模型。只运行 `--only-glossary` 时，可以只配置 `GLOSSARY_PROVIDER` 和对应 API key；完整翻译流程仍需要 `TRANSLATE_PROVIDER`。
 
@@ -163,7 +179,7 @@ glossary tool 阶段会强制移除 provider `request_kwargs.response_format` �
 
 Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 query / `topic_hints`、metadata 与 `tavily_domains.json` 中的全局百科域名、题材关键词和站点执行 `include_domains` 搜索；如果结果不足，再执行普通 Tavily 搜索；最终合并去重时会优先保留百科/知识库域名结果。`tavily_domains.json` 由 `tavily_domains.example.json` 初始化，用户可以自行添加题材、关键词和站点。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引会额外保存 `glossary.md` 项目知识、`web_evidence.json` 网页证据、源文 transcript chunk 和翻译/分割后生成的双语 translation memory chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。校对阶段会用源文+译文一起检索，以保持术语和译风一致。`glossary.md` 会由本地脚本直接前置 YouTube 原视频元信息，包括标题、作者、上传时间、简介和标签；`web_evidence:*` chunk 来自 `<name>.web_evidence.json` 中的规范化 Tavily 结果，保留 query、域名、标题、URL 和证据摘要。索引会自动按 Markdown 标题切分 glossary；transcript chunk 使用干净字幕文本建向量，但返回给 LLM 的 retrieved context 会带 segment 时间码，并按末尾时间窗口自动 overlap，避免长视频上下文断裂。重建索引前会清理当前项目旧 chunk，避免残留结果污染检索。
+`glossary.md` 是完整常驻的全局硬规则；retrieved context 只能补充。glossary evidence 可参与构建全局术语，proofread `confirmed_terms` 只在 sidecar 持久化为局部约束。当前自动 evidence→structured hard promotion 仅支持拉丁字母源语言到中文目标语言；其他方向保留 raw web evidence、模型判断和 human review，不生成伪确定性 hard constraint。`web_evidence:*` 来自规范化 Tavily/Exa 结果。
 
 `providers.json` 使用 OpenAI SDK 兼容配置，仓库只提交 `providers.example.json`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
@@ -181,6 +197,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 | `chromadb` | 本地持久化向量库 |
 | `langcodes[data]` Python 包 | 语言名/标签规范为 ISO 639 输出后缀 |
 | `tavily-python` | glossary 可选联网搜索 SDK |
+| `exa-py>=2.0.0` | Exa 可选联网搜索 SDK；2.0.0 起 `search(..., contents=...)` 支持当前调用协议 |
 | `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |
 
 ## 注意事项
