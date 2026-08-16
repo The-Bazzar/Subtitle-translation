@@ -515,6 +515,11 @@ def translate_concurrency_from_env(env: dict[str, str]) -> int:
     return max(1, env_int(env.get("TRANSLATE_CONCURRENCY", ""), 1))
 
 
+def translate_context_window_from_env(env: dict[str, str]) -> int:
+    """Return the number of stable transcript neighbors on each side."""
+    return env_nonnegative_int(env.get("TRANSLATE_CONTEXT_WINDOW", ""), 1)
+
+
 def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_size: int) -> LLMConfig:
     configured_provider = env.get("PROOFREAD_PROVIDER", "").strip()
     provider = configured_provider or translate_llm.provider
@@ -1171,6 +1176,15 @@ def env_int(value: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def env_nonnegative_int(value: str, default: int) -> int:
+    """Parse settings where zero is meaningful instead of falling back."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def embedding_enabled_for_stage(only_beautify: bool, only_glossary: bool) -> bool:
     return not only_beautify
 
@@ -1457,7 +1471,7 @@ _providers_cache = None
 
 _TRANSLATE_PROMPT_FALLBACK = """You are the first-pass translator in a high-precision subtitle pipeline. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
 
-The input contains transcript segments. A segment may be a complete sentence or a clause continuing into a neighbor. Translate the speaker's meaning, intent, register, humor, and implied meaning — not the source-language word order or syntax. If the current item is syntactically unfinished, keep the target naturally unfinished so it joins the next subtitle; never invent a conclusion to make one item self-contained. The target must sound like something a native ${TARGET_LANG} speaker would actually say in subtitles.
+The input contains transcript segments. A segment may be a complete sentence or a clause continuing into a neighbor. `sentence_context.previous` and `sentence_context.next` are ordered arrays frozen from the complete transcript; use them only to understand the current item and never return, translate, merge, or alter a neighbor. Translate the speaker's meaning, intent, register, humor, and implied meaning — not the source-language word order or syntax. If the current item is syntactically unfinished, keep the target naturally unfinished so it joins the next subtitle; never invent a conclusion to make one item self-contained. The target must sound like something a native ${TARGET_LANG} speaker would actually say in subtitles.
 
 Translation priorities:
 1. Preserve factual meaning, scope, negation, agency, tense, modality, and relationships.
@@ -4304,30 +4318,38 @@ class ChatSession:
         retry_feedback=None,
     ):
         template = retry_template or CompletionRetryTemplate(attempts=1)
+        request_history_start = len(self.messages)
         self.messages.append({"role": "user", "content": content})
         last_error: Exception | None = None
-        for attempt in range(template.normalized_attempts()):
-            answer: str | None = None
-            try:
-                resp = self._create_once({})
-                answer = self._answer_from_response(resp)
-                parsed = validator(answer) if validator is not None else answer
-                self.messages.append({"role": "assistant", "content": answer})
-                return answer, parsed
-            except Exception as e:
-                last_error = e
-                if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
-                    raise
-                if retry_feedback is not None and answer is not None:
+        try:
+            for attempt in range(template.normalized_attempts()):
+                answer: str | None = None
+                try:
+                    resp = self._create_once({})
+                    answer = self._answer_from_response(resp)
+                    parsed = validator(answer) if validator is not None else answer
                     self.messages.append({"role": "assistant", "content": answer})
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": str(retry_feedback(answer, e, attempt)),
-                        }
-                    )
-                self._wait_before_retry(template, attempt, e)
-        raise RuntimeError(f"LLM completion failed: {last_error}")
+                    return answer, parsed
+                except Exception as e:
+                    last_error = e
+                    if attempt >= template.normalized_attempts() - 1 or is_context_length_error(e):
+                        raise
+                    if retry_feedback is not None and answer is not None:
+                        self.messages.append({"role": "assistant", "content": answer})
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": str(retry_feedback(answer, e, attempt)),
+                            }
+                        )
+                    self._wait_before_retry(template, attempt, e)
+            raise RuntimeError(f"LLM completion failed: {last_error}")
+        except BaseException:
+            # A failed request is not conversation history.  Recursive batch
+            # recovery may safely reuse this session from its last successful
+            # turn without carrying the rejected oversized/invalid request.
+            del self.messages[request_history_start:]
+            raise
 
     def _answer_from_response(self, resp) -> str:
         choice = resp.choices[0]
@@ -4544,6 +4566,7 @@ def translate_segments(
     quiet: bool,
     retriever: ContextRetriever | None = None,
     concurrency: int = 1,
+    context_window: int = 1,
 ) -> bool:
     pending = [s for s in transcript.segments if not s.translation]
     if not pending:
@@ -4571,22 +4594,25 @@ def translate_segments(
     # the same neighboring subtitles.  It intentionally uses sentence_context
     # rather than reviving split-specific context_before/context_after fields.
     ordered_segments = list(transcript.segments)
-    translation_contexts = {
-        segment.index: {
-            "previous": (
-                LanguageFields.from_ctx(ctx).build(
-                    source=ordered_segments[position - 1].en_text()
-                ) | {"id": ordered_segments[position - 1].index}
-            ) if position else {},
-            "next": (
-                LanguageFields.from_ctx(ctx).build(
-                    source=ordered_segments[position + 1].en_text()
-                ) | {"id": ordered_segments[position + 1].index}
-            ) if position + 1 < len(ordered_segments) else {},
-            "instruction": "Neighbors are understanding-only; return only this item's id and translation.",
-        }
-        for position, segment in enumerate(ordered_segments)
-    }
+    neighbor_window = max(0, int(context_window or 0))
+
+    def context_item(segment: TranscriptSegment) -> dict:
+        return LanguageFields.from_ctx(ctx).build(source=segment.en_text()) | {"id": segment.index}
+
+    translation_contexts: dict[int, dict] = {}
+    for position, segment in enumerate(ordered_segments):
+        if neighbor_window == 0:
+            translation_contexts[segment.index] = {}
+            continue
+        previous = ordered_segments[max(0, position - neighbor_window) : position]
+        following = ordered_segments[position + 1 : position + 1 + neighbor_window]
+        translation_contexts[segment.index] = prune_empty_json(
+            {
+                "previous": [context_item(item) for item in previous],
+                "next": [context_item(item) for item in following],
+                "instruction": "Neighbors are understanding-only; return only this item's id and translation.",
+            }
+        ) or {}
     shared_session = ChatSession(llm, translate_system_prompt, temperature=0.3) if worker_count == 1 else None
     changed = False
 
@@ -5745,6 +5771,7 @@ def main() -> None:
         args.quiet,
         retriever,
         concurrency=translate_concurrency_from_env(env),
+        context_window=translate_context_window_from_env(env),
     )
     changed = split_segments(
         transcript,

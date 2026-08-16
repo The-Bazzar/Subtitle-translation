@@ -45,6 +45,7 @@ winget install Microsoft.PowerShell
 ├── split_prompt.example.md
 ├── AGENTS.md
 ├── README.md
+├── MIGRATION.md
 └── .agents/skills/
     ├── beautify/SKILL.md
     ├── download/SKILL.md
@@ -139,7 +140,8 @@ winget install Microsoft.PowerShell
 - 顺序固定为：整句翻译 -> AI 分割 -> 词级对轴 -> split event 校对
 - 翻译使用整句 segment，避免先分割导致上下文破碎
 - 分割使用未校对源语言文本匹配 WhisperX words，校对发生在 split event 上
-- 首译每个 item 发送稳定的 `sentence_context` 邻接字幕快照，只供远端理解；必须只返回当前 item。快照基于完整 transcript，跨 batch 和递归缩批不变；并发 work unit 不共享 session 上下文
+- 首译每个 item 发送稳定的 `sentence_context.previous` / `sentence_context.next` 邻接字幕数组，只供远端理解；必须只返回当前 item。`TRANSLATE_CONTEXT_WINDOW` 默认 `1`，表示前后各最多 1 条，`0` 关闭，`2` 表示前后各最多 2 条，以此类推。快照基于完整 transcript 一次性冻结，跨 batch、递归缩批、context-length recovery 和并发调度不变；该窗口与 concurrency、thinking、RAG 独立，并发 work unit 不共享 session 上下文
+- split 只切分当前已经翻译完成的完整双语 segment；旧 `context_before` / `context_after` request contract 和 `--split-context-window` 已有意移除。跨 segment 语义理解由首译稳定邻居上下文承担；迁移说明见 `MIGRATION.md`
 - `split_status` 明确记录分割缓存状态：`ok`=有效分割，`fallback`=AI 分割失败后整句回退且可重试，`unsplit`=低于阈值或合法保留整句；`split_reason` 是枚举原因码，`split_reason_detail` 是具体诊断文本
 - 默认 ASS 模板按 1080p 双语观看调校：`bi-zh` / `bg-bi-zh` 字号 68，`bi-en` / `bg-bi-en` 字号 44；默认 AI 分割阈值是源文超过 72 字符或 3.8 秒
 - 翻译、分割、校对的 user prompt 都是 JSON object，顶层包含 `items` array；glossary 和 description 的 user prompt 也是 JSON object；远端 LLM 必须只返回 JSON
@@ -205,6 +207,7 @@ ${TARGET_LANG_CODE}
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
 | `TRANSLATE_CONCURRENCY` | 首译并发请求数，默认 `1`；和 `PROOFREAD_CONCURRENCY`、thinking 完全独立 |
+| `TRANSLATE_CONTEXT_WINDOW` | 首译稳定邻居窗口，默认 `1`；`0` 关闭，正整数表示当前 segment 前后各最多多少条完整 transcript 邻居；与 concurrency、thinking、RAG 独立 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |

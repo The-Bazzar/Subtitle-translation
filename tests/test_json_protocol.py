@@ -1620,13 +1620,55 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
         by_id = {item["id"]: item for item, _session_id in requests}
-        self.assertEqual(by_id[1]["sentence_context"]["next"]["id"], 2)
+        self.assertEqual(by_id[1]["sentence_context"]["next"][0]["id"], 2)
         self.assertNotIn("previous", by_id[1]["sentence_context"])
-        self.assertEqual(by_id[2]["sentence_context"]["previous"]["id"], 1)
-        self.assertEqual(by_id[2]["sentence_context"]["next"]["id"], 3)
-        self.assertEqual(by_id[3]["sentence_context"]["previous"]["id"], 2)
+        self.assertEqual(by_id[2]["sentence_context"]["previous"][0]["id"], 1)
+        self.assertEqual(by_id[2]["sentence_context"]["next"][0]["id"], 3)
+        self.assertEqual(by_id[3]["sentence_context"]["previous"][0]["id"], 2)
         self.assertNotIn("next", by_id[3]["sentence_context"])
         self.assertEqual(len({session_id for _item, session_id in requests}), 3)
+
+    def test_translate_context_window_zero_one_and_two_use_full_transcript_snapshot(self):
+        def capture(window):
+            captured = {}
+
+            def fake_batch(request, _session, _quiet, **_kwargs):
+                for item in request.to_json_value()["items"]:
+                    captured[item["id"]] = item
+                return [
+                    {"id": item["id"], "zh": f"译文{item['id']}"}
+                    for item in request.to_json_value()["items"]
+                ]
+
+            transcript = t.Transcript(
+                path="video.json", language="en", segments=[
+                    t.TranscriptSegment(index, float(index - 1), float(index), f"Segment {index}")
+                    for index in range(1, 5)
+                ],
+            )
+            with patch.object(t, "llm_numbered_batch", side_effect=fake_batch):
+                t.translate_segments(
+                    transcript, self.ctx, FakeBatchLLM(1), "system", quiet=True,
+                    concurrency=2, context_window=window,
+                )
+            return captured
+
+        disabled = capture(0)
+        self.assertNotIn("sentence_context", disabled[2])
+
+        one = capture(1)
+        self.assertEqual([item["id"] for item in one[2]["sentence_context"]["previous"]], [1])
+        self.assertEqual([item["id"] for item in one[2]["sentence_context"]["next"]], [3])
+
+        two = capture(2)
+        self.assertEqual([item["id"] for item in two[1]["sentence_context"]["next"]], [2, 3])
+        self.assertEqual([item["id"] for item in two[2]["sentence_context"]["previous"]], [1])
+        self.assertEqual([item["id"] for item in two[2]["sentence_context"]["next"]], [3, 4])
+        self.assertEqual([item["id"] for item in two[4]["sentence_context"]["previous"]], [2, 3])
+
+        self.assertEqual(t.translate_context_window_from_env({}), 1)
+        self.assertEqual(t.translate_context_window_from_env({"TRANSLATE_CONTEXT_WINDOW": "0"}), 0)
+        self.assertEqual(t.translate_context_window_from_env({"TRANSLATE_CONTEXT_WINDOW": "2"}), 2)
 
     def test_translate_sentence_context_survives_recursive_batch_recovery(self):
         requests = []
@@ -1649,8 +1691,63 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertTrue(t.translate_segments(transcript, self.ctx, FakeBatchLLM(3), "system", quiet=True))
 
         recovered_middle = next(items[0] for items in requests if len(items) == 1 and items[0]["id"] == 2)
-        self.assertEqual(recovered_middle["sentence_context"]["previous"]["id"], 1)
-        self.assertEqual(recovered_middle["sentence_context"]["next"]["id"], 3)
+        self.assertEqual(recovered_middle["sentence_context"]["previous"][0]["id"], 1)
+        self.assertEqual(recovered_middle["sentence_context"]["next"][0]["id"], 3)
+
+    def test_real_chat_session_rolls_back_failed_batch_before_recursive_recovery(self):
+        calls = []
+
+        def respond(kwargs):
+            user_payloads = [
+                json.loads(message["content"])
+                for message in kwargs["messages"]
+                if message["role"] == "user"
+            ]
+            current_items = user_payloads[-1]["items"]
+            if len(current_items) > 1:
+                raise RuntimeError("maximum context length exceeded")
+            failed_id_set = {1, 2}
+            self.assertNotIn(
+                failed_id_set,
+                [{item["id"] for item in payload["items"]} for payload in user_payloads[:-1]],
+            )
+            item_id = current_items[0]["id"]
+            return FakeSDKResponse(
+                FakeSDKMessage(content=json.dumps({"items": [{"id": item_id, "zh": f"译文{item_id}"}]}))
+            )
+
+        llm = FakeChatLLM(calls=calls, responses=[respond] * 8)
+        llm.batch_size = 2
+        transcript = t.Transcript(
+            path="video.json", language="en", segments=[
+                t.TranscriptSegment(1, 0.0, 1.0, "First"),
+                t.TranscriptSegment(2, 1.0, 2.0, "Second"),
+            ],
+        )
+
+        self.assertTrue(t.translate_segments(transcript, self.ctx, llm, "system", quiet=True))
+        self.assertEqual([segment.translation for segment in transcript.segments], ["译文1", "译文2"])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(isinstance(call["messages"][0]["content"], str) for call in calls))
+
+    def test_translate_system_message_reaches_openai_compatible_client_as_string(self):
+        calls = []
+        llm = FakeChatLLM(
+            calls=calls,
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(content='{"items": [{"id": 1, "zh": "译文"}]}')
+                )
+            ],
+        )
+        llm.batch_size = 1
+        transcript = t.Transcript(
+            path="video.json", language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "Source")],
+        )
+
+        self.assertTrue(t.translate_segments(transcript, self.ctx, llm, "editable prompt", quiet=True))
+        self.assertIsInstance(calls[0]["messages"][0]["content"], str)
 
     def test_translate_concurrency_consumes_all_worker_failures(self):
         calls = []
