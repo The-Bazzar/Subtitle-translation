@@ -6370,6 +6370,69 @@ def proofread_split_events(
             relevant_term_evidence(event.en, evidence_sidecar)
             for event in batch_events
         ]
+
+        def apply_candidate_post_guards(
+            event: SplitEvent,
+            index: int,
+            new_en: str,
+            new_zh: str,
+            guarded_review: dict,
+            safety_events: list[str],
+        ) -> tuple[str, str, dict]:
+            """Apply the same deterministic post-gates to initial and retry candidates."""
+            if breaks_cross_event_sentence_boundary(
+                new_en,
+                event.zh,
+                new_zh,
+                sentence_contexts[item_offset + index],
+            ):
+                new_zh = event.zh
+                safety_events.append("cross_event_sentence_closure")
+            ui_target = apply_glossary_ui_translation(
+                new_en, new_zh, batch_contexts[index], ctx
+            )
+            if ui_target != new_zh:
+                _ui_source, new_zh, guarded_review = apply_proofread_safety_constraints(
+                    new_en,
+                    new_zh,
+                    new_en,
+                    ui_target,
+                    {
+                        "source_changed": False,
+                        "target_changed": True,
+                        "categories": ["terminology"],
+                        "reasons": ["deterministic glossary UI mapping"],
+                    },
+                    guarded_review,
+                    batch_term_context[index][0],
+                    batch_term_context[index][1],
+                    safety_mode=safety_mode_enabled,
+                    safety_events=safety_events,
+                    semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
+                )
+            unresolved_reasons = (
+                search_runtime.unresolved_reasons(item_offset + index + 1)
+                if search_runtime is not None
+                else []
+            )
+            if unresolved_reasons:
+                new_en = event.en
+                new_zh = event.zh
+                safety_events.append("unresolved_external_evidence")
+            guarded_review = add_unresolved_search_human_review(
+                guarded_review,
+                unresolved_reasons,
+            )
+            return (
+                new_en,
+                new_zh,
+                merge_retrieval_review_evidence(
+                    new_en,
+                    guarded_review,
+                    batch_contexts[index],
+                ),
+            )
+
         request = LLMBatchRequest(
             [
                 make_pair_item(
@@ -6515,50 +6578,13 @@ def proofread_split_events(
                 safety_events=safety_events,
                 semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
             )
-            if breaks_cross_event_sentence_boundary(
+            new_en, new_zh, normalized_review = apply_candidate_post_guards(
+                event,
+                index,
                 new_en,
-                event.zh,
                 new_zh,
-                sentence_contexts[item_offset + index],
-            ):
-                new_zh = event.zh
-                safety_events.append("cross_event_sentence_closure")
-            ui_target = apply_glossary_ui_translation(
-                new_en, new_zh, batch_contexts[index], ctx
-            )
-            if ui_target != new_zh:
-                _ui_source, new_zh, guarded_review = apply_proofread_safety_constraints(
-                    new_en,
-                    new_zh,
-                    new_en,
-                    ui_target,
-                    {
-                        "source_changed": False,
-                        "target_changed": True,
-                        "categories": ["terminology"],
-                        "reasons": ["deterministic glossary UI mapping"],
-                    },
-                    guarded_review,
-                    batch_term_context[index][0],
-                    batch_term_context[index][1],
-                    safety_mode=safety_mode_enabled,
-                    safety_events=safety_events,
-                    semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
-                )
-            if search_runtime is not None:
-                unresolved_reasons = search_runtime.unresolved_reasons(item_offset + index + 1)
-                if unresolved_reasons:
-                    new_en = event.en
-                    new_zh = event.zh
-                    safety_events.append("unresolved_external_evidence")
-                guarded_review = add_unresolved_search_human_review(
-                    guarded_review,
-                    unresolved_reasons,
-                )
-            normalized_review = merge_retrieval_review_evidence(
-                new_en,
                 guarded_review,
-                batch_contexts[index],
+                safety_events,
             )
             decision, diagnostic_reasons = proofread_decision_diagnostic(
                 event.en,
@@ -6614,13 +6640,13 @@ def proofread_split_events(
                         safety_mode=safety_mode_enabled, safety_events=retry_events,
                         semantic_anchor_enabled=supports_en_zh_semantic_anchor_gate(ctx),
                     )
-                    if breaks_cross_event_sentence_boundary(
-                        new_en, event.zh, new_zh, sentence_contexts[item_offset + index]
-                    ):
-                        new_zh = event.zh
-                        retry_events.append("cross_event_sentence_closure")
-                    normalized_review = merge_retrieval_review_evidence(
-                        new_en, guarded_review, batch_contexts[index]
+                    new_en, new_zh, normalized_review = apply_candidate_post_guards(
+                        event,
+                        index,
+                        new_en,
+                        new_zh,
+                        guarded_review,
+                        retry_events,
                     )
                     retry_decision, retry_reasons = proofread_decision_diagnostic(
                         event.en, event.zh,
