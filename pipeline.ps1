@@ -63,6 +63,45 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+function Invoke-TaskBell {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Success', 'Error')]
+        [string]$Kind
+    )
+
+    $tones = if ($Kind -eq 'Success') {
+        @(@(880, 120), @(1175, 180))
+    } else {
+        @(@(740, 180), @(440, 360))
+    }
+
+    try {
+        foreach ($tone in $tones) {
+            [Console]::Beep($tone[0], $tone[1])
+        }
+    } catch {
+    }
+}
+
+$script:PipelineNotificationActive = $false
+
+function Exit-Pipeline {
+    param([int]$Code)
+
+    if ($script:PipelineNotificationActive -and $env:PIPELINE_BATCH_CHILD -ne '1') {
+        if ($Code -ne 0) {
+            Invoke-TaskBell -Kind Error
+        } else {
+            Invoke-TaskBell -Kind Success
+        }
+    }
+    if ($env:PIPELINE_BATCH_CHILD -eq '1') {
+        Write-Output "__PIPELINE_BATCH_EXIT__=$Code"
+    }
+    exit $Code
+}
+
 $ScriptDir = Split-Path $PSCommandPath -Parent
 . "$PSScriptRoot\.env.ps1"
 
@@ -155,17 +194,13 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 "@
     exit 0
 }
+
 # ── 工具路径 ──────────────────────────────────────────────────────────────────
 
 $DownloadPs1  = Join-Path $ScriptDir "download.ps1"
 $WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
 $TranslatePy  = Join-Path $ScriptDir "translate_srt.py"
 $BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
-
-if (-not (Test-Path $PythonExe -PathType Leaf)) {
-    Write-Host "Error: Python venv not found. Run .\setup.ps1 first, or set PYTHON_PATH_WIN." -ForegroundColor Red
-    exit 1
-}
 
 # ── 启动信息 ──────────────────────────────────────────────────────────────────
 
@@ -191,6 +226,18 @@ if ($DryRun) {
     exit 0
 }
 
+$script:PipelineNotificationActive = $true
+
+trap {
+    Write-Error $_
+    Exit-Pipeline 1
+}
+
+if (-not (Test-Path $PythonExe -PathType Leaf)) {
+    Write-Host "Error: Python venv not found. Run .\setup.ps1 first, or set PYTHON_PATH_WIN." -ForegroundColor Red
+    Exit-Pipeline 1
+}
+
 # ── 步骤 1: 下载 ─────────────────────────────────────────────────────────────
 
 if ($SkipDownload) {
@@ -201,7 +248,7 @@ if ($SkipDownload) {
     $VideoPath = Read-Host "视频文件路径"
     if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
         Write-Host "Error: Video file not found: $VideoPath" -ForegroundColor Red
-        exit 1
+        Exit-Pipeline 1
     }
     $VideoPath = (Get-Item $VideoPath).FullName
     $RenderVideoPath = $VideoPath
@@ -221,11 +268,11 @@ if ($SkipDownload) {
     $DownloadExitCode = $LASTEXITCODE
     if ($DownloadExitCode -ne 0) {
         Write-Host "Error: Download step failed (exit code $DownloadExitCode)." -ForegroundColor Red
-        exit $DownloadExitCode
+        Exit-Pipeline $DownloadExitCode
     }
     if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
         Write-Host "Error: Failed to locate downloaded video." -ForegroundColor Red
-        exit 1
+        Exit-Pipeline 1
     }
     if (-not $RenderVideoPath -or -not (Test-Path $RenderVideoPath)) {
         $RenderVideoPath = $VideoPath
@@ -255,7 +302,7 @@ if ($SkipWhisper) {
     Write-Host ""
     Write-Host "Step 2/6: WhisperX" -ForegroundColor Cyan
     & $WhisperPs1 $VideoPath
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
 if ($ExistingAss) {
@@ -265,7 +312,7 @@ if ($ExistingAss) {
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
     $AssOutput = & $PythonExe $TranslatePy $JsonPath @LangArgs --print-output-path
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
     $AssPath = ($AssOutput | Where-Object { $_ -match '^OUTPUT_ASS=' } | Select-Object -Last 1) -replace '^OUTPUT_ASS=', ''
 }
 
@@ -283,7 +330,7 @@ if ($SkipBeautify) {
     Write-Host ""
     Write-Host "Step 3/6: Beautify JSON" -ForegroundColor Cyan
     & $PythonExe $TranslatePy $JsonPath --video $VideoPath --only-beautify
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
 # ── 步骤 4: 术语知识库 ──────────────────────────────────────────────────────
@@ -302,7 +349,7 @@ if ($SkipKnowledge) {
     Write-Host ""
     Write-Host "Step 4/6: Knowledge" -ForegroundColor Cyan
     & $PythonExe $TranslatePy $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
 # ── 步骤 5: 翻译 ──────────────────────────────────────────────────────────────
@@ -323,7 +370,7 @@ if ($SkipTranslate) {
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
     & $PythonExe $TranslatePy $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
 # ── 步骤 6: 硬压 ──────────────────────────────────────────────────────────────
@@ -340,12 +387,12 @@ if ($SkipBurn) {
     Write-Host "JSON:    $FinalJsonPath" -ForegroundColor Gray
     Write-Host "ASS:     $AssPath" -ForegroundColor Gray
     Write-Host "=============================================" -ForegroundColor Green
-    exit 0
+    Exit-Pipeline 0
 }
 
 if (-not (Test-Path $AssPath)) {
     Write-Host "Error: ASS not found, cannot burn: $AssPath" -ForegroundColor Red
-    exit 1
+    Exit-Pipeline 1
 }
 
 Write-Host ""
@@ -368,7 +415,7 @@ if ($FfmpegExtra.Count -gt 0) {
 }
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Error: Burn failed" -ForegroundColor Red
-    exit $LASTEXITCODE
+    Exit-Pipeline $LASTEXITCODE
 }
 
 Write-Host ""
@@ -380,5 +427,6 @@ if ($RenderVideoPath -and ($RenderVideoPath -ne $VideoPath)) {
 }
 Write-Host "ASS:     $AssPath" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Green
+Exit-Pipeline 0
 
 

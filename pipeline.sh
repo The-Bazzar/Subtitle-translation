@@ -38,6 +38,50 @@
 
 set -euo pipefail
 
+PIPELINE_NOTIFY_ACTIVE=1
+if [ $# -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    PIPELINE_NOTIFY_ACTIVE=0
+fi
+
+emit_terminal_bell() {
+    if [ -w /dev/tty ]; then
+        printf '\a' > /dev/tty 2>/dev/null || true
+    else
+        printf '\a' >&2 || true
+    fi
+}
+
+task_bell() {
+    local kind="$1"
+    local delays
+    if [ "$kind" = "success" ]; then
+        delays="0.08"
+    else
+        delays="0.18 0.18"
+    fi
+
+    emit_terminal_bell
+    for delay in $delays; do
+        sleep "$delay" 2>/dev/null || true
+        emit_terminal_bell
+    done
+}
+
+notify_pipeline_exit() {
+    local status=$?
+    trap - EXIT
+    if [ "$PIPELINE_NOTIFY_ACTIVE" = "1" ] && [ "${PIPELINE_BATCH_CHILD:-0}" != "1" ]; then
+        if [ "$status" -ne 0 ]; then
+            task_bell error
+        else
+            task_bell success
+        fi
+    fi
+    exit "$status"
+}
+
+trap notify_pipeline_exit EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_SCRIPT="$SCRIPT_DIR/download.sh"
 WHISPER_SCRIPT="$SCRIPT_DIR/whisper.sh"
@@ -113,6 +157,7 @@ BURN_RES="${BURN_RES:-}"
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
 show_help() {
+    PIPELINE_NOTIFY_ACTIVE=0
     cat << 'EOF'
 pipeline.sh — 一键流水线: 下载原片 + 编辑版 + WhisperX 字幕 + 时间码美化 + LLM 翻译 [+ 硬压]
 

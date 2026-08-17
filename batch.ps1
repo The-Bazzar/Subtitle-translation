@@ -31,6 +31,29 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+function Invoke-TaskBell {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Success', 'Error')]
+        [string]$Kind
+    )
+
+    $tones = if ($Kind -eq 'Success') {
+        @(@(880, 120), @(1175, 180))
+    } else {
+        @(@(740, 180), @(440, 360))
+    }
+
+    try {
+        foreach ($tone in $tones) {
+            [Console]::Beep($tone[0], $tone[1])
+        }
+    } catch {
+    }
+}
+
+$script:BatchNotificationActive = $false
+
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
 if ($Help -or ($Urls.Count -eq 0)) {
@@ -98,6 +121,17 @@ if ($DryRun) {
     exit 0
 }
 
+$script:BatchNotificationActive = $true
+$env:PIPELINE_BATCH_CHILD = '1'
+
+trap {
+    if ($script:BatchNotificationActive) {
+        Invoke-TaskBell -Kind Error
+    }
+    Write-Error $_
+    exit 1
+}
+
 # ── 并行执行 ──────────────────────────────────────────────────────────────────
 
 # 使用 RunspacePool 实现真正的并行 + 并发控制
@@ -151,8 +185,12 @@ while ($Jobs.Count -gt 0) {
     foreach ($job in $finished) {
         try {
             $result = $job.PS.EndInvoke($job.Handle)
-            $exitCode = 0
-            $output = if ($result) { $result -join "`n" } else { "" }
+            $resultLines = @($result | ForEach-Object { "$_" })
+            $exitMarker = $resultLines |
+                Where-Object { $_ -match '^__PIPELINE_BATCH_EXIT__=(-?\d+)$' } |
+                Select-Object -Last 1
+            $exitCode = if ($exitMarker) { [int]($exitMarker -replace '^__PIPELINE_BATCH_EXIT__=', '') } else { 1 }
+            $output = ($resultLines | Where-Object { $_ -notmatch '^__PIPELINE_BATCH_EXIT__=' }) -join "`n"
         } catch {
             $exitCode = 1
             $output = $_.Exception.Message
@@ -162,7 +200,13 @@ while ($Jobs.Count -gt 0) {
 
         $elapsed = [math]::Round(((Get-Date) - $job.Started).TotalMinutes, 1)
         $Completed++
-        if ($exitCode -eq 0) { $FailedCount = 0 } else { $FailedCount = 1; $Failed++ }
+        if ($exitCode -eq 0) {
+            $FailedCount = 0
+        } else {
+            $FailedCount = 1
+            $Failed++
+            Invoke-TaskBell -Kind Error
+        }
 
         $status = if ($exitCode -eq 0) { "OK" } else { "FAIL" }
         $color = if ($exitCode -eq 0) { "Green" } else { "Red" }
@@ -218,4 +262,7 @@ $Results | Select-Object @{N='#';E={$Results.IndexOf($_) + 1}}, Url, Status, Ela
 "`nTotal: $Total, Success: $($Total - $Failed), Failed: $Failed, Elapsed: ${TotalElapsed}min`n" |
     Add-Content -Path $Report -Encoding UTF8
 
+$NotificationKind = if ($Failed -gt 0) { 'Error' } else { 'Success' }
+Invoke-TaskBell -Kind $NotificationKind
+$script:BatchNotificationActive = $false
 exit ($Failed -gt 0 ? 1 : 0)

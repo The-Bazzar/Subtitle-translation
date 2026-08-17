@@ -11,8 +11,25 @@ batch.py — 批量字幕流水线 (Linux 并行)
 import argparse
 import os
 import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+
+def emit_task_bell(kind: str, stream=None) -> None:
+    """Emit a dependency-free terminal bell pattern without affecting task status."""
+    stream = stream if stream is not None else sys.stderr
+    delays = (0.08,) if kind == "success" else (0.18, 0.18)
+    try:
+        stream.write("\a")
+        stream.flush()
+        for delay in delays:
+            time.sleep(delay)
+            stream.write("\a")
+            stream.flush()
+    except (OSError, ValueError):
+        pass
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
@@ -62,7 +79,7 @@ Examples:
             if not args.burn:
                 cmd = f"BURN=0 {cmd}"
             print(f"[DRY RUN] {cmd}")
-        return
+        return 0
 
     # ── 并行执行 ──────────────────────────────────────────────────────────
     results = []
@@ -74,6 +91,7 @@ Examples:
         job_start = datetime.now()
 
         env = os.environ.copy()
+        env['PIPELINE_BATCH_CHILD'] = '1'
         if not args.burn:
             env['BURN'] = '0'
 
@@ -112,6 +130,7 @@ Examples:
             completed += 1
             if not result['ok']:
                 failed += 1
+                emit_task_bell("error")
 
             remaining = total - completed
             avg_min = (datetime.now() - start_time).total_seconds() / 60 / completed
@@ -156,6 +175,15 @@ Examples:
         f.write(f"Total: {total}, Success: {total - failed}, "
                 f"Failed: {failed}, Elapsed: {total_elapsed}min\n")
 
+    emit_task_bell("error" if failed else "success")
+    return 1 if failed else 0
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        emit_task_bell("error")
+        raise

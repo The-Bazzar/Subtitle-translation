@@ -53,6 +53,10 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --scene-threshold 0.12 --snap-frames 10
 ```
 
+### 完成通知
+
+`pipeline.ps1` / `pipeline.sh` 独立运行时，任务成功响成功铃，错误退出响错误铃。批处理中的 child pipeline 保持静默，由 `batch.ps1` / `batch.py` 在每个失败结果返回时各响一次错误铃，最后再按整体结果响一次；任一任务失败时批处理退出码为 `1`。帮助和 dry-run 不响铃。Linux/WSL 使用终端 BEL，是否有声音取决于终端的响铃设置。
+
 ## 主流程
 
 1. `download.ps1/.sh` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，然后把原片改名为 `<name>.original.<ext>`，并统一重编码出编辑用 `<name>.mkv`

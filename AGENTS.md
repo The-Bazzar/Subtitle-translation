@@ -71,6 +71,14 @@ winget install Microsoft.PowerShell
 
 流程与 Windows 对齐，使用 `download.sh`、`whisper.sh`、`translate_srt.py`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
 
+### Task Notifications
+
+- 独立运行 `pipeline.ps1` / `pipeline.sh` 时，成功响成功铃，错误退出响错误铃
+- batch 启动的 child pipeline 全部静默；batch runner 在每个失败结果返回时各响一次错误铃，覆盖正常失败、超时和启动异常
+- `batch.ps1` / `batch.py` 最终只按聚合结果再响一次；全部成功响成功铃，任一失败响错误铃并以退出码 `1` 结束
+- help 和 dry-run 路径保持静默；Linux/WSL 使用终端 BEL，是否可听取决于终端设置
+- `PIPELINE_BATCH_CHILD=1` 仅用于父子进程内部协调，不属于 `.env` 用户配置；PowerShell child 额外输出 `__PIPELINE_BATCH_EXIT__=<code>`，由 `batch.ps1` 消费以恢复 runspace 不直接暴露的退出码
+
 ### Output Chain
 
 ```text

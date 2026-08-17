@@ -8,7 +8,7 @@ Add distinct success and error sounds to the PowerShell and Linux/WSL pipeline a
 
 - `pipeline.ps1` and `pipeline.sh` notify after a real task finishes or exits with an error.
 - `batch.ps1` and `batch.py` notify once after the aggregate batch result is known.
-- A pipeline launched by a batch suppresses its success sound, but still emits its own error sound. Three failed child pipelines therefore produce three error sounds, followed by one aggregate batch error sound.
+- A pipeline launched by a batch suppresses its own sounds. The batch runner emits one error sound as each failed result arrives, including timeout and launch failures. Three failed child pipelines therefore produce three error sounds, followed by one aggregate batch error sound.
 - Help and dry-run paths do not notify.
 - Any batch containing a failed task exits nonzero.
 
@@ -20,14 +20,14 @@ Linux/WSL uses the terminal BEL character with different cadences because it is 
 
 ## Process Coordination
 
-Batch runners set the process-local `PIPELINE_BATCH_CHILD=1` marker for child pipelines. This marker is not a user configuration variable and is not read from `.env`.
+Batch runners set the process-local `PIPELINE_BATCH_CHILD=1` marker for child pipelines. This marker is not a user configuration variable and is not read from `.env`. PowerShell child pipelines also return an internal `__PIPELINE_BATCH_EXIT__=<code>` output marker because runspace `EndInvoke()` does not expose a script's `exit` code; `batch.ps1` consumes this marker before recording the aggregate result.
 
 Pipeline notification rules:
 
 | Invocation | Success | Error |
 |---|---|---|
 | Standalone pipeline | success sound | error sound |
-| Batch child pipeline | silent | error sound |
+| Batch child pipeline | silent | batch runner emits one error sound |
 
 Batch notification rules:
 
@@ -38,7 +38,7 @@ Batch notification rules:
 
 ## Error Handling
 
-Each script routes real task completion through one notification boundary. The boundary receives or observes the original exit code, attempts the appropriate sound, and preserves that code. PowerShell sound calls are wrapped so unsupported hosts cannot turn a successful task into a failure. Bash exit handling uses a single `EXIT` trap installed only after help and dry-run handling.
+Each script routes real task completion through one notification boundary. The boundary receives or observes the original exit code, attempts the appropriate sound, and preserves that code. PowerShell sound calls are wrapped so unsupported hosts cannot turn a successful task into a failure. Bash exit handling uses a single `EXIT` trap whose notification flag is disabled before configuration loading when help was requested.
 
 ## Testing
 
