@@ -1,10 +1,8 @@
 import importlib.util
 import io
 import pathlib
-import re
 import tempfile
-import unittest
-from unittest import mock
+from unittest import TestCase, main, mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,7 +20,7 @@ def load_batch_module():
     return module
 
 
-class TaskNotificationTests(unittest.TestCase):
+class TaskNotificationTests(TestCase):
     def test_pipeline_scripts_define_success_and_error_notifications(self):
         powershell = read_script("pipeline.ps1")
         bash = read_script("pipeline.sh")
@@ -153,4 +151,4 @@ class TaskNotificationTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()

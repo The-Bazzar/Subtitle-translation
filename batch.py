@@ -29,7 +29,7 @@ def emit_task_bell(kind: str, stream=None) -> None:
             stream.write("\a")
             stream.flush()
     except (OSError, ValueError):
-        pass
+        return
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
