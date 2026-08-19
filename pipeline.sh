@@ -2,7 +2,7 @@
 # =============================================================================
 # pipeline.sh — 一键流水线: 下载原片 + 编辑版 → JSON → 美化 → 术语库 → 翻译 → 硬压
 #
-# 串联 download.sh → whisper.sh → translate_srt.py → (ffmpeg-burn.sh)
+# 串联 download.sh → whisper.sh → translate_srt.sh → (ffmpeg-burn.sh)
 # 从 YouTube 链接直达双语 .<source>-<target>.ass 字幕 / burned.mkv 硬字幕。
 #
 # 成果物链:
@@ -85,7 +85,7 @@ trap notify_pipeline_exit EXIT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_SCRIPT="$SCRIPT_DIR/download.sh"
 WHISPER_SCRIPT="$SCRIPT_DIR/whisper.sh"
-TRANSLATE_SCRIPT="$SCRIPT_DIR/translate_srt.py"
+TRANSLATE_SCRIPT="$SCRIPT_DIR/translate_srt.sh"
 BURN_SCRIPT="$SCRIPT_DIR/ffmpeg-burn.sh"
 
 # ── 从 .env 读取默认配置 (环境变量优先, .env 次之) ────────────────────────────
@@ -131,12 +131,8 @@ if [ -z "$TRANSLATE_PROVIDER" ]; then
     exit 1
 fi
 
-if [ -n "${PYTHON_PATH_LINUX:-}" ]; then
-    PYTHON_BIN="$PYTHON_PATH_LINUX"
-elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
-    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
-else
-    echo "Error: Python venv not found. Run ./setup.sh first, or set PYTHON_PATH_LINUX." >&2
+if [ ! -f "$TRANSLATE_SCRIPT" ]; then
+    echo "Error: translate_srt.sh not found: $TRANSLATE_SCRIPT" >&2
     exit 1
 fi
 
@@ -338,7 +334,7 @@ if [ -n "${EXISTING_ASS:-}" ]; then
     ASS_PATH="$EXISTING_ASS"
 else
     ASS_PATH="$(
-        "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$JSON_PATH" "${LANG_ARGS[@]}" --print-output-path \
+        bash "$TRANSLATE_SCRIPT" "$JSON_PATH" "${LANG_ARGS[@]}" --print-output-path \
         | awk -F= '/^OUTPUT_ASS=/{print $2}' \
         | tail -n 1
     )"
@@ -366,7 +362,7 @@ else
         exit 1
     fi
 
-    "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$JSON_PATH" --video "$VIDEO_PATH" --only-beautify "${BEAUTIFY_ARGS[@]}"
+    bash "$TRANSLATE_SCRIPT" "$JSON_PATH" --video "$VIDEO_PATH" --only-beautify "${BEAUTIFY_ARGS[@]}"
     echo ""
 fi
 
@@ -393,7 +389,7 @@ else
     echo "pipeline — 步骤 4/6: AI Agent 生成术语知识库 → glossary.md"
     echo "============================================="
     echo ""
-    "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --only-glossary --skip-beautify
+    bash "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --only-glossary --skip-beautify
     echo ""
 fi
 
@@ -423,7 +419,7 @@ else
     if [ "${PROOFREAD:-1}" = "0" ]; then
         export PROOFREAD=0
     fi
-    "$PYTHON_BIN" "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --skip-beautify --skip-knowledge \
+    bash "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --skip-beautify --skip-knowledge \
         "${LANG_ARGS[@]}"
 
     echo ""

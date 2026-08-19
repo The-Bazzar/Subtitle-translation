@@ -15,6 +15,10 @@
 ├── download.sh
 ├── whisper.ps1
 ├── whisper.sh
+├── merge_ass.ps1
+├── merge_ass.sh
+├── translate_srt.ps1
+├── translate_srt.sh
 ├── translate_srt.py
 ├── ffmpeg-burn.ps1
 ├── ffmpeg-burn.sh
@@ -77,20 +81,30 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 ## translate_srt.py
 
-入口只接受 WhisperX JSON：
+入口只接受 WhisperX JSON。推荐使用项目包装器，不需要用户设置 PATH，也不要求从仓库目录运行：
 
 ```powershell
-.\.venv\Scripts\python.exe translate_srt.py video.json --video video.mp4
-.\.venv\Scripts\python.exe translate_srt.py video.json --video video.mp4 --only-beautify
-.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.mp4 --source-lang en --target-lang ja
-.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.mp4 -o custom.en-ja.ass
+& "<repo>\translate_srt.ps1" "video.json" --video "video.mp4"
+& "<repo>\translate_srt.ps1" "video.json" --video "video.mp4" --only-beautify
+& "<repo>\translate_srt.ps1" "video.beautified.json" --video "video.mp4" --source-lang en --target-lang ja
+& "<repo>\translate_srt.ps1" "video.beautified.json" --video "video.mp4" -o "custom.en-ja.ass"
 ```
 
 ```bash
-./.venv/bin/python translate_srt.py video.json --video video.mp4
-./.venv/bin/python translate_srt.py video.json --video video.mp4 --only-beautify
-./.venv/bin/python translate_srt.py video.beautified.json --video video.mp4 --source-lang en --target-lang ja
-./.venv/bin/python translate_srt.py video.beautified.json --video video.mp4 -o custom.en-ja.ass
+bash "<repo>/translate_srt.sh" "video.json" --video "video.mp4"
+bash "<repo>/translate_srt.sh" "video.json" --video "video.mp4" --only-beautify
+bash "<repo>/translate_srt.sh" "video.beautified.json" --video "video.mp4" --source-lang en --target-lang ja
+bash "<repo>/translate_srt.sh" "video.beautified.json" --video "video.mp4" -o "custom.en-ja.ass"
+```
+
+合并已校对的双语 ASS 时，同样使用项目包装器：
+
+```powershell
+& "<repo>\merge_ass.ps1" "video.zh.ass" "video.en.ass"
+```
+
+```bash
+bash "<repo>/merge_ass.sh" "video.zh.ass" "video.en.ass"
 ```
 
 输出：
@@ -191,7 +205,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 
 - `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
 - 不要把 Python 包安装到系统环境；Windows 运行 `.\setup.ps1`，Linux/WSL 运行 `./setup.sh`，它们会创建/更新仓库 `.venv`
-- 运行 pipeline 或任一 `.py` 相关脚本前必须先完成 setup；脚本统一使用项目 `.venv`，不调用全局 `python` / `python3`
+- 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；pipeline 和 `translate_srt.ps1/.sh`、`merge_ass.ps1/.sh` 统一使用项目 `.venv`，不调用全局 `python` / `python3`，也不要求用户设置 PATH。独立脚本可从任意工作目录通过包装器路径调用
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
 - `download.ps1/.sh` 会固定输出两条路径：`OUTPUT_VIDEO` 是编辑用 `<name>.mkv`，`OUTPUT_RENDER_VIDEO` 是保留给最终压制的 `<name>.original.<ext>`；若目录中已有 `<name>.original.mkv`，脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`，然后直接进入重编码。编辑版优先使用 `h264_nvenc` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264`，并统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建音频时间轴。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。

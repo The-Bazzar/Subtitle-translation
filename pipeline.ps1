@@ -148,11 +148,6 @@ if (-not $PSBoundParameters.ContainsKey('TargetLang')) {
     $TargetLang = Merge-EnvDefault 'TARGET_LANG' '' 'zh'
 }
 
-$PythonExe = Get-EnvValue 'PYTHON_PATH_WIN' ''
-if (-not $PythonExe) {
-    $PythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
-}
-
 # ── 帮助 ──────────────────────────────────────────────────────────────────────
 
 if ($Help -or (-not $Url)) {
@@ -199,7 +194,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
 $DownloadPs1  = Join-Path $ScriptDir "download.ps1"
 $WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
-$TranslatePy  = Join-Path $ScriptDir "translate_srt.py"
+$TranslatePs1 = Join-Path $ScriptDir "translate_srt.ps1"
 $BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
 
 # ── 启动信息 ──────────────────────────────────────────────────────────────────
@@ -230,11 +225,6 @@ $script:PipelineNotificationActive = $true
 
 trap {
     Write-Error $_
-    Exit-Pipeline 1
-}
-
-if (-not (Test-Path $PythonExe -PathType Leaf)) {
-    Write-Host "Error: Python venv not found. Run .\setup.ps1 first, or set PYTHON_PATH_WIN." -ForegroundColor Red
     Exit-Pipeline 1
 }
 
@@ -311,7 +301,7 @@ if ($ExistingAss) {
     $LangArgs = @()
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
-    $AssOutput = & $PythonExe $TranslatePy $JsonPath @LangArgs --print-output-path
+    $AssOutput = & $TranslatePs1 $JsonPath @LangArgs --print-output-path
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
     $AssPath = ($AssOutput | Where-Object { $_ -match '^OUTPUT_ASS=' } | Select-Object -Last 1) -replace '^OUTPUT_ASS=', ''
 }
@@ -329,7 +319,7 @@ if ($SkipBeautify) {
 } else {
     Write-Host ""
     Write-Host "Step 3/6: Beautify JSON" -ForegroundColor Cyan
-    & $PythonExe $TranslatePy $JsonPath --video $VideoPath --only-beautify
+    & $TranslatePs1 $JsonPath --video $VideoPath --only-beautify
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
@@ -348,7 +338,7 @@ if ($SkipKnowledge) {
 } else {
     Write-Host ""
     Write-Host "Step 4/6: Knowledge" -ForegroundColor Cyan
-    & $PythonExe $TranslatePy $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
+    & $TranslatePs1 $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
@@ -369,7 +359,7 @@ if ($SkipTranslate) {
     $LangArgs = @()
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
-    & $PythonExe $TranslatePy $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
+    & $TranslatePs1 $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 

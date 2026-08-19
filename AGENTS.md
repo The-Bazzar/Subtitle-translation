@@ -19,12 +19,16 @@ winget install Microsoft.PowerShell
 所有运行脚本位于仓库根目录：
 
 ```text
-├── pipeline.ps1              # Windows: download -> whisper -> translate_srt.py -> ffmpeg-burn
+├── pipeline.ps1              # Windows: download -> whisper -> translate_srt.ps1 -> ffmpeg-burn
 ├── pipeline.sh               # Linux/WSL: 同流程
 ├── download.ps1              # Windows: yt-dlp 下载视频和元数据
 ├── download.sh               # Linux/WSL: yt-dlp 下载视频和元数据
 ├── whisper.ps1               # Windows: WhisperX 生成词级 JSON
 ├── whisper.sh                # Linux/WSL: WhisperX 生成词级 JSON
+├── merge_ass.ps1             # Windows: 项目虚拟环境包装器
+├── merge_ass.sh              # Linux/WSL: 项目虚拟环境包装器
+├── translate_srt.ps1         # Windows: 项目虚拟环境包装器
+├── translate_srt.sh           # Linux/WSL: 项目虚拟环境包装器
 ├── translate_srt.py          # JSON 美化 + glossary + 翻译/分割/校对 + SRT/ASS 导出
 ├── ffmpeg-burn.ps1           # Windows: ffmpeg ASS 硬压
 ├── ffmpeg-burn.sh            # Linux/WSL: ffmpeg ASS 硬压
@@ -69,7 +73,7 @@ winget install Microsoft.PowerShell
 
 ### Linux/WSL `pipeline.sh`
 
-流程与 Windows 对齐，使用 `download.sh`、`whisper.sh`、`translate_srt.py`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
+流程与 Windows 对齐，使用 `download.sh`、`whisper.sh`、`translate_srt.sh`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
 
 ### Task Notifications
 
@@ -255,18 +259,18 @@ TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 ```powershell
 .\download.ps1 "URL"
 .\whisper.ps1 "video.mp4"
-.\.venv\Scripts\python.exe translate_srt.py video.json --video video.mp4 --only-beautify
-.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.mp4 --only-glossary --skip-beautify
-.\.venv\Scripts\python.exe translate_srt.py video.beautified.json --video video.mp4 --source-lang en --target-lang zh
+& "<repo>\translate_srt.ps1" video.json --video video.mp4 --only-beautify
+& "<repo>\translate_srt.ps1" video.beautified.json --video video.mp4 --only-glossary --skip-beautify
+& "<repo>\translate_srt.ps1" video.beautified.json --video video.mp4 --source-lang en --target-lang zh
 .\ffmpeg-burn.ps1 "video.original.webm" -SubFile "video.en-zh.ass"
 ```
 
 ```bash
 ./download.sh "URL"
 ./whisper.sh "video.mp4"
-./.venv/bin/python translate_srt.py video.json --video video.mp4 --only-beautify
-./.venv/bin/python translate_srt.py video.beautified.json --video video.mp4 --only-glossary --skip-beautify
-./.venv/bin/python translate_srt.py video.beautified.json --video video.mp4 --source-lang en --target-lang zh
+bash "<repo>/translate_srt.sh" video.json --video video.mp4 --only-beautify
+bash "<repo>/translate_srt.sh" video.beautified.json --video video.mp4 --only-glossary --skip-beautify
+bash "<repo>/translate_srt.sh" video.beautified.json --video video.mp4 --source-lang en --target-lang zh
 ./ffmpeg-burn.sh "video.original.webm" --sub-file "video.en-zh.ass"
 ```
 
@@ -290,6 +294,7 @@ TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 
 - 更新文档时以实际脚本参数和文件名为准，不保留历史 SRT 流程
 - 保持 PowerShell 和 bash 入口行为对齐
+- 独立调用 Python 功能时使用 `translate_srt.ps1/.sh` 或 `merge_ass.ps1/.sh` 包装器；包装器从自身目录定位 `.venv`，不要求用户设置系统 PATH，也不依赖当前工作目录
 - 不要提交 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 或生成产物
 - 不要回退用户本地数据或未请求的工作区改动
 - `README.md` 面向用户快速使用；`AGENTS.md` 面向维护和自动化代理；`.agents/skills/*` 面向分步骤执行
