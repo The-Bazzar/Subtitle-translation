@@ -22,7 +22,7 @@
 ./batch.sh "URL1" "URL2"
 ```
 
-当前 stage-aware batch 执行 `download -> prepare-video -> mono 16kHz WAV -> ASR -> alignment -> beautify -> glossary -> translate`。每次原子写 ASR recovery sidecar 都生成唯一 UUID generation；缺少/非法 generation 的未发布旧格式会安全视为 cache miss。所有 sidecar 写与 alignment commit 使用持久 `<base>.asr.lock` 跨进程互斥；parent 持锁 dispatch，child 只写 generation candidate，parent 持锁校验，并通过 per-task commit state 的 non-blocking cancel arbitration 线性化取消与 promote/delete：cancel-wins 保留 sidecar，commit-wins 完成 owned sidecar 删除并继续 postprocess。重复取消不会打断已经开始的 commit 或 abort cleanup，`worker_released` 只在 transaction/request thread 和 worker cleanup 全部结束后设置。并发新 writer 会在旧 commit 后写入并保留；失败或 cancel-wins 只清自己的 candidate。lock 文件是已忽略、最多 1 byte 的协调 artifact，不是字幕/cache，也不应在活跃任务间删除。`--translate-provider` / `--translate-model` 已用于 postprocess；burn 仍等待 Task 6 接入，`-B/--burn` 与 `--skip-burn` 目前只保留配置，启动信息会明确显示未调度。
+当前 stage-aware batch 执行 `download -> prepare-video -> mono 16kHz WAV -> ASR -> alignment -> beautify -> glossary -> translate -> burn`。每次原子写 ASR recovery sidecar 都生成唯一 UUID generation；缺少/非法 generation 的未发布旧格式会安全视为 cache miss。所有 sidecar 写与 alignment commit 使用持久 `<base>.asr.lock` 跨进程互斥；parent 持锁 dispatch，child 只写 generation candidate，parent 持锁校验，并通过 per-task commit state 的 non-blocking cancel arbitration 线性化取消与 promote/delete：cancel-wins 保留 sidecar，commit-wins 完成 owned sidecar 删除并继续 postprocess。`worker_released` 只在 transaction/request thread 和 worker cleanup 全部结束后设置，所有 burn 必须等待该 event，之后最多 4 路动态执行；`--skip-burn` 仍可让任务在 `translated` 结束。worker crash 不重启，已 alignment 的任务继续收尾，其余 worker-dependent task 被阻断，并在 invocation cwd 写时间戳故障日志。外部命令改为带 task/stage 前缀的实时行日志；第一次 `Ctrl+C` 停止推进但等待当前命令，第二次强制清理子进程树并返回 `130`。
 
 ## Split Download and Edit Preparation
 

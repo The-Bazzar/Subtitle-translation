@@ -415,6 +415,20 @@ class WorkerProtocolTests(unittest.TestCase):
             "load_asr transcribe unload_asr load_align align unload_align shutdown".split(),
         )
 
+    def test_normal_close_removes_worker_capture_files(self):
+        controller = self.controller()
+        controller.start()
+        try:
+            stdout_path, stderr_path = controller.capture_paths
+            self.assertTrue(stdout_path.is_file())
+            self.assertTrue(stderr_path.is_file())
+            controller.shutdown()
+        finally:
+            controller.close()
+
+        self.assertFalse(stdout_path.exists())
+        self.assertFalse(stderr_path.exists())
+
     def test_default_worker_config_matches_standalone_cpu_defaults(self):
         config = AsrWorkerConfig()
 

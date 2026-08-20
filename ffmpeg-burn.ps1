@@ -276,6 +276,7 @@ if ($ExitCode -eq 0) {
     Write-Host "硬字幕压制完成!" -ForegroundColor Green
     Write-Host "输出: $OutputAbs" -ForegroundColor Green
     Write-Host "=============================================" -ForegroundColor Green
+    Write-Output "OUTPUT_BURNED_VIDEO=$OutputAbs"
 } else {
     Write-Host ""
     Write-Host "Error: ffmpeg encoding failed (exit code: $ExitCode)" -ForegroundColor Red
