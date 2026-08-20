@@ -89,15 +89,12 @@ $script:PipelineNotificationActive = $false
 function Exit-Pipeline {
     param([int]$Code)
 
-    if ($script:PipelineNotificationActive -and $env:PIPELINE_BATCH_CHILD -ne '1') {
+    if ($script:PipelineNotificationActive) {
         if ($Code -ne 0) {
             Invoke-TaskBell -Kind Error
         } else {
             Invoke-TaskBell -Kind Success
         }
-    }
-    if ($env:PIPELINE_BATCH_CHILD -eq '1') {
-        Write-Output "__PIPELINE_BATCH_EXIT__=$Code"
     }
     exit $Code
 }

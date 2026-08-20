@@ -38,8 +38,10 @@ winget install Microsoft.PowerShell
 ├── ffmpeg-burn.sh            # Linux/WSL: ffmpeg ASS 硬压
 ├── mpv-burn.ps1              # Windows: mpv 硬压备选
 ├── mpv-burn.sh               # Linux/WSL: mpv 硬压备选
-├── batch.ps1                 # Windows: 多 URL 批处理
-├── batch.py                  # Linux/WSL: 多 URL 批处理
+├── batch.ps1                 # Windows: batch.py 参数透传包装器
+├── batch.sh                  # Linux/WSL: batch.py 参数透传包装器
+├── batch.py                  # stage-aware batch CLI 与平台 runner
+├── batch_scheduler.py        # 任务状态、资源容量与 acquisition scheduler
 ├── setup.ps1                 # Windows: 安装依赖
 ├── setup.sh                  # Linux/WSL: 安装依赖
 ├── .env.ps1                  # PowerShell 读取 .env 的共享模块
@@ -81,13 +83,23 @@ winget install Microsoft.PowerShell
 
 流程与 Windows 对齐，使用 `download.sh`、`prepare-video.sh`、`whisper.sh`、`translate_srt.sh`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
 
+### Stage-aware Batch Acquisition
+
+- `batch.ps1` / `batch.sh` 只负责把参数透传给 `py_launcher.ps1/.sh` 的 `batch` target；跨平台调度逻辑统一位于 `batch.py` / `batch_scheduler.py`
+- CPU/IO capacity 自动设为 `max(1, (os.cpu_count() or 1) // 4)`，用于 download 和 WAV 提取；prepare 使用固定 `4` 路 NVENC capacity
+- 不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，启动时打印自动检测出的 CPU/IO 和 NVENC capacity
+- acquisition 按任务流水执行 `download -> prepare-video -> extract-audio`；任务完成 download 后可立即等待 prepare，完成 prepare 后可立即提取 mono 16kHz WAV
+- 本阶段成功终态为 `wav_ready`，不会加载 Whisper；后续 ASR、alignment、translate 和 burn 由后续 scheduler 任务接入
+- CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；当前未执行的 burn/provider/model 值保存在阶段环境中，不启动对应阶段
+- `batch.py` 直接读取项目 `.env`，优先级为显式 CLI / 进程环境 > `.env` > 硬编码默认；`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`
+- 任一任务失败只终止该任务的后续 acquisition 阶段，其他任务继续；存在失败时聚合退出码为 `1`
+
 ### Task Notifications
 
 - 独立运行 `pipeline.ps1` / `pipeline.sh` 时，成功响成功铃，错误退出响错误铃
-- batch 启动的 child pipeline 全部静默；batch runner 在每个失败结果返回时各响一次错误铃，覆盖正常失败、超时和启动异常
-- `batch.ps1` / `batch.py` 最终只按聚合结果再响一次；全部成功响成功铃，任一失败响错误铃并以退出码 `1` 结束
+- stage-aware batch 直接运行阶段 runner，不使用 pipeline 内部静默或退出码 marker 协议；每个进入失败终态的任务各响一次错误铃
+- `batch.py` 在全部任务终态后按聚合结果再响一次；全部成功响成功铃，任一失败响错误铃并以退出码 `1` 结束
 - help 和 dry-run 路径保持静默；Linux/WSL 使用终端 BEL，是否可听取决于终端设置
-- `PIPELINE_BATCH_CHILD=1` 仅用于父子进程内部协调，不属于 `.env` 用户配置；PowerShell child 额外输出 `__PIPELINE_BATCH_EXIT__=<code>`，由 `batch.ps1` 消费以恢复 runspace 不直接暴露的退出码
 
 ### Output Chain
 
@@ -257,6 +269,7 @@ glossary tool 阶段会强制移除 provider `request_kwargs.response_format` �
 .\pipeline.ps1 "https://youtu.be/xxxxx" -SourceLang en -TargetLang ja -SkipBurn
 .\pipeline.ps1 "https://youtu.be/xxxxx" -ExistingAss "path\to\video.en-zh.ass"
 .\batch.ps1 "URL1" "URL2"
+.\batch.ps1 --dry-run --report "batch-result.txt" "URL1" "URL2"
 ```
 
 ### Linux / WSL
@@ -265,7 +278,8 @@ glossary tool 阶段会强制移除 provider `request_kwargs.response_format` �
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 ./pipeline.sh "URL" -- --scene-threshold 0.12 --snap-frames 10
-./.venv/bin/python batch.py "URL1" "URL2"
+./batch.sh "URL1" "URL2"
+./batch.sh --skip-burn --translate-provider deepseek "URL1" "URL2"
 ```
 
 ### Manual Steps
@@ -316,7 +330,7 @@ video_base="${edit_video%.*}"
 
 - 更新文档时以实际脚本参数和文件名为准，不保留历史 SRT 流程
 - 保持 PowerShell 和 bash 入口行为对齐
-- 独立调用 Python 功能时使用 `translate_srt.ps1/.sh` 或 `merge_ass.ps1/.sh` 包装器；它们委托给 `py_launcher.ps1/.sh`，共享启动器只允许 `translate_srt`、`merge_ass`、`batch`，并从自身目录定位 `.venv`，不要求用户设置系统 PATH，也不依赖当前工作目录
+- 独立调用 Python 功能时使用 `translate_srt.ps1/.sh`、`merge_ass.ps1/.sh` 或 `batch.ps1/.sh` 包装器；它们委托给 `py_launcher.ps1/.sh`，共享启动器只允许 `translate_srt`、`merge_ass`、`batch`，并从自身目录定位 `.venv`，不要求用户设置系统 PATH，也不依赖当前工作目录
 - 不要提交 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 或生成产物
 - 不要回退用户本地数据或未请求的工作区改动
 - `README.md` 面向用户快速使用；`AGENTS.md` 面向维护和自动化代理；`.agents/skills/*` 面向分步骤执行

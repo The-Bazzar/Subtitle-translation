@@ -28,6 +28,10 @@
 ├── ffmpeg-burn.sh
 ├── mpv-burn.ps1
 ├── mpv-burn.sh
+├── batch.ps1
+├── batch.sh
+├── batch.py
+├── batch_scheduler.py
 ├── setup.ps1
 ├── setup.sh
 ├── .env.ps1
@@ -62,9 +66,25 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --scene-threshold 0.12 --snap-frames 10
 ```
 
+### Stage-aware 批处理
+
+```powershell
+.\batch.ps1 "URL1" "URL2"
+.\batch.ps1 --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
+.\batch.ps1 --dry-run --report "batch-result.txt" "URL1" "URL2"
+```
+
+```bash
+./batch.sh "URL1" "URL2"
+./batch.sh --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
+./batch.sh --dry-run --report batch-result.txt "URL1" "URL2"
+```
+
+`batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，实际调度由 `batch.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 的 NVENC 槽位固定为 `4`，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。当前 stage-aware 入口执行 `download -> prepare-video -> mono 16kHz WAV` 后停止，不加载 Whisper；`--skip-burn`、`--translate-provider`、`--translate-model` 仍会保留到阶段配置中，供后续 scheduler 阶段使用。
+
 ### 完成通知
 
-`pipeline.ps1` / `pipeline.sh` 独立运行时，任务成功响成功铃，错误退出响错误铃。批处理中的 child pipeline 保持静默，由 `batch.ps1` / `batch.py` 在每个失败结果返回时各响一次错误铃，最后再按整体结果响一次；任一任务失败时批处理退出码为 `1`。帮助和 dry-run 不响铃。Linux/WSL 使用终端 BEL，是否有声音取决于终端的响铃设置。
+`pipeline.ps1` / `pipeline.sh` 独立运行时，任务成功响成功铃，错误退出响错误铃。stage-aware batch 直接运行阶段 runner，不再使用整条 pipeline 的内部静默协议；每个最终失败任务响一次错误铃，全部任务终态后再按聚合结果响一次，任一失败时退出码为 `1`。帮助和 dry-run 不响铃。Linux/WSL 使用终端 BEL，是否有声音取决于终端的响铃设置。
 
 ## 主流程
 
@@ -211,7 +231,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 
 - `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
 - 不要把 Python 包安装到系统环境；Windows 运行 `.\setup.ps1`，Linux/WSL 运行 `./setup.sh`，它们会创建/更新仓库 `.venv`
-- 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；`py_launcher.ps1/.sh` 只允许启动 `translate_srt`、`merge_ass`、`batch`，并统一使用项目 `.venv`。`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh` 是其薄包装器，不调用全局 `python` / `python3`，也不要求用户设置 PATH，可从任意工作目录调用
+- 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；`py_launcher.ps1/.sh` 只允许启动 `translate_srt`、`merge_ass`、`batch`，并统一使用项目 `.venv`。`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh`、`batch.ps1/.sh` 是其薄包装器，不调用全局 `python` / `python3`，也不要求用户设置 PATH，可从任意工作目录调用
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
 - [Issue #12](https://github.com/The-Bazzar/Subtitle-translation/issues/12) 起，`download.ps1/.sh` 只输出 `OUTPUT_RENDER_VIDEO=<name>.original.<ext>`，不再生成编辑版。直接调用 download 的用户必须按 [MIGRATION.md](MIGRATION.md) 把该路径传给 `prepare-video.ps1/.sh`；prepare 成功后只输出 `OUTPUT_VIDEO=<name>.mkv`。若目录中已有 `<name>.original.mkv`，download 只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`。

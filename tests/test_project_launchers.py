@@ -136,6 +136,7 @@ class PowerShellLauncherBehaviorTests(LauncherBehaviorMixin, unittest.TestCase):
     wrappers = (
         ("translate_srt.ps1", "translate_srt.py"),
         ("merge_ass.ps1", "merge_ass.py"),
+        ("batch.ps1", "batch.py"),
     )
 
     def run_script(self, script_name, *script_args, exit_code=0):
@@ -168,6 +169,7 @@ class BashLauncherBehaviorTests(LauncherBehaviorMixin, unittest.TestCase):
     wrappers = (
         ("translate_srt.sh", "translate_srt.py"),
         ("merge_ass.sh", "merge_ass.py"),
+        ("batch.sh", "batch.py"),
     )
 
     @classmethod

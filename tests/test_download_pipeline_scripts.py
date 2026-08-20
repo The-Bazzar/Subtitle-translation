@@ -323,8 +323,6 @@ function Invoke-FakeFfmpeg {
             encoding="utf-8",
         )
         shutil.copy2(ROOT / ".env.ps1", self.sandbox / ".env.ps1")
-        env = os.environ.copy()
-        env["PIPELINE_BATCH_CHILD"] = "1"
         result = subprocess.run(
             [
                 PWSH,
@@ -336,7 +334,6 @@ function Invoke-FakeFfmpeg {
                 "-SkipBurn",
             ],
             cwd=self.work_dir,
-            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -562,15 +559,9 @@ exit {exit_code}
         self.write_env()
         with (self.sandbox / ".env").open("a", encoding="utf-8", newline="\n") as env_file:
             env_file.write("TRANSLATE_PROVIDER=fake\n")
-        env = os.environ.copy()
-        env["PIPELINE_BATCH_CHILD"] = "1"
-        if os.name == "nt" and BASH and "system32" in BASH.lower():
-            inherited = env.get("WSLENV", "")
-            env["WSLENV"] = f"{inherited}:PIPELINE_BATCH_CHILD" if inherited else "PIPELINE_BATCH_CHILD"
         result = self.run_bash_script(
             self.sandbox / "pipeline.sh",
             "https://example.invalid/video",
-            env=env,
         )
         return result, downstream_sentinel
 

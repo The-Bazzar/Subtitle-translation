@@ -1,5 +1,12 @@
 # Task Completion Bells Design
 
+> **Superseded:** This document records the original notification design. The
+> current batch architecture is defined by
+> [Batch Resource Scheduler Design](2026-08-20-batch-resource-scheduler-design.md).
+> Stage-aware batch scheduling no longer launches whole pipelines, so the
+> historical `PIPELINE_BATCH_CHILD` / `__PIPELINE_BATCH_EXIT__` child protocol
+> described below is retired and must not be treated as current behavior.
+
 ## Goal
 
 Add distinct success and error sounds to the PowerShell and Linux/WSL pipeline and batch entry points without adding runtime dependencies.
