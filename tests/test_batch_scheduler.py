@@ -1,20 +1,27 @@
 import asyncio
 import contextlib
 import io
+import json
+import multiprocessing
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from datetime import datetime
 from unittest import mock
 
+import batch_scheduler
 from batch import (
     _run_stage_command,
     build_parser,
     build_stage_environment,
+    create_platform_postprocess_runner,
     create_platform_runners,
     run_acquisition,
+    write_report,
 )
 from batch_cache import build_asr_fingerprint, read_valid_asr_cache, write_asr_cache
 from batch_scheduler import (
@@ -33,10 +40,25 @@ from whisper_worker import (
     WorkerResult,
     WorkerUnresponsiveError,
     resolve_source_language,
+    write_aligned_candidate_json,
 )
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def write_asr_cache_process_target(
+    edit_video_path,
+    fingerprint,
+    result,
+    started,
+    finished,
+):
+    started.set()
+    try:
+        write_asr_cache(edit_video_path, fingerprint, result)
+    finally:
+        finished.set()
 
 
 class StageCommandCancellationTests(unittest.IsolatedAsyncioTestCase):
@@ -392,6 +414,59 @@ class AcquisitionSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(peak, 4)
 
+    async def test_acquisition_cancellation_sets_release_without_spawning_worker(self):
+        for canceled_stage in ("download", "prepare", "extract_audio"):
+            with self.subTest(canceled_stage=canceled_stage):
+                root = pathlib.Path(self.output_dir.name)
+                render_video = root / f"{canceled_stage}.original.mkv"
+                edit_video = root / f"{canceled_stage}.mkv"
+                wav_path = root / f"{canceled_stage}.wav"
+                render_video.write_bytes(b"original")
+                edit_video.write_bytes(b"edit")
+                wav_path.write_bytes(b"wav")
+                started = asyncio.Event()
+                blocker = asyncio.Event()
+                worker_factory = mock.Mock(
+                    side_effect=AssertionError("worker must not be spawned")
+                )
+
+                async def stage(name, result):
+                    if name == canceled_stage:
+                        started.set()
+                        await blocker.wait()
+                    return result
+
+                async def download(_url):
+                    return await stage("download", render_video)
+
+                async def prepare(_render_video):
+                    return await stage("prepare", edit_video)
+
+                async def extract_audio(_edit_video):
+                    return await stage("extract_audio", wav_path)
+
+                scheduler = AcquisitionScheduler(
+                    urls=["url-1", "url-2"],
+                    limits=ResourceLimits(cpu_io=1),
+                    runners=AcquisitionRunners(download, prepare, extract_audio),
+                    asr_config=AsrWorkerConfig(),
+                    worker_factory=worker_factory,
+                    postprocess_runner=mock.AsyncMock(),
+                )
+                run_task = asyncio.create_task(scheduler.run())
+                await asyncio.wait_for(started.wait(), 1.0)
+                run_task.cancel()
+
+                with self.assertRaises(asyncio.CancelledError):
+                    await run_task
+
+                self.assertTrue(scheduler.worker_released.is_set())
+                self.assertTrue(
+                    all(task.state is TaskState.CANCELED for task in scheduler.tasks)
+                )
+                self.assertIsNone(scheduler._worker)
+                worker_factory.assert_not_called()
+
 
 class FakeAsrController:
     def __init__(
@@ -403,6 +478,17 @@ class FakeAsrController:
         crash_name="",
         crash_on_unload=False,
         hang_on_shutdown=False,
+        fail_align_name="",
+        crash_align_name="",
+        invalid_align_name="",
+        block_align_name="",
+        align_started=None,
+        align_release=None,
+        align_finished=None,
+        abort_error=None,
+        close_error=None,
+        before_align=None,
+        after_align=None,
     ):
         self.config = config
         self.calls = calls
@@ -410,14 +496,33 @@ class FakeAsrController:
         self.crash_name = crash_name
         self.crash_on_unload = crash_on_unload
         self.hang_on_shutdown = hang_on_shutdown
+        self.fail_align_name = fail_align_name
+        self.crash_align_name = crash_align_name
+        self.invalid_align_name = invalid_align_name
+        self.block_align_name = block_align_name
+        self.align_started = align_started
+        self.align_release = align_release
+        self.align_finished = align_finished
+        self.abort_error = abort_error
+        self.close_error = close_error
+        self.before_align = before_align
+        self.after_align = after_align
         self.is_alive = False
+        self.alignment_language = ""
 
-    def __enter__(self):
+    def start(self):
         self.calls.append(("worker_start",))
         self.is_alive = True
+
+    def __enter__(self):
+        self.start()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        self.close()
+
+    def shutdown(self):
         self.calls.append(("worker_shutdown",))
         self.is_alive = False
         if self.hang_on_shutdown:
@@ -426,6 +531,20 @@ class FakeAsrController:
                 "operation timeout exceeded",
                 0.1,
             )
+        return WorkerResult(command=WorkerCommand.SHUTDOWN, ok=True)
+
+    def close(self):
+        self.is_alive = False
+        if self.close_error is not None:
+            raise self.close_error
+
+    def abort(self):
+        self.calls.append(("worker_abort",))
+        self.is_alive = False
+        if self.align_release is not None:
+            self.align_release.set()
+        if self.abort_error is not None:
+            raise self.abort_error
 
     def load_asr(self):
         self.calls.append(("load_asr",))
@@ -479,6 +598,92 @@ class FakeAsrController:
             raise WorkerExitedError(19, WorkerCommand.UNLOAD_ASR)
         return WorkerResult(command=WorkerCommand.UNLOAD_ASR, ok=True)
 
+    def load_align(self, language):
+        self.calls.append(("load_align", language, self.config.align_model or "auto"))
+        self.alignment_language = language
+        return WorkerResult(
+            command=WorkerCommand.LOAD_ALIGN,
+            ok=True,
+            language=language,
+        )
+
+    def align(self, sidecar_path, generation, candidate_path=None):
+        sidecar_path = pathlib.Path(sidecar_path).resolve()
+        candidate_path = pathlib.Path(candidate_path).resolve()
+        self.calls.append(("align", sidecar_path.name, self.alignment_language))
+        if sidecar_path.name == self.block_align_name:
+            try:
+                if self.align_started is not None:
+                    self.align_started.set()
+                if self.align_release is None or not self.align_release.wait(2.0):
+                    raise AssertionError("blocked ALIGN was not released")
+            finally:
+                if self.align_finished is not None:
+                    self.align_finished.set()
+        if self.before_align is not None:
+            self.before_align(sidecar_path)
+        if sidecar_path.name == self.crash_align_name:
+            self.is_alive = False
+            raise WorkerExitedError(29, WorkerCommand.ALIGN)
+        if sidecar_path.name == self.fail_align_name:
+            return WorkerResult(
+                command=WorkerCommand.ALIGN,
+                ok=False,
+                path=str(sidecar_path),
+                error_type="ValueError",
+                error="fake alignment failure",
+            )
+        if sidecar_path.name == self.invalid_align_name:
+            candidate_path.write_text("{}", encoding="utf-8")
+            return WorkerResult(
+                command=WorkerCommand.ALIGN,
+                ok=True,
+                path=str(sidecar_path),
+                output_path=str(candidate_path),
+                language=self.alignment_language,
+                generation=generation,
+            )
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        if payload["generation"] != generation:
+            raise AssertionError("scheduler passed stale ASR generation")
+        result = payload["result"]
+        written_candidate = write_aligned_candidate_json(
+            sidecar_path,
+            generation,
+            candidate_path,
+            {
+                "language": result["language"],
+                "segments": [
+                    {
+                        **segment,
+                        "words": [
+                            {
+                                "word": segment["text"],
+                                "start": segment["start"],
+                                "end": segment["end"],
+                            }
+                        ],
+                    }
+                    for segment in result["segments"]
+                ],
+            },
+        )
+        if self.after_align is not None:
+            self.after_align(sidecar_path)
+        return WorkerResult(
+            command=WorkerCommand.ALIGN,
+            ok=True,
+            path=str(sidecar_path),
+            output_path=str(written_candidate),
+            language=result["language"],
+            generation=generation,
+        )
+
+    def unload_align(self):
+        self.calls.append(("unload_align", self.alignment_language))
+        self.alignment_language = ""
+        return WorkerResult(command=WorkerCommand.UNLOAD_ALIGN, ok=True)
+
 
 class BatchAsrExecutionTests(unittest.TestCase):
     def test_run_acquisition_enables_asr_wave_with_project_environment(self):
@@ -523,6 +728,7 @@ class BatchAsrExecutionTests(unittest.TestCase):
                     script_dir=root,
                     runners=AcquisitionRunners(download, prepare, extract_audio),
                     worker_factory=worker_factory,
+                    postprocess_runner=mock.AsyncMock(),
                 )
 
         self.assertEqual(seen_configs[0].model, "test-model")
@@ -530,7 +736,7 @@ class BatchAsrExecutionTests(unittest.TestCase):
         self.assertEqual(seen_configs[0].compute_type, "float32")
         self.assertEqual(seen_configs[0].options_dict(), {"batch_size": 8})
         self.assertEqual(seen_configs[0].hf_token, "test-token")
-        self.assertEqual(tasks[0].stage, "asr_ready")
+        self.assertEqual(tasks[0].stage, "translated")
         self.assertEqual(worker_calls.count(("load_asr",)), 1)
         self.assertEqual(worker_calls.count(("unload_asr",)), 1)
 
@@ -628,16 +834,21 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 ("load_asr",),
                 ("transcribe", "fresh.wav"),
                 ("unload_asr",),
+                ("load_align", "en", "auto"),
+                ("align", "cached.asr.json", "en"),
+                ("unload_align", "en"),
+                ("load_align", "ja", "auto"),
+                ("align", "fresh.asr.json", "ja"),
+                ("unload_align", "ja"),
                 ("worker_shutdown",),
             ],
         )
         self.assertTrue(all(task.state is TaskState.SUCCEEDED for task in tasks))
-        self.assertTrue(all(task.stage == "asr_ready" for task in tasks))
+        self.assertTrue(all(task.stage == "alignment_ready" for task in tasks))
         self.assertEqual(tasks[0].asr_path, media["cached"][1].with_suffix(".asr.json"))
         self.assertEqual(tasks[1].asr_path, media["fresh"][1].with_suffix(".asr.json"))
-        self.assertIsNotNone(
-            read_valid_asr_cache(media["fresh"][1], self.fingerprint(media["fresh"][1]))
-        )
+        self.assertTrue(all(not task.asr_path.exists() for task in tasks))
+        self.assertTrue(all(task.json_path.is_file() for task in tasks))
 
     async def test_all_cached_tasks_still_open_and_close_reusable_controller(self):
         media = {"cached": self.create_media("cached")}
@@ -660,9 +871,18 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         tasks = await scheduler.run()
 
-        self.assertEqual(worker_calls, [("worker_start",), ("worker_shutdown",)])
+        self.assertEqual(
+            worker_calls,
+            [
+                ("worker_start",),
+                ("load_align", "en", "auto"),
+                ("align", "cached.asr.json", "en"),
+                ("unload_align", "en"),
+                ("worker_shutdown",),
+            ],
+        )
         self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
-        self.assertEqual(tasks[0].stage, "asr_ready")
+        self.assertEqual(tasks[0].stage, "alignment_ready")
 
     async def test_structured_task_failure_does_not_stop_later_asr_task(self):
         media = {
@@ -725,7 +945,9 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exit code: 17", tasks[1].error_detail)
         self.assertNotIn(("transcribe", "waiting.wav"), worker_calls)
         self.assertNotIn(("unload_asr",), worker_calls)
-        self.assertEqual(worker_calls[-1], ("worker_shutdown",))
+        self.assertEqual(worker_calls[-1], ("transcribe", "crash.wav"))
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(scheduler._worker.is_alive)
         self.assertEqual(aggregate_exit_code(tasks), 1)
 
     async def test_unresponsive_worker_fails_current_and_blocks_waiting(self):
@@ -852,6 +1074,1000 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(controllers[0]._asr_unload_attempted)
         self.assertFalse(controllers[0].is_alive)
         self.assertEqual(controllers[0].exitcode, 0)
+
+    async def test_alignment_groups_mixed_cached_and_fresh_asr_by_iso_language(self):
+        media = {
+            "ja-first": self.create_media("ja-first", "ja"),
+            "en-cached": self.create_media("en-cached", "en-US"),
+            "ja-second": self.create_media("ja-second", "ja"),
+            "en-fresh": self.create_media("en-fresh", "en-GB"),
+        }
+        write_asr_cache(
+            media["en-cached"][1],
+            self.fingerprint(media["en-cached"][1]),
+            {
+                "segments": [{"start": 0.0, "end": 1.0, "text": "cached"}],
+                "language": "en-US",
+            },
+        )
+        worker_calls = []
+        postprocess_calls = []
+
+        async def postprocess(task):
+            postprocess_calls.append(
+                ("postprocess", task.index, task.json_path.name)
+            )
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertEqual(
+            worker_calls,
+            [
+                ("worker_start",),
+                ("load_asr",),
+                ("transcribe", "ja-first.wav"),
+                ("transcribe", "ja-second.wav"),
+                ("transcribe", "en-fresh.wav"),
+                ("unload_asr",),
+                ("load_align", "en", "auto"),
+                ("align", "en-cached.asr.json", "en"),
+                ("align", "en-fresh.asr.json", "en"),
+                ("unload_align", "en"),
+                ("load_align", "ja", "auto"),
+                ("align", "ja-first.asr.json", "ja"),
+                ("align", "ja-second.asr.json", "ja"),
+                ("unload_align", "ja"),
+                ("worker_shutdown",),
+            ],
+        )
+        self.assertEqual(
+            postprocess_calls,
+            [
+                ("postprocess", 2, "en-cached.json"),
+                ("postprocess", 4, "en-fresh.json"),
+                ("postprocess", 1, "ja-first.json"),
+                ("postprocess", 3, "ja-second.json"),
+            ],
+        )
+        self.assertTrue(all(task.state is TaskState.SUCCEEDED for task in tasks))
+        self.assertTrue(all(task.stage == "translated" for task in tasks))
+        self.assertEqual([task.detected_language for task in tasks], ["ja", "en", "ja", "en"])
+        self.assertTrue(all(task.json_path.is_file() for task in tasks))
+        self.assertTrue(all(not task.asr_path.exists() for task in tasks))
+        self.assertTrue(scheduler.worker_released.is_set())
+
+    async def test_postprocess_overlaps_later_alignment_and_waits_for_release_event(self):
+        media = {
+            "first": self.create_media("first", "en"),
+            "second": self.create_media("second", "en"),
+        }
+        worker_calls = []
+        first_postprocess_started = threading.Event()
+        second_alignment_finished = threading.Event()
+        observations = []
+
+        def before_align(sidecar_path):
+            if sidecar_path.name == "second.asr.json":
+                if not first_postprocess_started.wait(1.0):
+                    raise AssertionError("first postprocess did not overlap alignment")
+
+        def after_align(sidecar_path):
+            if sidecar_path.name == "second.asr.json":
+                second_alignment_finished.set()
+
+        async def postprocess(task):
+            if task.index == 1:
+                observations.append(("postprocess_started", scheduler.worker_released.is_set()))
+                first_postprocess_started.set()
+                aligned = await asyncio.to_thread(
+                    second_alignment_finished.wait,
+                    1.0,
+                )
+                self.assertTrue(aligned)
+                await scheduler.worker_released.wait()
+                observations.append(("worker_released", True))
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                before_align=before_align,
+                after_align=after_align,
+            ),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertEqual(
+            observations,
+            [("postprocess_started", False), ("worker_released", True)],
+        )
+        self.assertTrue(all(task.stage == "translated" for task in tasks))
+        self.assertTrue(scheduler.worker_released.is_set())
+
+    async def test_alignment_failure_keeps_sidecar_and_continues_same_language(self):
+        media = {
+            "bad": self.create_media("bad", "en"),
+            "good": self.create_media("good", "en"),
+        }
+        worker_calls = []
+        postprocessed = []
+
+        async def postprocess(task):
+            postprocessed.append(task.index)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                fail_align_name="bad.asr.json",
+            ),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "alignment")
+        self.assertIn("ValueError: fake alignment failure", tasks[0].error_detail)
+        self.assertTrue(media["bad"][1].with_suffix(".asr.json").is_file())
+        self.assertIs(tasks[1].state, TaskState.SUCCEEDED)
+        self.assertEqual(tasks[1].stage, "translated")
+        self.assertEqual(postprocessed, [2])
+        self.assertIn(("align", "good.asr.json", "en"), worker_calls)
+        self.assertEqual(worker_calls.count(("unload_align", "en")), 1)
+        self.assertTrue(scheduler.worker_released.is_set())
+
+    async def test_parent_rejects_invalid_final_json_and_keeps_sidecar(self):
+        media = {"invalid": self.create_media("invalid", "en")}
+        worker_calls = []
+        postprocess = mock.AsyncMock()
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                invalid_align_name="invalid.asr.json",
+            ),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "alignment")
+        self.assertTrue(media["invalid"][1].with_suffix(".asr.json").is_file())
+        self.assertEqual(worker_calls.count(("unload_align", "en")), 1)
+        postprocess.assert_not_awaited()
+
+    async def test_alignment_lock_commits_old_generation_before_new_writer(self):
+        media = {"race": self.create_media("race", "en")}
+        worker_calls = []
+        align_started = threading.Event()
+        align_release = threading.Event()
+        context = multiprocessing.get_context("spawn")
+        writer_started = context.Event()
+        writer_finished = context.Event()
+        writer = context.Process(
+            target=write_asr_cache_process_target,
+            args=(
+                media["race"][1],
+                self.fingerprint(media["race"][1]),
+                {
+                    "segments": [
+                        {"start": 0.0, "end": 1.0, "text": "new generation"}
+                    ],
+                    "language": "en",
+                },
+                writer_started,
+                writer_finished,
+            ),
+        )
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                block_align_name="race.asr.json",
+                align_started=align_started,
+                align_release=align_release,
+            ),
+        )
+        run_task = asyncio.create_task(scheduler.run())
+        self.assertTrue(await asyncio.to_thread(align_started.wait, 1.0))
+        writer.start()
+        self.assertTrue(await asyncio.to_thread(writer_started.wait, 1.0))
+        writer_was_blocked = not await asyncio.to_thread(writer_finished.wait, 0.2)
+        align_release.set()
+
+        tasks = await asyncio.wait_for(run_task, 2.0)
+        await asyncio.to_thread(writer.join, 2.0)
+        if writer.is_alive():
+            writer.terminate()
+            writer.join()
+
+        sidecar_path = media["race"][1].with_suffix(".asr.json")
+        current_payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        self.assertTrue(writer_was_blocked)
+        self.assertEqual(writer.exitcode, 0)
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(current_payload["result"]["segments"][0]["text"], "new generation")
+        self.assertTrue(media["race"][1].with_suffix(".json").is_file())
+        self.assertEqual(worker_calls.count(("unload_align", "en")), 1)
+        lock_path = media["race"][1].with_suffix(".asr.lock")
+        self.assertTrue(lock_path.is_file())
+        self.assertLessEqual(lock_path.stat().st_size, 1)
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+
+    async def test_failed_alignment_releases_lock_for_new_writer(self):
+        media = {"failed": self.create_media("failed", "en")}
+        align_started = threading.Event()
+        align_release = threading.Event()
+        context = multiprocessing.get_context("spawn")
+        writer_started = context.Event()
+        writer_finished = context.Event()
+        writer = context.Process(
+            target=write_asr_cache_process_target,
+            args=(
+                media["failed"][1],
+                self.fingerprint(media["failed"][1]),
+                {
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "new"}],
+                    "language": "en",
+                },
+                writer_started,
+                writer_finished,
+            ),
+        )
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                [],
+                block_align_name="failed.asr.json",
+                fail_align_name="failed.asr.json",
+                align_started=align_started,
+                align_release=align_release,
+            ),
+        )
+        run_task = asyncio.create_task(scheduler.run())
+        self.assertTrue(await asyncio.to_thread(align_started.wait, 1.0))
+        writer.start()
+        self.assertTrue(await asyncio.to_thread(writer_started.wait, 1.0))
+        writer_was_blocked = not await asyncio.to_thread(writer_finished.wait, 0.2)
+        align_release.set()
+
+        tasks = await asyncio.wait_for(run_task, 2.0)
+        await asyncio.to_thread(writer.join, 2.0)
+        if writer.is_alive():
+            writer.terminate()
+            writer.join()
+
+        current = json.loads(
+            media["failed"][1].with_suffix(".asr.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(writer_was_blocked)
+        self.assertEqual(writer.exitcode, 0)
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(current["result"]["segments"][0]["text"], "new")
+        self.assertFalse(media["failed"][1].with_suffix(".json").exists())
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+
+    async def test_canceled_alignment_releases_lock_for_new_writer(self):
+        media = {"canceled": self.create_media("canceled", "en")}
+        align_started = threading.Event()
+        align_release = threading.Event()
+        context = multiprocessing.get_context("spawn")
+        writer_started = context.Event()
+        writer_finished = context.Event()
+        writer = context.Process(
+            target=write_asr_cache_process_target,
+            args=(
+                media["canceled"][1],
+                self.fingerprint(media["canceled"][1]),
+                {
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "new"}],
+                    "language": "en",
+                },
+                writer_started,
+                writer_finished,
+            ),
+        )
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                [],
+                block_align_name="canceled.asr.json",
+                align_started=align_started,
+                align_release=align_release,
+            ),
+        )
+        run_task = asyncio.create_task(scheduler.run())
+        self.assertTrue(await asyncio.to_thread(align_started.wait, 1.0))
+        writer.start()
+        self.assertTrue(await asyncio.to_thread(writer_started.wait, 1.0))
+        writer_was_blocked = not await asyncio.to_thread(writer_finished.wait, 0.2)
+        run_task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, 2.0)
+        await asyncio.to_thread(writer.join, 2.0)
+        if writer.is_alive():
+            writer.terminate()
+            writer.join()
+
+        current = json.loads(
+            media["canceled"][1].with_suffix(".asr.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(writer_was_blocked)
+        self.assertEqual(writer.exitcode, 0)
+        self.assertEqual(current["result"]["segments"][0]["text"], "new")
+        self.assertFalse(media["canceled"][1].with_suffix(".json").exists())
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+
+    async def test_cancel_before_alignment_commit_preserves_sidecar(self):
+        media = {"cancel-first": self.create_media("cancel-first", "en")}
+        worker_calls = []
+        precommit_ready = threading.Event()
+        precommit_release = threading.Event()
+        postprocess = mock.AsyncMock()
+        real_read_aligned_json = batch_scheduler.read_aligned_json
+
+        def block_before_commit(candidate_path):
+            result = real_read_aligned_json(candidate_path)
+            precommit_ready.set()
+            if not precommit_release.wait(2.0):
+                raise AssertionError("precommit barrier was not released")
+            return result
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+        with mock.patch(
+            "batch_scheduler.read_aligned_json",
+            side_effect=block_before_commit,
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            self.assertTrue(await asyncio.to_thread(precommit_ready.wait, 1.0))
+            run_task.cancel()
+            for _ in range(100):
+                if ("worker_abort",) in worker_calls:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(("worker_abort",), worker_calls)
+            precommit_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(run_task, 2.0)
+
+        self.assertIs(scheduler.tasks[0].state, TaskState.CANCELED)
+        self.assertTrue(media["cancel-first"][1].with_suffix(".asr.json").is_file())
+        self.assertFalse(media["cancel-first"][1].with_suffix(".json").exists())
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+        postprocess.assert_not_awaited()
+
+    async def test_commit_before_cancel_completes_and_runs_postprocess(self):
+        media = {"commit-first": self.create_media("commit-first", "en")}
+        worker_calls = []
+        commit_started = threading.Event()
+        commit_release = threading.Event()
+        cancel_handler_started = threading.Event()
+        postprocess = mock.AsyncMock()
+        real_promote = batch_scheduler.promote_aligned_candidate
+        real_request_cancel = batch_scheduler._AlignmentCommitState.try_request_cancel
+
+        def block_during_commit(candidate_path, final_path):
+            commit_started.set()
+            if not commit_release.wait(2.0):
+                raise AssertionError("commit barrier was not released")
+            return real_promote(candidate_path, final_path)
+
+        def observe_cancel_handler(commit_state):
+            cancel_handler_started.set()
+            return real_request_cancel(commit_state)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+        with (
+            mock.patch(
+                "batch_scheduler.promote_aligned_candidate",
+                side_effect=block_during_commit,
+            ),
+            mock.patch.object(
+                batch_scheduler._AlignmentCommitState,
+                "try_request_cancel",
+                new=observe_cancel_handler,
+            ),
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            self.assertTrue(await asyncio.to_thread(commit_started.wait, 1.0))
+            run_task.cancel()
+            self.assertTrue(
+                await asyncio.to_thread(cancel_handler_started.wait, 1.0)
+            )
+            aborted_before_release = ("worker_abort",) in worker_calls
+            commit_release.set()
+            tasks = await asyncio.wait_for(run_task, 2.0)
+
+        final_path = media["commit-first"][1].with_suffix(".json")
+        final_result = json.loads(final_path.read_text(encoding="utf-8"))
+        self.assertFalse(aborted_before_release)
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(tasks[0].stage, "translated")
+        self.assertFalse(media["commit-first"][1].with_suffix(".asr.json").exists())
+        self.assertEqual(final_result["language"], "en")
+        self.assertTrue(final_result["segments"][0]["words"])
+        postprocess.assert_awaited_once_with(tasks[0])
+
+    async def test_repeated_cancel_waits_for_commit_thread_and_stable_result(self):
+        media = {"double-commit": self.create_media("double-commit", "en")}
+        worker_calls = []
+        commit_started = threading.Event()
+        commit_release = threading.Event()
+        transaction_finished = threading.Event()
+        postprocess = mock.AsyncMock()
+        real_promote = batch_scheduler.promote_aligned_candidate
+
+        def block_during_commit(candidate_path, final_path):
+            commit_started.set()
+            if not commit_release.wait(2.0):
+                raise AssertionError("commit barrier was not released")
+            return real_promote(candidate_path, final_path)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+        real_transaction = scheduler._run_locked_alignment_transaction
+
+        def observe_transaction(*args):
+            try:
+                return real_transaction(*args)
+            finally:
+                transaction_finished.set()
+
+        with (
+            mock.patch.object(
+                scheduler,
+                "_run_locked_alignment_transaction",
+                side_effect=observe_transaction,
+            ),
+            mock.patch(
+                "batch_scheduler.promote_aligned_candidate",
+                side_effect=block_during_commit,
+            ),
+            mock.patch(
+                "batch_scheduler.WORKER_CALL_JOIN_TIMEOUT_SECONDS",
+                0.05,
+                create=True,
+            ),
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            self.assertTrue(await asyncio.to_thread(commit_started.wait, 1.0))
+            run_task.cancel()
+            await asyncio.sleep(0)
+            run_task.cancel()
+            await asyncio.sleep(0.1)
+            returned_before_transaction = run_task.done()
+            released_before_transaction = scheduler.worker_released.is_set()
+            commit_release.set()
+            canceled_outcome = False
+            try:
+                tasks = await asyncio.wait_for(run_task, 2.0)
+            except asyncio.CancelledError:
+                canceled_outcome = True
+                tasks = scheduler.tasks
+            self.assertTrue(await asyncio.to_thread(transaction_finished.wait, 1.0))
+
+        final_path = media["double-commit"][1].with_suffix(".json")
+        final_bytes = final_path.read_bytes()
+        final_mtime = final_path.stat().st_mtime_ns
+        await asyncio.sleep(0.05)
+        self.assertFalse(returned_before_transaction)
+        self.assertFalse(released_before_transaction)
+        self.assertFalse(canceled_outcome)
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(scheduler._worker.is_alive)
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(tasks[0].stage, "translated")
+        self.assertFalse(media["double-commit"][1].with_suffix(".asr.json").exists())
+        self.assertEqual(final_path.read_bytes(), final_bytes)
+        self.assertEqual(final_path.stat().st_mtime_ns, final_mtime)
+        postprocess.assert_awaited_once_with(tasks[0])
+
+    async def test_same_tick_triple_cancel_commit_wins_clears_cancellation_count(self):
+        media = {"triple-commit": self.create_media("triple-commit", "en")}
+        worker_calls = []
+        commit_started = threading.Event()
+        commit_release = threading.Event()
+        postprocess = mock.AsyncMock()
+        real_promote = batch_scheduler.promote_aligned_candidate
+
+        def block_during_commit(candidate_path, final_path):
+            commit_started.set()
+            if not commit_release.wait(2.0):
+                raise AssertionError("commit barrier was not released")
+            return real_promote(candidate_path, final_path)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+        with mock.patch(
+            "batch_scheduler.promote_aligned_candidate",
+            side_effect=block_during_commit,
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            self.assertTrue(await asyncio.to_thread(commit_started.wait, 1.0))
+            run_task.cancel()
+            run_task.cancel()
+            run_task.cancel()
+            await asyncio.sleep(0)
+            commit_release.set()
+            tasks = await asyncio.wait_for(run_task, 2.0)
+
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(tasks[0].stage, "translated")
+        postprocess.assert_awaited_once_with(tasks[0])
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(scheduler._worker.is_alive)
+        self.assertEqual(run_task.cancelling(), 0)
+
+    async def test_same_tick_triple_cancel_commit_failure_clears_cancellation_count(self):
+        media = {"failed-commit": self.create_media("failed-commit", "en")}
+        worker_calls = []
+        commit_started = threading.Event()
+        commit_release = threading.Event()
+        postprocess = mock.AsyncMock()
+
+        def fail_during_commit(_candidate_path, _final_path):
+            commit_started.set()
+            if not commit_release.wait(2.0):
+                raise AssertionError("commit barrier was not released")
+            raise OSError("fake promote failure")
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+        with mock.patch(
+            "batch_scheduler.promote_aligned_candidate",
+            side_effect=fail_during_commit,
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            self.assertTrue(await asyncio.to_thread(commit_started.wait, 1.0))
+            run_task.cancel()
+            run_task.cancel()
+            run_task.cancel()
+            await asyncio.sleep(0)
+            commit_release.set()
+            tasks = await asyncio.wait_for(run_task, 2.0)
+
+        sidecar_path = media["failed-commit"][1].with_suffix(".asr.json")
+        sidecar_bytes = sidecar_path.read_bytes()
+        sidecar_mtime = sidecar_path.stat().st_mtime_ns
+        await asyncio.sleep(0.05)
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "alignment")
+        self.assertIn("fake promote failure", tasks[0].error_detail)
+        self.assertEqual(run_task.cancelling(), 0)
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(scheduler._worker.is_alive)
+        self.assertEqual(sidecar_path.read_bytes(), sidecar_bytes)
+        self.assertEqual(sidecar_path.stat().st_mtime_ns, sidecar_mtime)
+        self.assertFalse(media["failed-commit"][1].with_suffix(".json").exists())
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+        postprocess.assert_not_awaited()
+
+    async def test_repeated_cancel_waits_for_abort_cleanup_before_release(self):
+        media = {"double-abort": self.create_media("double-abort", "en")}
+        worker_calls = []
+        precommit_ready = threading.Event()
+        precommit_release = threading.Event()
+        transaction_finished = threading.Event()
+        postprocess = mock.AsyncMock()
+        real_read_aligned_json = batch_scheduler.read_aligned_json
+
+        def block_before_commit(candidate_path):
+            result = real_read_aligned_json(candidate_path)
+            precommit_ready.set()
+            if not precommit_release.wait(2.0):
+                raise AssertionError("precommit barrier was not released")
+            return result
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+        real_transaction = scheduler._run_locked_alignment_transaction
+
+        def observe_transaction(*args):
+            try:
+                return real_transaction(*args)
+            finally:
+                transaction_finished.set()
+
+        with (
+            mock.patch.object(
+                scheduler,
+                "_run_locked_alignment_transaction",
+                side_effect=observe_transaction,
+            ),
+            mock.patch(
+                "batch_scheduler.read_aligned_json",
+                side_effect=block_before_commit,
+            ),
+            mock.patch(
+                "batch_scheduler.WORKER_CALL_JOIN_TIMEOUT_SECONDS",
+                0.05,
+                create=True,
+            ),
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            self.assertTrue(await asyncio.to_thread(precommit_ready.wait, 1.0))
+            run_task.cancel()
+            for _ in range(100):
+                if ("worker_abort",) in worker_calls:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(("worker_abort",), worker_calls)
+            run_task.cancel()
+            await asyncio.sleep(0.1)
+            returned_before_transaction = run_task.done()
+            released_before_transaction = scheduler.worker_released.is_set()
+            precommit_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(run_task, 2.0)
+            self.assertTrue(await asyncio.to_thread(transaction_finished.wait, 1.0))
+
+        self.assertFalse(returned_before_transaction)
+        self.assertFalse(released_before_transaction)
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(scheduler._worker.is_alive)
+        self.assertIs(scheduler.tasks[0].state, TaskState.CANCELED)
+        self.assertTrue(media["double-abort"][1].with_suffix(".asr.json").is_file())
+        self.assertFalse(media["double-abort"][1].with_suffix(".json").exists())
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+        postprocess.assert_not_awaited()
+
+    async def test_canceled_candidate_cleanup_failure_is_diagnostic(self):
+        media = {"cleanup": self.create_media("cleanup", "en")}
+        worker_calls = []
+        precommit_ready = threading.Event()
+        precommit_release = threading.Event()
+        postprocess = mock.AsyncMock()
+        real_read_aligned_json = batch_scheduler.read_aligned_json
+        real_unlink = pathlib.Path.unlink
+
+        def block_before_commit(candidate_path):
+            result = real_read_aligned_json(candidate_path)
+            precommit_ready.set()
+            if not precommit_release.wait(2.0):
+                raise AssertionError("precommit barrier was not released")
+            return result
+
+        def fail_candidate_unlink(path, *args, **kwargs):
+            if path.name.endswith(".candidate.json"):
+                raise OSError("fake candidate unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+            postprocess_runner=postprocess,
+        )
+        with (
+            mock.patch(
+                "batch_scheduler.read_aligned_json",
+                side_effect=block_before_commit,
+            ),
+            mock.patch("pathlib.Path.unlink", new=fail_candidate_unlink),
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            self.assertTrue(await asyncio.to_thread(precommit_ready.wait, 1.0))
+            run_task.cancel()
+            for _ in range(100):
+                if ("worker_abort",) in worker_calls:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(("worker_abort",), worker_calls)
+            precommit_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(run_task, 2.0)
+
+        self.assertTrue(media["cleanup"][1].with_suffix(".asr.json").is_file())
+        self.assertEqual(len(list(self.root.glob(".*.candidate.json"))), 1)
+        self.assertIn(
+            ("alignment_candidate_cleanup", "fake candidate unlink failure"),
+            scheduler._release_errors,
+        )
+        self.assertIn("fake candidate unlink failure", scheduler.tasks[0].error_detail)
+        self.assertEqual(aggregate_exit_code(scheduler.tasks), 1)
+        report_path = self.root / "cleanup-report.txt"
+        write_report(report_path, scheduler.tasks, datetime.now())
+        self.assertIn(
+            "alignment_candidate_cleanup: fake candidate unlink failure",
+            report_path.read_text(encoding="utf-8"),
+        )
+        postprocess.assert_not_awaited()
+
+    async def test_alignment_worker_exit_blocks_waiting_and_sets_release_event(self):
+        media = {
+            "crash": self.create_media("crash", "en"),
+            "waiting": self.create_media("waiting", "ja"),
+        }
+        worker_calls = []
+
+        async def postprocess(_task):
+            raise AssertionError("postprocess must not run after worker exit")
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                crash_align_name="crash.asr.json",
+            ),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "alignment")
+        self.assertIs(tasks[1].state, TaskState.BLOCKED_BY_WORKER_FAILURE)
+        self.assertNotIn(("load_align", "ja", "auto"), worker_calls)
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(scheduler._worker.is_alive)
+
+    async def test_slow_alignment_cancellation_aborts_worker_and_keeps_sidecar(self):
+        media = {"slow": self.create_media("slow-align", "en")}
+        ready_path = self.root / "align-ready"
+        log_path = self.root / "cancel-worker.log"
+        controllers = []
+        postprocess = mock.AsyncMock()
+
+        def worker_factory(config):
+            controller = AsrWorkerController(
+                config,
+                backend_factory="tests.test_whisper_worker:FakeBackend",
+                heartbeat_interval=0.01,
+                max_heartbeat_silence=1.0,
+                operation_timeout=5.0,
+            )
+            controllers.append(controller)
+            return controller
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+            postprocess_runner=postprocess,
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WHISPER_WORKER_TEST_ALIGN_READY": str(ready_path),
+                "WHISPER_WORKER_TEST_LOG": str(log_path),
+            },
+        ):
+            run_task = asyncio.create_task(scheduler.run())
+            for _ in range(200):
+                if ready_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(ready_path.exists(), "ALIGN did not start")
+            canceled_at = asyncio.get_running_loop().time()
+            run_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(run_task, 2.0)
+            cancel_elapsed = asyncio.get_running_loop().time() - canceled_at
+
+        self.assertLess(cancel_elapsed, 0.5)
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(controllers[0].is_alive)
+        self.assertTrue(media["slow"][1].with_suffix(".asr.json").is_file())
+        self.assertFalse(media["slow"][1].with_suffix(".json").exists())
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+        self.assertIs(scheduler.tasks[0].state, TaskState.CANCELED)
+        self.assertNotIn("unload_align", log_path.read_text(encoding="utf-8").splitlines())
+        postprocess.assert_not_awaited()
+
+    async def test_cancellation_preserves_cancelled_error_when_abort_fails(self):
+        media = {
+            "first": self.create_media("first", "en"),
+            "blocked": self.create_media("blocked", "en"),
+        }
+        worker_calls = []
+        align_started = threading.Event()
+        align_release = threading.Event()
+        align_finished = threading.Event()
+        postprocess_started = asyncio.Event()
+        postprocess_finished = asyncio.Event()
+
+        async def postprocess(task):
+            if task.index != 1:
+                raise AssertionError("blocked task must not reach postprocess")
+            postprocess_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                postprocess_finished.set()
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                block_align_name="blocked.asr.json",
+                align_started=align_started,
+                align_release=align_release,
+                align_finished=align_finished,
+                abort_error=OSError("fake abort failure"),
+            ),
+            postprocess_runner=postprocess,
+        )
+        run_task = asyncio.create_task(scheduler.run())
+        await asyncio.wait_for(postprocess_started.wait(), 1.0)
+        self.assertTrue(await asyncio.to_thread(align_started.wait, 1.0))
+
+        run_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, 1.0)
+
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertTrue(align_finished.is_set())
+        self.assertTrue(postprocess_finished.is_set())
+        self.assertTrue(
+            all(task.state is TaskState.CANCELED for task in scheduler.tasks)
+        )
+        self.assertIn(("abort", "fake abort failure"), scheduler._release_errors)
+        self.assertNotIn(("unload_align", "en"), worker_calls)
+
+    async def test_close_error_is_applied_as_aggregate_failure_without_raising(self):
+        media = {"video": self.create_media("video", "en")}
+        worker_calls = []
+        postprocess = mock.AsyncMock()
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                close_error=OSError("fake close failure"),
+            ),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "close")
+        self.assertIn("fake close failure", tasks[0].error_detail)
+        self.assertEqual(aggregate_exit_code(tasks), 1)
+        postprocess.assert_awaited_once()
+
+    async def test_worker_factory_failure_marks_tasks_and_sets_release_event(self):
+        media = {
+            "first": self.create_media("first", "en"),
+            "second": self.create_media("second", "ja"),
+        }
+
+        def worker_factory(_config):
+            raise RuntimeError("fake worker factory failure")
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+            postprocess_runner=mock.AsyncMock(),
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "asr_worker")
+        self.assertIn("fake worker factory failure", tasks[0].error_detail)
+        self.assertIs(tasks[1].state, TaskState.BLOCKED_BY_WORKER_FAILURE)
+
+    async def test_postprocess_failure_is_terminal_after_worker_release(self):
+        media = {"video": self.create_media("video", "en")}
+
+        async def postprocess(_task):
+            await scheduler.worker_released.wait()
+            raise RuntimeError("fake translate failure")
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, []),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertTrue(scheduler.worker_released.is_set())
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "postprocess")
+        self.assertEqual(tasks[0].error_detail, "fake translate failure")
 
 
 class BatchCliTests(unittest.TestCase):
@@ -1015,6 +2231,97 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 await runners.extract_audio(str(script_dir / "video.mkv"))
 
         self.assertEqual(commands[0][0], "ffmpeg")
+
+    async def test_postprocess_runner_uses_existing_wrappers_for_all_three_stages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_dir = pathlib.Path(temp_dir)
+            edit_video = script_dir / "video.mkv"
+            json_path = script_dir / "video.json"
+            edit_video.write_bytes(b"edit")
+            json_path.write_text('{"language":"en","segments":[]}', encoding="utf-8")
+            task = BatchTask(
+                index=1,
+                url="url",
+                edit_video_path=edit_video,
+                json_path=json_path,
+            )
+
+            for platform, expected_prefix, wrapper_name in (
+                (
+                    "nt",
+                    ["pwsh", "-NoProfile", "-File"],
+                    "translate_srt.ps1",
+                ),
+                ("posix", ["bash"], "translate_srt.sh"),
+            ):
+                commands = []
+
+                async def fake_stage_command(command, **kwargs):
+                    commands.append((command, kwargs))
+                    if kwargs["stage"] == "beautify":
+                        script_dir.joinpath("video.beautified.json").write_text(
+                            "{}",
+                            encoding="utf-8",
+                        )
+                    return ""
+
+                with self.subTest(platform=platform):
+                    with mock.patch(
+                        "batch._run_stage_command",
+                        side_effect=fake_stage_command,
+                    ):
+                        with mock.patch("batch.shutil.which", return_value="pwsh"):
+                            runner = create_platform_postprocess_runner(
+                                script_dir,
+                                {"TRANSLATE_PROVIDER": "test"},
+                                platform=platform,
+                            )
+                            await runner(task)
+
+                wrapper = str(script_dir / wrapper_name)
+                beautified = str(script_dir / "video.beautified.json")
+                self.assertEqual(
+                    [entry[1]["stage"] for entry in commands],
+                    ["beautify", "glossary", "translate"],
+                )
+                self.assertEqual(
+                    commands[0][0],
+                    expected_prefix
+                    + [
+                        wrapper,
+                        str(json_path),
+                        "--video",
+                        str(edit_video),
+                        "--only-beautify",
+                    ],
+                )
+                self.assertEqual(
+                    commands[1][0],
+                    expected_prefix
+                    + [
+                        wrapper,
+                        beautified,
+                        "--video",
+                        str(edit_video),
+                        "--only-glossary",
+                        "--skip-beautify",
+                    ],
+                )
+                self.assertEqual(
+                    commands[2][0],
+                    expected_prefix
+                    + [
+                        wrapper,
+                        beautified,
+                        "--video",
+                        str(edit_video),
+                        "--skip-beautify",
+                        "--skip-knowledge",
+                    ],
+                )
+                self.assertTrue(
+                    all(entry[1]["env"]["TRANSLATE_PROVIDER"] == "test" for entry in commands)
+                )
 
 
 if __name__ == "__main__":

@@ -92,11 +92,16 @@ winget install Microsoft.PowerShell
 - 不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，启动时打印自动检测出的 CPU/IO 和 NVENC capacity
 - acquisition 按任务流水执行 `download -> prepare-video -> extract-audio`；任务完成 download 后可立即等待 prepare，完成 prepare 后可立即提取 mono 16kHz WAV
 - 所有 acquisition 任务到达成功或失败终态后，scheduler 才启动一个 `multiprocessing.get_context('spawn')` worker；WhisperX 只在 child 内 import
-- ASR wave 只把已完成的 WAV path 交给 worker；同一 worker 加载一次 ASR，串行处理所有未缓存任务，wave 结束后只卸载一次并显式 shutdown，当前 CLI 不保留孤儿进程
-- 每个 ASR 成功任务通过 `batch_cache.py` 原子写 `<base>.asr.json`；fingerprint 包含编辑版 resolved path、size、mtime、Whisper model、compute type、源语言和 ASR options，损坏、旧版或 fingerprint 不匹配都视为无缓存
-- fingerprint 有效的 `.asr.json` 跳过 `TRANSCRIBE`；当前成功终态为 `asr_ready`，alignment、translate 和 burn 由后续 scheduler 任务接入
+- ASR wave 只把已完成的 WAV path 交给 worker；同一 worker 加载一次 ASR，串行处理所有未缓存任务，wave 结束后显式 `UNLOAD_ASR`，但不 shutdown
+- 每个 ASR 成功任务通过 `batch_cache.py` 原子写 `<base>.asr.json`；fingerprint 包含编辑版 resolved path、size、mtime、Whisper model、compute type、源语言和 ASR options，每次写入另生成唯一 UUID generation；所有 sidecar 写入与 alignment commit 共享 `<base>.asr.lock` 跨进程锁（POSIX `flock` / Windows `msvcrt`），损坏、缺少/非法 generation、旧版或 fingerprint 不匹配都视为无缓存
+- fingerprint 有效的 `.asr.json` 跳过 `TRANSCRIBE`；detected language 通过 `langcodes` 验证并规范为稳定 ISO 639 主语言代码，`zz` / `zzz` / `und` / `unknown` 会拒绝，只有配置了有效 `SOURCE_LANG` 时才允许作为 fallback；缓存 ASR 与新 ASR 混合时使用同一分组规则
+- alignment group 按 ISO language 稳定排序，组内保持原 task order；worker 一次只加载一个语言模型，同语言复用，组间执行 `UNLOAD_ALIGN -> LOAD_ALIGN`，`WHISPER_ALIGN_MODEL` 为空时由 WhisperX 自动选择，非空时覆盖
+- parent 在 blocking thread 中先取得 media cache lock，再 dispatch `ALIGN`；command 只传 `.asr.json` path、expected generation 和 parent-owned candidate path。child 校验 generation 与 sidecar/result，只原子写隐藏的 generation-specific candidate 并回传 candidate path/generation，绝不覆盖 `<base>.json`。parent 持锁复核 sidecar ownership、candidate path/schema，并用 per-task commit state lock 将取消与 destructive commit 线性化：`try_request_cancel()` 只做 non-blocking acquire，cancel-wins 保留 sidecar、只清 candidate；lock busy 表示 commit-wins，不再 abort，原子 promote final、删除 owned sidecar 后继续 postprocess
+- 每个 alignment 成功任务立即在 CPU/IO semaphore 中异步执行 beautify、glossary、translate，不等待其他 alignment；当前成功终态为 `translated`
+- 所有 alignment terminal 后 scheduler 才 `UNLOAD_ALIGN -> SHUTDOWN -> join`，并设置明确的 `worker_released` event；后续 burn 调度必须先等待该 event；active worker command 在 precommit cancel-wins 时 abort/terminate/kill，随后用 shield loop 忽略重复取消直到 request/transaction thread 真正结束，transaction thread 在 finally 清理 candidate、释放 lock，不再排队 unload/shutdown。commit-wins 同样等待 promote + owned sidecar delete 完成，该任务继续正常 postprocess；`worker_released` 只能在所有 `to_thread` request/transaction 与 worker controller/process cleanup 完成后设置。candidate cleanup/abort/close 异常进入 release diagnostics 和失败报告，不替换 cancel-wins 的原始 `CancelledError`；acquisition 取消且未创建 worker 时由 `run()` 外层 finally 设置 event
+- `<base>.asr.lock` 是持久、最多 1 byte 的运行时协调 artifact，加入 `.gitignore` 且不会作为字幕或 cache 输入；不得在活跃任务间 unlink，以免产生 inode/handle 锁竞态
 - worker 单任务异常返回结构化失败并继续后续任务；request 使用 Queue，response 使用 parent-recv / child-send 单向 Pipe，child 的 heartbeat 线程与主线程通过同一锁发送；active command 每 5 秒发送 request-scoped heartbeat，controller 以 30 秒 heartbeat silence 和内部 24 小时 operation watchdog 检测无响应，deadline 前先有界排空当前 request 已到达的消息，超时后 terminate/kill + join，且不自动重启；当前任务为 `failed`，等待中的 worker-dependent 任务为 `blocked_by_worker_failure`；完整 fail-fast drain 和诊断日志由后续 scheduler 阶段补齐
-- CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；当前未执行的 burn/provider/model 值保存在阶段环境中，不启动对应阶段
+- CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；provider/model 已用于 postprocess，burn 值保留给 Task 6 且当前不启动 burn
 - `batch.py` 直接读取项目 `.env`，优先级为显式 CLI / 进程环境 > `.env` > 硬编码默认；`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`
 - 任一任务失败只终止该任务的后续 acquisition 阶段，其他任务继续；存在失败时聚合退出码为 `1`
 
@@ -148,8 +153,9 @@ winget install Microsoft.PowerShell
 - `.info.json` 中的 `language` 会用于 WhisperX `--language`；缺省回退 `en`
 - 输出 JSON 的 `segments[].words[]` 是后续分割对轴的唯一词源
 - `whisper.ps1` / `whisper.sh` 始终保持 standalone 最终 JSON 行为，不读取或写入 batch `.asr.json`
-- batch 先在 worker 外提取 WAV，再用 `LOAD_ASR -> TRANSCRIBE* -> UNLOAD_ASR -> SHUTDOWN` 生成恢复 sidecar；command payload 只传 path，不通过 IPC 传模型或大型结果
+- batch 先在 worker 外提取 WAV，再执行 `LOAD_ASR -> TRANSCRIBE* -> UNLOAD_ASR -> (LOAD_ALIGN -> ALIGN* -> UNLOAD_ALIGN)* -> SHUTDOWN`；`TRANSCRIBE` / `ALIGN` payload 只传 path，不通过 IPC 传模型或大型结果
 - `<base>.asr.json` 只有在 fingerprint 完全匹配，且 result 包含合法字符串 `language`、list `segments` 以及每个 segment 的数值 `start` / `end` 和字符串 `text` 时才命中；写入先 fsync sibling temp 并原子替换，POSIX 再尽力 fsync parent directory
+- alignment 输出保留 `language`、`segments` 和每个 segment 的 `words` list；word text 必须存在，无法对齐的合法 WhisperX word 可以没有成对的 `start` / `end`
 
 ### beautify
 

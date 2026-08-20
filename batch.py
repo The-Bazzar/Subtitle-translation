@@ -1,4 +1,4 @@
-"""Stage-aware batch entry point for acquisition and persistent ASR."""
+"""Stage-aware batch entry point through translation postprocessing."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from batch_scheduler import (
     AcquisitionRunners,
     AcquisitionScheduler,
     BatchTask,
+    PostprocessRunner,
     ResourceLimits,
     StageCommandError,
     TaskState,
@@ -322,6 +323,74 @@ def create_platform_runners(
     return AcquisitionRunners(download, prepare, extract_audio)
 
 
+def create_platform_postprocess_runner(
+    script_dir: Path,
+    env: dict[str, str],
+    *,
+    platform: str | None = None,
+) -> PostprocessRunner:
+    platform = platform or os.name
+    if platform == "nt":
+        wrapper_prefix = [
+            shutil.which("pwsh") or "pwsh",
+            "-NoProfile",
+            "-File",
+            str(script_dir / "translate_srt.ps1"),
+        ]
+    else:
+        wrapper_prefix = ["bash", str(script_dir / "translate_srt.sh")]
+
+    async def postprocess(task: BatchTask) -> None:
+        if task.json_path is None or task.edit_video_path is None:
+            raise StageCommandError(
+                "postprocess task is missing aligned JSON or edit-video path"
+            )
+        aligned_json = str(task.json_path)
+        edit_video = str(task.edit_video_path)
+        beautified_json = task.json_path.with_name(
+            f"{task.json_path.stem}.beautified.json"
+        )
+        await _run_stage_command(
+            wrapper_prefix
+            + [aligned_json, "--video", edit_video, "--only-beautify"],
+            cwd=script_dir,
+            env=env,
+            stage="beautify",
+        )
+        if not beautified_json.is_file():
+            raise StageCommandError(
+                f"beautify did not write expected output: {beautified_json}"
+            )
+        await _run_stage_command(
+            wrapper_prefix
+            + [
+                str(beautified_json),
+                "--video",
+                edit_video,
+                "--only-glossary",
+                "--skip-beautify",
+            ],
+            cwd=script_dir,
+            env=env,
+            stage="glossary",
+        )
+        await _run_stage_command(
+            wrapper_prefix
+            + [
+                str(beautified_json),
+                "--video",
+                edit_video,
+                "--skip-beautify",
+                "--skip-knowledge",
+            ],
+            cwd=script_dir,
+            env=env,
+            stage="translate",
+        )
+
+    return postprocess
+
+
 def run_acquisition(
     args: argparse.Namespace,
     limits: ResourceLimits,
@@ -329,15 +398,23 @@ def run_acquisition(
     script_dir: Path,
     runners: AcquisitionRunners | None = None,
     worker_factory=AsrWorkerController,
+    postprocess_runner: PostprocessRunner | None = None,
 ) -> list[BatchTask]:
     stage_environment = build_stage_environment(args, script_dir=script_dir)
     stage_runners = runners or create_platform_runners(script_dir, stage_environment)
+    stage_postprocess_runner = postprocess_runner
+    if stage_postprocess_runner is None:
+        stage_postprocess_runner = create_platform_postprocess_runner(
+            script_dir,
+            stage_environment,
+        )
     scheduler = AcquisitionScheduler(
         args.urls,
         limits,
         stage_runners,
         asr_config=asr_worker_config_from_environment(stage_environment),
         worker_factory=worker_factory,
+        postprocess_runner=stage_postprocess_runner,
     )
     return asyncio.run(scheduler.run())
 
@@ -386,19 +463,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Start:    {started_at.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"CPU/IO:   {limits.cpu_io}")
     print(f"NVENC:    {limits.nvenc}")
-    print(f"Burn:     {'yes' if args.burn else 'no'} (reserved for later stage)")
+    print(f"Burn:     {'yes' if args.burn else 'no'} (Task 6 stage not yet scheduled)")
     if args.translate_provider:
-        print(f"Provider: {args.translate_provider} (reserved for later stage)")
+        print(f"Provider: {args.translate_provider}")
     if args.translate_model:
-        print(f"Model:    {args.translate_model} (reserved for later stage)")
-    print("Current:  download -> prepare -> WAV preparation -> ASR sidecar")
+        print(f"Model:    {args.translate_model}")
+    print("Current:  download -> prepare -> ASR -> align -> translate")
     print("=" * 60)
 
     if args.dry_run:
         for index, url in enumerate(args.urls, start=1):
             print(
                 f"[DRY RUN][{index:02d}] "
-                f"download -> prepare -> extract_audio -> asr <- {url}"
+                f"download -> prepare -> extract_audio -> asr -> align -> translate <- {url}"
             )
         return 0
 

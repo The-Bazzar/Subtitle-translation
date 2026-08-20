@@ -4,13 +4,26 @@ import json
 import math
 import os
 import tempfile
+import time
+import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 ASR_CACHE_SCHEMA_VERSION = 1
+ASR_CACHE_LOCK_POLL_SECONDS = 0.05
+
+
+class AsrCacheLockCancelled(RuntimeError):
+    pass
 
 
 def _canonical_options(options: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
@@ -50,6 +63,12 @@ class AsrFingerprint:
         }
 
 
+@dataclass(frozen=True)
+class AsrCacheEntry:
+    generation: str
+    result: dict[str, Any]
+
+
 def build_asr_fingerprint(
     edit_video_path: str | os.PathLike[str],
     *,
@@ -73,6 +92,78 @@ def build_asr_fingerprint(
 
 def asr_sidecar_path(edit_video_path: str | os.PathLike[str]) -> Path:
     return Path(edit_video_path).with_suffix(".asr.json")
+
+
+def asr_cache_lock_path(media_path: str | os.PathLike[str]) -> Path:
+    path = Path(media_path)
+    if path.name.endswith(".asr.json"):
+        return path.with_name(
+            path.name.removesuffix(".asr.json") + ".asr.lock"
+        )
+    return path.with_suffix(".asr.lock")
+
+
+def _lock_cancelled(cancel_event: Any) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _acquire_cache_lock(lock_file, cancel_event: Any) -> None:
+    if os.name == "nt":
+        lock_file.seek(0)
+        while True:
+            if _lock_cancelled(cancel_event):
+                raise AsrCacheLockCancelled("ASR cache lock acquisition canceled")
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (13, 36):
+                    raise
+                time.sleep(ASR_CACHE_LOCK_POLL_SECONDS)
+    else:
+        while True:
+            if _lock_cancelled(cancel_event):
+                raise AsrCacheLockCancelled("ASR cache lock acquisition canceled")
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                time.sleep(ASR_CACHE_LOCK_POLL_SECONDS)
+
+
+def _release_cache_lock(lock_file) -> None:
+    try:
+        if os.name == "nt":
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextmanager
+def asr_cache_lock(
+    media_path: str | os.PathLike[str],
+    *,
+    cancel_event: Any = None,
+) -> Iterator[Path]:
+    lock_path = asr_cache_lock_path(media_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    acquired = False
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        _acquire_cache_lock(lock_file, cancel_event)
+        acquired = True
+        yield lock_path
+    finally:
+        if acquired:
+            _release_cache_lock(lock_file)
+        lock_file.close()
 
 
 def _fsync_parent_directory(
@@ -130,7 +221,39 @@ def _is_finite_timestamp(value: Any) -> bool:
     return not isinstance(value, float) or math.isfinite(value)
 
 
+def is_valid_asr_generation(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return parsed.version == 4 and str(parsed) == value.lower()
+
+
+def read_asr_cache_generation(
+    sidecar_path: str | os.PathLike[str],
+) -> str | None:
+    try:
+        payload = json.loads(Path(sidecar_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    generation = payload.get("generation")
+    return generation if is_valid_asr_generation(generation) else None
+
+
 def write_asr_cache(
+    edit_video_path: str | os.PathLike[str],
+    fingerprint: AsrFingerprint,
+    result: Mapping[str, Any],
+) -> Path:
+    with asr_cache_lock(edit_video_path):
+        return _write_asr_cache_unlocked(edit_video_path, fingerprint, result)
+
+
+def _write_asr_cache_unlocked(
     edit_video_path: str | os.PathLike[str],
     fingerprint: AsrFingerprint,
     result: Mapping[str, Any],
@@ -139,6 +262,7 @@ def write_asr_cache(
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": ASR_CACHE_SCHEMA_VERSION,
+        "generation": str(uuid.uuid4()),
         "fingerprint": fingerprint.to_dict(),
         "result": dict(result),
     }
@@ -170,7 +294,7 @@ def write_asr_cache(
 def read_valid_asr_cache(
     edit_video_path: str | os.PathLike[str],
     expected_fingerprint: AsrFingerprint,
-) -> dict[str, Any] | None:
+) -> AsrCacheEntry | None:
     cache_path = asr_sidecar_path(edit_video_path)
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -180,7 +304,12 @@ def read_valid_asr_cache(
         return None
     if payload.get("schema_version") != ASR_CACHE_SCHEMA_VERSION:
         return None
+    generation = payload.get("generation")
+    if not is_valid_asr_generation(generation):
+        return None
     if payload.get("fingerprint") != expected_fingerprint.to_dict():
         return None
     result = payload.get("result")
-    return result if _is_valid_asr_result(result) else None
+    if not _is_valid_asr_result(result):
+        return None
+    return AsrCacheEntry(generation=generation, result=dict(result))

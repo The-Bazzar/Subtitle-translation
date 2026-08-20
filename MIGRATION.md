@@ -22,7 +22,7 @@
 ./batch.sh "URL1" "URL2"
 ```
 
-当前 stage-aware batch 只执行 `download -> prepare-video -> mono 16kHz WAV`，成功后停在 `wav_ready`，不加载 Whisper。`--skip-burn`、`--translate-provider`、`--translate-model`、`--report` 和 `--dry-run` 仍可表达；burn/provider/model 会保留到阶段环境，等待后续 scheduler 阶段接入。
+当前 stage-aware batch 执行 `download -> prepare-video -> mono 16kHz WAV -> ASR -> alignment -> beautify -> glossary -> translate`。每次原子写 ASR recovery sidecar 都生成唯一 UUID generation；缺少/非法 generation 的未发布旧格式会安全视为 cache miss。所有 sidecar 写与 alignment commit 使用持久 `<base>.asr.lock` 跨进程互斥；parent 持锁 dispatch，child 只写 generation candidate，parent 持锁校验，并通过 per-task commit state 的 non-blocking cancel arbitration 线性化取消与 promote/delete：cancel-wins 保留 sidecar，commit-wins 完成 owned sidecar 删除并继续 postprocess。重复取消不会打断已经开始的 commit 或 abort cleanup，`worker_released` 只在 transaction/request thread 和 worker cleanup 全部结束后设置。并发新 writer 会在旧 commit 后写入并保留；失败或 cancel-wins 只清自己的 candidate。lock 文件是已忽略、最多 1 byte 的协调 artifact，不是字幕/cache，也不应在活跃任务间删除。`--translate-provider` / `--translate-model` 已用于 postprocess；burn 仍等待 Task 6 接入，`-B/--burn` 与 `--skip-burn` 目前只保留配置，启动信息会明确显示未调度。
 
 ## Split Download and Edit Preparation
 

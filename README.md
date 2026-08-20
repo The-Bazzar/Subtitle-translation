@@ -84,9 +84,15 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 `batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，实际调度由 `batch.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 的 NVENC 槽位固定为 `4`，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。
 
-当前 stage-aware 入口先并行流水执行 `download -> prepare-video -> mono 16kHz WAV`，等待 acquisition 全部到达终态后，再用一个 `spawn` worker 加载一次 WhisperX ASR 模型并串行识别所有有效 WAV。每个成功任务原子写入 `<name>.asr.json`；其 fingerprint 包含编辑版视频的绝对路径、大小、mtime、模型、compute type、源语言和 ASR options。下次 batch 只有在 fingerprint 完全匹配，且 result 仍符合未对齐 WhisperX ASR 的 `segments` / `language` 最小结构时才跳过识别；损坏、旧版、结构无效或输入变化的 sidecar 都会重跑。worker 在 ASR wave 结束后只卸载一次并显式关闭；active command 使用内部 heartbeat 和最长 24 小时的 operation watchdog，heartbeat 静默或 operation 超时会强制回收 child。意外退出或无响应都不会自动重启，当前任务失败，仍等待 worker 的任务进入 `blocked_by_worker_failure`。
+当前 stage-aware 入口先并行流水执行 `download -> prepare-video -> mono 16kHz WAV`，等待 acquisition 全部到达终态后，再启动一个 `spawn` worker。worker 加载一次 WhisperX ASR 模型并串行识别所有未缓存 WAV；每个成功任务原子写入 `<name>.asr.json`，fingerprint 包含编辑版视频的绝对路径、大小、mtime、模型、compute type、源语言和 ASR options，每次写入还会生成唯一 UUID generation。所有 sidecar 写入与 alignment commit 共享旁边的 `<name>.asr.lock` 跨进程锁；fingerprint、generation 或最小 schema 不匹配时会重跑 ASR。
 
-`<name>.asr.json` 只是 batch 的恢复中间件，不是字幕主入口。当前 batch 在 `asr_ready` 停止，后续 alignment scheduler 会把它转换为正式 `<name>.json`；`whisper.ps1` / `whisper.sh` standalone 路径仍直接输出最终词级 `<name>.json`，不会读取或写入 `.asr.json`。`--skip-burn`、`--translate-provider`、`--translate-model` 继续保留到阶段配置中，供后续 scheduler 阶段使用。
+ASR wave 显式卸载模型后不关闭 worker。scheduler 用 `langcodes` 验证 sidecar 的 `result.language` 并规范为稳定 ISO 639 主语言代码；无效、未知或 `und` 会拒绝，配置有效 `SOURCE_LANG` 时可作为 fallback。任务按语言稳定排序分组并保持组内原顺序；每组只加载一次 alignment model，逐任务串行生成 WhisperX-compatible `<name>.json`，组间卸载并替换模型。parent 在 blocking thread 中持有 media lock 后才 dispatch `ALIGN`；child 只原子写隐藏的 generation candidate，绝不覆盖 final。parent 在同一锁内验证 ownership/candidate/schema，并通过 per-task commit state 将取消与 destructive commit 线性化：取消先取得状态锁时保留 sidecar 并只清 candidate；commit 先取得状态锁时不可被 abort 打断，会 durable promote、删除 owned sidecar，并继续正常 postprocess。并发 ASR writer 会阻塞到 commit 完成，随后写入的新 generation sidecar 会保留。`WHISPER_ALIGN_MODEL` 非空时覆盖自动模型，空时沿用 WhisperX 按语言自动选择。
+
+每个任务 alignment 成功后会立即进入 CPU/IO semaphore 执行 beautify、glossary 和 translate，不等待其他语言组完成。所有 alignment 到达终态后，scheduler 才卸载 alignment model、关闭并 join worker，同时设置 `worker_released` event；后续 burn scheduler 必须等待该 event。active command 在 precommit 取消时由 controller terminate/kill，再不可中断地等待 request thread 真正结束；transaction thread 在 finally 清 candidate、释放 lock，不会把 `UNLOAD_ALIGN` 或 `SHUTDOWN` 排到仍在执行的请求后面。若 destructive commit 已开始，非阻塞仲裁立即判定 commit-wins，重复取消只被记录，scheduler 等 commit 完成且该任务继续 postprocess，不会产生“已删 sidecar 但任务 canceled”的矛盾状态。`worker_released` 只在全部 request/transaction thread 与 worker controller/process 清理完成后设置；candidate unlink、abort、close 等 cleanup 异常记录为 release diagnostics 并写入失败报告，不替换原始 precommit `CancelledError`。acquisition 取消且尚未创建 worker 时也会设置 release event。heartbeat 超时或意外退出仍不自动重启，当前任务失败，仍依赖 worker 的任务进入 `blocked_by_worker_failure`。当前 batch 成功终态为 `translated`，Task 6 尚未接入 burn，因此 `-B/--burn` 只保留配置且启动信息会明确提示未调度。
+
+`<name>.asr.json` 只是 batch 的恢复中间件，不是字幕主入口。`whisper.ps1` / `whisper.sh` standalone 路径仍直接输出最终词级 `<name>.json`，不会读取或写入 `.asr.json`。
+
+`<name>.asr.lock` 是持久、最多 1 byte 且已被 Git 忽略的运行时协调文件，不是字幕或 cache；保留它可避免活跃进程因 unlink 后锁定不同 inode/handle 而失去互斥。
 
 ### 完成通知
 
