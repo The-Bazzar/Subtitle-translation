@@ -6,12 +6,10 @@
 #   ./download.sh <YouTube URL>
 #
 # 输出:
-#   OUTPUT_VIDEO=<编辑视频绝对路径>
 #   OUTPUT_RENDER_VIDEO=<原始渲染视频绝对路径>
 #
 # 环境变量:
 #   YTDLP_PATH_LINUX  yt-dlp 路径 (默认: yt-dlp)
-#   FFMPEG_PATH_LINUX ffmpeg 路径 (默认: ffmpeg)
 # =============================================================================
 
 set -euo pipefail
@@ -19,7 +17,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
 YTDLP="${YTDLP_PATH_LINUX:-yt-dlp}"
-FFMPEG="${FFMPEG_PATH_LINUX:-ffmpeg}"
 PYTHON_BIN="${PYTHON_PATH_LINUX:-$SCRIPT_DIR/.venv/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "错误: Python venv not found. Run ./setup.sh first, or set PYTHON_PATH_LINUX." >&2
@@ -35,91 +32,6 @@ URL="$1"
 
 resolve_abs_path() {
     realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$PWD/$1"
-}
-
-print_native_cmd() {
-    local label="$1"
-    shift
-    {
-        printf '%s' "$label"
-        printf ' %q' "$@"
-        printf '\n'
-    } >&2
-}
-
-ffmpeg_encoder_available() {
-    "$FFMPEG" -hide_banner -encoders 2>/dev/null | grep -Fq "$1"
-}
-
-nvidia_available() {
-    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
-}
-
-run_edit_reencode() {
-    local input_path="$1"
-    local output_path="$2"
-
-    echo "============================================="
-    echo "download — 步骤 4/4: 重编码生成编辑视频"
-    echo "============================================="
-    echo "原片: $input_path"
-    echo "编辑: $output_path"
-    echo "模式: 优先 h264_nvenc；不可用时回退 libx264；音频统一 aresample s16 + flac"
-
-    rm -f "$output_path"
-
-    run_reencode_attempt() {
-        local label="$1"
-        shift
-        local -a video_args=("$@")
-        local -a ffmpeg_cmd=(
-            "$FFMPEG"
-            -hide_banner
-            -stats
-            -i "$input_path"
-            -pix_fmt yuv420p
-            "${video_args[@]}"
-            -filter_complex "[0:a]aresample=async=1:out_sample_fmt=s16[aout]"
-            -map 0:v:0
-            -map "[aout]"
-            -c:a flac
-            -map_metadata -1
-            -movflags +faststart
-            -y
-            "$output_path"
-        )
-
-        rm -f "$output_path"
-        echo "尝试: $label"
-        print_native_cmd "ffmpeg cmd:" "${ffmpeg_cmd[@]}"
-        if "${ffmpeg_cmd[@]}"; then
-            return 0
-        fi
-
-        if [ "$label" = "h264_nvenc" ] && [ -s "$output_path" ]; then
-            echo "Warning: h264_nvenc 返回非零退出码，但已输出非 0B 文件，继续使用该文件" >&2
-            return 0
-        fi
-
-        rm -f "$output_path"
-        echo "Warning: $label 重编码失败" >&2
-        return 1
-    }
-
-    if nvidia_available && ffmpeg_encoder_available "h264_nvenc"; then
-        if run_reencode_attempt "h264_nvenc" -c:v h264_nvenc -cq 12; then
-            return 0
-        fi
-    else
-        echo "跳过 h264_nvenc: 未检测到可用 NVIDIA GPU 或 ffmpeg h264_nvenc 编码器" >&2
-    fi
-
-    if run_reencode_attempt "libx264" -c:v libx264 -crf 12; then
-        return 0
-    fi
-
-    echo "Error: ffmpeg re-encode failed." >&2
-    return 1
 }
 
 echo "============================================="
@@ -193,7 +105,6 @@ echo "============================================="
 echo "download — 步骤 3/3: 定位视频文件"
 echo "============================================="
 
-EDIT_VIDEO_PATH="$FOLDER_NAME/$FOLDER_NAME.mkv"
 if [ "$HAS_EXISTING_ORIGINAL_MKV" = true ]; then
     RENDER_VIDEO_PATH="$EXISTING_ORIGINAL_MKV"
     echo "使用已有原片: $RENDER_VIDEO_PATH"
@@ -220,14 +131,10 @@ else
 fi
 
 RENDER_VIDEO_ABS="$(resolve_abs_path "$RENDER_VIDEO_PATH")"
-EDIT_VIDEO_ABS="$(resolve_abs_path "$EDIT_VIDEO_PATH")"
-run_edit_reencode "$RENDER_VIDEO_ABS" "$EDIT_VIDEO_ABS"
 
 echo "============================================="
 echo "download — 完成"
 echo "============================================="
 
-echo "编辑视频: $EDIT_VIDEO_ABS"
 echo "渲染原片: $RENDER_VIDEO_ABS"
-echo "OUTPUT_VIDEO=$EDIT_VIDEO_ABS"
 echo "OUTPUT_RENDER_VIDEO=$RENDER_VIDEO_ABS"

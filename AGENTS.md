@@ -4,7 +4,7 @@
 
 ## Overview
 
-`download(original + edit mkv) -> whisper(json) -> beautify(json words) -> glossary -> translate -> split -> proofread -> ass -> burn`
+`download(original) -> prepare-video(edit mkv) -> whisper(json) -> beautify(json words) -> glossary -> translate -> split -> proofread -> ass -> burn`
 
 Windows 主机必须使用 PowerShell 7，旧版 Windows PowerShell 5.x 会导致 `.ps1` 脚本报错。升级命令：
 
@@ -19,10 +19,12 @@ winget install Microsoft.PowerShell
 所有运行脚本位于仓库根目录：
 
 ```text
-├── pipeline.ps1              # Windows: download -> whisper -> translate_srt.ps1 -> ffmpeg-burn
+├── pipeline.ps1              # Windows: download -> prepare-video -> whisper -> translate_srt.ps1 -> ffmpeg-burn
 ├── pipeline.sh               # Linux/WSL: 同流程
 ├── download.ps1              # Windows: yt-dlp 下载视频和元数据
 ├── download.sh               # Linux/WSL: yt-dlp 下载视频和元数据
+├── prepare-video.ps1         # Windows: 原片重编码为编辑版 mkv
+├── prepare-video.sh          # Linux/WSL: 原片重编码为编辑版 mkv
 ├── whisper.ps1               # Windows: WhisperX 生成词级 JSON
 ├── whisper.sh                # Linux/WSL: WhisperX 生成词级 JSON
 ├── py_launcher.ps1           # Windows: 白名单 Python 共享启动器
@@ -50,6 +52,7 @@ winget install Microsoft.PowerShell
 ├── proofread_prompt.example.md
 ├── split_prompt.example.md
 ├── AGENTS.md
+├── MIGRATION.md             # breaking change 迁移说明
 ├── README.md
 └── .agents/skills/
     ├── beautify/SKILL.md
@@ -66,16 +69,17 @@ winget install Microsoft.PowerShell
 
 ### Windows `pipeline.ps1`
 
-1. `download.ps1` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，把原片改名为 `<base>.original.<ext>`，并统一重编码出编辑用 `<base>.mkv`
-2. `whisper.ps1` 对编辑版 `<base>.mkv` 调用 WhisperX，只输出 `<base>.json`
-3. `translate_srt.py --only-beautify` 美化 JSON 中的 word 时间轴，输出 `<base>.beautified.json`
-4. `translate_srt.py --only-glossary` 在翻译前强制重新生成并覆盖 `glossary.md`
-5. `translate_srt.py` 整句翻译、AI 分割、词级对轴、split event 校对，输出最终字幕
-6. `ffmpeg-burn.ps1` 可选硬压双语 ASS 到 `burned.mkv`
+1. `download.ps1` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，把原片改名为 `<base>.original.<ext>`
+2. `prepare-video.ps1` 接收原片路径并统一重编码出编辑用 `<base>.mkv`
+3. `whisper.ps1` 对编辑版 `<base>.mkv` 调用 WhisperX，只输出 `<base>.json`
+4. `translate_srt.py --only-beautify` 美化 JSON 中的 word 时间轴，输出 `<base>.beautified.json`
+5. `translate_srt.py --only-glossary` 在翻译前强制重新生成并覆盖 `glossary.md`
+6. `translate_srt.py` 整句翻译、AI 分割、词级对轴、split event 校对，输出最终字幕
+7. `ffmpeg-burn.ps1` 可选硬压双语 ASS 到 `burned.mkv`
 
 ### Linux/WSL `pipeline.sh`
 
-流程与 Windows 对齐，使用 `download.sh`、`whisper.sh`、`translate_srt.sh`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
+流程与 Windows 对齐，使用 `download.sh`、`prepare-video.sh`、`whisper.sh`、`translate_srt.sh`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
 
 ### Task Notifications
 
@@ -101,14 +105,22 @@ winget install Microsoft.PowerShell
 ### download
 
 - 输出目录名和视频基名相同，视频路径形如 `<video_dir>/<video_dir>.<ext>`
-- 下载后会保留原片为 `<video_dir>/<video_dir>.original.<ext>`，并始终重编码生成编辑用 `<video_dir>/<video_dir>.mkv`
-- 如果 `<video_dir>/<video_dir>.original.mkv` 已存在，download 脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`，然后直接进入编辑版重编码
-- 脚本输出 `OUTPUT_VIDEO=<编辑版 mkv>` 和 `OUTPUT_RENDER_VIDEO=<原片>`；pipeline 前半段使用前者，burn 使用后者
+- 下载后会保留原片为 `<video_dir>/<video_dir>.original.<ext>`，不再生成编辑版
+- 如果 `<video_dir>/<video_dir>.original.mkv` 已存在，download 脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`
+- 脚本只输出 `OUTPUT_RENDER_VIDEO=<原片>`；此契约见 [Issue #12](https://github.com/The-Bazzar/Subtitle-translation/issues/12)，direct download 迁移见 `MIGRATION.md`
 - 同步保存 `.png` 封面、`.info.json` 元数据、`.description` 简介、`.tags.txt` 标签
 - SponsorBlock 移除 `sponsor,selfpromo`
-- 下载后固定做一次时间戳抚平重编码：优先使用 `h264_nvenc -cq 12` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -crf 12`；音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
 - `cookies.txt` 通过相对路径引用，必须在仓库根目录运行脚本
 - Windows 文件夹名会做 Unicode 标点和非法字符清理，避免引号、破折号等导致跨 Windows/WSL 路径乱码
+
+### prepare-video
+
+- 只接受一个 original video path，输出同目录下去掉 `.original` 后缀的 `<base>.mkv`
+- 成功只输出 `OUTPUT_VIDEO=<编辑版 mkv 绝对路径>`；pipeline 前半段使用编辑版，burn 继续使用 download 返回的原片
+- 固定做一次时间戳抚平重编码：保持 CPU decode，优先使用 `h264_nvenc -cq 12`，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -crf 12`
+- 音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata
+- 若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本保留该文件并成功结束，不再回退重编码
+- 直接调用 download 的用户必须显式串联 prepare：PowerShell 使用 `& .\prepare-video.ps1 <OUTPUT_RENDER_VIDEO>`，Linux/WSL 使用 `./prepare-video.sh <OUTPUT_RENDER_VIDEO>`
 
 ### whisper
 
@@ -259,21 +271,29 @@ TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 ### Manual Steps
 
 ```powershell
-.\download.ps1 "URL"
-.\whisper.ps1 "video.mp4"
-& "<repo>\translate_srt.ps1" video.json --video video.mp4 --only-beautify
-& "<repo>\translate_srt.ps1" video.beautified.json --video video.mp4 --only-glossary --skip-beautify
-& "<repo>\translate_srt.ps1" video.beautified.json --video video.mp4 --source-lang en --target-lang zh
-.\ffmpeg-burn.ps1 "video.original.webm" -SubFile "video.en-zh.ass"
+$downloadOutput = & .\download.ps1 "URL"
+$renderVideo = ($downloadOutput | Where-Object { $_ -like 'OUTPUT_RENDER_VIDEO=*' } | Select-Object -Last 1) -replace '^OUTPUT_RENDER_VIDEO=', ''
+$prepareOutput = & .\prepare-video.ps1 $renderVideo
+$editVideo = ($prepareOutput | Where-Object { $_ -like 'OUTPUT_VIDEO=*' } | Select-Object -Last 1) -replace '^OUTPUT_VIDEO=', ''
+$videoBase = Join-Path ([IO.Path]::GetDirectoryName($editVideo)) ([IO.Path]::GetFileNameWithoutExtension($editVideo))
+& .\whisper.ps1 $editVideo
+& .\translate_srt.ps1 "$videoBase.json" --video $editVideo --only-beautify
+& .\translate_srt.ps1 "$videoBase.beautified.json" --video $editVideo --only-glossary --skip-beautify
+& .\translate_srt.ps1 "$videoBase.beautified.json" --video $editVideo --source-lang en --target-lang zh
+& .\ffmpeg-burn.ps1 $renderVideo -SubFile "$videoBase.en-zh.ass"
 ```
 
 ```bash
-./download.sh "URL"
-./whisper.sh "video.mp4"
-bash "<repo>/translate_srt.sh" video.json --video video.mp4 --only-beautify
-bash "<repo>/translate_srt.sh" video.beautified.json --video video.mp4 --only-glossary --skip-beautify
-bash "<repo>/translate_srt.sh" video.beautified.json --video video.mp4 --source-lang en --target-lang zh
-./ffmpeg-burn.sh "video.original.webm" --sub-file "video.en-zh.ass"
+download_output="$(./download.sh "URL")"
+render_video="$(printf '%s\n' "$download_output" | sed -n 's/^OUTPUT_RENDER_VIDEO=//p' | tail -n 1)"
+prepare_output="$(./prepare-video.sh "$render_video")"
+edit_video="$(printf '%s\n' "$prepare_output" | sed -n 's/^OUTPUT_VIDEO=//p' | tail -n 1)"
+video_base="${edit_video%.*}"
+./whisper.sh "$edit_video"
+./translate_srt.sh "$video_base.json" --video "$edit_video" --only-beautify
+./translate_srt.sh "$video_base.beautified.json" --video "$edit_video" --only-glossary --skip-beautify
+./translate_srt.sh "$video_base.beautified.json" --video "$edit_video" --source-lang en --target-lang zh
+./ffmpeg-burn.sh "$render_video" --sub-file "$video_base.en-zh.ass"
 ```
 
 ## Dependencies

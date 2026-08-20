@@ -2,7 +2,7 @@
 
 从 YouTube 链接出发，完成：
 
-`下载原片 + 重编码编辑版 -> WhisperX JSON -> JSON 时间轴美化 -> glossary 术语知识库 -> 整句翻译 -> 分割对轴 -> split 校对 -> 双语 ASS -> burned.mkv`
+`下载原片 -> 准备编辑版 -> WhisperX JSON -> JSON 时间轴美化 -> glossary 术语知识库 -> 整句翻译 -> 分割对轴 -> split 校对 -> 双语 ASS -> burned.mkv`
 
 > 必须使用 PowerShell 7。旧版 Windows PowerShell 5.x 会导致 `.ps1` 脚本报错。升级命令：`winget install Microsoft.PowerShell`
 
@@ -13,6 +13,8 @@
 ├── pipeline.sh
 ├── download.ps1
 ├── download.sh
+├── prepare-video.ps1
+├── prepare-video.sh
 ├── whisper.ps1
 ├── whisper.sh
 ├── py_launcher.ps1
@@ -36,7 +38,8 @@
 ├── glossary_prompt.example.md
 ├── translate_prompt.example.md
 ├── proofread_prompt.example.md
-└── split_prompt.example.md
+├── split_prompt.example.md
+└── MIGRATION.md
 ```
 
 时间轴美化和 glossary 生成已集中到 `translate_srt.py`。主链路不再使用 SRT，WhisperX `.json` 是唯一字幕输入。`glossary_prompt.md` / `split_prompt.md` 可作为本地风格微调文件使用，`tavily_domains.json` 可维护题材相关站点；这些本地文件不提交，仓库只提交对应 example。
@@ -65,13 +68,14 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 
 ## 主流程
 
-1. `download.ps1/.sh` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，然后把原片改名为 `<name>.original.<ext>`，并统一重编码出编辑用 `<name>.mkv`
-2. `whisper.ps1/.sh` 对编辑版 `<name>.mkv` 调用 `whisperx --output_format json`，输出 `<name>.json`
-3. `translate_srt.py --only-beautify` 美化 JSON 里的 word 时间轴并回写 segment，输出 `<name>.beautified.json`、`<name>.scenes.json`、`<name>.scenechange.txt`
-4. `translate_srt.py --only-glossary` 读取整句 transcript 和元数据，重新生成并覆盖 `glossary.md`
-5. `translate_srt.py` 使用整句 JSON 翻译
-6. AI 分割后用每个源语言 split 的首尾 word 匹配美化后的 `words[]` 回填时间，再对 split events 做最终校对，输出 `.split.<source>.srt` / `.split.<target>.srt` 和最终 ASS；显式 `--no-split` 时也继续输出 ASS
-7. `ffmpeg-burn.ps1/.sh` 使用双语 `.ass` 硬压字幕；pipeline 默认回到 `<name>.original.<ext>` 原片压制
+1. `download.ps1/.sh` 下载原片、封面、`.info.json`、`.description`、`.tags.txt`，然后把原片改名为 `<name>.original.<ext>`
+2. `prepare-video.ps1/.sh` 接收原片路径，统一重编码出编辑用 `<name>.mkv`
+3. `whisper.ps1/.sh` 对编辑版 `<name>.mkv` 调用 `whisperx --output_format json`，输出 `<name>.json`
+4. `translate_srt.py --only-beautify` 美化 JSON 里的 word 时间轴并回写 segment，输出 `<name>.beautified.json`、`<name>.scenes.json`、`<name>.scenechange.txt`
+5. `translate_srt.py --only-glossary` 读取整句 transcript 和元数据，重新生成并覆盖 `glossary.md`
+6. `translate_srt.py` 使用整句 JSON 翻译
+7. AI 分割后用每个源语言 split 的首尾 word 匹配美化后的 `words[]` 回填时间，再对 split events 做最终校对，输出 `.split.<source>.srt` / `.split.<target>.srt` 和最终 ASS；显式 `--no-split` 时也继续输出 ASS
+8. `ffmpeg-burn.ps1/.sh` 使用双语 `.ass` 硬压字幕；pipeline 默认回到 `<name>.original.<ext>` 原片压制
 
 成果物链：
 
@@ -210,7 +214,8 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 - 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；`py_launcher.ps1/.sh` 只允许启动 `translate_srt`、`merge_ass`、`batch`，并统一使用项目 `.venv`。`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh` 是其薄包装器，不调用全局 `python` / `python3`，也不要求用户设置 PATH，可从任意工作目录调用
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
-- `download.ps1/.sh` 会固定输出两条路径：`OUTPUT_VIDEO` 是编辑用 `<name>.mkv`，`OUTPUT_RENDER_VIDEO` 是保留给最终压制的 `<name>.original.<ext>`；若目录中已有 `<name>.original.mkv`，脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`，然后直接进入重编码。编辑版优先使用 `h264_nvenc` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264`，并统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建音频时间轴。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
+- [Issue #12](https://github.com/The-Bazzar/Subtitle-translation/issues/12) 起，`download.ps1/.sh` 只输出 `OUTPUT_RENDER_VIDEO=<name>.original.<ext>`，不再生成编辑版。直接调用 download 的用户必须按 [MIGRATION.md](MIGRATION.md) 把该路径传给 `prepare-video.ps1/.sh`；prepare 成功后只输出 `OUTPUT_VIDEO=<name>.mkv`。若目录中已有 `<name>.original.mkv`，download 只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`。
+- `prepare-video.ps1/.sh` 优先使用 `h264_nvenc` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264`，并统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建音频时间轴。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
 - 完整翻译流程必须配置 `TRANSLATE_PROVIDER`；只构建 glossary 时可改用 `GLOSSARY_PROVIDER`
 - WhisperX 首次运行会下载模型
 - 默认不硬压，推荐先人工校对 ASS，再决定是否压制
