@@ -41,7 +41,9 @@ winget install Microsoft.PowerShell
 ├── batch.ps1                 # Windows: batch.py 参数透传包装器
 ├── batch.sh                  # Linux/WSL: batch.py 参数透传包装器
 ├── batch.py                  # stage-aware batch CLI 与平台 runner
-├── batch_scheduler.py        # 任务状态、资源容量与 acquisition scheduler
+├── batch_scheduler.py        # 任务状态、资源容量、acquisition 与 ASR wave scheduler
+├── batch_cache.py            # ASR fingerprint 与原子 recovery sidecar
+├── whisper_worker.py         # spawn WhisperX worker 与 parent controller
 ├── setup.ps1                 # Windows: 安装依赖
 ├── setup.sh                  # Linux/WSL: 安装依赖
 ├── .env.ps1                  # PowerShell 读取 .env 的共享模块
@@ -83,13 +85,17 @@ winget install Microsoft.PowerShell
 
 流程与 Windows 对齐，使用 `download.sh`、`prepare-video.sh`、`whisper.sh`、`translate_srt.sh`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
 
-### Stage-aware Batch Acquisition
+### Stage-aware Batch ASR
 
 - `batch.ps1` / `batch.sh` 只负责把参数透传给 `py_launcher.ps1/.sh` 的 `batch` target；跨平台调度逻辑统一位于 `batch.py` / `batch_scheduler.py`
 - CPU/IO capacity 自动设为 `max(1, (os.cpu_count() or 1) // 4)`，用于 download 和 WAV 提取；prepare 使用固定 `4` 路 NVENC capacity
 - 不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，启动时打印自动检测出的 CPU/IO 和 NVENC capacity
 - acquisition 按任务流水执行 `download -> prepare-video -> extract-audio`；任务完成 download 后可立即等待 prepare，完成 prepare 后可立即提取 mono 16kHz WAV
-- 本阶段成功终态为 `wav_ready`，不会加载 Whisper；后续 ASR、alignment、translate 和 burn 由后续 scheduler 任务接入
+- 所有 acquisition 任务到达成功或失败终态后，scheduler 才启动一个 `multiprocessing.get_context('spawn')` worker；WhisperX 只在 child 内 import
+- ASR wave 只把已完成的 WAV path 交给 worker；同一 worker 加载一次 ASR，串行处理所有未缓存任务，wave 结束后只卸载一次并显式 shutdown，当前 CLI 不保留孤儿进程
+- 每个 ASR 成功任务通过 `batch_cache.py` 原子写 `<base>.asr.json`；fingerprint 包含编辑版 resolved path、size、mtime、Whisper model、compute type、源语言和 ASR options，损坏、旧版或 fingerprint 不匹配都视为无缓存
+- fingerprint 有效的 `.asr.json` 跳过 `TRANSCRIBE`；当前成功终态为 `asr_ready`，alignment、translate 和 burn 由后续 scheduler 任务接入
+- worker 单任务异常返回结构化失败并继续后续任务；request 使用 Queue，response 使用 parent-recv / child-send 单向 Pipe，child 的 heartbeat 线程与主线程通过同一锁发送；active command 每 5 秒发送 request-scoped heartbeat，controller 以 30 秒 heartbeat silence 和内部 24 小时 operation watchdog 检测无响应，deadline 前先有界排空当前 request 已到达的消息，超时后 terminate/kill + join，且不自动重启；当前任务为 `failed`，等待中的 worker-dependent 任务为 `blocked_by_worker_failure`；完整 fail-fast drain 和诊断日志由后续 scheduler 阶段补齐
 - CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；当前未执行的 burn/provider/model 值保存在阶段环境中，不启动对应阶段
 - `batch.py` 直接读取项目 `.env`，优先级为显式 CLI / 进程环境 > `.env` > 硬编码默认；`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`
 - 任一任务失败只终止该任务的后续 acquisition 阶段，其他任务继续；存在失败时聚合退出码为 `1`
@@ -104,7 +110,7 @@ winget install Microsoft.PowerShell
 ### Output Chain
 
 ```text
-<base>.original.<ext> + <base>.mkv -> json -> beautified.json -> web_evidence.json + glossary.md
+<base>.original.<ext> + <base>.mkv -> [batch: asr.json ->] json -> beautified.json -> web_evidence.json + glossary.md
       -> split.<source>.srt / split.<target>.srt
       -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass
       -> burned.mkv
@@ -138,9 +144,12 @@ winget install Microsoft.PowerShell
 
 - 已存在 `<base>.json` 时跳过
 - 视频先转为 mono 16kHz WAV，再调用 WhisperX
-- WhisperX 参数固定为 `--output_format json`
+- standalone PowerShell/bash 参数对齐：`--output_format json`、batch size `8`，CUDA 使用 `float16`、CPU 使用 `float32`
 - `.info.json` 中的 `language` 会用于 WhisperX `--language`；缺省回退 `en`
 - 输出 JSON 的 `segments[].words[]` 是后续分割对轴的唯一词源
+- `whisper.ps1` / `whisper.sh` 始终保持 standalone 最终 JSON 行为，不读取或写入 batch `.asr.json`
+- batch 先在 worker 外提取 WAV，再用 `LOAD_ASR -> TRANSCRIBE* -> UNLOAD_ASR -> SHUTDOWN` 生成恢复 sidecar；command payload 只传 path，不通过 IPC 传模型或大型结果
+- `<base>.asr.json` 只有在 fingerprint 完全匹配，且 result 包含合法字符串 `language`、list `segments` 以及每个 segment 的数值 `start` / `end` 和字符串 `text` 时才命中；写入先 fsync sibling temp 并原子替换，POSIX 再尽力 fsync parent directory
 
 ### beautify
 

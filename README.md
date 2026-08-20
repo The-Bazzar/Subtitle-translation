@@ -32,6 +32,8 @@
 ├── batch.sh
 ├── batch.py
 ├── batch_scheduler.py
+├── batch_cache.py
+├── whisper_worker.py
 ├── setup.ps1
 ├── setup.sh
 ├── .env.ps1
@@ -80,7 +82,11 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ./batch.sh --dry-run --report batch-result.txt "URL1" "URL2"
 ```
 
-`batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，实际调度由 `batch.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 的 NVENC 槽位固定为 `4`，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。当前 stage-aware 入口执行 `download -> prepare-video -> mono 16kHz WAV` 后停止，不加载 Whisper；`--skip-burn`、`--translate-provider`、`--translate-model` 仍会保留到阶段配置中，供后续 scheduler 阶段使用。
+`batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，实际调度由 `batch.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 的 NVENC 槽位固定为 `4`，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。
+
+当前 stage-aware 入口先并行流水执行 `download -> prepare-video -> mono 16kHz WAV`，等待 acquisition 全部到达终态后，再用一个 `spawn` worker 加载一次 WhisperX ASR 模型并串行识别所有有效 WAV。每个成功任务原子写入 `<name>.asr.json`；其 fingerprint 包含编辑版视频的绝对路径、大小、mtime、模型、compute type、源语言和 ASR options。下次 batch 只有在 fingerprint 完全匹配，且 result 仍符合未对齐 WhisperX ASR 的 `segments` / `language` 最小结构时才跳过识别；损坏、旧版、结构无效或输入变化的 sidecar 都会重跑。worker 在 ASR wave 结束后只卸载一次并显式关闭；active command 使用内部 heartbeat 和最长 24 小时的 operation watchdog，heartbeat 静默或 operation 超时会强制回收 child。意外退出或无响应都不会自动重启，当前任务失败，仍等待 worker 的任务进入 `blocked_by_worker_failure`。
+
+`<name>.asr.json` 只是 batch 的恢复中间件，不是字幕主入口。当前 batch 在 `asr_ready` 停止，后续 alignment scheduler 会把它转换为正式 `<name>.json`；`whisper.ps1` / `whisper.sh` standalone 路径仍直接输出最终词级 `<name>.json`，不会读取或写入 `.asr.json`。`--skip-burn`、`--translate-provider`、`--translate-model` 继续保留到阶段配置中，供后续 scheduler 阶段使用。
 
 ### 完成通知
 
@@ -100,7 +106,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 成果物链：
 
 ```text
-<name>.original.<ext> + <name>.mkv -> <name>.json -> <name>.beautified.json
+<name>.original.<ext> + <name>.mkv -> [batch: <name>.asr.json ->] <name>.json -> <name>.beautified.json
 -> <name>.web_evidence.json + glossary.md
 -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
 ```

@@ -36,6 +36,8 @@ if (-not $Device) {
         $Device = 'cpu'
     }
 }
+$BatchSize = 8
+$ComputeType = if ($Device -eq 'cuda') { 'float16' } else { 'float32' }
 $WhisperXExe             = Get-EnvValue 'WHISPERX_PATH_WIN' ''
 if (-not $WhisperXExe) {
     $WhisperXExe = Join-Path $PSScriptRoot ".venv\Scripts\whisperx.exe"
@@ -88,6 +90,7 @@ $VideoName = [System.IO.Path]::GetFileNameWithoutExtension($VideoAbs)
 $JsonPath = Join-Path $VideoDir "$VideoName.json"
 if (Test-Path $JsonPath) {
     Write-Host "JSON 已存在, 跳过: $JsonPath"
+    Write-Host "OUTPUT_JSON=$JsonPath"
     exit 0
 }
 
@@ -111,6 +114,7 @@ Write-Host "视频:        $VideoAbs" -ForegroundColor Gray
 Write-Host "语言:        $VideoLang" -ForegroundColor Gray
 Write-Host "模型:        $Model" -ForegroundColor Gray
 Write-Host "设备:        $Device" -ForegroundColor Gray
+Write-Host "计算精度:    $ComputeType" -ForegroundColor Gray
 if ($AlignModel) { Write-Host "对齐:        $AlignModel" -ForegroundColor Gray }
 Write-Host "=============================================" -ForegroundColor Cyan
 
@@ -125,7 +129,9 @@ $WhisperArgs = @(
     '--language', $VideoLang,
     '--output_dir', $VideoDir,
     '--output_format', 'json',
-    '--device', $Device
+    '--device', $Device,
+    '--batch_size', $BatchSize,
+    '--compute_type', $ComputeType
 )
 if ($AlignModel) {
     $WhisperArgs += '--align_model'
@@ -134,8 +140,8 @@ if ($AlignModel) {
 
 $env:TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD = "1"
 & $WhisperXExe @WhisperArgs
-Remove-Item $WavPath -Force
 $ExitCode = $LASTEXITCODE
+Remove-Item $WavPath -Force
 
 if ($ExitCode -eq 0) {
     Write-Host "=============================================" -ForegroundColor Green

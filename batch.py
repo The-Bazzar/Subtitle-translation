@@ -1,4 +1,4 @@
-"""Stage-aware batch entry point for acquisition through WAV preparation."""
+"""Stage-aware batch entry point for acquisition and persistent ASR."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from batch_scheduler import (
     TaskState,
     aggregate_exit_code,
 )
+from whisper_worker import AsrWorkerController, asr_worker_config_from_environment
 
 
 def emit_task_bell(kind: str, stream=None) -> None:
@@ -327,12 +328,17 @@ def run_acquisition(
     *,
     script_dir: Path,
     runners: AcquisitionRunners | None = None,
+    worker_factory=AsrWorkerController,
 ) -> list[BatchTask]:
-    stage_runners = runners or create_platform_runners(
-        script_dir,
-        build_stage_environment(args, script_dir=script_dir),
+    stage_environment = build_stage_environment(args, script_dir=script_dir)
+    stage_runners = runners or create_platform_runners(script_dir, stage_environment)
+    scheduler = AcquisitionScheduler(
+        args.urls,
+        limits,
+        stage_runners,
+        asr_config=asr_worker_config_from_environment(stage_environment),
+        worker_factory=worker_factory,
     )
-    scheduler = AcquisitionScheduler(args.urls, limits, stage_runners)
     return asyncio.run(scheduler.run())
 
 
@@ -385,12 +391,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Provider: {args.translate_provider} (reserved for later stage)")
     if args.translate_model:
         print(f"Model:    {args.translate_model} (reserved for later stage)")
-    print("Current:  download -> prepare -> WAV preparation")
+    print("Current:  download -> prepare -> WAV preparation -> ASR sidecar")
     print("=" * 60)
 
     if args.dry_run:
         for index, url in enumerate(args.urls, start=1):
-            print(f"[DRY RUN][{index:02d}] download -> prepare -> extract_audio <- {url}")
+            print(
+                f"[DRY RUN][{index:02d}] "
+                f"download -> prepare -> extract_audio -> asr <- {url}"
+            )
         return 0
 
     tasks = run_acquisition(args, limits, script_dir=script_dir)

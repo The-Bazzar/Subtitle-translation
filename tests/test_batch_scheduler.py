@@ -14,7 +14,9 @@ from batch import (
     build_parser,
     build_stage_environment,
     create_platform_runners,
+    run_acquisition,
 )
+from batch_cache import build_asr_fingerprint, read_valid_asr_cache, write_asr_cache
 from batch_scheduler import (
     AcquisitionRunners,
     AcquisitionScheduler,
@@ -22,6 +24,15 @@ from batch_scheduler import (
     ResourceLimits,
     TaskState,
     aggregate_exit_code,
+)
+from whisper_worker import (
+    AsrWorkerConfig,
+    AsrWorkerController,
+    WorkerCommand,
+    WorkerExitedError,
+    WorkerResult,
+    WorkerUnresponsiveError,
+    resolve_source_language,
 )
 
 
@@ -182,6 +193,17 @@ class BatchTaskStateTests(unittest.TestCase):
             with self.subTest(state=task.state):
                 with self.assertRaises(RuntimeError):
                     task.advance("prepare")
+
+    def test_successful_phase_can_explicitly_start_the_next_phase(self):
+        task = BatchTask(index=1, url="next")
+        task.start("download")
+        task.succeed("wav_ready")
+
+        task.start_next_phase("asr_waiting")
+
+        self.assertIs(task.state, TaskState.RUNNING)
+        self.assertEqual(task.stage, "asr_waiting")
+        self.assertIsNone(task.finished_at)
 
 
 class AcquisitionSchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -369,6 +391,467 @@ class AcquisitionSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await scheduler.run()
 
         self.assertEqual(peak, 4)
+
+
+class FakeAsrController:
+    def __init__(
+        self,
+        config,
+        calls,
+        *,
+        fail_name="",
+        crash_name="",
+        crash_on_unload=False,
+        hang_on_shutdown=False,
+    ):
+        self.config = config
+        self.calls = calls
+        self.fail_name = fail_name
+        self.crash_name = crash_name
+        self.crash_on_unload = crash_on_unload
+        self.hang_on_shutdown = hang_on_shutdown
+        self.is_alive = False
+
+    def __enter__(self):
+        self.calls.append(("worker_start",))
+        self.is_alive = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.calls.append(("worker_shutdown",))
+        self.is_alive = False
+        if self.hang_on_shutdown:
+            raise WorkerUnresponsiveError(
+                WorkerCommand.SHUTDOWN,
+                "operation timeout exceeded",
+                0.1,
+            )
+
+    def load_asr(self):
+        self.calls.append(("load_asr",))
+        return WorkerResult(command=WorkerCommand.LOAD_ASR, ok=True)
+
+    def transcribe(self, wav_path):
+        wav_path = pathlib.Path(wav_path).resolve()
+        self.calls.append(("transcribe", wav_path.name))
+        if wav_path.name == self.crash_name:
+            self.is_alive = False
+            raise WorkerExitedError(17, WorkerCommand.TRANSCRIBE)
+        if wav_path.name == self.fail_name:
+            return WorkerResult(
+                command=WorkerCommand.TRANSCRIBE,
+                ok=False,
+                path=str(wav_path),
+                error_type="ValueError",
+                error="fake ASR failure",
+            )
+        edit_video = wav_path.with_suffix(".mkv")
+        source_language = resolve_source_language(edit_video)
+        fingerprint = build_asr_fingerprint(
+            edit_video,
+            model=self.config.model,
+            compute_type=self.config.compute_type,
+            source_language=source_language,
+            asr_options=self.config.options_dict(),
+        )
+        output_path = write_asr_cache(
+            edit_video,
+            fingerprint,
+            {
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": wav_path.stem}
+                ],
+                "language": source_language,
+            },
+        )
+        return WorkerResult(
+            command=WorkerCommand.TRANSCRIBE,
+            ok=True,
+            path=str(wav_path),
+            output_path=str(output_path),
+            language=source_language,
+        )
+
+    def unload_asr(self):
+        self.calls.append(("unload_asr",))
+        if self.crash_on_unload:
+            self.is_alive = False
+            raise WorkerExitedError(19, WorkerCommand.UNLOAD_ASR)
+        return WorkerResult(command=WorkerCommand.UNLOAD_ASR, ok=True)
+
+
+class BatchAsrExecutionTests(unittest.TestCase):
+    def test_run_acquisition_enables_asr_wave_with_project_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            render_video = root / "video.original.mkv"
+            edit_video = root / "video.mkv"
+            wav_path = root / "video.wav"
+            render_video.write_bytes(b"original")
+            edit_video.write_bytes(b"edit")
+            wav_path.write_bytes(b"wav")
+
+            async def download(_url):
+                return render_video
+
+            async def prepare(_render_video):
+                return edit_video
+
+            async def extract_audio(_edit_video):
+                return wav_path
+
+            worker_calls = []
+            seen_configs = []
+
+            def worker_factory(config):
+                seen_configs.append(config)
+                return FakeAsrController(config, worker_calls)
+
+            args = build_parser().parse_args(["url"])
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "TORCH_BACKEND": "cpu",
+                    "WHISPER_MODEL": "test-model",
+                    "HF_TOKEN": "test-token",
+                },
+                clear=True,
+            ):
+                tasks = run_acquisition(
+                    args,
+                    ResourceLimits(cpu_io=1),
+                    script_dir=root,
+                    runners=AcquisitionRunners(download, prepare, extract_audio),
+                    worker_factory=worker_factory,
+                )
+
+        self.assertEqual(seen_configs[0].model, "test-model")
+        self.assertEqual(seen_configs[0].device, "cpu")
+        self.assertEqual(seen_configs[0].compute_type, "float32")
+        self.assertEqual(seen_configs[0].options_dict(), {"batch_size": 8})
+        self.assertEqual(seen_configs[0].hf_token, "test-token")
+        self.assertEqual(tasks[0].stage, "asr_ready")
+        self.assertEqual(worker_calls.count(("load_asr",)), 1)
+        self.assertEqual(worker_calls.count(("unload_asr",)), 1)
+
+
+class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = pathlib.Path(self.temp_dir.name)
+        self.config = AsrWorkerConfig(
+            model="fake-model",
+            device="cpu",
+            compute_type="int8",
+            asr_options={"batch_size": 2},
+        )
+
+    def create_media(self, name, language="en"):
+        render_video = self.root / f"{name}.original.mkv"
+        edit_video = self.root / f"{name}.mkv"
+        wav_path = self.root / f"{name}.wav"
+        render_video.write_bytes(b"original")
+        edit_video.write_bytes(b"edit")
+        wav_path.write_bytes(b"wav")
+        (self.root / f"{name}.info.json").write_text(
+            '{"language": "' + language + '"}',
+            encoding="utf-8",
+        )
+        return render_video, edit_video, wav_path
+
+    def runners_for(self, media, acquisition_calls):
+        async def download(url):
+            acquisition_calls.append(("download", url))
+            return media[url][0]
+
+        async def prepare(render_video):
+            acquisition_calls.append(("prepare", pathlib.Path(render_video).name))
+            for values in media.values():
+                if values[0] == pathlib.Path(render_video):
+                    return values[1]
+            raise AssertionError(f"unknown render video: {render_video}")
+
+        async def extract_audio(edit_video):
+            acquisition_calls.append(("extract_audio", pathlib.Path(edit_video).name))
+            for values in media.values():
+                if values[1] == pathlib.Path(edit_video):
+                    return values[2]
+            raise AssertionError(f"unknown edit video: {edit_video}")
+
+        return AcquisitionRunners(download, prepare, extract_audio)
+
+    def fingerprint(self, edit_video):
+        return build_asr_fingerprint(
+            edit_video,
+            model=self.config.model,
+            compute_type=self.config.compute_type,
+            source_language=resolve_source_language(edit_video),
+            asr_options=self.config.options_dict(),
+        )
+
+    async def test_asr_starts_after_acquisition_and_skips_valid_cache(self):
+        media = {
+            "cached": self.create_media("cached", "en-US"),
+            "fresh": self.create_media("fresh", "ja"),
+        }
+        write_asr_cache(
+            media["cached"][1],
+            self.fingerprint(media["cached"][1]),
+            {
+                "segments": [{"start": 0.0, "end": 1.0, "text": "cached"}],
+                "language": "en",
+            },
+        )
+        acquisition_calls = []
+        worker_calls = []
+
+        def worker_factory(config):
+            extracted = [call for call in acquisition_calls if call[0] == "extract_audio"]
+            self.assertEqual(len(extracted), 2)
+            return FakeAsrController(config, worker_calls)
+
+        scheduler = AcquisitionScheduler(
+            urls=["cached", "fresh"],
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, acquisition_calls),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertEqual(
+            worker_calls,
+            [
+                ("worker_start",),
+                ("load_asr",),
+                ("transcribe", "fresh.wav"),
+                ("unload_asr",),
+                ("worker_shutdown",),
+            ],
+        )
+        self.assertTrue(all(task.state is TaskState.SUCCEEDED for task in tasks))
+        self.assertTrue(all(task.stage == "asr_ready" for task in tasks))
+        self.assertEqual(tasks[0].asr_path, media["cached"][1].with_suffix(".asr.json"))
+        self.assertEqual(tasks[1].asr_path, media["fresh"][1].with_suffix(".asr.json"))
+        self.assertIsNotNone(
+            read_valid_asr_cache(media["fresh"][1], self.fingerprint(media["fresh"][1]))
+        )
+
+    async def test_all_cached_tasks_still_open_and_close_reusable_controller(self):
+        media = {"cached": self.create_media("cached")}
+        write_asr_cache(
+            media["cached"][1],
+            self.fingerprint(media["cached"][1]),
+            {
+                "segments": [{"start": 0.0, "end": 1.0, "text": "cached"}],
+                "language": "en",
+            },
+        )
+        worker_calls = []
+        scheduler = AcquisitionScheduler(
+            urls=["cached"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertEqual(worker_calls, [("worker_start",), ("worker_shutdown",)])
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(tasks[0].stage, "asr_ready")
+
+    async def test_structured_task_failure_does_not_stop_later_asr_task(self):
+        media = {
+            "bad": self.create_media("bad"),
+            "good": self.create_media("good"),
+        }
+        worker_calls = []
+        scheduler = AcquisitionScheduler(
+            urls=["bad", "good"],
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                fail_name="bad.wav",
+            ),
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "asr")
+        self.assertIn("ValueError: fake ASR failure", tasks[0].error_detail)
+        self.assertIs(tasks[1].state, TaskState.SUCCEEDED)
+        self.assertIn(("transcribe", "good.wav"), worker_calls)
+        self.assertEqual(worker_calls.count(("unload_asr",)), 1)
+
+    async def test_worker_crash_fails_current_and_blocks_waiting_without_restart(self):
+        media = {
+            "crash": self.create_media("crash"),
+            "waiting": self.create_media("waiting"),
+        }
+        worker_calls = []
+        factory_calls = 0
+
+        def worker_factory(config):
+            nonlocal factory_calls
+            factory_calls += 1
+            return FakeAsrController(
+                config,
+                worker_calls,
+                crash_name="crash.wav",
+            )
+
+        scheduler = AcquisitionScheduler(
+            urls=["crash", "waiting"],
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertEqual(factory_calls, 1)
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertIs(tasks[1].state, TaskState.BLOCKED_BY_WORKER_FAILURE)
+        self.assertIn("exit code: 17", tasks[0].error_detail)
+        self.assertIn("exit code: 17", tasks[1].error_detail)
+        self.assertNotIn(("transcribe", "waiting.wav"), worker_calls)
+        self.assertNotIn(("unload_asr",), worker_calls)
+        self.assertEqual(worker_calls[-1], ("worker_shutdown",))
+        self.assertEqual(aggregate_exit_code(tasks), 1)
+
+    async def test_unresponsive_worker_fails_current_and_blocks_waiting(self):
+        asyncio.get_running_loop().slow_callback_duration = 2.0
+        media = {
+            "hang": self.create_media("heartbeat-hang"),
+            "waiting": self.create_media("waiting"),
+        }
+        controllers = []
+
+        def worker_factory(config):
+            controller = AsrWorkerController(
+                config,
+                backend_factory="tests.test_whisper_worker:FakeBackend",
+                heartbeat_interval=0.01,
+                max_heartbeat_silence=0.5,
+                operation_timeout=0.75,
+            )
+            controllers.append(controller)
+            return controller
+
+        scheduler = AcquisitionScheduler(
+            urls=["hang", "waiting"],
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertIs(tasks[1].state, TaskState.BLOCKED_BY_WORKER_FAILURE)
+        self.assertIn("operation timeout", tasks[0].error_detail)
+        self.assertIn("operation timeout", tasks[1].error_detail)
+        self.assertFalse(controllers[0].is_alive)
+        self.assertEqual(aggregate_exit_code(tasks), 1)
+
+    async def test_worker_exit_during_unload_is_reported_as_batch_failure(self):
+        media = {"video": self.create_media("video")}
+        worker_calls = []
+        scheduler = AcquisitionScheduler(
+            urls=["video"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                crash_on_unload=True,
+            ),
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "unload_asr")
+        self.assertIn("exit code: 19", tasks[0].error_detail)
+        self.assertTrue(media["video"][1].with_suffix(".asr.json").is_file())
+        self.assertEqual(aggregate_exit_code(tasks), 1)
+
+    async def test_unresponsive_shutdown_marks_completed_asr_wave_failed(self):
+        media = {"video": self.create_media("video")}
+        worker_calls = []
+        scheduler = AcquisitionScheduler(
+            urls=["video"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                hang_on_shutdown=True,
+            ),
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "shutdown")
+        self.assertIn("operation timeout", tasks[0].error_detail)
+        self.assertEqual(worker_calls.count(("unload_asr",)), 1)
+        self.assertEqual(worker_calls.count(("worker_shutdown",)), 1)
+        self.assertEqual(aggregate_exit_code(tasks), 1)
+
+    async def test_structured_unload_failure_is_attempted_once_then_shutdown(self):
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+        media = {"video": self.create_media("video")}
+        log_path = self.root / "worker.log"
+        controllers = []
+
+        def worker_factory(config):
+            controller = AsrWorkerController(
+                config,
+                backend_factory="tests.test_whisper_worker:FakeBackend",
+            )
+            controllers.append(controller)
+            return controller
+
+        scheduler = AcquisitionScheduler(
+            urls=["video"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WHISPER_WORKER_TEST_LOG": str(log_path),
+                "WHISPER_WORKER_TEST_UNLOAD_ERROR": "1",
+            },
+        ):
+            tasks = await scheduler.run()
+
+        self.assertEqual(
+            log_path.read_text(encoding="utf-8").splitlines(),
+            ["load", "transcribe:video.wav", "unload"],
+        )
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "unload_asr")
+        self.assertEqual(tasks[0].error_detail, "RuntimeError: fake unload failure")
+        self.assertTrue(controllers[0]._asr_unload_attempted)
+        self.assertFalse(controllers[0].is_alive)
+        self.assertEqual(controllers[0].exitcode, 0)
 
 
 class BatchCliTests(unittest.TestCase):
