@@ -19,8 +19,8 @@ download.ps1 — 下载 YouTube 视频 + 元数据 (不含字幕生成)
 
 说明:
   下载原片、缩略图 (PNG)、元数据、简介、标签。
-  然后保留 <标题>.original.<ext> 原片，并重编码出 <标题>.mkv 编辑版。
-  只负责下载和重编码，不运行 WhisperX。
+  将原片保留为 <标题>.original.<ext>，不生成编辑版。
+  如需编辑版，请将 OUTPUT_RENDER_VIDEO 传给 prepare-video.ps1。
 "@
     if ($Help) {
         exit 0
@@ -31,158 +31,10 @@ download.ps1 — 下载 YouTube 视频 + 元数据 (不含字幕生成)
 # ── 从 .env 读取配置 ─────────────────────────────────────────────────────────
 . "$PSScriptRoot\.env.ps1"
 $Ytdlp = Get-EnvValue 'YTDLP_PATH_WIN' 'yt-dlp'
-$Ffmpeg = Get-EnvValue 'FFMPEG_PATH_WIN' 'ffmpeg'
 
 function Resolve-AbsolutePath {
     param([Parameter(Mandatory)][string]$Path)
     return (Get-Item $Path).FullName
-}
-
-function Format-NativeCommand {
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [Parameter(Mandatory)][string[]]$Arguments
-    )
-
-    $quoted = foreach ($arg in $Arguments) {
-        $text = [string]$arg
-        if ($text -match '[\s"`]') {
-            '"' + ($text -replace '"', '\"') + '"'
-        } else {
-            $text
-        }
-    }
-
-    return ((@($FilePath) + @($quoted)) -join ' ').Trim()
-}
-
-function Test-FfmpegEncoder {
-    param([Parameter(Mandatory)][string]$Name)
-    try {
-        $encoders = & $Ffmpeg -hide_banner -encoders 2>$null
-        return (($LASTEXITCODE -eq 0) -and (($encoders | Select-String -SimpleMatch $Name -Quiet) -eq $true))
-    } catch {
-        return $false
-    }
-}
-
-function Test-NvidiaAvailable {
-    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
-    if (-not $nvidiaSmi) {
-        return $false
-    }
-
-    try {
-        & $nvidiaSmi.Source -L *> $null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
-}
-
-function New-EditVideoReencodeArgs {
-    param(
-        [Parameter(Mandatory)][string]$InputPath,
-        [Parameter(Mandatory)][string]$OutputPath,
-        [Parameter(Mandatory)][string[]]$VideoArgs
-    )
-
-    return @(
-        '-hide_banner',
-        '-stats',
-        '-i', $InputPath,
-        '-pix_fmt', 'yuv420p'
-    ) + $VideoArgs + @(
-        '-filter_complex', '[0:a]aresample=async=1:out_sample_fmt=s16[aout]',
-        '-map', '0:v:0',
-        '-map', '[aout]',
-        '-c:a', 'flac',
-        '-map_metadata', '-1',
-        '-movflags', '+faststart',
-        '-y',
-        $OutputPath
-    )
-}
-
-function Test-NonEmptyFile {
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path $Path -PathType Leaf)) {
-        return $false
-    }
-
-    try {
-        return (Get-Item -LiteralPath $Path).Length -gt 0
-    } catch {
-        return $false
-    }
-}
-
-function Invoke-EditVideoReencode {
-    param(
-        [Parameter(Mandatory)][string]$InputPath,
-        [Parameter(Mandatory)][string]$OutputPath
-    )
-
-    Write-Host "=============================================" -ForegroundColor Cyan
-    Write-Host "步骤 4: 重编码生成编辑视频" -ForegroundColor Cyan
-    Write-Host "=============================================" -ForegroundColor Cyan
-    Write-Host "原片: $InputPath" -ForegroundColor Gray
-    Write-Host "编辑: $OutputPath" -ForegroundColor Gray
-    Write-Host "模式: 优先 h264_nvenc；不可用时回退 libx264；音频统一 aresample s16 + flac" -ForegroundColor Gray
-
-    if (Test-Path $OutputPath) {
-        Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
-    }
-
-    $attempts = @()
-    if ((Test-NvidiaAvailable) -and (Test-FfmpegEncoder -Name 'h264_nvenc')) {
-        $attempts += @{
-            Name = 'h264_nvenc'
-            Args = New-EditVideoReencodeArgs -InputPath $InputPath -OutputPath $OutputPath -VideoArgs @(
-                '-c:v', 'h264_nvenc',
-                '-cq', '12'
-            )
-        }
-    } else {
-        Write-Host "跳过 h264_nvenc: 未检测到可用 NVIDIA GPU 或 ffmpeg h264_nvenc 编码器" -ForegroundColor Yellow
-    }
-
-    $attempts += @{
-        Name = 'libx264'
-        Args = New-EditVideoReencodeArgs -InputPath $InputPath -OutputPath $OutputPath -VideoArgs @(
-            '-c:v', 'libx264',
-            '-crf', '12'
-        )
-    }
-
-    $lastExitCode = 1
-    foreach ($attempt in $attempts) {
-        if (Test-Path $OutputPath) {
-            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
-        }
-
-        Write-Host "尝试: $($attempt.Name)" -ForegroundColor DarkGray
-        [Console]::Error.WriteLine("ffmpeg cmd: $(Format-NativeCommand -FilePath $Ffmpeg -Arguments $attempt.Args)")
-        & $Ffmpeg @($attempt.Args)
-        $lastExitCode = $LASTEXITCODE
-        if ($lastExitCode -eq 0 -and (Test-Path $OutputPath)) {
-            return
-        }
-
-        if ($attempt.Name -eq 'h264_nvenc' -and $lastExitCode -ne 0 -and (Test-NonEmptyFile -Path $OutputPath)) {
-            Write-Host "Warning: h264_nvenc 返回 exit=$lastExitCode，但已输出非 0B 文件，继续使用该文件" -ForegroundColor Yellow
-            return
-        }
-
-        Write-Host "Warning: $($attempt.Name) 重编码失败: exit=$lastExitCode" -ForegroundColor Yellow
-
-        if (Test-Path $OutputPath) {
-            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    Write-Host "Error: ffmpeg re-encode failed." -ForegroundColor Red
-    exit $lastExitCode
 }
 
 # ── 步骤 1: 获取视频标题并创建文件夹 ──────────────────────────────────────────
@@ -273,7 +125,6 @@ Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "步骤 3: 寻找下载好的视频文件" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 
-$EditVideoPath = Join-Path $FolderName "$FolderName.mkv"
 if ($HasExistingOriginalMkv) {
     $RenderVideoPath = $ExistingOriginalMkv
     $RenderVideoAbs = Resolve-AbsolutePath $RenderVideoPath
@@ -306,17 +157,12 @@ if ($HasExistingOriginalMkv) {
     Move-Item -LiteralPath $OriginalVideoAbs -Destination $RenderVideoPath -Force
     $RenderVideoAbs = Resolve-AbsolutePath $RenderVideoPath
 }
-$EditVideoAbs = Join-Path (Resolve-Path $FolderName).Path "$FolderName.mkv"
-
-Invoke-EditVideoReencode -InputPath $RenderVideoAbs -OutputPath $EditVideoAbs
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────
 
 Write-Host "=============================================" -ForegroundColor Green
 Write-Host "Finish! 所有文件已保存在文件夹: $FolderName" -ForegroundColor Green
-Write-Host "编辑视频: $EditVideoAbs" -ForegroundColor Gray
 Write-Host "渲染原片: $RenderVideoAbs" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Green
 
-Write-Output "OUTPUT_VIDEO=$EditVideoAbs"
 Write-Output "OUTPUT_RENDER_VIDEO=$RenderVideoAbs"
