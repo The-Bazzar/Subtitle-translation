@@ -343,7 +343,7 @@ class WslInterpreterResolverTests(unittest.TestCase):
 @unittest.skipUnless(PWSH, "requires PowerShell 7")
 class WindowsProductionBatchSmokeTests(ProductionBatchSmokeMixin, unittest.TestCase):
     platform_name = "windows-powershell"
-    wrapper_chain = "batch.ps1 -> py_launcher.ps1 -> batch.py"
+    wrapper_chain = "py_launcher.ps1 -> batch.py"
 
     def run_smoke(self):
         return production_batch_smoke.run_windows(
@@ -356,7 +356,7 @@ class WindowsProductionBatchSmokeTests(ProductionBatchSmokeMixin, unittest.TestC
 
 class BashProductionBatchSmokeTests(ProductionBatchSmokeMixin, unittest.TestCase):
     platform_name = "wsl-bash" if os.name == "nt" else "bash"
-    wrapper_chain = "batch.sh -> py_launcher.sh -> batch.py"
+    wrapper_chain = "py_launcher.sh -> batch.py"
 
     def run_smoke(self):
         if os.name == "nt":

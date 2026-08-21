@@ -679,10 +679,15 @@ def create_platform_postprocess_runner(
             shutil.which("pwsh") or "pwsh",
             "-NoProfile",
             "-File",
-            str(script_dir / "translate_srt.ps1"),
+            str(script_dir / "py_launcher.ps1"),
+            "translate_srt",
         ]
     else:
-        wrapper_prefix = ["bash", str(script_dir / "translate_srt.sh")]
+        wrapper_prefix = [
+            "bash",
+            str(script_dir / "py_launcher.sh"),
+            "translate_srt",
+        ]
 
     async def postprocess(task: BatchTask) -> None:
         if (

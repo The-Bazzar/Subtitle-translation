@@ -657,7 +657,7 @@ exit {exit_code}
             encoding="utf-8",
             newline="\n",
         )
-        (self.sandbox / "translate_srt.sh").write_text(
+        (self.sandbox / "py_launcher.sh").write_text(
             "#!/bin/bash\nexit 0\n",
             encoding="utf-8",
             newline="\n",
@@ -985,18 +985,18 @@ class DownloadPipelineScriptTests(unittest.TestCase):
                 r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
             ),
             "beautify": (
-                r"&\s+\$TranslatePs1\s+\$JsonPath\s+--video\s+\$VideoPath\s+"
+                r"&\s+\$PyLauncherPs1\s+translate_srt\s+\$JsonPath\s+--video\s+\$VideoPath\s+"
                 r"--only-beautify\s*if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*"
                 r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
             ),
             "glossary": (
-                r"&\s+\$TranslatePs1\s+\$TranslateSrc\s+--video\s+\$VideoPath\s+"
+                r"&\s+\$PyLauncherPs1\s+translate_srt\s+\$TranslateSrc\s+--video\s+\$VideoPath\s+"
                 r"--only-glossary\s+--skip-beautify\s*"
                 r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*"
                 r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
             ),
             "translate": (
-                r"&\s+\$TranslatePs1\s+\$TranslateSrc\s+--video\s+\$VideoPath\s+"
+                r"&\s+\$PyLauncherPs1\s+translate_srt\s+\$TranslateSrc\s+--video\s+\$VideoPath\s+"
                 r"--skip-beautify\s+--skip-knowledge\s+@LangArgs\s*"
                 r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*"
                 r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
@@ -1016,7 +1016,7 @@ class DownloadPipelineScriptTests(unittest.TestCase):
 
         self.assertRegex(
             powershell,
-            r"\$AssOutput\s*=\s*&\s+\$TranslatePs1[\s\S]*?--print-output-path\s*"
+            r"\$AssOutput\s*=\s*&\s+\$PyLauncherPs1\s+translate_srt[\s\S]*?--print-output-path\s*"
             r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)[\s\S]*?OUTPUT_ASS=",
         )
         self.assertRegex(
@@ -1048,15 +1048,15 @@ class DownloadPipelineScriptTests(unittest.TestCase):
         }
         errexit_stage_patterns = {
             "beautify": (
-                r"(?m)^\s*bash \"\$TRANSLATE_SCRIPT\" \"\$JSON_PATH\" --video "
+                r"(?m)^\s*bash \"\$PY_LAUNCHER\" translate_srt \"\$JSON_PATH\" --video "
                 r"\"\$VIDEO_PATH\" --only-beautify \"\$\{BEAUTIFY_ARGS\[@\]\}\"$"
             ),
             "glossary": (
-                r"(?m)^\s*bash \"\$TRANSLATE_SCRIPT\" \"\$TRANSLATE_SRC\" --video "
+                r"(?m)^\s*bash \"\$PY_LAUNCHER\" translate_srt \"\$TRANSLATE_SRC\" --video "
                 r"\"\$VIDEO_PATH\" --only-glossary --skip-beautify$"
             ),
             "translate": (
-                r"(?m)^\s*bash \"\$TRANSLATE_SCRIPT\" \"\$TRANSLATE_SRC\" --video "
+                r"(?m)^\s*bash \"\$PY_LAUNCHER\" translate_srt \"\$TRANSLATE_SRC\" --video "
                 r"\"\$VIDEO_PATH\" --skip-beautify --skip-knowledge \\$"
             ),
             "burn": (

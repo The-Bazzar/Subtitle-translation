@@ -19,7 +19,7 @@ winget install Microsoft.PowerShell
 所有运行脚本位于仓库根目录：
 
 ```text
-├── pipeline.ps1              # Windows: download -> prepare-video -> whisper -> translate_srt.ps1 -> ffmpeg-burn
+├── pipeline.ps1              # Windows: download -> prepare-video -> whisper -> py_launcher translate_srt -> ffmpeg-burn
 ├── pipeline.sh               # Linux/WSL: 同流程
 ├── download.ps1              # Windows: yt-dlp 下载视频和元数据
 ├── download.sh               # Linux/WSL: yt-dlp 下载视频和元数据
@@ -29,17 +29,12 @@ winget install Microsoft.PowerShell
 ├── whisper.sh                # Linux/WSL: WhisperX 生成词级 JSON
 ├── py_launcher.ps1           # Windows: 白名单 Python 共享启动器
 ├── py_launcher.sh            # Linux/WSL: 白名单 Python 共享启动器
-├── merge_ass.ps1             # Windows: merge_ass 薄包装器
-├── merge_ass.sh              # Linux/WSL: merge_ass 薄包装器
-├── translate_srt.ps1         # Windows: translate_srt 薄包装器
-├── translate_srt.sh           # Linux/WSL: translate_srt 薄包装器
 ├── translate_srt.py          # JSON 美化 + glossary + 翻译/分割/校对 + SRT/ASS 导出
+├── merge_ass.py              # 合并相同时间轴的双语 ASS
 ├── ffmpeg-burn.ps1           # Windows: ffmpeg ASS 硬压
 ├── ffmpeg-burn.sh            # Linux/WSL: ffmpeg ASS 硬压
 ├── mpv-burn.ps1              # Windows: mpv 硬压备选
 ├── mpv-burn.sh               # Linux/WSL: mpv 硬压备选
-├── batch.ps1                 # Windows: batch.py 参数透传包装器
-├── batch.sh                  # Linux/WSL: batch.py 参数透传包装器
 ├── batch.py                  # stage-aware batch CLI 薄入口
 ├── batch_runtime.py          # batch CLI 实现与平台 runner
 ├── batch_scheduler.py        # 任务状态、资源容量、acquisition 与 ASR wave scheduler
@@ -84,12 +79,12 @@ winget install Microsoft.PowerShell
 
 ### Linux/WSL `pipeline.sh`
 
-流程与 Windows 对齐，使用 `download.sh`、`prepare-video.sh`、`whisper.sh`、`translate_srt.sh`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
+流程与 Windows 对齐，使用 `download.sh`、`prepare-video.sh`、`whisper.sh`、`py_launcher.sh translate_srt`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
 prepare 失败时，`pipeline.sh` 精确透传 `prepare-video.sh 的原始退出码`，与 PowerShell 行为一致。
 
 ### Stage-aware Batch ASR
 
-- `batch.ps1` / `batch.sh` 只负责把参数透传给 `py_launcher.ps1/.sh` 的 `batch` target；`batch.py` 是只委托 `batch_runtime.main` 的薄入口，跨平台调度逻辑统一位于 `batch_runtime.py` / `batch_scheduler.py`
+- `py_launcher.ps1/.sh batch` 是 batch 的跨平台入口；`batch.py` 是只委托 `batch_runtime.main` 的薄入口，跨平台调度逻辑统一位于 `batch_runtime.py` / `batch_scheduler.py`
 - CPU/IO capacity 自动设为 `max(1, (os.cpu_count() or 1) // 4)`，用于 download、WAV 提取和 postprocess；prepare 与最终 burn 共用固定 `4` 路 NVENC capacity
 - 不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，启动时打印自动检测出的 CPU/IO 和 NVENC capacity
 - acquisition 按任务流水执行 `download -> prepare-video -> extract-audio`；任务完成 download 后可立即等待 prepare，完成 prepare 后可立即提取 mono 16kHz WAV。匹配有效 `.asr.json` 的现存 WAV snapshot 会在重启时直接复用，缺失或变化才重新提取。prepare 和 WAV 提取/替换都持有同一媒体的 `<base>.asr.lock`，与 alignment 校验/提交串行，但不同媒体仍独立并发
@@ -114,7 +109,7 @@ prepare 失败时，`pipeline.sh` 精确透传 `prepare-video.sh 的原始退出
 - CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；provider/model 用于 postprocess，burn 默认启用且 `--skip-burn` 可关闭
 - `batch_runtime.py` 直接读取项目 `.env`，优先级为显式 CLI / 进程环境 > `.env` > 硬编码默认；`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`
 - 任一任务失败只终止该任务的后续 acquisition 阶段，其他任务继续；存在失败时聚合退出码为 `1`
-- 跨平台 release smoke 使用 `tests/test_batch_smoke.py`：分别经过 `batch.ps1 -> py_launcher.ps1 -> batch.py` 与 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言字段契约。smoke 将 `batch.py`、`batch_runtime.py`、production modules 和对应 wrappers byte-identical 复制到隔离目录并校验 SHA-256；只 fake download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 外部边界。WSL 路径由 `wsl -u root` 按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；没有候选时开发者测试精确 skip，测试不得下载或安装依赖。`BATCH_SMOKE_REQUIRE_WSL=1` 是仅供 test/release gate 使用的内部变量，不是项目用户配置；启用后缺少 WSL root 或合格 interpreter 必须失败而不是 skip。跨进程 wall timestamp 断言所有 acquisition 完成后才加载 ASR、prepare/burn 不与 worker ASR/alignment lifetime 重叠、ASR 与 alignment command 串行、同语言 alignment model 复用、worker shutdown 先于所有 burn，prepare 与 burn 各自峰值不超过 4。该测试不证明真实 CUDA、ffmpeg、网络、LLM 或媒体质量
+- 跨平台 release smoke 使用 `tests/test_batch_smoke.py`：分别经过 `py_launcher.ps1 batch -> batch.py` 与 `py_launcher.sh batch -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言字段契约。smoke 将 `batch.py`、`batch_runtime.py`、production modules 和共享 launcher byte-identical 复制到隔离目录并校验 SHA-256；只 fake download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 外部边界。WSL 路径由 `wsl -u root` 按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；没有候选时开发者测试精确 skip，测试不得下载或安装依赖。`BATCH_SMOKE_REQUIRE_WSL=1` 是仅供 test/release gate 使用的内部变量，不是项目用户配置；启用后缺少 WSL root 或合格 interpreter 必须失败而不是 skip。跨进程 wall timestamp 断言所有 acquisition 完成后才加载 ASR、prepare/burn 不与 worker ASR/alignment lifetime 重叠、ASR 与 alignment command 串行、同语言 alignment model 复用、worker shutdown 先于所有 burn，prepare 与 burn 各自峰值不超过 4。该测试不证明真实 CUDA、ffmpeg、网络、LLM 或媒体质量
 
 ### Task Notifications
 
@@ -295,8 +290,8 @@ glossary tool 阶段会强制移除 provider `request_kwargs.response_format` �
 .\pipeline.ps1 "https://youtu.be/xxxxx" -SkipBurn
 .\pipeline.ps1 "https://youtu.be/xxxxx" -SourceLang en -TargetLang ja -SkipBurn
 .\pipeline.ps1 "https://youtu.be/xxxxx" -ExistingAss "path\to\video.en-zh.ass"
-.\batch.ps1 "URL1" "URL2"
-.\batch.ps1 --dry-run --report "batch-result.txt" "URL1" "URL2"
+.\py_launcher.ps1 batch "URL1" "URL2"
+.\py_launcher.ps1 batch --dry-run --report "batch-result.txt" "URL1" "URL2"
 ```
 
 ### Linux / WSL
@@ -305,8 +300,8 @@ glossary tool 阶段会强制移除 provider `request_kwargs.response_format` �
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 TARGET_LANG=ja SKIP_BURN=1 ./pipeline.sh "URL"
 ./pipeline.sh "URL" -- --scene-threshold 0.12 --snap-frames 10
-./batch.sh "URL1" "URL2"
-./batch.sh --skip-burn --translate-provider deepseek "URL1" "URL2"
+bash ./py_launcher.sh batch "URL1" "URL2"
+bash ./py_launcher.sh batch --skip-burn --translate-provider deepseek "URL1" "URL2"
 ```
 
 ### Manual Steps
@@ -318,9 +313,9 @@ $prepareOutput = & .\prepare-video.ps1 $renderVideo
 $editVideo = ($prepareOutput | Where-Object { $_ -like 'OUTPUT_VIDEO=*' } | Select-Object -Last 1) -replace '^OUTPUT_VIDEO=', ''
 $videoBase = Join-Path ([IO.Path]::GetDirectoryName($editVideo)) ([IO.Path]::GetFileNameWithoutExtension($editVideo))
 & .\whisper.ps1 $editVideo
-& .\translate_srt.ps1 "$videoBase.json" --video $editVideo --only-beautify
-& .\translate_srt.ps1 "$videoBase.beautified.json" --video $editVideo --only-glossary --skip-beautify
-& .\translate_srt.ps1 "$videoBase.beautified.json" --video $editVideo --source-lang en --target-lang zh
+& .\py_launcher.ps1 translate_srt "$videoBase.json" --video $editVideo --only-beautify
+& .\py_launcher.ps1 translate_srt "$videoBase.beautified.json" --video $editVideo --only-glossary --skip-beautify
+& .\py_launcher.ps1 translate_srt "$videoBase.beautified.json" --video $editVideo --source-lang en --target-lang zh
 & .\ffmpeg-burn.ps1 $renderVideo -SubFile "$videoBase.en-zh.ass"
 ```
 
@@ -331,9 +326,9 @@ prepare_output="$(./prepare-video.sh "$render_video")"
 edit_video="$(printf '%s\n' "$prepare_output" | sed -n 's/^OUTPUT_VIDEO=//p' | tail -n 1)"
 video_base="${edit_video%.*}"
 ./whisper.sh "$edit_video"
-./translate_srt.sh "$video_base.json" --video "$edit_video" --only-beautify
-./translate_srt.sh "$video_base.beautified.json" --video "$edit_video" --only-glossary --skip-beautify
-./translate_srt.sh "$video_base.beautified.json" --video "$edit_video" --source-lang en --target-lang zh
+bash ./py_launcher.sh translate_srt "$video_base.json" --video "$edit_video" --only-beautify
+bash ./py_launcher.sh translate_srt "$video_base.beautified.json" --video "$edit_video" --only-glossary --skip-beautify
+bash ./py_launcher.sh translate_srt "$video_base.beautified.json" --video "$edit_video" --source-lang en --target-lang zh
 ./ffmpeg-burn.sh "$render_video" --sub-file "$video_base.en-zh.ass"
 ```
 
@@ -357,7 +352,7 @@ video_base="${edit_video%.*}"
 
 - 更新文档时以实际脚本参数和文件名为准，不保留历史 SRT 流程
 - 保持 PowerShell 和 bash 入口行为对齐
-- 独立调用 Python 功能时使用 `translate_srt.ps1/.sh`、`merge_ass.ps1/.sh` 或 `batch.ps1/.sh` 包装器；它们委托给 `py_launcher.ps1/.sh`，共享启动器只允许 `translate_srt`、`merge_ass`、`batch`，并从自身目录定位 `.venv`，不要求用户设置系统 PATH，也不依赖当前工作目录
+- 独立调用 Python 功能时直接使用 `py_launcher.ps1/.sh <target>`；共享启动器只允许 `translate_srt`、`merge_ass`、`batch`，并从自身目录定位 `.venv`，不要求用户设置系统 PATH，也不依赖当前工作目录
 - 不要提交 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 或生成产物
 - 不要回退用户本地数据或未请求的工作区改动
 - `README.md` 面向用户快速使用；`AGENTS.md` 面向维护和自动化代理；`.agents/skills/*` 面向分步骤执行

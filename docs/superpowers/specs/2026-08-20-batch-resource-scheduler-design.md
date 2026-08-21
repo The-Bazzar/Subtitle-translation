@@ -34,8 +34,6 @@ Scope: 方案 A，仅协调当前 batch 进程及其子进程
 ## 3. Process Architecture
 
 ```text
-batch.ps1 / batch.sh
-        |
 py_launcher.ps1 / py_launcher.sh
         |
       batch.py
@@ -78,7 +76,7 @@ launcher 负责：
 - 原样转发后续参数
 - 原样返回 Python 退出码
 
-`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh`、`batch.ps1/.sh` 保留为薄包装，继续兼容用户现有命令。
+所有 Python 目标直接通过共享 launcher 调用，不再保留 per-target 薄包装脚本。
 
 ## 4. Script Decomposition
 
@@ -430,12 +428,12 @@ CI 不使用真实网络、GPU 或视频，所有外部命令必须 mock。
 
 按 `DISCIPLINE.md` 拆分为独立 PR：
 
-1. `py_launcher` 抽取及 translate/merge 包装入口迁移；`batch` launcher target 和 batch 包装入口延至 PR7 原子接线。
+1. `py_launcher` 抽取及 translate/merge target 迁移；`batch` launcher target 延至 PR7 原子接线。
 2. download 与 prepare-video 解耦，保持 PowerShell/bash parity。
 3. batch scheduler 核心、任务状态和 mock executor。
 4. 音频提取、ASR sidecar 和常驻 Whisper worker。
 5. alignment wave、语言分组和后处理流水化。
 6. burn wave、实时日志、通知和失败恢复。
-7. 原子接线 `batch` launcher target、batch 包装入口，并同步 README、AGENTS、setup 与迁移文档。
+7. 原子接线 `batch` launcher target，并同步 README、AGENTS、setup 与迁移文档。
 
 每个 PR 必须独立可测试、可回滚，不得把脚本拆分、worker 和完整 scheduler 一次性提交。
