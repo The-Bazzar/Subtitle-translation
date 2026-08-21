@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import codecs
+import json
 import os
 import re
 import signal
@@ -147,10 +148,26 @@ class LogEvent:
     line_complete: bool = True
 
 
+class BatchRunResult(list[BatchTask]):
+    def __init__(
+        self,
+        tasks: Sequence[BatchTask],
+        report_metadata: Mapping[str, object],
+    ) -> None:
+        super().__init__(tasks)
+        self.report_metadata = dict(report_metadata)
+
+
 class BatchInterrupted(Exception):
-    def __init__(self, tasks: Sequence[BatchTask], interrupt_count: int) -> None:
+    def __init__(
+        self,
+        tasks: Sequence[BatchTask],
+        interrupt_count: int,
+        report_metadata: Mapping[str, object] | None = None,
+    ) -> None:
         self.tasks = list(tasks)
         self.interrupt_count = interrupt_count
+        self.report_metadata = dict(report_metadata or {})
         super().__init__(f"batch interrupted {interrupt_count} time(s)")
 
 
@@ -791,7 +808,7 @@ def run_acquisition(
     worker_factory=AsrWorkerController,
     postprocess_runner: PostprocessRunner | None = None,
     burn_runner: BurnRunner | None = None,
-) -> list[BatchTask]:
+) -> BatchRunResult:
     stage_environment = build_stage_environment(args, script_dir=script_dir)
     control = BatchControl()
     terminal = TerminalEventQueue()
@@ -849,16 +866,49 @@ def run_acquisition(
             await printer_task
 
     tasks = asyncio.run(execute())
+    report_metadata = scheduler.report_metadata
     if control.interrupted:
-        raise BatchInterrupted(tasks, control.interrupt_count)
-    return tasks
+        raise BatchInterrupted(
+            tasks,
+            control.interrupt_count,
+            report_metadata=report_metadata,
+        )
+    return BatchRunResult(tasks, report_metadata)
 
 
 def _task_status(task: BatchTask) -> str:
     return "OK" if task.state is TaskState.SUCCEEDED else "FAIL"
 
 
-def write_report(path: Path, tasks: Sequence[BatchTask], started_at: datetime) -> None:
+def _task_output_directory(task: BatchTask) -> str | None:
+    for output_path in (
+        task.burned_video_path,
+        task.ass_path,
+        task.json_path,
+        task.edit_video_path,
+        task.render_video_path,
+    ):
+        if output_path is not None:
+            return str(output_path.resolve().parent)
+    return None
+
+
+def write_report(
+    path: Path,
+    tasks: Sequence[BatchTask],
+    started_at: datetime,
+    *,
+    diagnostics: Mapping[str, object] | None = None,
+) -> None:
+    diagnostics = dict(diagnostics or {})
+    worker_failure = bool(diagnostics.get("worker_failure", False))
+    worker_failure_log = diagnostics.get("worker_failure_log")
+    worker_failure_root_cause = diagnostics.get("worker_failure_root_cause")
+    worker_failure_detail = diagnostics.get("worker_failure_detail")
+    output_directory = str(
+        Path(str(diagnostics.get("output_directory") or Path.cwd())).resolve()
+    )
+    cleanup_diagnostics = list(diagnostics.get("cleanup_diagnostics") or [])
     total_elapsed = (datetime.now() - started_at).total_seconds() / 60
     lines = [
         f"batch report - {started_at.strftime('%Y-%m-%d %H:%M:%S')}",
@@ -879,10 +929,91 @@ def write_report(path: Path, tasks: Sequence[BatchTask], started_at: datetime) -
                 f"Total: {len(tasks)}, Success: {len(tasks) - failed}, "
                 f"Failed: {failed}, Elapsed: {total_elapsed:.1f}min"
             ),
+            f"Worker failure: {'yes' if worker_failure else 'no'}",
+            f"Worker failure log: {worker_failure_log or '-'}",
+            (
+                "Worker failure root cause: "
+                + (
+                    json.dumps(worker_failure_root_cause, ensure_ascii=False)
+                    if worker_failure_root_cause
+                    else "-"
+                )
+            ),
+            f"Worker failure detail: {worker_failure_detail or '-'}",
+            f"Output directory: {output_directory}",
         ]
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if cleanup_diagnostics:
+        lines.append("Cleanup diagnostics:")
+        lines.extend(
+            f"  - {item.get('stage', 'cleanup')}: {item.get('detail', '')}"
+            for item in cleanup_diagnostics
+        )
+    else:
+        lines.append("Cleanup diagnostics: none")
+
+    report_payload = {
+        "schema_version": 1,
+        "started_at": started_at.isoformat(),
+        "elapsed_seconds": total_elapsed * 60,
+        "worker_failure": worker_failure,
+        "worker_failure_log": worker_failure_log,
+        "worker_failure_root_cause": worker_failure_root_cause,
+        "worker_failure_detail": worker_failure_detail,
+        "output_directory": output_directory,
+        "cleanup_diagnostics": cleanup_diagnostics,
+        "summary": {
+            "total": len(tasks),
+            "success": len(tasks) - failed,
+            "failed": failed,
+        },
+        "tasks": [
+            {
+                "index": task.index,
+                "url": task.url,
+                "state": task.state.value,
+                "stage": task.stage,
+                "elapsed_seconds": task.elapsed_seconds,
+                "error_detail": task.error_detail or None,
+                "output_directory": _task_output_directory(task),
+                "render_video": (
+                    str(task.render_video_path.resolve())
+                    if task.render_video_path is not None
+                    else None
+                ),
+                "edit_video": (
+                    str(task.edit_video_path.resolve())
+                    if task.edit_video_path is not None
+                    else None
+                ),
+                "aligned_json": (
+                    str(task.json_path.resolve())
+                    if task.json_path is not None
+                    else None
+                ),
+                "subtitle": (
+                    str(task.ass_path.resolve())
+                    if task.ass_path is not None
+                    else None
+                ),
+                "burned_video": (
+                    str(task.burned_video_path.resolve())
+                    if task.burned_video_path is not None
+                    else None
+                ),
+            }
+            for task in tasks
+        ],
+    }
+    text_path = path.with_suffix(".txt") if path.suffix.lower() == ".json" else path
+    json_path = path if path.suffix.lower() == ".json" else path.with_suffix(".json")
+    text_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    json_path.write_text(
+        json.dumps(report_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -916,10 +1047,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     interrupted = False
+    report_metadata: Mapping[str, object] = {}
     try:
         tasks = run_acquisition(args, limits, script_dir=script_dir)
+        report_metadata = getattr(tasks, "report_metadata", {})
     except BatchInterrupted as exc:
         tasks = exc.tasks
+        report_metadata = exc.report_metadata
         interrupted = True
     for task in tasks:
         print(
@@ -931,7 +1065,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"  {task.error_detail}")
             emit_task_bell("error")
 
-    write_report(report_path, tasks, started_at)
+    write_report(
+        report_path,
+        tasks,
+        started_at,
+        diagnostics=report_metadata,
+    )
     exit_code = 130 if interrupted else aggregate_exit_code(tasks)
     emit_task_bell("error" if exit_code else "success")
     return exit_code

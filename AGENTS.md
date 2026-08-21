@@ -84,6 +84,7 @@ winget install Microsoft.PowerShell
 ### Linux/WSL `pipeline.sh`
 
 流程与 Windows 对齐，使用 `download.sh`、`prepare-video.sh`、`whisper.sh`、`translate_srt.sh`、`ffmpeg-burn.sh`。两个 pipeline 都实时透传各步骤输出。
+prepare 失败时，`pipeline.sh` 精确透传 `prepare-video.sh 的原始退出码`，与 PowerShell 行为一致。
 
 ### Stage-aware Batch ASR
 
@@ -91,18 +92,22 @@ winget install Microsoft.PowerShell
 - CPU/IO capacity 自动设为 `max(1, (os.cpu_count() or 1) // 4)`，用于 download、WAV 提取和 postprocess；prepare 与最终 burn 共用固定 `4` 路 NVENC capacity
 - 不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，启动时打印自动检测出的 CPU/IO 和 NVENC capacity
 - acquisition 按任务流水执行 `download -> prepare-video -> extract-audio`；任务完成 download 后可立即等待 prepare，完成 prepare 后可立即提取 mono 16kHz WAV
+- 正常重启时，如果既有编辑版 `<base>.mkv` 与当前 `<base>.asr.json` fingerprint 匹配，acquisition 跳过 prepare；原片更新、模型/语言/options 变化或缓存无效时仍重新 prepare，禁止用 no-op prepare 掩盖 recovery
 - 所有 acquisition 任务到达成功或失败终态后，scheduler 才启动一个 `multiprocessing.get_context('spawn')` worker；WhisperX 只在 child 内 import
 - ASR wave 只把已完成的 WAV path 交给 worker；同一 worker 加载一次 ASR，串行处理所有未缓存任务，wave 结束后显式 `UNLOAD_ASR`，但不 shutdown
 - 每个 ASR 成功任务通过 `batch_cache.py` 原子写 `<base>.asr.json`；fingerprint 包含编辑版 resolved path、size、mtime、Whisper model、compute type、源语言和 ASR options，每次写入另生成唯一 UUID generation；所有 sidecar 写入与 alignment commit 共享 `<base>.asr.lock` 跨进程锁（POSIX `flock` / Windows `msvcrt`），损坏、缺少/非法 generation、旧版或 fingerprint 不匹配都视为无缓存
 - fingerprint 有效的 `.asr.json` 跳过 `TRANSCRIBE`；detected language 通过 `langcodes` 验证并规范为稳定 ISO 639 主语言代码，`zz` / `zzz` / `und` / `unknown` 会拒绝，只有配置了有效 `SOURCE_LANG` 时才允许作为 fallback；缓存 ASR 与新 ASR 混合时使用同一分组规则
 - alignment group 按 ISO language 稳定排序，组内保持原 task order；worker 一次只加载一个语言模型，同语言复用，组间执行 `UNLOAD_ALIGN -> LOAD_ALIGN`，`WHISPER_ALIGN_MODEL` 为空时由 WhisperX 自动选择，非空时覆盖
 - parent 在 blocking thread 中先取得 media cache lock，再 dispatch `ALIGN`；command 只传 `.asr.json` path、expected generation 和 parent-owned candidate path。child 校验 generation 与 sidecar/result，只原子写隐藏的 generation-specific candidate 并回传 candidate path/generation，绝不覆盖 `<base>.json`。parent 持锁复核 sidecar ownership、candidate path/schema，并用 per-task commit state lock 将取消与 destructive commit 线性化：`try_request_cancel()` 只做 non-blocking acquire，cancel-wins 保留 sidecar、只清 candidate；lock busy 表示 commit-wins，不再 abort，原子 promote final、删除 owned sidecar 后继续 postprocess
+- 新 alignment generation 进入 destructive commit 时先失效并删除旧 `<base>.beautified.json`；删除失败会阻止 final promote，并进入 `cleanup_diagnostics`，避免新词级 JSON 与旧翻译/分割缓存混用
+- alignment 成功后删除 WAV；alignment 失败、取消或 worker crash 时保留 WAV。WAV 删除失败不覆盖已成功 alignment，但会进入 `cleanup_diagnostics`
 - 每个 alignment 成功任务立即在 CPU/IO semaphore 中异步执行 beautify、glossary、translate，不等待其他 alignment；`--skip-burn` 成功终态为 `translated`，启用 burn 时翻译完成的任务进入 `burn_waiting`
 - 所有 alignment terminal 后 scheduler 才 `UNLOAD_ALIGN -> SHUTDOWN -> join`，并设置明确的 `worker_released` event；任何 burn 都必须等待该 event，且通过同一个固定 `4` 槽 NVENC semaphore 调用 `ffmpeg-burn.ps1/.sh`。已 ready 的 ASS 会立即进入 burn，较晚完成翻译的任务可动态加入，不要求等待全部 translation；runner 使用原片与最终 `<source>-<target>.ass`，同时验证 `OUTPUT_BURNED_VIDEO=` marker 和非空输出，成功终态为 `burned`
 - active worker command 在 precommit cancel-wins 时 abort/terminate/kill，随后用 shield loop 忽略重复取消直到 request/transaction thread 真正结束，transaction thread 在 finally 清理 candidate、释放 lock，不再排队 unload/shutdown。commit-wins 同样等待 promote + owned sidecar delete 完成，该任务继续 postprocess；`worker_released` 只能在所有 `to_thread` request/transaction 与 worker controller/process cleanup 完成后设置。candidate cleanup/abort/close 异常进入 release diagnostics 和失败报告，不替换 cancel-wins 的原始 `CancelledError`；acquisition 取消且未创建 worker 时由 `run()` 外层 finally 设置 event
 - `<base>.asr.lock` 是持久、最多 1 byte 的运行时协调 artifact，加入 `.gitignore` 且不会作为字幕或 cache 输入；不得在活跃任务间 unlink，以免产生 inode/handle 锁竞态
 - worker 单任务异常返回结构化失败并继续后续任务；request 使用 Queue，response 使用 parent-recv / child-send 单向 Pipe，child 的 heartbeat 线程与主线程通过同一锁发送；active command 每 5 秒发送 request-scoped heartbeat，controller 以 30 秒 heartbeat silence 和内部 24 小时 operation watchdog 检测无响应，deadline 前先有界排空当前 request 已到达的消息，超时后 terminate/kill + join，且不自动重启。每个 spawned controller 拥有临时 stdout/stderr capture 文件；child 在进入 worker target 前同时重定向 Python stream 与 native fd 1/2。异常对象保留 bounded capture tail 供 scheduler 写日志，正常 close 删除临时目录
 - worker unexpected exit/hung 会立即关闭新任务和 worker-stage admission：当前 worker task 标为 `failed`，等待 ASR/alignment 的任务标为 `blocked_by_worker_failure`；已 alignment 成功的 task 继续 postprocess，worker release 后仍可 burn。scheduler best-effort 写 invocation `Path.cwd()` 下的 `batch-worker-failure-<timestamp>.log`，包含 task/phase、CPU/IO 与 NVENC 队列快照、worker exit code、traceback，以及合并后的外部命令/worker stdout、stderr，写盘前移除 ANSI。日志先写 sibling temp 再原子 replace；mkdir/write/replace 失败只在 task state/drain 已完成后追加内存 `failure_log` cleanup diagnostic，不替换首个 worker 根因
+- batch 文本报告旁边同时写同基名 JSON 机器报告；顶层包含 `worker_failure`、`worker_failure_log`、`worker_failure_root_cause`、`worker_failure_detail`、invocation `output_directory` 和 `cleanup_diagnostics`，每个 task 另有自己的 `output_directory`、终态、阶段、耗时与输出路径
 - 外部命令 stdout/stderr reader 使用 64 KiB `read()` chunk，按 `\n`、`\r` progress 或 EOF partial framing，不使用 `readline()`；超过 64 KiB 的逻辑行拆成 bounded continuation `LogEvent`，确保 pipe 持续实时排空。唯一 printer 保持 queue 顺序与 `[02][prepare]` 前缀。queue 有固定上限并为 sentinel 预留一格；每个 task/stream 只保留 256 KiB tail，failure report 对截断显式写 marker
 - 第一次 `Ctrl+C` 同步关闭 command admission 和 stage advancement。`_run_stage_command()` 必须在首次 spawn await 前取得同步 reservation：reservation 成功返回是 scheduler 的线性化点，该 command 计为 active 并可自然结束；没有 reservation 的 command 绝不调用 OS spawn API。这里不宣称 Python 与操作系统进程创建之间存在不可能的原子性。第二次 `Ctrl+C` 终止已注册的 child process trees、abort worker 并等待真实退出。precommit interrupt 使用 Task 5 的 cancel-wins/commit-wins 仲裁，保留完成输出和未消费 `.asr.json`；batch 中断返回 `130`
 - CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；provider/model 用于 postprocess，burn 默认启用且 `--skip-burn` 可关闭

@@ -90,6 +90,25 @@ class BatchMigrationDocumentationTests(unittest.TestCase):
         )
         self.assertIn("不证明真实 CUDA", migration)
 
+    def test_release_docs_cover_recovery_cleanup_and_machine_report_contract(self):
+        documents = {
+            name: read_script(name)
+            for name in ("README.md", "AGENTS.md", "MIGRATION.md")
+        }
+        required_facts = (
+            "跳过 prepare",
+            ".beautified.json",
+            "alignment 成功后删除 WAV",
+            "worker_failure_root_cause",
+            "cleanup_diagnostics",
+            "output_directory",
+            "prepare-video.sh 的原始退出码",
+        )
+        for document, content in documents.items():
+            for fact in required_facts:
+                with self.subTest(document=document, fact=fact):
+                    self.assertIn(fact, content)
+
 
 if __name__ == "__main__":
     unittest.main()

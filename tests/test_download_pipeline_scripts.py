@@ -185,7 +185,7 @@ class ScriptBehaviorMixin:
 
     def test_pipeline_stops_when_prepare_fails(self):
         result, downstream_sentinel = self.run_pipeline_prepare_failure()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
         self.assertFalse(downstream_sentinel.exists())
 
 
@@ -901,8 +901,11 @@ class DownloadPipelineScriptTests(unittest.TestCase):
                 r"\"\$DOWNLOAD_LOG\"; then[\s\S]*?exit 1[\s\S]*?fi"
             ),
             "prepare": (
-                r"if ! bash \"\$PREPARE_VIDEO_SCRIPT\" \"\$RENDER_VIDEO_PATH\" "
-                r"2>&1 \| tee \"\$PREPARE_LOG\"; then[\s\S]*?exit 1[\s\S]*?fi"
+                r"set \+e\s+bash \"\$PREPARE_VIDEO_SCRIPT\" "
+                r"\"\$RENDER_VIDEO_PATH\" 2>&1 \| tee \"\$PREPARE_LOG\"\s+"
+                r"PREPARE_STATUS=\$\{PIPESTATUS\[0\]\}\s+set -e\s+"
+                r"if \[ \"\$PREPARE_STATUS\" -ne 0 \]; then[\s\S]*?"
+                r"exit \"\$PREPARE_STATUS\"[\s\S]*?fi"
             ),
             "whisper": (
                 r"if ! bash \"\$WHISPER_SCRIPT\" \"\$VIDEO_PATH\"; then"

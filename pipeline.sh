@@ -294,11 +294,15 @@ else
     echo "============================================="
     VIDEO_PATH=""
     PREPARE_LOG="$(mktemp)"
-    if ! bash "$PREPARE_VIDEO_SCRIPT" "$RENDER_VIDEO_PATH" 2>&1 | tee "$PREPARE_LOG"; then
+    set +e
+    bash "$PREPARE_VIDEO_SCRIPT" "$RENDER_VIDEO_PATH" 2>&1 | tee "$PREPARE_LOG"
+    PREPARE_STATUS=${PIPESTATUS[0]}
+    set -e
+    if [ "$PREPARE_STATUS" -ne 0 ]; then
         echo ""
         echo "Error: Prepare video step failed." >&2
         rm -f "$PREPARE_LOG"
-        exit 1
+        exit "$PREPARE_STATUS"
     fi
     VIDEO_PATH="$(awk -F= '/^OUTPUT_VIDEO=/{print substr($0, index($0, "=") + 1)}' "$PREPARE_LOG" | tail -n 1)"
     rm -f "$PREPARE_LOG"

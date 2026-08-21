@@ -23,6 +23,7 @@ from batch_cache import (
     asr_cache_lock,
     asr_sidecar_path,
     build_asr_fingerprint,
+    invalidate_beautified_cache,
     read_asr_cache_generation,
     read_valid_asr_cache,
 )
@@ -353,6 +354,7 @@ WorkerFactory: TypeAlias = Callable[[AsrWorkerConfig], AsrWorkerController]
 PostprocessRunner: TypeAlias = Callable[[BatchTask], Awaitable[None]]
 BurnRunner: TypeAlias = Callable[[BatchTask], Awaitable[None]]
 LogSnapshotProvider: TypeAlias = Callable[[int], tuple[str, str]]
+ResumeProbe: TypeAlias = Callable[[Path, AsrWorkerConfig], Path | None]
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -371,6 +373,40 @@ def _validate_wav_output(path: Path) -> None:
         ) from exc
     if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size <= 0:
         raise StageCommandError(f"WAV output is not a non-empty regular file: {path}")
+
+
+def _expected_edit_video_path(render_video_path: Path) -> Path | None:
+    stem = render_video_path.stem
+    if not stem.endswith(".original"):
+        return None
+    return render_video_path.with_name(f"{stem.removesuffix('.original')}.mkv")
+
+
+def probe_asr_recovery_edit(
+    render_video_path: Path,
+    asr_config: AsrWorkerConfig,
+) -> Path | None:
+    edit_video_path = _expected_edit_video_path(render_video_path)
+    if edit_video_path is None:
+        return None
+    try:
+        render_stat = render_video_path.stat()
+        edit_stat = edit_video_path.stat()
+        if render_stat.st_mtime_ns > edit_stat.st_mtime_ns:
+            return None
+        source_language = resolve_source_language(edit_video_path)
+        fingerprint = build_asr_fingerprint(
+            edit_video_path,
+            model=asr_config.model,
+            compute_type=asr_config.compute_type,
+            source_language=source_language,
+            asr_options=asr_config.options_dict(),
+        )
+    except (OSError, ValueError):
+        return None
+    if read_valid_asr_cache(edit_video_path, fingerprint) is None:
+        return None
+    return edit_video_path
 
 
 @dataclass(frozen=True)
@@ -393,6 +429,7 @@ class AcquisitionScheduler:
         control: BatchControl | None = None,
         failure_log_dir: Path | None = None,
         log_snapshot_provider: LogSnapshotProvider | None = None,
+        resume_probe: ResumeProbe = probe_asr_recovery_edit,
     ) -> None:
         self.limits = limits
         self.runners = runners
@@ -403,6 +440,7 @@ class AcquisitionScheduler:
         self.control = control or BatchControl()
         self.failure_log_dir = (failure_log_dir or Path.cwd()).resolve()
         self.log_snapshot_provider = log_snapshot_provider
+        self.resume_probe = resume_probe
         self.failure_log_path: Path | None = None
         self.tasks = [
             BatchTask(index=index, url=url)
@@ -414,9 +452,12 @@ class AcquisitionScheduler:
         self._worker: AsrWorkerController | None = None
         self._active_worker_task: BatchTask | None = None
         self._release_errors: list[tuple[str, str]] = []
+        self._cleanup_diagnostics: list[tuple[str, str]] = []
         self._release_errors_lock = threading.Lock()
         self._worker_failure_recorded = False
         self._worker_failure_task: BatchTask | None = None
+        self._worker_failure_root_cause: dict[str, object] | None = None
+        self._worker_failure_detail: str | None = None
         self._worker_abort_attempted = False
         self._worker_calls: set[asyncio.Task] = set()
         self._active_alignment_commit: _AlignmentCommitState | None = None
@@ -706,6 +747,7 @@ class AcquisitionScheduler:
                 output_path = Path(result.output_path).resolve()
                 self._active_worker_task = None
                 task.json_path = output_path
+                self._cleanup_wav_after_alignment(task)
                 if not self.control.worker_admission_open:
                     task.cancel(detail="batch interrupted after alignment")
                     self._cancel_worker_dependents("batch interrupted")
@@ -833,6 +875,14 @@ class AcquisitionScheduler:
                 read_aligned_json(candidate)
                 with commit_state.commit_section():
                     final_path = task.edit_video_path.with_suffix(".json").resolve()
+                    try:
+                        invalidate_beautified_cache(final_path)
+                    except Exception as exc:
+                        self._record_cleanup_diagnostic(
+                            "beautified_cache_invalidation",
+                            exc,
+                        )
+                        raise
                     promote_aligned_candidate(candidate, final_path)
                     candidate_written = False
                     task.asr_path.unlink()
@@ -910,8 +960,25 @@ class AcquisitionScheduler:
     def _record_release_error(self, stage: str, error: object) -> None:
         diagnostic = (stage, str(error))
         with self._release_errors_lock:
+            if diagnostic not in self._cleanup_diagnostics:
+                self._cleanup_diagnostics.append(diagnostic)
             if diagnostic not in self._release_errors:
                 self._release_errors.append(diagnostic)
+
+    def _record_cleanup_diagnostic(self, stage: str, error: object) -> None:
+        diagnostic = (stage, str(error))
+        with self._release_errors_lock:
+            if diagnostic not in self._cleanup_diagnostics:
+                self._cleanup_diagnostics.append(diagnostic)
+
+    def _cleanup_wav_after_alignment(self, task: BatchTask) -> None:
+        if task.wav_path is None:
+            return
+        try:
+            task.wav_path.unlink(missing_ok=True)
+            _fsync_parent_directory(task.wav_path)
+        except Exception as exc:
+            self._record_cleanup_diagnostic("wav_cleanup", exc)
 
     def _record_release_failure(self, stage: str, error: object) -> None:
         self._record_release_error(stage, error)
@@ -1032,6 +1099,14 @@ class AcquisitionScheduler:
             return
         self._worker_failure_recorded = True
         self._worker_failure_task = current_task
+        self._worker_failure_root_cause = {
+            "task_index": current_task.index if current_task is not None else None,
+            "stage": stage,
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "worker_exit_code": getattr(error, "exitcode", None),
+        }
+        self._worker_failure_detail = str(error)
         self.control.close_for_worker_failure()
         self._fail_worker_dependents(current_task, stage=stage, detail=str(error))
         self._write_worker_failure_log(current_task, stage, error)
@@ -1202,6 +1277,26 @@ class AcquisitionScheduler:
                 task.fail(stage=stage, detail=detail)
                 return
 
+    @property
+    def report_metadata(self) -> dict[str, object]:
+        with self._release_errors_lock:
+            cleanup_diagnostics = [
+                {"stage": stage, "detail": detail}
+                for stage, detail in self._cleanup_diagnostics
+            ]
+        return {
+            "worker_failure": self._worker_failure_recorded,
+            "worker_failure_log": (
+                str(self.failure_log_path.resolve())
+                if self.failure_log_path is not None
+                else None
+            ),
+            "worker_failure_root_cause": self._worker_failure_root_cause,
+            "worker_failure_detail": self._worker_failure_detail,
+            "output_directory": str(self.failure_log_dir),
+            "cleanup_diagnostics": cleanup_diagnostics,
+        }
+
     async def _run_task(self, task: BatchTask) -> None:
         token = CURRENT_TASK_INDEX.set(task.index)
         try:
@@ -1218,10 +1313,17 @@ class AcquisitionScheduler:
                 raise StageAdvancementStopped("batch interrupted after download")
 
             task.advance("prepare")
-            async with self._nvenc_slots:
-                if not self.control.stage_advancement_open:
-                    raise StageAdvancementStopped("batch interrupted before prepare")
-                edit_video = await self.runners.prepare(str(task.render_video_path))
+            edit_video = None
+            if self.asr_config is not None:
+                edit_video = self.resume_probe(
+                    task.render_video_path,
+                    self.asr_config,
+                )
+            if edit_video is None:
+                async with self._nvenc_slots:
+                    if not self.control.stage_advancement_open:
+                        raise StageAdvancementStopped("batch interrupted before prepare")
+                    edit_video = await self.runners.prepare(str(task.render_video_path))
             task.edit_video_path = Path(edit_video)
             if not self.control.stage_advancement_open:
                 raise StageAdvancementStopped("batch interrupted after prepare")

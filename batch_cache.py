@@ -94,6 +94,15 @@ def asr_sidecar_path(edit_video_path: str | os.PathLike[str]) -> Path:
     return Path(edit_video_path).with_suffix(".asr.json")
 
 
+def invalidate_beautified_cache(aligned_json_path: str | os.PathLike[str]) -> None:
+    aligned_path = Path(aligned_json_path)
+    beautified_path = aligned_path.with_name(
+        f"{aligned_path.stem}.beautified.json"
+    )
+    beautified_path.unlink(missing_ok=True)
+    _fsync_parent_directory(beautified_path)
+
+
 def asr_cache_lock_path(media_path: str | os.PathLike[str]) -> Path:
     path = Path(media_path)
     if path.name.endswith(".asr.json"):

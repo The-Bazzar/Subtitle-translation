@@ -369,6 +369,10 @@ class AcquisitionSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared, ["good.original.mkv"])
         self.assertEqual(extracted, ["good.mkv"])
         self.assertEqual(aggregate_exit_code(tasks), 1)
+        self.assertFalse(scheduler.report_metadata["worker_failure"])
+        self.assertIsNone(scheduler.report_metadata["worker_failure_log"])
+        self.assertIsNone(scheduler.report_metadata["worker_failure_root_cause"])
+        self.assertIsNone(scheduler.report_metadata["worker_failure_detail"])
 
     async def test_download_and_audio_share_cpu_io_capacity(self):
         active = 0
@@ -822,6 +826,146 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             asr_options=self.config.options_dict(),
         )
 
+    def write_recovery_sidecar(self, edit_video, *, config=None):
+        config = config or self.config
+        return write_asr_cache(
+            edit_video,
+            build_asr_fingerprint(
+                edit_video,
+                model=config.model,
+                compute_type=config.compute_type,
+                source_language=resolve_source_language(edit_video),
+                asr_options=config.options_dict(),
+            ),
+            {
+                "segments": [{"start": 0.0, "end": 1.0, "text": edit_video.stem}],
+                "language": resolve_source_language(edit_video),
+            },
+        )
+
+    async def test_restart_reuses_edit_and_valid_sidecar_without_prepare(self):
+        media = {"restart": self.create_media("restart", "en")}
+        render_video, edit_video, wav_path = media["restart"]
+        prepare_calls = []
+        extract_calls = []
+
+        async def download(_url):
+            return render_video
+
+        async def prepare(_render_video):
+            prepare_calls.append(edit_video.stat().st_mtime_ns)
+            replacement = edit_video.with_name(".restart.prepare.mkv")
+            replacement.write_bytes(b"replacement-edit")
+            os.replace(replacement, edit_video)
+            return edit_video
+
+        async def extract_audio(_edit_video):
+            extract_calls.append(edit_video.stat().st_mtime_ns)
+            wav_path.write_bytes(b"wav")
+            return wav_path
+
+        first_scheduler = AcquisitionScheduler(
+            urls=["restart"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=AcquisitionRunners(download, prepare, extract_audio),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                [],
+                fail_align_name="restart.asr.json",
+            ),
+        )
+
+        first_tasks = await first_scheduler.run()
+        recovered_mtime = edit_video.stat().st_mtime_ns
+
+        self.assertIs(first_tasks[0].state, TaskState.FAILED)
+        self.assertEqual(len(prepare_calls), 1)
+        self.assertTrue(edit_video.with_suffix(".asr.json").is_file())
+        self.assertTrue(wav_path.is_file())
+
+        second_worker_calls = []
+        second_scheduler = AcquisitionScheduler(
+            urls=["restart"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=AcquisitionRunners(download, prepare, extract_audio),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                second_worker_calls,
+            ),
+        )
+
+        second_tasks = await second_scheduler.run()
+
+        self.assertIs(second_tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(len(prepare_calls), 1)
+        self.assertEqual(edit_video.stat().st_mtime_ns, recovered_mtime)
+        self.assertEqual(len(extract_calls), 2)
+        self.assertNotIn(("transcribe", "restart.wav"), second_worker_calls)
+        self.assertIn(("align", "restart.asr.json", "en"), second_worker_calls)
+        self.assertFalse(wav_path.exists())
+
+    async def test_resume_probe_rejects_changed_recovery_inputs(self):
+        cases = ("fingerprint", "model", "language", "original")
+        for case in cases:
+            with self.subTest(case=case):
+                render_video, edit_video, wav_path = self.create_media(case, "en")
+                self.write_recovery_sidecar(edit_video)
+                config = self.config
+                if case == "fingerprint":
+                    replacement = edit_video.with_name(f".{case}.changed.mkv")
+                    replacement.write_bytes(b"changed-edit")
+                    os.replace(replacement, edit_video)
+                elif case == "model":
+                    config = AsrWorkerConfig(
+                        model="changed-model",
+                        device=self.config.device,
+                        compute_type=self.config.compute_type,
+                        asr_options=self.config.asr_options,
+                    )
+                elif case == "language":
+                    edit_video.with_suffix(".info.json").write_text(
+                        '{"language": "ja"}',
+                        encoding="utf-8",
+                    )
+                else:
+                    original_mtime = edit_video.stat().st_mtime_ns + 1_000_000_000
+                    os.utime(render_video, ns=(original_mtime, original_mtime))
+
+                prepare = mock.AsyncMock()
+
+                async def replace_edit(_render_video):
+                    replacement = edit_video.with_name(f".{case}.prepare.mkv")
+                    replacement.write_bytes(b"prepared-edit")
+                    os.replace(replacement, edit_video)
+                    return edit_video
+
+                prepare.side_effect = replace_edit
+
+                async def download(_url):
+                    return render_video
+
+                async def extract_audio(_edit_video):
+                    wav_path.write_bytes(b"wav")
+                    return wav_path
+
+                scheduler = AcquisitionScheduler(
+                    urls=[case],
+                    limits=ResourceLimits(cpu_io=1),
+                    runners=AcquisitionRunners(download, prepare, extract_audio),
+                    asr_config=config,
+                    worker_factory=lambda worker_config: FakeAsrController(
+                        worker_config,
+                        [],
+                    ),
+                )
+
+                tasks = await scheduler.run()
+
+                self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+                prepare.assert_awaited_once_with(str(render_video))
+
     async def test_asr_starts_after_acquisition_and_skips_valid_cache(self):
         media = {
             "cached": self.create_media("cached", "en-US"),
@@ -875,6 +1019,7 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tasks[1].asr_path, media["fresh"][1].with_suffix(".asr.json"))
         self.assertTrue(all(not task.asr_path.exists() for task in tasks))
         self.assertTrue(all(task.json_path.is_file() for task in tasks))
+        self.assertTrue(all(not task.wav_path.exists() for task in tasks))
 
     async def test_all_cached_tasks_still_open_and_close_reusable_controller(self):
         media = {"cached": self.create_media("cached")}
@@ -974,7 +1119,50 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker_calls[-1], ("transcribe", "crash.wav"))
         self.assertTrue(scheduler.worker_released.is_set())
         self.assertFalse(scheduler._worker.is_alive)
+        self.assertTrue(media["crash"][2].is_file())
+        self.assertTrue(media["waiting"][2].is_file())
         self.assertEqual(aggregate_exit_code(tasks), 1)
+
+        report_path = self.root / "worker-report.txt"
+        write_report(
+            report_path,
+            tasks,
+            datetime.now(),
+            diagnostics=scheduler.report_metadata,
+        )
+        report_payload = json.loads(
+            report_path.with_suffix(".json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(report_payload["worker_failure"])
+        self.assertEqual(
+            report_payload["worker_failure_log"],
+            str(scheduler.failure_log_path.resolve()),
+        )
+        self.assertIn("exit code: 17", report_payload["worker_failure_detail"])
+        self.assertEqual(
+            report_payload["worker_failure_root_cause"],
+            {
+                "task_index": 1,
+                "stage": "asr",
+                "error_type": "WorkerExitedError",
+                "message": (
+                    "Whisper worker exited unexpectedly during transcribe "
+                    "(exit code: 17)"
+                ),
+                "worker_exit_code": 17,
+            },
+        )
+        self.assertEqual(report_payload["output_directory"], str(self.root.resolve()))
+        self.assertEqual(report_payload["cleanup_diagnostics"], [])
+        self.assertEqual(report_payload["summary"]["failed"], 2)
+        self.assertEqual(len(report_payload["tasks"]), 2)
+        self.assertEqual(
+            {task["output_directory"] for task in report_payload["tasks"]},
+            {str(self.root.resolve())},
+        )
+        report_text = report_path.read_text(encoding="utf-8")
+        self.assertEqual(report_text.count("[FAIL]"), 2)
+        self.assertIn("Worker failure: yes", report_text)
 
     async def test_unresponsive_worker_fails_current_and_blocks_waiting(self):
         asyncio.get_running_loop().slow_callback_duration = 2.0
@@ -1384,6 +1572,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             "bad": self.create_media("bad", "en"),
             "good": self.create_media("good", "en"),
         }
+        bad_beautified = media["bad"][1].with_suffix(".beautified.json")
+        bad_beautified.write_text('{"generation": "old"}', encoding="utf-8")
         worker_calls = []
         postprocessed = []
 
@@ -1409,12 +1599,128 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tasks[0].stage, "alignment")
         self.assertIn("ValueError: fake alignment failure", tasks[0].error_detail)
         self.assertTrue(media["bad"][1].with_suffix(".asr.json").is_file())
+        self.assertTrue(bad_beautified.is_file())
+        self.assertTrue(media["bad"][2].is_file())
         self.assertIs(tasks[1].state, TaskState.SUCCEEDED)
         self.assertEqual(tasks[1].stage, "translated")
         self.assertEqual(postprocessed, [2])
         self.assertIn(("align", "good.asr.json", "en"), worker_calls)
         self.assertEqual(worker_calls.count(("unload_align", "en")), 1)
         self.assertTrue(scheduler.worker_released.is_set())
+        self.assertFalse(media["good"][2].exists())
+
+    async def test_new_alignment_invalidates_beautified_before_postprocess(self):
+        media = {"generation": self.create_media("generation", "en")}
+        beautified_path = media["generation"][1].with_suffix(".beautified.json")
+        beautified_path.write_text('{"generation": "old"}', encoding="utf-8")
+
+        async def postprocess(_task):
+            self.assertFalse(beautified_path.exists())
+            beautified_path.write_text('{"generation": "new"}', encoding="utf-8")
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, []),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(
+            json.loads(beautified_path.read_text(encoding="utf-8"))["generation"],
+            "new",
+        )
+        self.assertFalse(media["generation"][2].exists())
+
+    async def test_beautified_invalidation_failure_blocks_commit_and_postprocess(self):
+        media = {"blocked": self.create_media("blocked", "en")}
+        edit_video = media["blocked"][1]
+        beautified_path = edit_video.with_suffix(".beautified.json")
+        beautified_path.write_text('{"generation": "old"}', encoding="utf-8")
+        postprocess = mock.AsyncMock()
+        real_unlink = pathlib.Path.unlink
+
+        def fail_beautified_unlink(path, *args, **kwargs):
+            if path.resolve() == beautified_path.resolve():
+                raise OSError("beautified cache is locked")
+            return real_unlink(path, *args, **kwargs)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, []),
+            postprocess_runner=postprocess,
+        )
+        with mock.patch("pathlib.Path.unlink", new=fail_beautified_unlink):
+            tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "alignment")
+        self.assertIn("beautified cache is locked", tasks[0].error_detail)
+        self.assertTrue(beautified_path.is_file())
+        self.assertTrue(edit_video.with_suffix(".asr.json").is_file())
+        self.assertFalse(edit_video.with_suffix(".json").exists())
+        self.assertTrue(media["blocked"][2].is_file())
+        self.assertEqual(
+            scheduler.report_metadata["cleanup_diagnostics"],
+            [
+                {
+                    "stage": "beautified_cache_invalidation",
+                    "detail": "beautified cache is locked",
+                }
+            ],
+        )
+        postprocess.assert_not_awaited()
+
+    async def test_wav_cleanup_failure_is_reported_without_masking_success(self):
+        media = {"cleanup-wav": self.create_media("cleanup-wav", "en")}
+        wav_path = media["cleanup-wav"][2]
+        real_unlink = pathlib.Path.unlink
+
+        def fail_wav_unlink(path, *args, **kwargs):
+            if path.resolve() == wav_path.resolve():
+                raise OSError("wav cleanup denied")
+            return real_unlink(path, *args, **kwargs)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, []),
+            postprocess_runner=mock.AsyncMock(),
+        )
+        with mock.patch("pathlib.Path.unlink", new=fail_wav_unlink):
+            tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(tasks[0].stage, "translated")
+        self.assertTrue(wav_path.is_file())
+        self.assertIn(
+            {"stage": "wav_cleanup", "detail": "wav cleanup denied"},
+            scheduler.report_metadata["cleanup_diagnostics"],
+        )
+        report_path = self.root / "wav-cleanup-report.txt"
+        write_report(
+            report_path,
+            tasks,
+            datetime.now(),
+            diagnostics=scheduler.report_metadata,
+        )
+        report_payload = json.loads(
+            report_path.with_suffix(".json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(report_payload["worker_failure"])
+        self.assertEqual(
+            report_payload["cleanup_diagnostics"],
+            [{"stage": "wav_cleanup", "detail": "wav cleanup denied"}],
+        )
 
     async def test_parent_rejects_invalid_final_json_and_keeps_sidecar(self):
         media = {"invalid": self.create_media("invalid", "en")}
@@ -1619,6 +1925,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_before_alignment_commit_preserves_sidecar(self):
         media = {"cancel-first": self.create_media("cancel-first", "en")}
+        beautified_path = media["cancel-first"][1].with_suffix(".beautified.json")
+        beautified_path.write_text('{"generation": "old"}', encoding="utf-8")
         worker_calls = []
         precommit_ready = threading.Event()
         precommit_release = threading.Event()
@@ -1659,6 +1967,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(scheduler.tasks[0].state, TaskState.CANCELED)
         self.assertTrue(media["cancel-first"][1].with_suffix(".asr.json").is_file())
         self.assertFalse(media["cancel-first"][1].with_suffix(".json").exists())
+        self.assertTrue(beautified_path.is_file())
+        self.assertTrue(media["cancel-first"][2].is_file())
         self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
         postprocess.assert_not_awaited()
 

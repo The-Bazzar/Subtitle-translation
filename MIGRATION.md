@@ -30,11 +30,15 @@ batch 自动使用 `max(1, (os.cpu_count() or 1) // 4)` 个 CPU/IO 槽位；prep
 
 每个 ASR 成功任务原子写 `<base>.asr.json`。其 fingerprint 包含编辑版 resolved path、size、mtime、Whisper model、compute type、源语言和 ASR options；每次写入还生成唯一 UUID generation。损坏、缺少或非法 generation、旧 schema、fingerprint 不匹配都视为 cache miss 并重跑 ASR。
 
+正常重启时，若既有编辑版 `<base>.mkv` 与当前 sidecar fingerprint 匹配，batch 会跳过 prepare，避免重编码改变 size/mtime 后让可恢复 sidecar 失效；原片更新或任一 fingerprint 输入变化时仍走完整 prepare。新的 alignment generation 提交前先删除旧 `<base>.beautified.json`；删除失败会阻止 final JSON commit 并记录 `cleanup_diagnostics`。alignment 成功后删除 WAV，alignment 失败、取消或 worker crash 时保留 WAV。
+
 所有 sidecar 写与 alignment commit 使用持久 `<base>.asr.lock` 跨进程互斥。parent 持锁 dispatch，child 只写 generation-specific candidate，parent 持锁复核 ownership、candidate 与 schema。取消先赢时只清 candidate 并保留 `<base>.asr.json` 供下次恢复；destructive commit 先赢时先原子 promote final `<base>.json`，再删除自己持有 generation 的 `<base>.asr.json`，然后继续 postprocess。`<base>.asr.lock` 最多 1 byte、已加入 `.gitignore`，活跃任务间不得 unlink。
 
 ### 故障与两阶段中断
 
 worker crash 或 heartbeat timeout 不自动重启。当前 worker task 失败，仍依赖 ASR/alignment 的任务进入 `blocked_by_worker_failure`，已经 alignment 成功的任务继续 postprocess，并在 worker 释放后允许 burn。scheduler best-effort 原子写 invocation cwd 下的 `batch-worker-failure-<timestamp>.log`，包含 task/phase、资源队列快照、worker exit code、traceback 以及有界 stdout/stderr tail；日志写盘失败只追加 cleanup diagnostic，不替换首个根因。
+
+`--report` 现在同时写文本报告和同基名 JSON 机器报告。JSON 顶层新增 `worker_failure`、`worker_failure_log`、`worker_failure_root_cause`、`worker_failure_detail`、invocation `output_directory` 和 `cleanup_diagnostics`；每个 task 也新增自己的 `output_directory`，便于自动化定位产物。指定 `.json` 路径时，文本报告写到同基名 `.txt`。
 
 第一次 `Ctrl+C` 同步关闭 command admission 和阶段推进；已经取得 reservation 的外部命令自然结束，尚未取得 reservation 的命令不再 spawn。第二次 `Ctrl+C` 终止已注册的子进程树并 abort worker，等待真实退出后返回 `130`。precommit cancel-wins 保留未消费 recovery sidecar，commit-wins 保留已经完成的 final 输出。
 
@@ -58,6 +62,8 @@ smoke 的时间证据只证明以下调度范围：所有 acquisition 完成后�
 ## Split Download and Edit Preparation
 
 [Issue #12](https://github.com/The-Bazzar/Subtitle-translation/issues/12) 将下载与编辑视频准备拆成两个独立步骤。这是 direct download 调用契约的 breaking change；`pipeline.ps1` / `pipeline.sh` 已自动适配，无需修改 pipeline 命令。
+
+Linux/WSL pipeline 在 prepare 失败时不再统一返回 `1`，而是精确透传 `prepare-video.sh 的原始退出码`，与 PowerShell 行为一致。
 
 ### 旧契约
 
