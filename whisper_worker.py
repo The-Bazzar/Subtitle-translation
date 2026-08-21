@@ -3,22 +3,31 @@ from __future__ import annotations
 import gc
 import importlib
 import json
+import math
 import multiprocessing
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+import langcodes
+
 from batch_cache import (
+    ASR_CACHE_SCHEMA_VERSION,
     WavArtifact,
-    build_asr_fingerprint_for_artifact,
+    _fsync_parent_directory,
+    build_asr_fingerprint_from_snapshot,
+    is_valid_asr_generation,
     validate_wav_artifact,
+    validate_wav_artifact_unlocked,
     write_asr_cache_for_artifact,
 )
 
@@ -27,6 +36,9 @@ class WorkerCommand(str, Enum):
     LOAD_ASR = "load_asr"
     TRANSCRIBE = "transcribe"
     UNLOAD_ASR = "unload_asr"
+    LOAD_ALIGN = "load_align"
+    ALIGN = "align"
+    UNLOAD_ALIGN = "unload_align"
     SHUTDOWN = "shutdown"
 
 
@@ -59,6 +71,8 @@ class AsrWorkerConfig:
     model: str = "large-v3-turbo"
     device: str = "cpu"
     compute_type: str = "float32"
+    align_model: str = ""
+    source_language: str = ""
     asr_options: Mapping[str, Any] | tuple[tuple[str, str], ...] = field(
         default_factory=_default_asr_options
     )
@@ -85,6 +99,7 @@ class WorkerResult:
     path: str = ""
     output_path: str = ""
     language: str = ""
+    generation: str = ""
     error_type: str = ""
     error: str = ""
     request_id: int = field(default=0, repr=False, compare=False)
@@ -96,6 +111,9 @@ class _WorkerRequest:
     command: str
     path: str = ""
     artifact: WavArtifact | None = None
+    language: str = ""
+    generation: str = ""
+    candidate_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -129,16 +147,46 @@ class WorkerUnresponsiveError(RuntimeError):
         )
 
 
-def resolve_source_language(media_path: str | os.PathLike[str]) -> str:
+def resolve_source_language(
+    media_path: str | os.PathLike[str],
+    fallback: str = "",
+) -> str:
     info_path = Path(media_path).with_suffix(".info.json")
     try:
         info = json.loads(info_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return "en"
+        return normalize_language_code(fallback) if fallback else "en"
     language = info.get("language") if isinstance(info, dict) else None
     if not isinstance(language, str) or not language.strip():
-        return "en"
-    return language.strip().split("-", 1)[0].lower()
+        return normalize_language_code(fallback) if fallback else "en"
+    return normalize_language_code(language, fallback=fallback)
+
+
+def normalize_language_code(language: object, *, fallback: object = "") -> str:
+    def normalize(value: object) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("language is required")
+        candidate = value.strip().replace("_", "-")
+        try:
+            parsed = langcodes.Language.get(candidate, normalize=True)
+        except ValueError as exc:
+            raise ValueError(f"language is not a valid ISO 639/BCP-47 code: {value}") from exc
+        code = parsed.language
+        if not parsed.is_valid() or not code or code == "und":
+            raise ValueError(f"language is not a valid ISO 639/BCP-47 code: {value}")
+        return code.lower()
+
+    try:
+        return normalize(language)
+    except ValueError:
+        if not isinstance(fallback, str) or not fallback.strip():
+            raise
+        try:
+            return normalize(fallback)
+        except ValueError as fallback_error:
+            raise ValueError(
+                f"language and fallback are invalid: {language}, {fallback}"
+            ) from fallback_error
 
 
 def _detect_device(environ: Mapping[str, str]) -> str:
@@ -171,6 +219,8 @@ def asr_worker_config_from_environment(
         model=values.get("WHISPER_MODEL", "").strip() or "large-v3-turbo",
         device=device,
         compute_type="float16" if device == "cuda" else "float32",
+        align_model=values.get("WHISPER_ALIGN_MODEL", "").strip(),
+        source_language=values.get("SOURCE_LANG", "").strip(),
         asr_options={"batch_size": 8},
         hf_token=(
             values.get("HF_TOKEN", "").strip()
@@ -180,26 +230,59 @@ def asr_worker_config_from_environment(
 
 
 class _WhisperXBackend:
-    def __init__(self, config: AsrWorkerConfig) -> None:
+    def __init__(
+        self,
+        config: AsrWorkerConfig,
+        alignment_language: str = "",
+    ) -> None:
         import whisperx
 
-        options = config.options_dict()
-        self._batch_size = int(options.pop("batch_size", 8))
+        self._whisperx = whisperx
         self._device = config.device
-        self._model = whisperx.load_model(
-            config.model,
-            config.device,
-            compute_type=config.compute_type,
-            asr_options=options or None,
-            language=None,
-            use_auth_token=config.hf_token or None,
-        )
+        self._metadata = None
+        if alignment_language:
+            alignment_options = {
+                "language_code": alignment_language,
+                "device": config.device,
+            }
+            if config.align_model:
+                alignment_options["model_name"] = config.align_model
+            self._model, self._metadata = whisperx.load_align_model(
+                **alignment_options
+            )
+            self._batch_size = 0
+        else:
+            options = config.options_dict()
+            self._batch_size = int(options.pop("batch_size", 8))
+            self._model = whisperx.load_model(
+                config.model,
+                config.device,
+                compute_type=config.compute_type,
+                asr_options=options or None,
+                language=None,
+                use_auth_token=config.hf_token or None,
+            )
 
     def transcribe(self, wav_path: str, source_language: str) -> dict[str, Any]:
         return self._model.transcribe(
             wav_path,
             batch_size=self._batch_size,
             language=source_language,
+        )
+
+    def align(
+        self,
+        wav_path: str,
+        segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        audio = self._whisperx.load_audio(wav_path)
+        return self._whisperx.align(
+            segments,
+            self._model,
+            self._metadata,
+            audio,
+            self._device,
+            return_char_alignments=False,
         )
 
     def unload(self) -> None:
@@ -209,6 +292,227 @@ class _WhisperXBackend:
             import torch
 
             torch.cuda.empty_cache()
+
+
+def _is_finite_timestamp(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return not isinstance(value, float) or math.isfinite(value)
+
+
+def _validate_timed_text_segment(segment: Any) -> dict[str, Any]:
+    if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+        raise ValueError("alignment segment must contain text")
+    start = segment.get("start")
+    end = segment.get("end")
+    if (
+        not _is_finite_timestamp(start)
+        or not _is_finite_timestamp(end)
+        or end < start
+    ):
+        raise ValueError("alignment segment has invalid timestamps")
+    return segment
+
+
+def read_alignment_input(
+    sidecar_path: str | os.PathLike[str],
+    expected_generation: str = "",
+    artifact: WavArtifact | None = None,
+) -> tuple[str, str, str, list[dict[str, Any]]]:
+    path = Path(sidecar_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid ASR recovery sidecar: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("ASR recovery sidecar must be an object")
+    if payload.get("schema_version") != ASR_CACHE_SCHEMA_VERSION:
+        raise ValueError("ASR recovery sidecar schema version is invalid")
+    generation = payload.get("generation")
+    if not is_valid_asr_generation(generation):
+        raise ValueError("ASR recovery sidecar generation is invalid")
+    if expected_generation and generation != expected_generation:
+        raise ValueError("ASR recovery sidecar generation changed before alignment")
+    media_generation = payload.get("media_generation")
+    if not is_valid_asr_generation(media_generation):
+        raise ValueError("ASR recovery sidecar media generation is invalid")
+    if artifact is not None:
+        validate_wav_artifact_unlocked(artifact)
+        if media_generation != artifact.media_generation:
+            raise ValueError(
+                "ASR recovery sidecar media generation changed before alignment"
+            )
+    if not isinstance(payload.get("fingerprint"), dict):
+        raise ValueError("ASR recovery sidecar fingerprint is invalid")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("ASR recovery sidecar result must be an object")
+    language = result.get("language")
+    if not isinstance(language, str) or not language.strip():
+        raise ValueError("ASR recovery sidecar language is invalid")
+    segments = result.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("ASR recovery sidecar segments must be a list")
+    return (
+        generation,
+        media_generation,
+        language.strip(),
+        [_validate_timed_text_segment(item) for item in segments],
+    )
+
+
+def _validate_aligned_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    language = result.get("language")
+    if not isinstance(language, str) or not language.strip():
+        raise ValueError("aligned result language is invalid")
+    segments = result.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("aligned result segments must be a list")
+    for segment in segments:
+        validated_segment = _validate_timed_text_segment(segment)
+        words = validated_segment.get("words")
+        if not isinstance(words, list):
+            raise ValueError("aligned segment words must be a list")
+        for word in words:
+            if not isinstance(word, dict) or not isinstance(word.get("word"), str):
+                raise ValueError("aligned word must contain text")
+            has_start = "start" in word
+            has_end = "end" in word
+            if has_start != has_end:
+                raise ValueError("aligned word timestamps must be paired")
+            if has_start:
+                start = word["start"]
+                end = word["end"]
+                if (
+                    not _is_finite_timestamp(start)
+                    or not _is_finite_timestamp(end)
+                    or end < start
+                ):
+                    raise ValueError("aligned word has invalid timestamps")
+    return dict(result)
+
+
+def read_aligned_json(
+    path: str | os.PathLike[str],
+    *,
+    expected_media_generation: str = "",
+    expected_alignment_generation: str = "",
+) -> dict[str, Any]:
+    final_path = Path(path)
+    try:
+        result = json.loads(final_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid aligned JSON: {final_path}") from exc
+    if not isinstance(result, Mapping):
+        raise ValueError("aligned JSON must be an object")
+    validated = _validate_aligned_result(result)
+    if expected_media_generation or expected_alignment_generation:
+        artifact = validated.get("_batch_artifact")
+        if not isinstance(artifact, Mapping):
+            raise ValueError("aligned JSON batch artifact is missing")
+        if artifact.get("media_generation") != expected_media_generation:
+            raise ValueError("aligned JSON media generation does not match task")
+        if artifact.get("alignment_generation") != expected_alignment_generation:
+            raise ValueError("aligned JSON alignment generation does not match task")
+    return validated
+
+
+def _final_json_path(sidecar_path: Path) -> Path:
+    suffix = ".asr.json"
+    if not sidecar_path.name.endswith(suffix):
+        raise ValueError(f"alignment input must end with {suffix}: {sidecar_path}")
+    return sidecar_path.with_name(f"{sidecar_path.name[:-len(suffix)]}.json")
+
+
+def alignment_candidate_path(
+    sidecar_path: str | os.PathLike[str],
+    generation: str,
+) -> Path:
+    recovery_path = Path(sidecar_path)
+    if not is_valid_asr_generation(generation):
+        raise ValueError("alignment generation is invalid")
+    final_path = _final_json_path(recovery_path)
+    return final_path.with_name(
+        f".{final_path.name}.{generation}.{uuid.uuid4().hex}.candidate.json"
+    )
+
+
+def validate_alignment_candidate_path(
+    sidecar_path: str | os.PathLike[str],
+    generation: str,
+    candidate_path: str | os.PathLike[str],
+) -> Path:
+    recovery_path = Path(sidecar_path).resolve()
+    if not is_valid_asr_generation(generation):
+        raise ValueError("alignment generation is invalid")
+    final_path = _final_json_path(recovery_path)
+    candidate = Path(candidate_path).resolve()
+    expected_prefix = f".{final_path.name}.{generation}."
+    if (
+        candidate.parent != final_path.parent
+        or not candidate.name.startswith(expected_prefix)
+        or not candidate.name.endswith(".candidate.json")
+    ):
+        raise ValueError(f"alignment candidate path is invalid: {candidate}")
+    return candidate
+
+
+def write_aligned_candidate_json(
+    sidecar_path: str | os.PathLike[str],
+    generation: str,
+    candidate_path: str | os.PathLike[str],
+    result: Mapping[str, Any],
+    *,
+    media_generation: str,
+) -> Path:
+    destination = validate_alignment_candidate_path(
+        sidecar_path,
+        generation,
+        candidate_path,
+    )
+    if not is_valid_asr_generation(media_generation):
+        raise ValueError("alignment media generation is invalid")
+    validated_result = _validate_aligned_result(result)
+    validated_result["_batch_artifact"] = {
+        "media_generation": media_generation,
+        "alignment_generation": generation,
+    }
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(validated_result, temporary_file, ensure_ascii=False, indent=2)
+            temporary_file.write("\n")
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, destination)
+        _fsync_parent_directory(destination)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+def promote_aligned_candidate(
+    candidate_path: str | os.PathLike[str],
+    final_path: str | os.PathLike[str],
+) -> Path:
+    candidate = Path(candidate_path).resolve()
+    destination = Path(final_path).resolve()
+    if candidate.parent != destination.parent:
+        raise ValueError("alignment candidate and final JSON must be siblings")
+    os.replace(candidate, destination)
+    _fsync_parent_directory(destination)
+    return destination
 
 
 def _load_backend_factory(factory_path: str) -> Callable[[AsrWorkerConfig], Any]:
@@ -241,12 +545,17 @@ def _worker_main(
             os.environ["HF_TOKEN"] = config.hf_token
             os.environ["HUGGING_FACE_HUB_TOKEN"] = config.hf_token
         backend = None
+        alignment_language = ""
         while True:
             request = request_queue.get()
             if not isinstance(request, _WorkerRequest):
                 raise TypeError("Whisper worker received an invalid request")
             command = WorkerCommand(request.command)
             path = str(request.path or "")
+            language = str(request.language or "").strip()
+            generation = str(request.generation or "").strip()
+            candidate_path = str(request.candidate_path or "").strip()
+            artifact = request.artifact
             heartbeat_stop = threading.Event()
 
             def send_heartbeats() -> None:
@@ -281,12 +590,15 @@ def _worker_main(
                     validate_wav_artifact(artifact)
                     wav_path = Path(artifact.wav_snapshot.path).resolve()
                     edit_video_path = Path(artifact.edit_snapshot.path).resolve()
-                    source_language = resolve_source_language(edit_video_path)
+                    source_language = resolve_source_language(
+                        edit_video_path,
+                        fallback=config.source_language,
+                    )
                     transcription = backend.transcribe(str(wav_path), source_language)
                     if not isinstance(transcription, Mapping):
                         raise TypeError("ASR backend returned a non-object result")
-                    fingerprint = build_asr_fingerprint_for_artifact(
-                        artifact,
+                    fingerprint = build_asr_fingerprint_from_snapshot(
+                        artifact.edit_snapshot,
                         model=config.model,
                         compute_type=config.compute_type,
                         source_language=source_language,
@@ -310,6 +622,75 @@ def _worker_main(
                         raise RuntimeError("ASR model is not loaded")
                     backend.unload()
                     backend = None
+                    result = WorkerResult(
+                        command=command,
+                        ok=True,
+                        request_id=request.request_id,
+                    )
+                elif command is WorkerCommand.LOAD_ALIGN:
+                    if backend is not None:
+                        raise RuntimeError("ASR or alignment model is already loaded")
+                    language = normalize_language_code(language)
+                    backend_factory = _load_backend_factory(backend_factory_path)
+                    backend = backend_factory(config, language)
+                    alignment_language = language
+                    result = WorkerResult(
+                        command=command,
+                        ok=True,
+                        language=language,
+                        request_id=request.request_id,
+                    )
+                elif command is WorkerCommand.ALIGN:
+                    if backend is None or not alignment_language:
+                        raise RuntimeError("alignment model is not loaded")
+                    if artifact is None:
+                        raise ValueError("ALIGN requires a bound WAV artifact")
+                    sidecar_path = Path(path).resolve()
+                    (
+                        input_generation,
+                        media_generation,
+                        detected_language,
+                        segments,
+                    ) = read_alignment_input(sidecar_path, generation, artifact)
+                    detected_language = normalize_language_code(
+                        detected_language,
+                        fallback=alignment_language,
+                    )
+                    if detected_language != alignment_language:
+                        raise ValueError(
+                            "alignment language mismatch: "
+                            f"{detected_language} != {alignment_language}"
+                        )
+                    validate_wav_artifact_unlocked(artifact)
+                    wav_path = Path(artifact.wav_snapshot.path).resolve()
+                    aligned = backend.align(str(wav_path), segments)
+                    validate_wav_artifact_unlocked(artifact)
+                    if not isinstance(aligned, Mapping):
+                        raise TypeError("alignment backend returned a non-object result")
+                    final_result = dict(aligned)
+                    final_result["language"] = detected_language
+                    output_path = write_aligned_candidate_json(
+                        sidecar_path,
+                        input_generation,
+                        candidate_path,
+                        final_result,
+                        media_generation=media_generation,
+                    )
+                    result = WorkerResult(
+                        command=command,
+                        ok=True,
+                        path=str(sidecar_path),
+                        output_path=str(output_path.resolve()),
+                        language=detected_language,
+                        generation=input_generation,
+                        request_id=request.request_id,
+                    )
+                elif command is WorkerCommand.UNLOAD_ALIGN:
+                    if backend is None or not alignment_language:
+                        raise RuntimeError("alignment model is not loaded")
+                    backend.unload()
+                    backend = None
+                    alignment_language = ""
                     result = WorkerResult(
                         command=command,
                         ok=True,
@@ -374,6 +755,9 @@ class AsrWorkerController:
         self._request_id = 0
         self._asr_loaded = False
         self._asr_unload_attempted = False
+        self._align_loaded = False
+        self._align_unload_attempted = False
+        self._alignment_language = ""
         self._shutdown_complete = False
         self._force_reaped = False
         self._unexpected_exit_reported = False
@@ -470,13 +854,35 @@ class AsrWorkerController:
         self._force_reaped = True
         self._shutdown_complete = True
         self._asr_loaded = False
+        self._align_loaded = False
+        self._alignment_language = ""
         return WorkerUnresponsiveError(command, reason, timeout_seconds)
 
     def abort(self) -> None:
-        self._terminate_process()
-        self._force_reaped = True
-        self._shutdown_complete = True
-        self._asr_loaded = False
+        if self._closed or self._force_reaped:
+            return
+        termination_error: Exception | None = None
+        try:
+            self._terminate_process()
+        except Exception as exc:
+            termination_error = exc
+        finally:
+            self._force_reaped = True
+            self._shutdown_complete = True
+            self._asr_loaded = False
+            self._align_loaded = False
+            self._alignment_language = ""
+            if (
+                self._response_connection is not None
+                and not self._response_connection.closed
+            ):
+                try:
+                    self._response_connection.close()
+                except Exception as exc:
+                    if termination_error is None:
+                        termination_error = exc
+        if termination_error is not None:
+            raise termination_error
 
     def _handle_response(
         self,
@@ -547,6 +953,9 @@ class AsrWorkerController:
         command: WorkerCommand,
         path: str = "",
         artifact: WavArtifact | None = None,
+        language: str = "",
+        generation: str = "",
+        candidate_path: str = "",
     ) -> WorkerResult:
         if self._process is None:
             raise RuntimeError("Whisper worker has not been started")
@@ -562,6 +971,9 @@ class AsrWorkerController:
                 command=command.value,
                 path=path,
                 artifact=artifact,
+                language=language,
+                generation=generation,
+                candidate_path=candidate_path,
             )
         )
         operation_started = time.monotonic()
@@ -640,7 +1052,7 @@ class AsrWorkerController:
         return self._request(
             WorkerCommand.TRANSCRIBE,
             artifact.wav_snapshot.path,
-            artifact,
+            artifact=artifact,
         )
 
     def unload_asr(self) -> WorkerResult:
@@ -650,6 +1062,61 @@ class AsrWorkerController:
         result = self._request(WorkerCommand.UNLOAD_ASR)
         if result.ok:
             self._asr_loaded = False
+        return result
+
+    def load_align(self, language: str) -> WorkerResult:
+        normalized_language = normalize_language_code(language)
+        if self._asr_loaded:
+            raise RuntimeError("ASR model must be unloaded before alignment")
+        if self._align_loaded:
+            raise RuntimeError("alignment model is already loaded")
+        result = self._request(
+            WorkerCommand.LOAD_ALIGN,
+            language=normalized_language,
+        )
+        if result.ok:
+            self._align_loaded = True
+            self._align_unload_attempted = False
+            self._alignment_language = normalized_language
+        return result
+
+    def align(
+        self,
+        sidecar_path: str | os.PathLike[str],
+        generation: str,
+        artifact: WavArtifact,
+        candidate_path: str | os.PathLike[str] | None = None,
+    ) -> WorkerResult:
+        if not self._align_loaded:
+            raise RuntimeError("alignment model is not loaded")
+        if not is_valid_asr_generation(generation):
+            raise ValueError("alignment generation is invalid")
+        recovery_path = Path(sidecar_path).resolve()
+        candidate = (
+            alignment_candidate_path(recovery_path, generation)
+            if candidate_path is None
+            else validate_alignment_candidate_path(
+                recovery_path,
+                generation,
+                candidate_path,
+            )
+        )
+        return self._request(
+            WorkerCommand.ALIGN,
+            str(recovery_path),
+            generation=generation,
+            candidate_path=str(candidate),
+            artifact=artifact,
+        )
+
+    def unload_align(self) -> WorkerResult:
+        if self._align_unload_attempted:
+            raise RuntimeError("alignment unload has already been attempted")
+        self._align_unload_attempted = True
+        result = self._request(WorkerCommand.UNLOAD_ALIGN)
+        if result.ok:
+            self._align_loaded = False
+            self._alignment_language = ""
         return result
 
     def shutdown(self) -> WorkerResult:
@@ -662,6 +1129,8 @@ class AsrWorkerController:
             if self.exitcode == 0:
                 self._shutdown_complete = True
                 self._asr_loaded = False
+                self._align_loaded = False
+                self._alignment_language = ""
                 return WorkerResult(command=WorkerCommand.SHUTDOWN, ok=True)
             raise self._unexpected_exit(WorkerCommand.SHUTDOWN)
         result = self._request(WorkerCommand.SHUTDOWN)
@@ -676,47 +1145,75 @@ class AsrWorkerController:
             raise self._unexpected_exit(WorkerCommand.SHUTDOWN)
         self._shutdown_complete = True
         self._asr_loaded = False
+        self._align_loaded = False
+        self._alignment_language = ""
         return result
 
     def close(self) -> None:
         if self._closed:
             return
+        cleanup_error: Exception | None = None
         try:
-            if self._process is None or self._force_reaped:
-                return
-            if (
-                self._process.is_alive()
-                and self._asr_loaded
-                and not self._asr_unload_attempted
-            ):
-                self.unload_asr()
-            if self._process.is_alive():
-                self.shutdown()
-            else:
-                self._process.join(timeout=0.2)
+            if self._process is not None and not self._force_reaped:
                 if (
-                    self.exitcode not in (None, 0)
-                    and not self._unexpected_exit_reported
+                    self._process.is_alive()
+                    and self._asr_loaded
+                    and not self._asr_unload_attempted
                 ):
-                    raise self._unexpected_exit(WorkerCommand.SHUTDOWN)
+                    self.unload_asr()
+                if (
+                    self._process.is_alive()
+                    and self._align_loaded
+                    and not self._align_unload_attempted
+                ):
+                    self.unload_align()
+                if self._process.is_alive():
+                    self.shutdown()
+                else:
+                    self._process.join(timeout=0.2)
+                    if (
+                        self.exitcode not in (None, 0)
+                        and not self._unexpected_exit_reported
+                    ):
+                        raise self._unexpected_exit(WorkerCommand.SHUTDOWN)
+        except Exception as exc:
+            cleanup_error = exc
         finally:
-            self._terminate_process()
+            try:
+                self._terminate_process()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
             if self._request_queue is not None:
-                self._request_queue.close()
-                self._request_queue.join_thread()
+                try:
+                    self._request_queue.close()
+                    self._request_queue.join_thread()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
                 self._request_queue = None
             if (
                 self._response_connection is not None
                 and not self._response_connection.closed
             ):
-                self._response_connection.close()
+                try:
+                    self._response_connection.close()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             if self._process is not None:
-                self._process.join(timeout=0)
-                self._last_pid = self._process.pid
-                self._last_exitcode = self._process.exitcode
-                self._process.close()
-                self._process = None
+                try:
+                    self._process.join(timeout=0)
+                    self._last_pid = self._process.pid
+                    self._last_exitcode = self._process.exitcode
+                    self._process.close()
+                    self._process = None
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             self._closed = True
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def __enter__(self) -> AsrWorkerController:
         self.start()
