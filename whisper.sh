@@ -85,6 +85,12 @@ elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
 else
     DEVICE="cpu"
 fi
+BATCH_SIZE=8
+if [ "$DEVICE" = "cuda" ]; then
+    COMPUTE_TYPE="float16"
+else
+    COMPUTE_TYPE="float32"
+fi
 
 # 提取音频为 WAV (避免长视频时间码漂移)
 WAV_NAME="${VIDEO_NAME%.*}.wav"
@@ -95,12 +101,19 @@ echo "视频:      $VIDEO_PATH"
 echo "语言:      $VIDEO_LANG"
 echo "模型:      ${WHISPER_MODEL:-large-v3-turbo}"
 echo "设备:      $DEVICE"
+echo "计算精度:  $COMPUTE_TYPE"
 [ -n "${WHISPER_ALIGN_MODEL:-}" ] && echo "对齐:      $WHISPER_ALIGN_MODEL"
 echo "============================================="
 
 cd "$VIDEO_DIR"
 echo "提取音频..."
 ffmpeg -i "$VIDEO_NAME" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$WAV_NAME" -y -loglevel error
+EXIT_CODE=$?
+if [ "$EXIT_CODE" -ne 0 ]; then
+    rm -f "$WAV_NAME"
+    echo "错误: ffmpeg failed (exit code: $EXIT_CODE)" >&2
+    exit "$EXIT_CODE"
+fi
 
 WHISPER_ARGS=(
     "$WAV_NAME"
@@ -109,10 +122,18 @@ WHISPER_ARGS=(
     --output_dir .
     --output_format json
     --device "$DEVICE"
+    --batch_size "$BATCH_SIZE"
+    --compute_type "$COMPUTE_TYPE"
 )
 [ -n "${WHISPER_ALIGN_MODEL:-}" ] && WHISPER_ARGS+=(--align_model "$WHISPER_ALIGN_MODEL")
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 "$WHISPERX_BIN" "${WHISPER_ARGS[@]}"
+EXIT_CODE=$?
 rm -f "$WAV_NAME"
+
+if [ "$EXIT_CODE" -ne 0 ]; then
+    echo "错误: whisperx failed (exit code: $EXIT_CODE)" >&2
+    exit "$EXIT_CODE"
+fi
 
 echo "============================================="
 echo "whisper — 完成: $VIDEO_DIR/$JSON_NAME"

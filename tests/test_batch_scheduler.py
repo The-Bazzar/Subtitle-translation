@@ -1,9 +1,17 @@
 import asyncio
 import pathlib
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+from batch_cache import (
+    bind_wav_artifact,
+    build_asr_fingerprint_for_artifact,
+    read_valid_asr_cache,
+    write_asr_cache_for_artifact,
+    write_prepare_state,
+)
 from batch_scheduler import (
     AcquisitionRunners,
     AcquisitionScheduler,
@@ -11,6 +19,13 @@ from batch_scheduler import (
     ResourceLimits,
     TaskState,
     aggregate_exit_code,
+)
+from whisper_worker import (
+    AsrWorkerConfig,
+    WorkerCommand,
+    WorkerExitedError,
+    WorkerResult,
+    resolve_source_language,
 )
 
 
@@ -336,6 +351,290 @@ class AcquisitionSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(task.state is TaskState.CANCELED for task in scheduler.tasks)
         )
+
+
+class FakeAsrController:
+    def __init__(self, config, calls, *, fail_name="", crash_name=""):
+        self.config = config
+        self.calls = calls
+        self.fail_name = fail_name
+        self.crash_name = crash_name
+
+    def start(self):
+        self.calls.append(("worker_start",))
+
+    def close(self):
+        self.calls.append(("worker_shutdown",))
+
+    def abort(self):
+        self.calls.append(("worker_abort",))
+
+    def load_asr(self):
+        self.calls.append(("load_asr",))
+        return WorkerResult(command=WorkerCommand.LOAD_ASR, ok=True)
+
+    def transcribe(self, artifact):
+        wav_path = pathlib.Path(artifact.wav_snapshot.path).resolve()
+        self.calls.append(("transcribe", wav_path.name))
+        if wav_path.name == self.crash_name:
+            raise WorkerExitedError(17, WorkerCommand.TRANSCRIBE)
+        if wav_path.name == self.fail_name:
+            return WorkerResult(
+                command=WorkerCommand.TRANSCRIBE,
+                ok=False,
+                path=str(wav_path),
+                error_type="ValueError",
+                error="fake ASR failure",
+            )
+        edit_video = pathlib.Path(artifact.edit_snapshot.path)
+        source_language = resolve_source_language(edit_video)
+        fingerprint = build_asr_fingerprint_for_artifact(
+            artifact,
+            model=self.config.model,
+            compute_type=self.config.compute_type,
+            source_language=source_language,
+            asr_options=self.config.options_dict(),
+        )
+        output_path = write_asr_cache_for_artifact(
+            artifact,
+            fingerprint,
+            {
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": wav_path.stem}
+                ],
+                "language": source_language,
+            },
+        )
+        return WorkerResult(
+            command=WorkerCommand.TRANSCRIBE,
+            ok=True,
+            path=str(wav_path),
+            output_path=str(output_path),
+            language=source_language,
+        )
+
+    def unload_asr(self):
+        self.calls.append(("unload_asr",))
+        return WorkerResult(command=WorkerCommand.UNLOAD_ASR, ok=True)
+
+
+class SlowAsrController(FakeAsrController):
+    def __init__(self, config, calls):
+        super().__init__(config, calls)
+        self.transcribe_started = threading.Event()
+        self.release_transcribe = threading.Event()
+
+    def transcribe(self, artifact):
+        self.transcribe_started.set()
+        self.release_transcribe.wait()
+        return super().transcribe(artifact)
+
+    def abort(self):
+        super().abort()
+        self.release_transcribe.set()
+
+
+class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = pathlib.Path(self.temp_dir.name)
+        self.config = AsrWorkerConfig(
+            model="fake-model",
+            device="cpu",
+            compute_type="int8",
+            asr_options={"batch_size": 2},
+        )
+
+    def create_media(self, name, language="en"):
+        render_video = self.root / f"{name}.original.mkv"
+        edit_video = self.root / f"{name}.mkv"
+        wav_path = self.root / f"{name}.wav"
+        render_video.write_bytes(b"original")
+        edit_video.write_bytes(b"edit")
+        wav_path.write_bytes(b"wav")
+        (self.root / f"{name}.info.json").write_text(
+            '{"language": "' + language + '"}',
+            encoding="utf-8",
+        )
+        return render_video, edit_video, wav_path
+
+    def runners_for(self, media, acquisition_calls):
+        async def download(url):
+            acquisition_calls.append(("download", url))
+            return media[url][0]
+
+        async def prepare(render_video):
+            acquisition_calls.append(("prepare", pathlib.Path(render_video).name))
+            for values in media.values():
+                if values[0] == pathlib.Path(render_video):
+                    return values[1]
+            raise AssertionError(f"unknown render video: {render_video}")
+
+        async def extract_audio(edit_video):
+            acquisition_calls.append(("extract_audio", pathlib.Path(edit_video).name))
+            for values in media.values():
+                if values[1] == pathlib.Path(edit_video):
+                    return values[2]
+            raise AssertionError(f"unknown edit video: {edit_video}")
+
+        return AcquisitionRunners(download, prepare, extract_audio)
+
+    def artifact(self, media):
+        prepared_state = write_prepare_state(media[0], media[1])
+        return bind_wav_artifact(media[1], media[2], prepared_state.generation)
+
+    def fingerprint(self, artifact):
+        return build_asr_fingerprint_for_artifact(
+            artifact,
+            model=self.config.model,
+            compute_type=self.config.compute_type,
+            source_language=resolve_source_language(artifact.edit_snapshot.path),
+            asr_options=self.config.options_dict(),
+        )
+
+    def write_cache(self, media, text="cached"):
+        artifact = self.artifact(media)
+        return write_asr_cache_for_artifact(
+            artifact,
+            self.fingerprint(artifact),
+            {
+                "segments": [{"start": 0.0, "end": 1.0, "text": text}],
+                "language": resolve_source_language(media[1]),
+            },
+        )
+
+    async def test_asr_starts_after_acquisition_and_skips_valid_cache(self):
+        media = {
+            "cached": self.create_media("cached", "en-US"),
+            "fresh": self.create_media("fresh", "ja"),
+        }
+        self.write_cache(media["cached"])
+        acquisition_calls = []
+        worker_calls = []
+
+        def worker_factory(config):
+            extracted = [call for call in acquisition_calls if call[0] == "extract_audio"]
+            self.assertEqual(len(extracted), 2)
+            return FakeAsrController(config, worker_calls)
+
+        scheduler = AcquisitionScheduler(
+            urls=["cached", "fresh"],
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, acquisition_calls),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+        )
+        tasks = await scheduler.run()
+
+        self.assertEqual(
+            worker_calls,
+            [
+                ("worker_start",),
+                ("load_asr",),
+                ("transcribe", "fresh.wav"),
+                ("unload_asr",),
+                ("worker_shutdown",),
+            ],
+        )
+        self.assertTrue(all(task.state is TaskState.SUCCEEDED for task in tasks))
+        self.assertTrue(all(task.stage == "asr_ready" for task in tasks))
+        self.assertIsNotNone(
+            read_valid_asr_cache(
+                media["fresh"][1],
+                self.fingerprint(tasks[1].wav_artifact),
+                tasks[1].media_generation,
+            )
+        )
+
+    async def test_all_cached_tasks_still_open_and_close_worker(self):
+        media = {"cached": self.create_media("cached")}
+        self.write_cache(media["cached"])
+        worker_calls = []
+        scheduler = AcquisitionScheduler(
+            urls=["cached"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, worker_calls),
+        )
+        tasks = await scheduler.run()
+
+        self.assertEqual(worker_calls, [("worker_start",), ("worker_shutdown",)])
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        self.assertEqual(tasks[0].stage, "asr_ready")
+
+    async def test_structured_failure_does_not_stop_later_asr_task(self):
+        media = {
+            "bad": self.create_media("bad"),
+            "good": self.create_media("good"),
+        }
+        worker_calls = []
+        scheduler = AcquisitionScheduler(
+            urls=["bad", "good"],
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                worker_calls,
+                fail_name="bad.wav",
+            ),
+        )
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertIn("ValueError: fake ASR failure", tasks[0].error_detail)
+        self.assertIs(tasks[1].state, TaskState.SUCCEEDED)
+        self.assertIn(("transcribe", "good.wav"), worker_calls)
+
+    async def test_worker_crash_blocks_waiting_tasks_without_restart(self):
+        media = {
+            "crash": self.create_media("crash"),
+            "waiting": self.create_media("waiting"),
+        }
+        worker_calls = []
+        factory_calls = 0
+
+        def worker_factory(config):
+            nonlocal factory_calls
+            factory_calls += 1
+            return FakeAsrController(config, worker_calls, crash_name="crash.wav")
+
+        scheduler = AcquisitionScheduler(
+            urls=["crash", "waiting"],
+            limits=ResourceLimits(cpu_io=2),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=worker_factory,
+        )
+        tasks = await scheduler.run()
+
+        self.assertEqual(factory_calls, 1)
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertIs(tasks[1].state, TaskState.BLOCKED_BY_WORKER_FAILURE)
+        self.assertNotIn(("transcribe", "waiting.wav"), worker_calls)
+
+    async def test_cancel_during_long_transcribe_aborts_without_blocking_loop(self):
+        media = {"slow": self.create_media("slow")}
+        worker_calls = []
+        controller = SlowAsrController(self.config, worker_calls)
+        scheduler = AcquisitionScheduler(
+            urls=["slow"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda _config: controller,
+        )
+        run_task = asyncio.create_task(scheduler.run())
+        await asyncio.to_thread(controller.transcribe_started.wait, 1.0)
+
+        run_task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, 1.0)
+        self.assertIn(("worker_abort",), worker_calls)
+        self.assertIs(scheduler.tasks[0].state, TaskState.CANCELED)
 
 
 if __name__ == "__main__":
