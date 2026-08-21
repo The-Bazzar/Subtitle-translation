@@ -331,6 +331,7 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "硬字幕压制完成!"
     echo "输出: $OUTPUT_ABS"
     echo "============================================="
+    echo "OUTPUT_BURNED_VIDEO=$OUTPUT_ABS"
 else
     echo ""
     echo "Error: ffmpeg encoding failed (exit code: $EXIT_CODE)" >&2

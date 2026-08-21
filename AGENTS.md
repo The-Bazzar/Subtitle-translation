@@ -86,8 +86,9 @@ winget install Microsoft.PowerShell
 - stage-aware scheduler 的公开 batch CLI 尚未接线；当前内部实现先完成 acquisition，再启动单个 `spawn` WhisperX worker，所有 controller blocking call 都通过 `asyncio.to_thread` 调用，取消时会 abort 并等待该调用真实结束
 - prepare 成功后写 `<base>.prepare.json`，用 media generation 绑定原片与编辑版的 resolved path、size、mtime；WAV 提取后绑定同 generation 的 edit/WAV immutable snapshot
 - worker 在调用 ASR backend 前和写 recovery sidecar 前都复核同一 artifact；backend 只能读取绑定 snapshot 的 WAV path，旧 WAV 不能认证给已替换的编辑版
-- schema v2 `<base>.asr.json` 包含唯一 ASR generation、media generation、WAV snapshot 和完整 fingerprint；prepare state、sidecar 与后续媒体操作使用持久 `<base>.asr.lock` 串行，`.prepare.json` 和 `.asr.lock` 均为忽略的运行时 artifact
-- worker controller 在 start 部分失败、取消或 shutdown 异常时 terminate/kill、join 可能已启动的 process，并关闭 Queue/Pipe；standalone `whisper.ps1/.sh` 保持最终 JSON 行为，ffmpeg 或 WhisperX 失败时透传原始退出码、清理 WAV 且不输出 `OUTPUT_JSON`
+- schema v2 `<base>.asr.json` 包含唯一 ASR generation、media generation、WAV snapshot 和完整 fingerprint；匹配 sidecar 的现存 WAV 会在重启时复用，WAV 缺失或 snapshot 改变才重新提取
+- prepare state、sidecar、alignment commit 和完整 postprocess runner 使用持久 `<base>.asr.lock` 串行，防止同媒体的旧 invocation 覆盖新 generation 的稳定 SRT/ASS/glossary；`.prepare.json` 和 `.asr.lock` 均为忽略的运行时 artifact
+- worker controller 在 start 部分失败、取消或 shutdown 异常时 terminate/kill、join 可能已启动的 process，并关闭 Queue/Pipe；只有确认 process 已退出才设置 `worker_released` 并放行 burn；standalone `whisper.ps1/.sh` 保持最终 JSON 行为，ffmpeg 或 WhisperX 失败时透传原始退出码、清理 WAV 且不输出 `OUTPUT_JSON`
 
 ### Task Notifications
 
