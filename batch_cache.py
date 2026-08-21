@@ -549,13 +549,6 @@ def read_asr_cache_identity(
     return generation, media_generation
 
 
-def read_asr_cache_generation(
-    sidecar_path: str | os.PathLike[str],
-) -> str | None:
-    identity = read_asr_cache_identity(sidecar_path)
-    return identity[0] if identity is not None else None
-
-
 def write_asr_cache(
     edit_video_path: str | os.PathLike[str],
     fingerprint: AsrFingerprint,

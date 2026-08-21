@@ -20,7 +20,6 @@ from batch_cache import (
     asr_sidecar_path,
     bind_wav_artifact,
     build_asr_fingerprint,
-    build_asr_fingerprint_from_snapshot,
     read_valid_asr_cache,
     write_asr_cache,
     write_prepare_state,
@@ -188,14 +187,14 @@ class AsrCacheTests(unittest.TestCase):
         self.edit_video.write_bytes(b"edit-video")
         self.render_video.write_bytes(b"original-video")
         self.wav_path.write_bytes(b"wav")
-        self.prepared_state = write_prepare_state(
+        self.prepare_state = write_prepare_state(
             self.render_video,
             self.edit_video,
         )
         self.artifact = bind_wav_artifact(
             self.edit_video,
             self.wav_path,
-            self.prepared_state.generation,
+            self.prepare_state.generation,
         )
 
     def fingerprint(self, **overrides):
@@ -209,26 +208,7 @@ class AsrCacheTests(unittest.TestCase):
             },
         }
         values.update(overrides)
-        return build_asr_fingerprint_from_snapshot(
-            self.artifact.edit_snapshot,
-            **values,
-        )
-
-    def write_cache(self, fingerprint, result):
-        return write_asr_cache(
-            self.edit_video,
-            fingerprint,
-            result,
-            media_generation=self.artifact.media_generation,
-            wav_snapshot=self.artifact.wav_snapshot,
-        )
-
-    def read_cache(self, fingerprint):
-        return read_valid_asr_cache(
-            self.edit_video,
-            fingerprint,
-            self.artifact.media_generation,
-        )
+        return build_asr_fingerprint(self.edit_video, **values)
 
     @staticmethod
     def asr_result(text="hello"):
@@ -236,6 +216,22 @@ class AsrCacheTests(unittest.TestCase):
             "segments": [{"start": 0.0, "end": 1.0, "text": text}],
             "language": "en",
         }
+
+    def write_cache(self, fingerprint, result):
+        return write_asr_cache(
+            self.edit_video,
+            fingerprint,
+            result,
+            media_generation=self.prepare_state.generation,
+            wav_snapshot=self.artifact.wav_snapshot,
+        )
+
+    def read_cache(self, fingerprint):
+        return read_valid_asr_cache(
+            self.edit_video,
+            fingerprint,
+            self.prepare_state.generation,
+        )
 
     def test_fingerprint_is_immutable_and_contains_all_asr_inputs(self):
         fingerprint = self.fingerprint()
@@ -382,7 +378,7 @@ class AsrCacheTests(unittest.TestCase):
         self.assertNotEqual(first_payload["generation"], second_payload["generation"])
         self.assertEqual(
             second_payload["media_generation"],
-            self.artifact.media_generation,
+            self.prepare_state.generation,
         )
         self.assertEqual(
             second_payload["wav_snapshot"],
@@ -544,7 +540,7 @@ class AsrCacheTests(unittest.TestCase):
         replacement_artifact = bind_wav_artifact(
             self.edit_video,
             self.wav_path,
-            self.prepared_state.generation,
+            self.prepare_state.generation,
         )
 
         cached = batch_cache.read_valid_asr_cache_for_artifact(
@@ -553,7 +549,6 @@ class AsrCacheTests(unittest.TestCase):
         )
 
         self.assertIsNone(cached)
-
 
 class WorkerProtocolTests(unittest.TestCase):
     def setUp(self):
@@ -582,21 +577,16 @@ class WorkerProtocolTests(unittest.TestCase):
                 json.dumps({"language": language}),
                 encoding="utf-8",
             )
-        prepared_state = write_prepare_state(render_video, edit_video)
-        artifact = bind_wav_artifact(
+        prepare_state = write_prepare_state(render_video, edit_video)
+        self.artifacts[edit_video.resolve()] = bind_wav_artifact(
             edit_video,
             wav_path,
-            prepared_state.generation,
+            prepare_state.generation,
         )
-        self.artifacts[wav_path.resolve()] = artifact
-        self.artifacts[edit_video.resolve()] = artifact
         return edit_video, wav_path
 
     def artifact_for(self, path):
-        resolved = pathlib.Path(path).resolve()
-        return self.artifacts.get(resolved) or self.artifacts[
-            resolved.with_suffix(".mkv")
-        ]
+        return self.artifacts[pathlib.Path(path).with_suffix(".mkv").resolve()]
 
     def write_cache(self, edit_video, result):
         artifact = self.artifacts[pathlib.Path(edit_video).resolve()]
@@ -626,6 +616,20 @@ class WorkerProtocolTests(unittest.TestCase):
             [command.value for command in WorkerCommand],
             "load_asr transcribe unload_asr load_align align unload_align shutdown".split(),
         )
+
+    def test_normal_close_removes_worker_capture_files(self):
+        controller = self.controller()
+        controller.start()
+        try:
+            stdout_path, stderr_path = controller.capture_paths
+            self.assertTrue(stdout_path.is_file())
+            self.assertTrue(stderr_path.is_file())
+            controller.shutdown()
+        finally:
+            controller.close()
+
+        self.assertFalse(stdout_path.exists())
+        self.assertFalse(stderr_path.exists())
 
     def test_default_worker_config_matches_standalone_cpu_defaults(self):
         config = AsrWorkerConfig()
@@ -704,6 +708,18 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertIsNone(controller._request_queue)
         self.assertIsNone(controller._response_connection)
 
+    def test_terminate_process_raises_when_kill_cannot_reap_worker(self):
+        controller = self.controller()
+        process = mock.Mock(pid=1234)
+        process.is_alive.side_effect = (True, True, True)
+        controller._process = process
+
+        with self.assertRaisesRegex(RuntimeError, "still alive"):
+            controller._terminate_process()
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+
     def test_one_asr_load_serves_multiple_path_only_transcriptions(self):
         first_video, first_wav = self.media_pair("first", language="en-US")
         second_video, second_wav = self.media_pair("second", language="ja")
@@ -727,17 +743,15 @@ class WorkerProtocolTests(unittest.TestCase):
             ["load", "transcribe:first.wav", "transcribe:second.wav", "unload"],
         )
 
-        first_artifact = self.artifact_for(first_wav)
-        second_artifact = self.artifact_for(second_wav)
-        first_fingerprint = build_asr_fingerprint_from_snapshot(
-            first_artifact.edit_snapshot,
+        first_fingerprint = build_asr_fingerprint(
+            first_video,
             model=self.config.model,
             compute_type=self.config.compute_type,
             source_language="en",
             asr_options=self.config.options_dict(),
         )
-        second_fingerprint = build_asr_fingerprint_from_snapshot(
-            second_artifact.edit_snapshot,
+        second_fingerprint = build_asr_fingerprint(
+            second_video,
             model=self.config.model,
             compute_type=self.config.compute_type,
             source_language="ja",

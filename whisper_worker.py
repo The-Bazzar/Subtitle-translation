@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -48,6 +49,7 @@ WORKER_OPERATION_TIMEOUT_SECONDS = 24 * 60 * 60
 WORKER_RESPONSE_POLL_SECONDS = 0.05
 WORKER_RESPONSE_DRAIN_LIMIT = 64
 WORKER_REAP_TIMEOUT_SECONDS = 5.0
+WORKER_CAPTURE_TAIL_BYTES = 256 * 1024
 
 
 def _freeze_options(options: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
@@ -110,10 +112,10 @@ class _WorkerRequest:
     request_id: int
     command: str
     path: str = ""
-    artifact: WavArtifact | None = None
     language: str = ""
     generation: str = ""
     candidate_path: str = ""
+    artifact: WavArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -122,9 +124,18 @@ class _WorkerHeartbeat:
 
 
 class WorkerExitedError(RuntimeError):
-    def __init__(self, exitcode: int | None, command: WorkerCommand) -> None:
+    def __init__(
+        self,
+        exitcode: int | None,
+        command: WorkerCommand,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
         self.exitcode = exitcode
         self.command = command
+        self.stdout = stdout
+        self.stderr = stderr
         super().__init__(
             f"Whisper worker exited unexpectedly during {command.value} "
             f"(exit code: {exitcode})"
@@ -137,10 +148,15 @@ class WorkerUnresponsiveError(RuntimeError):
         command: WorkerCommand,
         reason: str,
         timeout_seconds: float,
+        *,
+        stdout: str = "",
+        stderr: str = "",
     ) -> None:
         self.command = command
         self.reason = reason
         self.timeout_seconds = timeout_seconds
+        self.stdout = stdout
+        self.stderr = stderr
         super().__init__(
             f"Whisper worker became unresponsive during {command.value}: "
             f"{reason} after {timeout_seconds:.3f}s"
@@ -526,6 +542,47 @@ def _load_backend_factory(factory_path: str) -> Callable[[AsrWorkerConfig], Any]
     return factory
 
 
+def _worker_process_entry(
+    process_target: Callable[..., None],
+    request_queue: Any,
+    response_connection: Any,
+    config: AsrWorkerConfig,
+    backend_factory_path: str,
+    heartbeat_interval: float,
+    stdout_path: str,
+    stderr_path: str,
+) -> None:
+    with (
+        open(stdout_path, "ab", buffering=0) as stdout_capture,
+        open(stderr_path, "ab", buffering=0) as stderr_capture,
+    ):
+        os.dup2(stdout_capture.fileno(), 1)
+        os.dup2(stderr_capture.fileno(), 2)
+        sys.stdout = open(
+            1,
+            "w",
+            encoding="utf-8",
+            errors="replace",
+            buffering=1,
+            closefd=False,
+        )
+        sys.stderr = open(
+            2,
+            "w",
+            encoding="utf-8",
+            errors="replace",
+            buffering=1,
+            closefd=False,
+        )
+        process_target(
+            request_queue,
+            response_connection,
+            config,
+            backend_factory_path,
+            heartbeat_interval,
+        )
+
+
 def _worker_main(
     request_queue: Any,
     response_connection: Any,
@@ -584,9 +641,8 @@ def _worker_main(
                 elif command is WorkerCommand.TRANSCRIBE:
                     if backend is None:
                         raise RuntimeError("ASR model is not loaded")
-                    if request.artifact is None:
+                    if artifact is None:
                         raise ValueError("TRANSCRIBE requires a bound WAV artifact")
-                    artifact = request.artifact
                     validate_wav_artifact(artifact)
                     wav_path = Path(artifact.wav_snapshot.path).resolve()
                     edit_video_path = Path(artifact.edit_snapshot.path).resolve()
@@ -762,6 +818,9 @@ class AsrWorkerController:
         self._force_reaped = False
         self._unexpected_exit_reported = False
         self._closed = False
+        self._capture_directory: Path | None = None
+        self._stdout_capture_path: Path | None = None
+        self._stderr_capture_path: Path | None = None
 
     @property
     def pid(self) -> int | None:
@@ -779,11 +838,67 @@ class AsrWorkerController:
     def is_alive(self) -> bool:
         return self._process is not None and self._process.is_alive()
 
+    @property
+    def capture_paths(self) -> tuple[Path, Path]:
+        if self._stdout_capture_path is None or self._stderr_capture_path is None:
+            raise RuntimeError("Whisper worker capture files are unavailable")
+        return self._stdout_capture_path, self._stderr_capture_path
+
+    @staticmethod
+    def _read_capture_tail(path: Path | None) -> str:
+        if path is None:
+            return ""
+        try:
+            with path.open("rb") as capture_file:
+                capture_file.seek(0, os.SEEK_END)
+                size = capture_file.tell()
+                if size > WORKER_CAPTURE_TAIL_BYTES:
+                    capture_file.seek(-WORKER_CAPTURE_TAIL_BYTES, os.SEEK_END)
+                    marker = (
+                        "[... worker output truncated; showing last "
+                        f"{WORKER_CAPTURE_TAIL_BYTES} bytes ...]\n"
+                    )
+                else:
+                    capture_file.seek(0)
+                    marker = ""
+                payload = capture_file.read()
+        except OSError:
+            return ""
+        return marker + payload.decode("utf-8", errors="replace")
+
+    def captured_output(self) -> tuple[str, str]:
+        return (
+            self._read_capture_tail(self._stdout_capture_path),
+            self._read_capture_tail(self._stderr_capture_path),
+        )
+
+    def _create_capture_files(self) -> None:
+        capture_directory = Path(
+            tempfile.mkdtemp(prefix="batch-whisper-worker-")
+        ).resolve()
+        stdout_path = capture_directory / "stdout.log"
+        stderr_path = capture_directory / "stderr.log"
+        stdout_path.touch()
+        stderr_path.touch()
+        self._capture_directory = capture_directory
+        self._stdout_capture_path = stdout_path
+        self._stderr_capture_path = stderr_path
+
+    def _cleanup_capture_files(self) -> None:
+        capture_directory = self._capture_directory
+        if capture_directory is None:
+            return
+        shutil.rmtree(capture_directory)
+        self._capture_directory = None
+        self._stdout_capture_path = None
+        self._stderr_capture_path = None
+
     def start(self) -> None:
         if self._closed:
             raise RuntimeError("Whisper worker controller is closed")
         if self._process is not None:
             raise RuntimeError("Whisper worker controller cannot be restarted")
+        self._create_capture_files()
         receive_connection = None
         send_connection = None
         try:
@@ -791,48 +906,70 @@ class AsrWorkerController:
             receive_connection, send_connection = self._context.Pipe(duplex=False)
             self._response_connection = receive_connection
             self._process = self._context.Process(
-                target=self._process_target,
+                target=_worker_process_entry,
                 args=(
+                    self._process_target,
                     self._request_queue,
                     send_connection,
                     self.config,
                     self.backend_factory,
                     self._heartbeat_interval,
+                    str(self._stdout_capture_path),
+                    str(self._stderr_capture_path),
                 ),
                 name="batch-whisper-worker",
             )
             self._process.start()
         except BaseException:
-            try:
-                self._terminate_process()
-                if self._process is not None:
-                    self._process.join(timeout=WORKER_REAP_TIMEOUT_SECONDS)
-                    self._process.close()
-            finally:
-                if receive_connection is not None and not receive_connection.closed:
-                    receive_connection.close()
-                    receive_connection = None
-                if send_connection is not None and not send_connection.closed:
-                    send_connection.close()
-                    send_connection = None
-                if self._request_queue is not None:
-                    self._request_queue.close()
-                    self._request_queue.join_thread()
+            process = self._process
+            if process is not None:
+                try:
+                    self._terminate_process()
+                except Exception:
+                    pass
+                try:
+                    process.close()
+                except (AssertionError, OSError, ValueError):
+                    pass
+            if receive_connection is not None and not receive_connection.closed:
+                receive_connection.close()
+            if send_connection is not None and not send_connection.closed:
+                send_connection.close()
+                send_connection = None
+            if self._request_queue is not None:
+                self._request_queue.close()
+                self._request_queue.join_thread()
             self._request_queue = None
             self._response_connection = None
             self._process = None
+            try:
+                self._cleanup_capture_files()
+            except OSError:
+                pass
             raise
         finally:
             if send_connection is not None and not send_connection.closed:
                 send_connection.close()
 
     def _unexpected_exit(self, command: WorkerCommand) -> WorkerExitedError:
+        stdout, stderr = self.captured_output()
         if self._process is None:
             self._unexpected_exit_reported = True
-            return WorkerExitedError(None, command)
+            return WorkerExitedError(
+                None,
+                command,
+                stdout=stdout,
+                stderr=stderr,
+            )
         self._process.join(timeout=0.2)
+        stdout, stderr = self.captured_output()
         self._unexpected_exit_reported = True
-        return WorkerExitedError(self.exitcode, command)
+        return WorkerExitedError(
+            self.exitcode,
+            command,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
     def _terminate_process(self) -> None:
         process = self._process
@@ -843,6 +980,10 @@ class AsrWorkerController:
         if process.is_alive():
             process.kill()
             process.join(timeout=WORKER_REAP_TIMEOUT_SECONDS)
+        if process.is_alive():
+            raise RuntimeError(
+                f"worker process {process.pid} is still alive after terminate and kill"
+            )
 
     def _force_reap(
         self,
@@ -856,7 +997,14 @@ class AsrWorkerController:
         self._asr_loaded = False
         self._align_loaded = False
         self._alignment_language = ""
-        return WorkerUnresponsiveError(command, reason, timeout_seconds)
+        stdout, stderr = self.captured_output()
+        return WorkerUnresponsiveError(
+            command,
+            reason,
+            timeout_seconds,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
     def abort(self) -> None:
         if self._closed or self._force_reaped:
@@ -952,10 +1100,10 @@ class AsrWorkerController:
         self,
         command: WorkerCommand,
         path: str = "",
-        artifact: WavArtifact | None = None,
         language: str = "",
         generation: str = "",
         candidate_path: str = "",
+        artifact: WavArtifact | None = None,
     ) -> WorkerResult:
         if self._process is None:
             raise RuntimeError("Whisper worker has not been started")
@@ -970,10 +1118,10 @@ class AsrWorkerController:
                 request_id=request_id,
                 command=command.value,
                 path=path,
-                artifact=artifact,
                 language=language,
                 generation=generation,
                 candidate_path=candidate_path,
+                artifact=artifact,
             )
         )
         operation_started = time.monotonic()
@@ -1211,8 +1359,21 @@ class AsrWorkerController:
                 except Exception as exc:
                     if cleanup_error is None:
                         cleanup_error = exc
+            captured_stdout, captured_stderr = self.captured_output()
+            try:
+                self._cleanup_capture_files()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
             self._closed = True
         if cleanup_error is not None:
+            try:
+                if not getattr(cleanup_error, "stdout", ""):
+                    cleanup_error.stdout = captured_stdout
+                if not getattr(cleanup_error, "stderr", ""):
+                    cleanup_error.stderr = captured_stderr
+            except (AttributeError, TypeError):
+                pass
             raise cleanup_error
 
     def __enter__(self) -> AsrWorkerController:
