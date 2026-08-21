@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# pipeline.sh — 一键流水线: 下载原片 + 编辑版 → JSON → 美化 → 术语库 → 翻译 → 硬压
+# pipeline.sh — 一键流水线: 下载原片 → 准备编辑版 → JSON → 美化 → 术语库 → 翻译 → 硬压
 #
-# 串联 download.sh → whisper.sh → translate_srt.sh → (ffmpeg-burn.sh)
+# 串联 download.sh → prepare-video.sh → whisper.sh → translate_srt.sh → (ffmpeg-burn.sh)
 # 从 YouTube 链接直达双语 .<source>-<target>.ass 字幕 / burned.mkv 硬字幕。
 #
 # 成果物链:
-#   OUTPUT_VIDEO(编辑版 mp4) → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
+#   OUTPUT_VIDEO(编辑版 mkv) → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
 #   OUTPUT_RENDER_VIDEO(原片) → ffmpeg-burn.sh
 #
 # 用法:
@@ -84,6 +84,7 @@ trap notify_pipeline_exit EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_SCRIPT="$SCRIPT_DIR/download.sh"
+PREPARE_VIDEO_SCRIPT="$SCRIPT_DIR/prepare-video.sh"
 WHISPER_SCRIPT="$SCRIPT_DIR/whisper.sh"
 TRANSLATE_SCRIPT="$SCRIPT_DIR/translate_srt.sh"
 BURN_SCRIPT="$SCRIPT_DIR/ffmpeg-burn.sh"
@@ -155,20 +156,21 @@ BURN_RES="${BURN_RES:-}"
 show_help() {
     PIPELINE_NOTIFY_ACTIVE=0
     cat << 'EOF'
-pipeline.sh — 一键流水线: 下载原片 + 编辑版 + WhisperX 字幕 + 时间码美化 + LLM 翻译 [+ 硬压]
+pipeline.sh — 一键流水线: 下载原片 + 准备编辑版 + WhisperX 字幕 + 时间码美化 + LLM 翻译 [+ 硬压]
 
 用法:
   ./pipeline.sh <YouTube URL> [-- <beautify选项>]
 
 流程:
-  1. yt-dlp 下载原片 + 元数据 (SponsorBlock 去广告)，并重编码出编辑版 mp4
-  2. WhisperX large-v3-turbo 对编辑版生成词级 JSON
-  3. ffmpeg 场景检测 → JSON 时间轴吸附对齐 → .beautified.json
-  4. translate_srt.py 从整句 JSON 生成 glossary.md
-  5. 整句翻译 + 校对 + 分割 + 词级对轴 → .<source>-<target>.ass + .<target>.ass + .<source>.proofread.ass
-  6. ffmpeg 使用保留的 .original 原片硬压字幕 → burned.mkv (默认启用, BURN=0 跳过)
+  1. yt-dlp 下载原片 + 元数据 (SponsorBlock 去广告)
+  2. prepare-video.sh 将原片重编码为编辑版 mkv
+  3. WhisperX large-v3-turbo 对编辑版生成词级 JSON
+  4. ffmpeg 场景检测 → JSON 时间轴吸附对齐 → .beautified.json
+  5. translate_srt.py 从整句 JSON 生成 glossary.md
+  6. 整句翻译 + 校对 + 分割 + 词级对轴 → .<source>-<target>.ass + .<target>.ass + .<source>.proofread.ass
+  7. ffmpeg 使用保留的 .original 原片硬压字幕 → burned.mkv (默认启用, BURN=0 跳过)
 
-成果物链: OUTPUT_VIDEO(编辑版 mp4) → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
+成果物链: OUTPUT_VIDEO(编辑版 mkv) → JSON_PATH → BEAUTIFIED_JSON → glossary.md → ASS_PATH → burned.mkv
            OUTPUT_RENDER_VIDEO(原片) → ffmpeg-burn.sh
   - 已存在的中间产物自动跳过 (跳过美化/跳过翻译)
   - 使用 EXISTING_ASS 指定已有双语 ASS
@@ -265,11 +267,10 @@ if [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then
     RENDER_VIDEO_PATH="$VIDEO_PATH"
 else
     echo "============================================="
-    echo "pipeline — 步骤 1/6: 下载视频"
+    echo "pipeline — 步骤 1/7: 下载视频"
     echo "============================================="
     echo ""
 
-    VIDEO_PATH=""
     RENDER_VIDEO_PATH=""
     DOWNLOAD_LOG="$(mktemp)"
     if ! bash "$DOWNLOAD_SCRIPT" "$URL" 2>&1 | tee "$DOWNLOAD_LOG"; then
@@ -278,17 +279,38 @@ else
         rm -f "$DOWNLOAD_LOG"
         exit 1
     fi
-    VIDEO_PATH="$(awk -F= '/^OUTPUT_VIDEO=/{print substr($0, index($0, "=") + 1)}' "$DOWNLOAD_LOG" | tail -n 1)"
     RENDER_VIDEO_PATH="$(awk -F= '/^OUTPUT_RENDER_VIDEO=/{print substr($0, index($0, "=") + 1)}' "$DOWNLOAD_LOG" | tail -n 1)"
     rm -f "$DOWNLOAD_LOG"
 
-    if [ -z "$VIDEO_PATH" ] || [ ! -f "$VIDEO_PATH" ]; then
+    if [ -z "$RENDER_VIDEO_PATH" ] || [ ! -f "$RENDER_VIDEO_PATH" ]; then
         echo ""
-        echo "Error: Failed to locate downloaded video file." >&2
+        echo "Error: Failed to locate downloaded original video file." >&2
         exit 1
     fi
-    if [ -z "$RENDER_VIDEO_PATH" ] || [ ! -f "$RENDER_VIDEO_PATH" ]; then
-        RENDER_VIDEO_PATH="$VIDEO_PATH"
+
+    echo ""
+    echo "============================================="
+    echo "pipeline — 步骤 2/7: 准备编辑视频"
+    echo "============================================="
+    VIDEO_PATH=""
+    PREPARE_LOG="$(mktemp)"
+    set +e
+    bash "$PREPARE_VIDEO_SCRIPT" "$RENDER_VIDEO_PATH" 2>&1 | tee "$PREPARE_LOG"
+    PREPARE_STATUS=${PIPESTATUS[0]}
+    set -e
+    if [ "$PREPARE_STATUS" -ne 0 ]; then
+        echo ""
+        echo "Error: Prepare video step failed." >&2
+        rm -f "$PREPARE_LOG"
+        exit "$PREPARE_STATUS"
+    fi
+    VIDEO_PATH="$(awk -F= '/^OUTPUT_VIDEO=/{print substr($0, index($0, "=") + 1)}' "$PREPARE_LOG" | tail -n 1)"
+    rm -f "$PREPARE_LOG"
+
+    if [ -z "$VIDEO_PATH" ] || [ ! -f "$VIDEO_PATH" ]; then
+        echo ""
+        echo "Error: Failed to locate prepared edit video file." >&2
+        exit 1
     fi
 fi
 
@@ -319,7 +341,7 @@ elif [ -f "$JSON_PATH" ]; then
 else
     echo ""
     echo "============================================="
-    echo "pipeline — 步骤 2/6: WhisperX 生成 JSON"
+    echo "pipeline — 步骤 3/7: WhisperX 生成 JSON"
     echo "============================================="
     echo ""
     if ! bash "$WHISPER_SCRIPT" "$VIDEO_PATH"; then
@@ -352,7 +374,7 @@ elif [ -f "$BEAUTIFIED_JSON" ]; then
     echo "============================================="
 else
     echo "============================================="
-    echo "pipeline — 步骤 3/6: JSON 时间码美化 → .beautified.json"
+    echo "pipeline — 步骤 4/7: JSON 时间码美化 → .beautified.json"
     echo "============================================="
     echo ""
 
@@ -386,7 +408,7 @@ elif [ -f "$VIDEO_DIR/glossary.md" ]; then
     echo "============================================="
 else
     echo "============================================="
-    echo "pipeline — 步骤 4/6: AI Agent 生成术语知识库 → glossary.md"
+    echo "pipeline — 步骤 5/7: AI Agent 生成术语知识库 → glossary.md"
     echo "============================================="
     echo ""
     bash "$TRANSLATE_SCRIPT" "$TRANSLATE_SRC" --video "$VIDEO_PATH" --only-glossary --skip-beautify
@@ -405,7 +427,7 @@ elif [ -f "$ASS_PATH" ]; then
     echo "============================================="
 else
     echo "============================================="
-    echo "pipeline — 步骤 5/6: LLM 翻译 (${SOURCE_LANG:-"(JSON language)"} → $TARGET_LANG) → $(basename "$ASS_PATH")"
+    echo "pipeline — 步骤 6/7: LLM 翻译 (${SOURCE_LANG:-"(JSON language)"} → $TARGET_LANG) → $(basename "$ASS_PATH")"
     echo "============================================="
     echo ""
 
@@ -438,7 +460,7 @@ elif [ "${SKIP_BURN:-0}" = "1" ]; then
     echo "============================================="
 else
     echo "============================================="
-    echo "pipeline — 步骤 6/6: 字幕硬压 → burned.mkv"
+    echo "pipeline — 步骤 7/7: 字幕硬压 → burned.mkv"
     echo "============================================="
     echo ""
 
