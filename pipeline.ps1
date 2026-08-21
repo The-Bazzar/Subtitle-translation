@@ -89,15 +89,12 @@ $script:PipelineNotificationActive = $false
 function Exit-Pipeline {
     param([int]$Code)
 
-    if ($script:PipelineNotificationActive -and $env:PIPELINE_BATCH_CHILD -ne '1') {
+    if ($script:PipelineNotificationActive) {
         if ($Code -ne 0) {
             Invoke-TaskBell -Kind Error
         } else {
             Invoke-TaskBell -Kind Success
         }
-    }
-    if ($env:PIPELINE_BATCH_CHILD -eq '1') {
-        Write-Output "__PIPELINE_BATCH_EXIT__=$Code"
     }
     exit $Code
 }
@@ -156,13 +153,14 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 
 用法: .\pipeline.ps1 <YouTube URL> [选项...]
 
-流程: 下载原片 + 编辑版 → JSON 语音识别 → JSON 美化 → 术语库 → 翻译 → 硬压 (纯 Windows)
-  1. yt-dlp 下载原片 + 元数据，并重编码出同 basename 的编辑版 mp4
-  2. WhisperX 对编辑版生成词级 JSON
-  3. 场景检测美化 JSON 时间轴 (Netflix 规范)
-  4. translate_srt.py 可选联网搜索 + LLM 生成术语知识库 (glossary.md)
-  5. 整句翻译 + 校对 + 分割 + 词级对轴 → .<source>-<target>.ass
-  6. ffmpeg 使用保留的 .original 原片硬压 → burned.mkv
+流程: 下载原片 → 准备编辑版 → JSON 语音识别 → JSON 美化 → 术语库 → 翻译 → 硬压 (纯 Windows)
+  1. yt-dlp 下载原片 + 元数据
+  2. prepare-video.ps1 将原片重编码为同 basename 的编辑版 mkv
+  3. WhisperX 对编辑版生成词级 JSON
+  4. 场景检测美化 JSON 时间轴 (Netflix 规范)
+  5. translate_srt.py 可选联网搜索 + LLM 生成术语知识库 (glossary.md)
+  6. 整句翻译 + 校对 + 分割 + 词级对轴 → .<source>-<target>.ass
+  7. ffmpeg 使用保留的 .original 原片硬压 → burned.mkv
 
 参数:
   -Url                YouTube 视频链接 (必选)
@@ -193,6 +191,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 # ── 工具路径 ──────────────────────────────────────────────────────────────────
 
 $DownloadPs1  = Join-Path $ScriptDir "download.ps1"
+$PrepareVideoScript = Join-Path $ScriptDir "prepare-video.ps1"
 $WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
 $TranslatePs1 = Join-Path $ScriptDir "translate_srt.ps1"
 $BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
@@ -208,6 +207,7 @@ Write-Host "Language:  $SourceLangDisplay → $TargetLang" -ForegroundColor Gray
 if ($ExistingAss)    { Write-Host "Existing:  $ExistingAss" -ForegroundColor Gray }
 $steps = @()
 if (-not $SkipDownload)  { $steps += "Download" }
+if (-not $SkipDownload)  { $steps += "Prepare" }
 if (-not $SkipWhisper)   { $steps += "Whisper" }
 if (-not $SkipBeautify)  { $steps += "Beautify" }
 if (-not $SkipKnowledge) { $steps += "Knowledge" }
@@ -217,7 +217,10 @@ Write-Host "Steps:     $($steps -join ' → ')" -ForegroundColor Gray
 Write-Host "=============================================" -ForegroundColor Cyan
 
 if ($DryRun) {
-    if (-not $SkipDownload) { Write-Host "[DRY RUN] .\download.ps1 `"$Url`"" -ForegroundColor Yellow }
+    if (-not $SkipDownload) {
+        Write-Host "[DRY RUN] .\download.ps1 `"$Url`"" -ForegroundColor Yellow
+        Write-Host "[DRY RUN] .\prepare-video.ps1 <OUTPUT_RENDER_VIDEO>" -ForegroundColor Yellow
+    }
     exit 0
 }
 
@@ -244,14 +247,11 @@ if ($SkipDownload) {
     $RenderVideoPath = $VideoPath
 } else {
     Write-Host ""
-    Write-Host ">>> Step 1/6: Download" -ForegroundColor Cyan
-    $VideoPath = $null
+    Write-Host ">>> Step 1/7: Download" -ForegroundColor Cyan
     $RenderVideoPath = $null
     & $DownloadPs1 $Url 2>&1 | ForEach-Object {
         $_
-        if ($_ -match '^OUTPUT_VIDEO=(.+)$') {
-            $VideoPath = $Matches[1].Trim()
-        } elseif ($_ -match '^OUTPUT_RENDER_VIDEO=(.+)$') {
+        if ($_ -match '^OUTPUT_RENDER_VIDEO=(.+)$') {
             $RenderVideoPath = $Matches[1].Trim()
         }
     }
@@ -260,12 +260,28 @@ if ($SkipDownload) {
         Write-Host "Error: Download step failed (exit code $DownloadExitCode)." -ForegroundColor Red
         Exit-Pipeline $DownloadExitCode
     }
-    if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
-        Write-Host "Error: Failed to locate downloaded video." -ForegroundColor Red
+    if (-not $RenderVideoPath -or -not (Test-Path $RenderVideoPath)) {
+        Write-Host "Error: Failed to locate downloaded original video." -ForegroundColor Red
         Exit-Pipeline 1
     }
-    if (-not $RenderVideoPath -or -not (Test-Path $RenderVideoPath)) {
-        $RenderVideoPath = $VideoPath
+
+    Write-Host ""
+    Write-Host ">>> Step 2/7: Prepare edit video" -ForegroundColor Cyan
+    $VideoPath = $null
+    & $PrepareVideoScript $RenderVideoPath 2>&1 | ForEach-Object {
+        $_
+        if ($_ -match '^OUTPUT_VIDEO=(.+)$') {
+            $VideoPath = $Matches[1].Trim()
+        }
+    }
+    $PrepareExitCode = $LASTEXITCODE
+    if ($PrepareExitCode -ne 0) {
+        Write-Host "Error: Prepare video step failed (exit code $PrepareExitCode)." -ForegroundColor Red
+        Exit-Pipeline $PrepareExitCode
+    }
+    if (-not $VideoPath -or -not (Test-Path $VideoPath)) {
+        Write-Host "Error: Failed to locate prepared edit video." -ForegroundColor Red
+        Exit-Pipeline 1
     }
 }
 
@@ -290,7 +306,7 @@ if ($SkipWhisper) {
     Write-Host "SKIP: WhisperX — $JsonPath 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host "Step 2/6: WhisperX" -ForegroundColor Cyan
+    Write-Host "Step 3/7: WhisperX" -ForegroundColor Cyan
     & $WhisperPs1 $VideoPath
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
@@ -318,7 +334,7 @@ if ($SkipBeautify) {
     Write-Host "SKIP: 美化 — $BeautifiedJson 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host "Step 3/6: Beautify JSON" -ForegroundColor Cyan
+    Write-Host "Step 4/7: Beautify JSON" -ForegroundColor Cyan
     & $TranslatePs1 $JsonPath --video $VideoPath --only-beautify
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
@@ -337,7 +353,7 @@ if ($SkipKnowledge) {
     Write-Host "SKIP: Knowledge — $GlossaryPath 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host "Step 4/6: Knowledge" -ForegroundColor Cyan
+    Write-Host "Step 5/7: Knowledge" -ForegroundColor Cyan
     & $TranslatePs1 $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
@@ -354,7 +370,7 @@ if ($SkipTranslate) {
     Write-Host "SKIP: 翻译 — $AssPath 已存在" -ForegroundColor Gray
 } else {
     Write-Host ""
-    Write-Host "Step 5/6: Translate ($SourceLangDisplay → $TargetLang)" -ForegroundColor Cyan
+    Write-Host "Step 6/7: Translate ($SourceLangDisplay → $TargetLang)" -ForegroundColor Cyan
     if ($NoProofread) { $env:PROOFREAD = "0" }
     $LangArgs = @()
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
@@ -386,7 +402,7 @@ if (-not (Test-Path $AssPath)) {
 }
 
 Write-Host ""
-Write-Host "Step 6/6: Burn" -ForegroundColor Cyan
+Write-Host "Step 7/7: Burn" -ForegroundColor Cyan
 
 $BurnParams = @{
     VideoPath = $RenderVideoPath
