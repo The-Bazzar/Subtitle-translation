@@ -14,7 +14,7 @@ Add distinct success and error sounds to the PowerShell and Linux/WSL pipeline a
 ## Scope
 
 - `pipeline.ps1` and `pipeline.sh` notify after a real task finishes or exits with an error.
-- `batch.ps1` and `batch.py` notify once after the aggregate batch result is known.
+- `batch_runtime.py` notifies once after the aggregate batch result is known.
 - A pipeline launched by a batch suppresses its own sounds. The batch runner emits one error sound as each failed result arrives, including timeout and launch failures. Three failed child pipelines therefore produce three error sounds, followed by one aggregate batch error sound.
 - Help and dry-run paths do not notify.
 - Any batch containing a failed task exits nonzero.
@@ -27,7 +27,7 @@ Linux/WSL uses the terminal BEL character with different cadences because it is 
 
 ## Process Coordination
 
-Batch runners set the process-local `PIPELINE_BATCH_CHILD=1` marker for child pipelines. This marker is not a user configuration variable and is not read from `.env`. PowerShell child pipelines also return an internal `__PIPELINE_BATCH_EXIT__=<code>` output marker because runspace `EndInvoke()` does not expose a script's `exit` code; `batch.ps1` consumes this marker before recording the aggregate result.
+Stage-aware batch runners call each stage directly and do not invoke child pipelines or use an internal pipeline exit marker.
 
 Pipeline notification rules:
 

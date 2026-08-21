@@ -19,17 +19,12 @@
 ├── whisper.sh
 ├── py_launcher.ps1
 ├── py_launcher.sh
-├── merge_ass.ps1
-├── merge_ass.sh
-├── translate_srt.ps1
-├── translate_srt.sh
 ├── translate_srt.py
+├── merge_ass.py
 ├── ffmpeg-burn.ps1
 ├── ffmpeg-burn.sh
 ├── mpv-burn.ps1
 ├── mpv-burn.sh
-├── batch.ps1
-├── batch.sh
 ├── batch.py
 ├── batch_runtime.py
 ├── batch_scheduler.py
@@ -72,18 +67,18 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ### Stage-aware 批处理
 
 ```powershell
-.\batch.ps1 "URL1" "URL2"
-.\batch.ps1 --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
-.\batch.ps1 --dry-run --report "batch-result.txt" "URL1" "URL2"
+.\py_launcher.ps1 batch "URL1" "URL2"
+.\py_launcher.ps1 batch --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
+.\py_launcher.ps1 batch --dry-run --report "batch-result.txt" "URL1" "URL2"
 ```
 
 ```bash
-./batch.sh "URL1" "URL2"
-./batch.sh --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
-./batch.sh --dry-run --report batch-result.txt "URL1" "URL2"
+bash ./py_launcher.sh batch "URL1" "URL2"
+bash ./py_launcher.sh batch --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
+bash ./py_launcher.sh batch --dry-run --report batch-result.txt "URL1" "URL2"
 ```
 
-`batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，`batch.py` 是薄入口，实际调度由 `batch_runtime.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 与最终 burn 共用固定 `4` 路 NVENC capacity，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。
+`py_launcher.ps1/.sh batch` 是 batch 的跨平台入口；`batch.py` 是薄入口，实际调度由 `batch_runtime.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 与最终 burn 共用固定 `4` 路 NVENC capacity，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。
 
 当前 stage-aware 入口先并行流水执行 `download -> prepare-video -> mono 16kHz WAV`，等待 acquisition 全部到达终态后，再启动一个 `spawn` worker。prepare 与 WAV 提取/替换都在同一媒体的 `<name>.asr.lock` 内完成；prepare 成功后原子写 `<name>.prepare.json`，用 UUID `generation` 绑定原片和编辑版各自的 resolved path、size、mtime，准备前后原片快照不一致时拒绝认证该编辑版。worker 加载一次 WhisperX ASR 模型并串行识别所有未缓存 WAV；每个 WAV 绑定到不可变 media generation，ASR 写 sidecar 前会在同一锁内重新验证 prepare state、编辑版和 WAV 快照。
 
@@ -107,7 +102,7 @@ active worker command 在 precommit 取消时由 controller terminate/kill，再
 
 单任务 `pipeline.sh` 在 prepare 失败时精确透传 `prepare-video.sh 的原始退出码`，与 PowerShell pipeline 的行为一致，不再把所有 prepare 错误折叠为 `1`。
 
-发布前的跨平台 contract smoke 位于 `tests/test_batch_smoke.py`：Windows 经 `batch.ps1 -> py_launcher.ps1 -> batch.py`，WSL/Linux 经 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言报告契约。smoke 把 `batch.py`、`batch_runtime.py` 及其他 byte-identical production modules 复制到隔离目录并校验 SHA-256；只把 download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 作为 deterministic fake 外部边界。WSL smoke 由 `wsl -u root` 按测试环境 override、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；找不到时开发者测试精确 skip，测试不会下载或安装依赖。内部测试变量 `BATCH_SMOKE_REQUIRE_WSL=1` 用于 release gate，此时缺少 WSL root 或合格 interpreter 会失败而不是 skip；它不是项目用户配置。带时间戳的证据断言所有 acquisition 完成后才加载 ASR、ASR 与 alignment command 串行、worker shutdown 先于所有 burn，且 prepare/burn 各自峰值为 4。它不替代真实 CUDA、ffmpeg、网络、LLM 或媒体质量验证。
+发布前的跨平台 contract smoke 位于 `tests/test_batch_smoke.py`：Windows 经 `py_launcher.ps1 batch -> batch.py`，WSL/Linux 经 `py_launcher.sh batch -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言报告契约。smoke 把 `batch.py`、`batch_runtime.py` 及其他 byte-identical production modules 和共享 launcher 复制到隔离目录并校验 SHA-256；只把 download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 作为 deterministic fake 外部边界。WSL smoke 由 `wsl -u root` 按测试环境 override、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；找不到时开发者测试精确 skip，测试不会下载或安装依赖。内部测试变量 `BATCH_SMOKE_REQUIRE_WSL=1` 用于 release gate，此时缺少 WSL root 或合格 interpreter 会失败而不是 skip；它不是项目用户配置。带时间戳的证据断言所有 acquisition 完成后才加载 ASR、ASR 与 alignment command 串行、worker shutdown 先于所有 burn，且 prepare/burn 各自峰值为 4。它不替代真实 CUDA、ffmpeg、网络、LLM 或媒体质量验证。
 
 ### 完成通知
 
@@ -137,27 +132,27 @@ active worker command 在 precommit 取消时由 controller terminate/kill，再
 入口只接受 WhisperX JSON。推荐使用项目包装器，不需要用户设置 PATH，也不要求从仓库目录运行：
 
 ```powershell
-& "<repo>\translate_srt.ps1" "video.json" --video "video.mp4"
-& "<repo>\translate_srt.ps1" "video.json" --video "video.mp4" --only-beautify
-& "<repo>\translate_srt.ps1" "video.beautified.json" --video "video.mp4" --source-lang en --target-lang ja
-& "<repo>\translate_srt.ps1" "video.beautified.json" --video "video.mp4" -o "custom.en-ja.ass"
+& "<repo>\py_launcher.ps1" translate_srt "video.json" --video "video.mp4"
+& "<repo>\py_launcher.ps1" translate_srt "video.json" --video "video.mp4" --only-beautify
+& "<repo>\py_launcher.ps1" translate_srt "video.beautified.json" --video "video.mp4" --source-lang en --target-lang ja
+& "<repo>\py_launcher.ps1" translate_srt "video.beautified.json" --video "video.mp4" -o "custom.en-ja.ass"
 ```
 
 ```bash
-bash "<repo>/translate_srt.sh" "video.json" --video "video.mp4"
-bash "<repo>/translate_srt.sh" "video.json" --video "video.mp4" --only-beautify
-bash "<repo>/translate_srt.sh" "video.beautified.json" --video "video.mp4" --source-lang en --target-lang ja
-bash "<repo>/translate_srt.sh" "video.beautified.json" --video "video.mp4" -o "custom.en-ja.ass"
+bash "<repo>/py_launcher.sh" translate_srt "video.json" --video "video.mp4"
+bash "<repo>/py_launcher.sh" translate_srt "video.json" --video "video.mp4" --only-beautify
+bash "<repo>/py_launcher.sh" translate_srt "video.beautified.json" --video "video.mp4" --source-lang en --target-lang ja
+bash "<repo>/py_launcher.sh" translate_srt "video.beautified.json" --video "video.mp4" -o "custom.en-ja.ass"
 ```
 
 合并已校对的双语 ASS 时，同样使用项目包装器：
 
 ```powershell
-& "<repo>\merge_ass.ps1" "video.zh.ass" "video.en.ass"
+& "<repo>\py_launcher.ps1" merge_ass "video.zh.ass" "video.en.ass"
 ```
 
 ```bash
-bash "<repo>/merge_ass.sh" "video.zh.ass" "video.en.ass"
+bash "<repo>/py_launcher.sh" merge_ass "video.zh.ass" "video.en.ass"
 ```
 
 输出：
@@ -258,7 +253,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 
 - `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
 - 不要把 Python 包安装到系统环境；Windows 运行 `.\setup.ps1`，Linux/WSL 运行 `./setup.sh`，它们会创建/更新仓库 `.venv`
-- 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；`py_launcher.ps1/.sh` 只允许启动 `translate_srt`、`merge_ass`、`batch`，并统一使用项目 `.venv`。`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh`、`batch.ps1/.sh` 是其薄包装器，不调用全局 `python` / `python3`，也不要求用户设置 PATH，可从任意工作目录调用
+- 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；直接调用 `py_launcher.ps1/.sh <target>`。启动器只允许 `translate_srt`、`merge_ass`、`batch`，统一使用项目 `.venv`，不调用全局 `python` / `python3`，也不要求用户设置 PATH，可从任意工作目录调用
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
 - [Issue #12](https://github.com/The-Bazzar/Subtitle-translation/issues/12) 起，`download.ps1/.sh` 只输出 `OUTPUT_RENDER_VIDEO=<name>.original.<ext>`，不再生成编辑版。直接调用 download 的用户必须按 [MIGRATION.md](MIGRATION.md) 把该路径传给 `prepare-video.ps1/.sh`；prepare 成功后只输出 `OUTPUT_VIDEO=<name>.mkv`。若目录中已有 `<name>.original.mkv`，download 只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`。

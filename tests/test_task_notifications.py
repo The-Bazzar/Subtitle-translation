@@ -46,8 +46,8 @@ class TaskNotificationTests(TestCase):
     def test_retired_batch_child_protocol_is_absent_from_all_entrypoints(self):
         entrypoints = (
             "batch.py",
-            "batch.ps1",
-            "batch.sh",
+            "py_launcher.ps1",
+            "py_launcher.sh",
             "pipeline.ps1",
             "pipeline.sh",
         )
@@ -57,8 +57,8 @@ class TaskNotificationTests(TestCase):
                 self.assertNotIn("PIPELINE_BATCH_CHILD", content)
                 self.assertNotIn("__PIPELINE_BATCH_EXIT__", content)
 
-        powershell = read_script("batch.ps1")
-        bash = read_script("batch.sh")
+        powershell = read_script("py_launcher.ps1")
+        bash = read_script("py_launcher.sh")
         python = read_script("batch.py")
         self.assertNotIn("pipeline.ps1", powershell)
         self.assertNotIn("pipeline.sh", bash)

@@ -71,33 +71,44 @@ exit 0
 '''
 
 
-WINDOWS_TRANSLATE = r'''param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-$inputPath = $Arguments[0]
-$videoIndex = [Array]::IndexOf($Arguments, '--video')
-if ($videoIndex -lt 0) { exit 92 }
-$editVideo = $Arguments[$videoIndex + 1]
-$beautifiedIndex = [Array]::IndexOf($Arguments, '--beautified-json')
-if ($beautifiedIndex -lt 0) { exit 94 }
-$beautified = $Arguments[$beautifiedIndex + 1]
-$name = [IO.Path]::GetFileNameWithoutExtension($editVideo)
-$mediaDir = [IO.Path]::GetDirectoryName($editVideo)
-$stageLog = Join-Path $mediaDir 'stage.log'
-if ($Arguments -contains '--only-beautify') {
-    Add-Content -LiteralPath $stageLog -Value 'beautify' -Encoding utf8
-    Copy-Item -LiteralPath $inputPath -Destination $beautified -Force
-    exit 0
-}
-if ($Arguments -contains '--only-glossary') {
-    Add-Content -LiteralPath $stageLog -Value 'glossary' -Encoding utf8
-    [IO.File]::WriteAllText((Join-Path $mediaDir 'glossary.md'), '# fake glossary')
-    exit 0
-}
-Add-Content -LiteralPath $stageLog -Value 'translate' -Encoding utf8
-$payload = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json
-$language = [string]$payload.language
-$assPath = Join-Path $mediaDir "$name.$language-zh.ass"
-[IO.File]::WriteAllText($assPath, 'fake ass')
-exit 0
+FAKE_TRANSLATE_PY = r'''import json
+from pathlib import Path
+import shutil
+import sys
+
+
+arguments = sys.argv[1:]
+input_path = Path(arguments[0])
+
+
+def option_value(name):
+    try:
+        return arguments[arguments.index(name) + 1]
+    except (ValueError, IndexError):
+        raise SystemExit(92)
+
+
+edit_video = Path(option_value("--video"))
+beautified = Path(option_value("--beautified-json"))
+stage_log = edit_video.parent / "stage.log"
+if "--only-beautify" in arguments:
+    stage = "beautify"
+    shutil.copyfile(input_path, beautified)
+elif "--only-glossary" in arguments:
+    stage = "glossary"
+    (edit_video.parent / "glossary.md").write_text(
+        "# fake glossary",
+        encoding="utf-8",
+    )
+else:
+    stage = "translate"
+    language = json.loads(input_path.read_text(encoding="utf-8"))["language"]
+    (edit_video.parent / f"{edit_video.stem}.{language}-zh.ass").write_text(
+        "fake ass",
+        encoding="utf-8",
+    )
+with stage_log.open("a", encoding="utf-8") as stream:
+    stream.write(stage + "\n")
 '''
 
 
@@ -167,45 +178,6 @@ edit_video="$media_dir/$name.mkv"
 printf edit > "$edit_video"
 date +%s%N > "$FAKE_BATCH_METRICS/$name.prepare.end"
 printf 'OUTPUT_VIDEO=%s\n' "$edit_video"
-'''
-
-
-BASH_TRANSLATE = r'''#!/usr/bin/env bash
-set -euo pipefail
-input_path="$1"
-shift
-edit_video=""
-beautified_json=""
-mode=translate
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --video) edit_video="$2"; shift 2 ;;
-        --beautified-json) beautified_json="$2"; shift 2 ;;
-        --only-beautify) mode=beautify; shift ;;
-        --only-glossary) mode=glossary; shift ;;
-        *) shift ;;
-    esac
-done
-[ -n "$edit_video" ] || exit 92
-[ -n "$beautified_json" ] || exit 94
-media_dir="$(dirname "$edit_video")"
-name="$(basename "${edit_video%.*}")"
-case "$mode" in
-    beautify)
-        printf 'beautify\n' >> "$media_dir/stage.log"
-        cp "$input_path" "$beautified_json"
-        ;;
-    glossary)
-        printf 'glossary\n' >> "$media_dir/stage.log"
-        printf '# fake glossary\n' > "$media_dir/glossary.md"
-        ;;
-    translate)
-        printf 'translate\n' >> "$media_dir/stage.log"
-        language="$(sed -n 's/.*"language"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$input_path" | head -n 1)"
-        [ -n "$language" ] || exit 93
-        printf 'fake ass\n' > "$media_dir/$name.$language-zh.ass"
-        ;;
-esac
 '''
 
 
@@ -421,7 +393,7 @@ def _write_fake_whisperx(sandbox):
 def _write_windows_boundaries(sandbox):
     _write(sandbox / "download.ps1", WINDOWS_DOWNLOAD)
     _write(sandbox / "prepare-video.ps1", WINDOWS_PREPARE)
-    _write(sandbox / "translate_srt.ps1", WINDOWS_TRANSLATE)
+    _write(sandbox / "translate_srt.py", FAKE_TRANSLATE_PY)
     _write(sandbox / "ffmpeg-burn.ps1", WINDOWS_BURN)
     _write(sandbox / "fake-ffmpeg.cmd", WINDOWS_FFMPEG)
     _write(sandbox / "fake_ffmpeg.py", FAKE_FFMPEG_PY)
@@ -431,7 +403,7 @@ def _write_windows_boundaries(sandbox):
 def _write_bash_boundaries(sandbox):
     _write(sandbox / "download.sh", BASH_DOWNLOAD, executable=True)
     _write(sandbox / "prepare-video.sh", BASH_PREPARE, executable=True)
-    _write(sandbox / "translate_srt.sh", BASH_TRANSLATE, executable=True)
+    _write(sandbox / "translate_srt.py", FAKE_TRANSLATE_PY)
     _write(sandbox / "ffmpeg-burn.sh", BASH_BURN, executable=True)
     _write(sandbox / "fake-ffmpeg.sh", BASH_FFMPEG, executable=True)
     _write(sandbox / "fake_ffmpeg.py", FAKE_FFMPEG_PY)
@@ -643,7 +615,7 @@ def run_windows(*, root, sandbox, python_executable, powershell):
     source_hashes, copied_hashes = _copy_production(
         root,
         sandbox,
-        ("batch.ps1", "py_launcher.ps1"),
+        ("py_launcher.ps1",),
     )
     workspace = sandbox / "work"
     metrics = sandbox / "metrics"
@@ -689,7 +661,8 @@ def run_windows(*, root, sandbox, python_executable, powershell):
             "-NoProfile",
             "-NonInteractive",
             "-File",
-            str(sandbox / "batch.ps1"),
+            str(sandbox / "py_launcher.ps1"),
+            "batch",
             "--report",
             str(report_path),
             *URLS,
@@ -704,7 +677,7 @@ def run_windows(*, root, sandbox, python_executable, powershell):
     )
     return _collect_evidence(
         platform="windows-powershell",
-        wrapper_chain="batch.ps1 -> py_launcher.ps1 -> batch.py",
+        wrapper_chain="py_launcher.ps1 -> batch.py",
         result=result,
         source_hashes=source_hashes,
         copied_hashes=copied_hashes,
@@ -846,7 +819,7 @@ def run_wsl_root(*, root, sandbox, wsl):
     source_hashes, copied_hashes = _copy_production(
         root,
         sandbox,
-        ("batch.sh", "py_launcher.sh"),
+        ("py_launcher.sh",),
     )
     workspace = sandbox / "work"
     metrics = sandbox / "metrics"
@@ -904,7 +877,8 @@ def run_wsl_root(*, root, sandbox, wsl):
             "WHISPER_MODEL=fake-model",
             "TARGET_LANG=zh",
             "bash",
-            f"{paths['sandbox']}/batch.sh",
+            f"{paths['sandbox']}/py_launcher.sh",
+            "batch",
             "--report",
             paths["report"],
             *URLS,
@@ -918,7 +892,7 @@ def run_wsl_root(*, root, sandbox, wsl):
     )
     return _collect_evidence(
         platform="wsl-bash",
-        wrapper_chain="batch.sh -> py_launcher.sh -> batch.py",
+        wrapper_chain="py_launcher.sh -> batch.py",
         result=result,
         source_hashes=source_hashes,
         copied_hashes=copied_hashes,
@@ -940,7 +914,7 @@ def run_bash(*, root, sandbox, python_executable, bash):
     source_hashes, copied_hashes = _copy_production(
         root,
         sandbox,
-        ("batch.sh", "py_launcher.sh"),
+        ("py_launcher.sh",),
     )
     workspace = sandbox / "work"
     metrics = sandbox / "metrics"
@@ -983,7 +957,8 @@ def run_bash(*, root, sandbox, python_executable, bash):
     result = subprocess.run(
         [
             bash,
-            str(sandbox / "batch.sh"),
+            str(sandbox / "py_launcher.sh"),
+            "batch",
             "--report",
             str(report_path),
             *URLS,
@@ -998,7 +973,7 @@ def run_bash(*, root, sandbox, python_executable, bash):
     )
     return _collect_evidence(
         platform="bash",
-        wrapper_chain="batch.sh -> py_launcher.sh -> batch.py",
+        wrapper_chain="py_launcher.sh -> batch.py",
         result=result,
         source_hashes=source_hashes,
         copied_hashes=copied_hashes,

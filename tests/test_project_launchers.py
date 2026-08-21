@@ -27,10 +27,14 @@ class ProjectLauncherTests(unittest.TestCase):
         powershell = read_script("pipeline.ps1")
         shell = read_script("pipeline.sh")
 
-        self.assertIn('$TranslatePs1 = Join-Path $ScriptDir "translate_srt.ps1"', powershell)
+        self.assertIn('$PyLauncherPs1 = Join-Path $ScriptDir "py_launcher.ps1"', powershell)
+        self.assertIn('& $PyLauncherPs1 translate_srt', powershell)
+        self.assertNotIn("translate_srt.ps1", powershell)
         self.assertNotIn("$PythonExe $TranslatePy", powershell)
         self.assertNotIn("$PythonExe =", powershell)
-        self.assertIn('TRANSLATE_SCRIPT="$SCRIPT_DIR/translate_srt.sh"', shell)
+        self.assertIn('PY_LAUNCHER="$SCRIPT_DIR/py_launcher.sh"', shell)
+        self.assertIn('bash "$PY_LAUNCHER" translate_srt', shell)
+        self.assertNotIn("translate_srt.sh", shell)
         self.assertNotIn('"$PYTHON_BIN" "$TRANSLATE_SCRIPT"', shell)
 
     def test_operational_script_names_match_across_platforms(self):
@@ -45,19 +49,28 @@ class ProjectLauncherTests(unittest.TestCase):
         self.assertEqual(
             powershell_names,
             {
-                "batch",
                 "download",
                 "ffmpeg-burn",
-                "merge_ass",
                 "mpv-burn",
                 "pipeline",
                 "prepare-video",
                 "py_launcher",
                 "setup",
-                "translate_srt",
                 "whisper",
             },
         )
+
+    def test_per_target_wrappers_are_removed(self):
+        for script_name in (
+            "translate_srt.ps1",
+            "translate_srt.sh",
+            "merge_ass.ps1",
+            "merge_ass.sh",
+            "batch.ps1",
+            "batch.sh",
+        ):
+            with self.subTest(script_name=script_name):
+                self.assertFalse((ROOT / script_name).exists())
 
     def test_shared_python_launcher_target_whitelists_match(self):
         powershell = read_script("py_launcher.ps1")
@@ -85,8 +98,15 @@ class ProjectLauncherTests(unittest.TestCase):
             powershell_env["PYTHON_PATH_WIN"] = sys.executable
             entries.append(
                 (
-                    "batch.ps1",
-                    [PWSH, "-NoProfile", "-NonInteractive", "-File", str(ROOT / "batch.ps1")],
+                    "py_launcher.ps1 batch",
+                    [
+                        PWSH,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-File",
+                        str(ROOT / "py_launcher.ps1"),
+                        "batch",
+                    ],
                     powershell_env,
                 )
             )
@@ -96,7 +116,7 @@ class ProjectLauncherTests(unittest.TestCase):
         env = os.environ.copy()
         if os.name == "nt" and WSL:
             repo_path = production_batch_smoke._wsl_path(WSL, ROOT)
-            script_path = production_batch_smoke._wsl_path(WSL, ROOT / "batch.sh")
+            script_path = production_batch_smoke._wsl_path(WSL, ROOT / "py_launcher.sh")
             bash_python, _probe = production_batch_smoke._resolve_wsl_python(
                 wsl=WSL,
                 repo_path=repo_path,
@@ -110,10 +130,11 @@ class ProjectLauncherTests(unittest.TestCase):
                 f"PYTHON_PATH_LINUX={bash_python}",
                 "bash",
                 script_path,
+                "batch",
             ]
         else:
             env["PYTHON_PATH_LINUX"] = sys.executable
-            command = [BASH, str(ROOT / "batch.sh")]
+            command = [BASH, str(ROOT / "py_launcher.sh"), "batch"]
         return command, env
 
     def test_batch_entrypoints_reject_retired_job_options(self):
@@ -139,7 +160,7 @@ class ProjectLauncherTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(BASH, "requires bash")
-    def test_bash_batch_wrapper_rejects_retired_job_options(self):
+    def test_bash_batch_launcher_rejects_retired_job_options(self):
         command, env = self.bash_batch_entrypoint()
         for arguments in (
             ("-j", "2"),
@@ -300,7 +321,7 @@ foreach ($node in $ast.FindAll({ param($candidate) $candidate -is [System.Manage
 }
 [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($findings)))
 '''
-        for script_name in ("batch.ps1", "pipeline.ps1"):
+        for script_name in ("py_launcher.ps1", "pipeline.ps1"):
             with self.subTest(script_name=script_name):
                 env = os.environ.copy()
                 env["BATCH_AST_TARGET"] = str(ROOT / script_name)
@@ -318,7 +339,7 @@ foreach ($node in $ast.FindAll({ param($candidate) $candidate -is [System.Manage
                 self.assertEqual(json.loads(result.stdout), [])
 
     @unittest.skipUnless(BASH, "requires bash")
-    def test_bash_batch_is_a_single_exec_wrapper_without_background_pool(self):
+    def test_bash_launcher_is_a_single_exec_wrapper_without_background_pool(self):
         if os.name == "nt" and WSL:
             command = [
                 WSL,
@@ -327,10 +348,10 @@ foreach ($node in $ast.FindAll({ param($candidate) $candidate -is [System.Manage
                 "--",
                 "bash",
                 "-n",
-                production_batch_smoke._wsl_path(WSL, ROOT / "batch.sh"),
+                production_batch_smoke._wsl_path(WSL, ROOT / "py_launcher.sh"),
             ]
         else:
-            command = [BASH, "-n", str(ROOT / "batch.sh")]
+            command = [BASH, "-n", str(ROOT / "py_launcher.sh")]
         result = subprocess.run(
             command,
             cwd=ROOT,
@@ -343,10 +364,10 @@ foreach ($node in $ast.FindAll({ param($candidate) $candidate -is [System.Manage
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = [
             line.strip()
-            for line in read_script("batch.sh").splitlines()
+            for line in read_script("py_launcher.sh").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-        self.assertEqual(commands[-1], 'exec bash "$SCRIPT_DIR/py_launcher.sh" batch "$@"')
+        self.assertEqual(commands[-1], 'exec "$PYTHON_BIN" "$SCRIPT_DIR/$script_name" "$@"')
         self.assertFalse(any(re.search(r"(^|[;&|])\s*(wait|parallel|xargs)\b", line) for line in commands))
 
     def test_batch_stage_contract_and_standalone_entrypoints_are_distinct(self):
@@ -403,7 +424,7 @@ class LauncherBehaviorMixin:
         )
         self.sandbox = pathlib.Path(self.temp_dir.name)
         self.cwd = ROOT.parent
-        scripts = (self.shared_launcher, *(wrapper for wrapper, _ in self.wrappers))
+        scripts = (self.shared_launcher,)
         for script_name in scripts:
             shutil.copy2(ROOT / script_name, self.sandbox / script_name)
         fake_target = """\
@@ -478,28 +499,10 @@ raise SystemExit(int(os.environ.get("FAKE_EXIT_CODE", "0")))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("unsupported Python target", result.stderr)
 
-    def test_wrappers_delegate_end_to_end(self):
-        forwarded = ["-Target", "batch", "--help", "value with spaces"]
-        for wrapper, script_name in self.wrappers:
-            with self.subTest(wrapper=wrapper):
-                result = self.run_script(wrapper, *forwarded, exit_code=41)
-                self.assertEqual(result.returncode, 41, result.stderr)
-                payload = self.parse_payload(result)
-                self.assertEqual(payload["script"], script_name)
-                self.assertEqual(payload["args"], forwarded)
-                self.assertEqual(payload["cwd"], self.expected_cwd())
-                self.assertEqual(payload["override"], self.platform)
-
-
 @unittest.skipUnless(PWSH, "requires PowerShell 7")
 class PowerShellLauncherBehaviorTests(LauncherBehaviorMixin, unittest.TestCase):
     platform = "powershell"
     shared_launcher = "py_launcher.ps1"
-    wrappers = (
-        ("translate_srt.ps1", "translate_srt.py"),
-        ("merge_ass.ps1", "merge_ass.py"),
-        ("batch.ps1", "batch.py"),
-    )
 
     def run_script(self, script_name, *script_args, exit_code=0):
         env = os.environ.copy()
@@ -523,16 +526,10 @@ class PowerShellLauncherBehaviorTests(LauncherBehaviorMixin, unittest.TestCase):
     def expected_cwd(self):
         return str(self.cwd.resolve())
 
-
 @unittest.skipUnless(BASH, "requires bash")
 class BashLauncherBehaviorTests(LauncherBehaviorMixin, unittest.TestCase):
     platform = "bash"
     shared_launcher = "py_launcher.sh"
-    wrappers = (
-        ("translate_srt.sh", "translate_srt.py"),
-        ("merge_ass.sh", "merge_ass.py"),
-        ("batch.sh", "batch.py"),
-    )
 
     @classmethod
     def setUpClass(cls):
