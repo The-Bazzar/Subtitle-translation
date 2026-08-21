@@ -28,6 +28,13 @@
 ├── ffmpeg-burn.sh
 ├── mpv-burn.ps1
 ├── mpv-burn.sh
+├── batch.ps1
+├── batch.sh
+├── batch.py
+├── batch_runtime.py
+├── batch_scheduler.py
+├── batch_cache.py
+├── whisper_worker.py
 ├── setup.ps1
 ├── setup.sh
 ├── .env.ps1
@@ -62,9 +69,49 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx" -- --scene-threshold 0.12 --snap-frames 10
 ```
 
+### Stage-aware 批处理
+
+```powershell
+.\batch.ps1 "URL1" "URL2"
+.\batch.ps1 --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
+.\batch.ps1 --dry-run --report "batch-result.txt" "URL1" "URL2"
+```
+
+```bash
+./batch.sh "URL1" "URL2"
+./batch.sh --skip-burn --translate-provider deepseek --translate-model deepseek-chat "URL1" "URL2"
+./batch.sh --dry-run --report batch-result.txt "URL1" "URL2"
+```
+
+`batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，`batch.py` 是薄入口，实际调度由 `batch_runtime.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 与最终 burn 共用固定 `4` 路 NVENC capacity，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。
+
+当前 stage-aware 入口先并行流水执行 `download -> prepare-video -> mono 16kHz WAV`，等待 acquisition 全部到达终态后，再启动一个 `spawn` worker。prepare 与 WAV 提取/替换都在同一媒体的 `<name>.asr.lock` 内完成；prepare 成功后原子写 `<name>.prepare.json`，用 UUID `generation` 绑定原片和编辑版各自的 resolved path、size、mtime，准备前后原片快照不一致时拒绝认证该编辑版。worker 加载一次 WhisperX ASR 模型并串行识别所有未缓存 WAV；每个 WAV 绑定到不可变 media generation，ASR 写 sidecar 前会在同一锁内重新验证 prepare state、编辑版和 WAV 快照。
+
+正常重启时，download 返回原片后，只有 `<name>.prepare.json` 中的原片与编辑版身份都仍匹配才跳过 prepare；即使原片 mtime 相同或更早，只要 path/size/mtime 任一变化也会重新 prepare。模型、语言或 ASR options 变化只使 `.asr.json` cache miss，不会无意义重编码视频。ASR sidecar schema v2 同时记录 ASR generation、media generation、WAV snapshot 和 fingerprint；旧 schema 不再命中。有效 sidecar 绑定的现存 WAV snapshot 会直接复用，缺失或变化才重新提取。alignment backend 始终读取绑定的 WAV snapshot path，并在调用前后复核同一 snapshot；parent 在 final promote 前再复核一次。alignment 成功后删除 WAV，删除动作仍在同一媒体锁内；失败、取消或 worker crash 则保留 WAV。
+
+alignment candidate、最终 `<name>.json` 与 `<name>.beautified.json` 都携带 `_batch_artifact.media_generation` 和 `_batch_artifact.alignment_generation`。同一进程内同一媒体继续使用 keyed transaction lock，跨 invocation 的 prepare、WAV 替换、alignment commit 与完整 postprocess runner 则共享 `<name>.asr.lock`，因此稳定 SRT/ASS/glossary 也不会被旧 invocation 覆盖。postprocess 写隐藏的 generation-specific beautified candidate，结束前重新验证 final generation，匹配时才原子发布为 `<name>.beautified.json`；过期或失败只清理本 generation candidate，不删除其他 invocation 已发布的新 cache。新的 alignment generation 提交前仍必须删除旧 `<name>.beautified.json`，删除失败会阻止 commit 并写入 cleanup diagnostic。
+
+ASR wave 显式卸载模型后不关闭 worker。scheduler 用 `langcodes` 验证 sidecar 的 `result.language` 并规范为稳定 ISO 639 主语言代码；无效、未知或 `und` 会拒绝，配置有效 `SOURCE_LANG` 时可作为 fallback。任务按语言稳定排序分组并保持组内原顺序；每组只加载一次 alignment model，逐任务串行生成 WhisperX-compatible `<name>.json`，组间卸载并替换模型。parent 在 blocking thread 中持有 media lock 后才 dispatch `ALIGN`；child 只原子写隐藏的 generation candidate，绝不覆盖 final。parent 在同一锁内验证 ownership/candidate/schema，并通过 per-task commit state 将取消与 destructive commit 线性化：取消先取得状态锁时保留 sidecar 并只清 candidate；commit 先取得状态锁时不可被 abort 打断，会 durable promote、删除 owned sidecar，并继续正常 postprocess。并发 ASR writer 会阻塞到 commit 完成，随后写入的新 generation sidecar 会保留。`WHISPER_ALIGN_MODEL` 非空时覆盖自动模型，空时沿用 WhisperX 按语言自动选择。
+
+每个任务 alignment 成功后会立即进入 CPU/IO semaphore 执行 beautify、glossary 和 translate，不等待其他语言组完成。所有 alignment 到达终态后，scheduler 才卸载 alignment model、关闭并 join worker，同时设置 `worker_released` event；任何 burn 都必须先等到该 event。启用 burn 时，任务翻译完成后使用原片和最终 `<source>-<target>.ass` 调用现有 `ffmpeg-burn.ps1/.sh`，同时校验 `OUTPUT_BURNED_VIDEO=` marker 与非空输出文件；最多 4 路并发，较晚完成翻译的任务会在 worker release 后动态加入。`--skip-burn` 任务以 `translated` 成功结束，启用 burn 的任务以 `burned` 成功结束。
+
+active worker command 在 precommit 取消时由 controller terminate/kill，再不可中断地等待 request thread 真正结束；transaction thread 在 finally 清 candidate、释放 lock。若 destructive commit 已开始，非阻塞仲裁立即判定 commit-wins，scheduler 等 promote 和 owned sidecar 删除完成；否则 cancel-wins 保留 `.asr.json`。`worker_released` 只在全部 request/transaction thread 与 worker controller/process 清理完成后设置。heartbeat 超时或意外退出不会自动重启：立即关闭 worker admission，当前 worker task 失败，其余仍依赖 ASR/alignment 的任务进入 `blocked_by_worker_failure`；已经 alignment 成功的任务继续 postprocess，并在 worker release 后正常 burn。worker child 把 Python 输出和 native fd 1/2 写入 controller 专属临时 capture 文件，故障时读取 bounded tail，正常 close 后删除。batch 会 best-effort 原子写 invocation `Path.cwd()` 下的 `batch-worker-failure-<timestamp>.log`，记录 task/phase、队列快照、exit code、traceback，以及合并后的外部命令与 worker stdout/stderr；文本会去除 ANSI，tail 截断会显式标记。日志目录或写盘失败只追加 cleanup diagnostic，不改变首个 worker 根因、任务终态或聚合退出码。
+
+`--report batch-result.txt` 除文本报告外还会生成同基名 `batch-result.json`。机器报告顶部包含 `worker_failure`、`worker_failure_log`、`worker_failure_root_cause`、`worker_failure_detail`、invocation `output_directory` 和 `cleanup_diagnostics`；每个 task 也记录自己的 `output_directory`、终态、失败阶段、耗时和输出路径。指定 `.json` 报告名时，JSON 使用指定路径，文本报告写到同基名 `.txt`。
+
+所有外部命令的 stdout/stderr 都以 64 KiB chunk 持续排空，并按 `\n`、`\r` progress 或 EOF partial framing 后进入有界 terminal queue；超长逻辑行拆为带同一 `[02][prepare]` 前缀的 bounded continuation events，不依赖 `StreamReader` line limit。唯一 printer 保持 queue 顺序；每个 task/stream 只保留 256 KiB diagnostic tail，截断时写明 marker。第一次 `Ctrl+C` 会同步关闭 command gate；外部命令只有在此前取得 reservation 才可 spawn，并被视为当前 active command 自然结束，尚未 reservation 的命令绝不 spawn。reservation 返回是 Python scheduler 定义的线性化点，不宣称与操作系统进程创建原子。当前命令结束后不再启动下一阶段。第二次 `Ctrl+C` 强制终止已注册的子进程树并 abort worker，等待真实退出后以 `130` 结束；已完成输出和 recovery sidecar 保留。
+
+`<name>.asr.json` 只是 batch 的恢复中间件，不是字幕主入口。`whisper.ps1` / `whisper.sh` standalone 路径仍直接输出最终词级 `<name>.json`，不会读取或写入 `.asr.json`。
+
+`<name>.asr.lock` 是持久、最多 1 byte 且已被 Git 忽略的运行时协调文件，不是字幕或 cache；保留它可避免活跃进程因 unlink 后锁定不同 inode/handle 而失去互斥。
+
+单任务 `pipeline.sh` 在 prepare 失败时精确透传 `prepare-video.sh 的原始退出码`，与 PowerShell pipeline 的行为一致，不再把所有 prepare 错误折叠为 `1`。
+
+发布前的跨平台 contract smoke 位于 `tests/test_batch_smoke.py`：Windows 经 `batch.ps1 -> py_launcher.ps1 -> batch.py`，WSL/Linux 经 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言报告契约。smoke 把 `batch.py`、`batch_runtime.py` 及其他 byte-identical production modules 复制到隔离目录并校验 SHA-256；只把 download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 作为 deterministic fake 外部边界。WSL smoke 由 `wsl -u root` 按测试环境 override、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；找不到时开发者测试精确 skip，测试不会下载或安装依赖。内部测试变量 `BATCH_SMOKE_REQUIRE_WSL=1` 用于 release gate，此时缺少 WSL root 或合格 interpreter 会失败而不是 skip；它不是项目用户配置。带时间戳的证据断言所有 acquisition 完成后才加载 ASR、ASR 与 alignment command 串行、worker shutdown 先于所有 burn，且 prepare/burn 各自峰值为 4。它不替代真实 CUDA、ffmpeg、网络、LLM 或媒体质量验证。
+
 ### 完成通知
 
-`pipeline.ps1` / `pipeline.sh` 独立运行时，任务成功响成功铃，错误退出响错误铃。批处理中的 child pipeline 保持静默，由 `batch.ps1` / `batch.py` 在每个失败结果返回时各响一次错误铃，最后再按整体结果响一次；任一任务失败时批处理退出码为 `1`。帮助和 dry-run 不响铃。Linux/WSL 使用终端 BEL，是否有声音取决于终端的响铃设置。
+`pipeline.ps1` / `pipeline.sh` 独立运行时，任务成功响成功铃，错误退出响错误铃。stage-aware batch 直接运行阶段 runner，不再使用整条 pipeline 的内部静默协议；每个最终失败或中断任务响一次错误铃，全部任务终态后再按聚合结果响一次。任一失败时退出码为 `1`，用户中断返回 `130`；帮助和 dry-run 不响铃。Linux/WSL 使用终端 BEL，是否有声音取决于终端的响铃设置。
 
 ## 主流程
 
@@ -80,7 +127,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 成果物链：
 
 ```text
-<name>.original.<ext> + <name>.mkv -> <name>.json -> <name>.beautified.json
+<name>.original.<ext> + <name>.mkv -> [batch: <name>.asr.json ->] <name>.json -> <name>.beautified.json
 -> <name>.web_evidence.json + glossary.md
 -> <source>.proofread.ass / <target>.ass / <source>-<target>.ass -> burned.mkv
 ```
@@ -211,7 +258,7 @@ Tavily tool 本地仍采用域名优先策略：脚本结合模型给出的 quer
 
 - `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 已 gitignored
 - 不要把 Python 包安装到系统环境；Windows 运行 `.\setup.ps1`，Linux/WSL 运行 `./setup.sh`，它们会创建/更新仓库 `.venv`
-- 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；`py_launcher.ps1/.sh` 当前只允许启动 `translate_srt`、`merge_ass`，并统一使用项目 `.venv`。`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh` 是其薄包装器，不调用全局 `python` / `python3`，也不要求用户设置 PATH，可从任意工作目录调用
+- 运行 pipeline 或任一 Python 相关脚本前必须先完成 setup；`py_launcher.ps1/.sh` 只允许启动 `translate_srt`、`merge_ass`、`batch`，并统一使用项目 `.venv`。`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh`、`batch.ps1/.sh` 是其薄包装器，不调用全局 `python` / `python3`，也不要求用户设置 PATH，可从任意工作目录调用
 - `TORCH_BACKEND=auto` 会用 `nvidia-smi` 检测 NVIDIA GPU；NVIDIA 用户可设 `cuda128`，AMD/无独显用户设 `cpu`
 - `cookies.txt` 通过相对路径引用，请在仓库根目录运行脚本
 - [Issue #12](https://github.com/The-Bazzar/Subtitle-translation/issues/12) 起，`download.ps1/.sh` 只输出 `OUTPUT_RENDER_VIDEO=<name>.original.<ext>`，不再生成编辑版。直接调用 download 的用户必须按 [MIGRATION.md](MIGRATION.md) 把该路径传给 `prepare-video.ps1/.sh`；prepare 成功后只输出 `OUTPUT_VIDEO=<name>.mkv`。若目录中已有 `<name>.original.mkv`，download 只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`。

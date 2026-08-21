@@ -17,6 +17,7 @@ fi
 case "$target" in
     translate_srt) script_name="translate_srt.py" ;;
     merge_ass) script_name="merge_ass.py" ;;
+    batch) script_name="batch.py" ;;
     *) echo "Error: unsupported Python target: $target" >&2; exit 2 ;;
 esac
 

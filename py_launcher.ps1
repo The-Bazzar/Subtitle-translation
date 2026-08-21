@@ -8,6 +8,7 @@ $target = if ($args.Count -gt 0) { [string] $args[0] } else { '' }
 switch -CaseSensitive -Exact ($target) {
     'translate_srt' { $scriptName = 'translate_srt.py'; break }
     'merge_ass' { $scriptName = 'merge_ass.py'; break }
+    'batch' { $scriptName = 'batch.py'; break }
     default {
         [Console]::Error.WriteLine("Error: unsupported Python target: $target")
         exit 2

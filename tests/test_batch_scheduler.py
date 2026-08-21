@@ -3186,7 +3186,6 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tasks[0].error_detail, "fake translate failure")
 
 
-@unittest.skip("public batch entrypoints are integrated in PR7")
 class BatchCliTests(unittest.TestCase):
     def test_manual_job_arguments_do_not_exist(self):
         parser = build_parser()
@@ -3228,7 +3227,6 @@ class BatchCliTests(unittest.TestCase):
         self.assertEqual(stage_environment["TRANSLATE_MODEL"], "deepseek-chat")
 
 
-@unittest.skip("public batch entrypoints are integrated in PR7")
 class BatchWrapperTests(unittest.TestCase):
     def test_import_batch_returns_runtime_module_identity(self):
         with mock.patch.dict(sys.modules, {}, clear=False):

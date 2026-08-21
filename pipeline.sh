@@ -70,7 +70,7 @@ task_bell() {
 notify_pipeline_exit() {
     local status=$?
     trap - EXIT
-    if [ "$PIPELINE_NOTIFY_ACTIVE" = "1" ] && [ "${PIPELINE_BATCH_CHILD:-0}" != "1" ]; then
+    if [ "$PIPELINE_NOTIFY_ACTIVE" = "1" ]; then
         if [ "$status" -ne 0 ]; then
             task_bell error
         else
