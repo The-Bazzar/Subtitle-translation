@@ -8,6 +8,7 @@ import stat
 import tempfile
 import threading
 import traceback
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -18,20 +19,23 @@ from pathlib import Path
 from typing import TypeAlias, TypeVar
 
 from batch_cache import (
+    AsrCacheLockCancelled,
     AsrFingerprint,
+    MediaGenerationMismatch,
     PreparedMediaState,
     WavArtifact,
     _fsync_parent_directory,
     asr_cache_lock,
     asr_sidecar_path,
-    bind_wav_artifact,
+    bind_wav_artifact_unlocked,
     build_asr_fingerprint_from_snapshot,
     capture_file_snapshot,
     invalidate_beautified_cache,
     read_asr_cache_identity,
     read_valid_asr_cache_for_artifact,
-    read_valid_prepare_state,
-    write_prepare_state,
+    read_valid_prepare_state_unlocked,
+    validate_wav_artifact_unlocked,
+    write_prepare_state_unlocked,
 )
 from whisper_worker import (
     AsrWorkerConfig,
@@ -289,6 +293,7 @@ class BatchTask:
     asr_path: Path | None = None
     asr_generation: str = ""
     json_path: Path | None = None
+    beautified_candidate_path: Path | None = None
     ass_path: Path | None = None
     burned_video_path: Path | None = None
     detected_language: str = ""
@@ -394,7 +399,7 @@ def probe_prepared_media(render_video_path: Path) -> PreparedMediaState | None:
     edit_video_path = _expected_edit_video_path(render_video_path)
     if edit_video_path is None:
         return None
-    return read_valid_prepare_state(render_video_path, edit_video_path)
+    return read_valid_prepare_state_unlocked(render_video_path, edit_video_path)
 
 
 @dataclass(frozen=True)
@@ -463,6 +468,40 @@ class AcquisitionScheduler:
         lock = self._media_transaction_locks.setdefault(key, asyncio.Lock())
         async with lock:
             yield
+
+    @asynccontextmanager
+    async def _media_file_transaction(
+        self,
+        media_path: str | os.PathLike[str],
+    ) -> AsyncIterator[None]:
+        cancel_event = threading.Event()
+        lock_context = asr_cache_lock(media_path, cancel_event=cancel_event)
+        acquire_task = asyncio.create_task(asyncio.to_thread(lock_context.__enter__))
+        acquired = False
+        try:
+            try:
+                await asyncio.shield(acquire_task)
+                acquired = True
+            except asyncio.CancelledError as cancellation:
+                cancel_event.set()
+                try:
+                    await _await_uninterruptibly(acquire_task)
+                    acquired = True
+                except AsrCacheLockCancelled:
+                    pass
+                finally:
+                    _clear_current_task_cancellation()
+                raise cancellation
+            yield
+        finally:
+            if acquired:
+                release_task = asyncio.create_task(
+                    asyncio.to_thread(lock_context.__exit__, None, None, None)
+                )
+                _, cancellation = await _await_uninterruptibly(release_task)
+                if cancellation is not None:
+                    _clear_current_task_cancellation()
+                    raise cancellation
 
     def request_interrupt(self) -> int:
         count = self.control.request_interrupt()
@@ -761,7 +800,6 @@ class AcquisitionScheduler:
                 output_path = Path(result.output_path).resolve()
                 self._active_worker_task = None
                 task.json_path = output_path
-                self._cleanup_wav_after_alignment(task)
                 if not self.control.worker_admission_open:
                     task.cancel(detail="batch interrupted after alignment")
                     self._cancel_worker_dependents("batch interrupted")
@@ -809,16 +847,20 @@ class AcquisitionScheduler:
         token = CURRENT_TASK_INDEX.set(task.index)
         try:
             task.advance("postprocess")
+            task.beautified_candidate_path = self._new_beautified_candidate_path(task)
             async with self._media_transaction(task.edit_video_path):
-                self._validate_postprocess_generation(task)
-                self._invalidate_stale_beautified(task)
+                async with self._media_file_transaction(task.edit_video_path):
+                    self._validate_postprocess_generation(task)
                 async with self._cpu_io_slots:
                     if not self.control.stage_advancement_open:
                         raise StageAdvancementStopped(
                             "batch interrupted before postprocess"
                         )
                     await self.postprocess_runner(task)
-                self._validate_postprocess_output_generation(task)
+                async with self._media_file_transaction(task.edit_video_path):
+                    self._validate_postprocess_generation(task)
+                    if task.beautified_candidate_path.exists():
+                        self._publish_beautified_candidate(task)
             if not self.control.stage_advancement_open:
                 raise StageAdvancementStopped("batch interrupted after postprocess")
             if self.burn_runner is None:
@@ -845,11 +887,35 @@ class AcquisitionScheduler:
             if task.state not in TERMINAL_STATES:
                 task.fail(stage=task.stage, detail=str(exc))
         finally:
+            self._cleanup_beautified_candidate(task)
             CURRENT_TASK_INDEX.reset(token)
 
     @staticmethod
     def _beautified_path(task: BatchTask) -> Path:
         return task.json_path.with_name(f"{task.json_path.stem}.beautified.json")
+
+    def _new_beautified_candidate_path(self, task: BatchTask) -> Path:
+        beautified_path = self._beautified_path(task).resolve()
+        return beautified_path.with_name(
+            f".{beautified_path.name}.{task.asr_generation}."
+            f"{uuid.uuid4().hex}.candidate.json"
+        )
+
+    def _validated_beautified_candidate_path(self, task: BatchTask) -> Path:
+        if task.beautified_candidate_path is None:
+            raise StageCommandError("postprocess task is missing beautified candidate")
+        beautified_path = self._beautified_path(task).resolve()
+        candidate = task.beautified_candidate_path.resolve()
+        expected_prefix = f".{beautified_path.name}.{task.asr_generation}."
+        if (
+            candidate.parent != beautified_path.parent
+            or not candidate.name.startswith(expected_prefix)
+            or not candidate.name.endswith(".candidate.json")
+        ):
+            raise StageCommandError(
+                f"postprocess beautified candidate path is invalid: {candidate}"
+            )
+        return candidate
 
     def _validate_postprocess_generation(self, task: BatchTask) -> None:
         if task.json_path is None:
@@ -860,47 +926,35 @@ class AcquisitionScheduler:
             expected_alignment_generation=task.asr_generation,
         )
 
-    def _invalidate_stale_beautified(self, task: BatchTask) -> None:
-        beautified_path = self._beautified_path(task)
-        if not beautified_path.exists():
-            return
+    def _publish_beautified_candidate(self, task: BatchTask) -> None:
+        self._validate_postprocess_generation(task)
+        candidate = self._validated_beautified_candidate_path(task)
         try:
             read_aligned_json(
-                beautified_path,
-                expected_media_generation=task.media_generation,
-                expected_alignment_generation=task.asr_generation,
-            )
-        except (OSError, ValueError):
-            try:
-                invalidate_beautified_cache(task.json_path)
-            except Exception as exc:
-                self._record_cleanup_diagnostic(
-                    "beautified_cache_invalidation",
-                    exc,
-                )
-                raise
-
-    def _validate_postprocess_output_generation(self, task: BatchTask) -> None:
-        beautified_path = self._beautified_path(task)
-        if not beautified_path.exists():
-            return
-        try:
-            read_aligned_json(
-                beautified_path,
+                candidate,
                 expected_media_generation=task.media_generation,
                 expected_alignment_generation=task.asr_generation,
             )
         except (OSError, ValueError) as exc:
-            try:
-                invalidate_beautified_cache(task.json_path)
-            except Exception as cleanup_error:
-                self._record_cleanup_diagnostic(
-                    "beautified_cache_invalidation",
-                    cleanup_error,
-                )
             raise StageCommandError(
                 "postprocess produced beautified JSON for another generation"
             ) from exc
+        beautified_path = self._beautified_path(task).resolve()
+        os.replace(candidate, beautified_path)
+        _fsync_parent_directory(beautified_path)
+
+    def _cleanup_beautified_candidate(self, task: BatchTask) -> None:
+        if task.beautified_candidate_path is None:
+            return
+        try:
+            candidate = self._validated_beautified_candidate_path(task)
+            candidate.unlink(missing_ok=True)
+            _fsync_parent_directory(candidate)
+        except Exception as exc:
+            self._record_cleanup_diagnostic(
+                "beautified_candidate_cleanup",
+                exc,
+            )
 
     def _run_locked_alignment_transaction(
         self,
@@ -956,6 +1010,7 @@ class AcquisitionScheduler:
                     expected_media_generation=task.media_generation,
                     expected_alignment_generation=task.asr_generation,
                 )
+                validate_wav_artifact_unlocked(task.wav_artifact)
                 with commit_state.commit_section():
                     final_path = task.edit_video_path.with_suffix(".json").resolve()
                     try:
@@ -970,6 +1025,7 @@ class AcquisitionScheduler:
                     candidate_written = False
                     task.asr_path.unlink()
                     _fsync_parent_directory(task.asr_path)
+                    self._cleanup_wav_after_alignment(task)
                 return replace(result, output_path=str(final_path))
         finally:
             if candidate_written or candidate.exists():
@@ -1402,22 +1458,41 @@ class AcquisitionScheduler:
                 expected_edit = _expected_edit_video_path(task.render_video_path)
                 transaction_path = expected_edit or task.render_video_path
                 async with self._media_transaction(transaction_path):
-                    prepared_state = self.resume_probe(task.render_video_path)
-                    if prepared_state is None:
-                        render_snapshot = capture_file_snapshot(task.render_video_path)
-                        async with self._nvenc_slots:
-                            if not self.control.stage_advancement_open:
-                                raise StageAdvancementStopped(
-                                    "batch interrupted before prepare"
-                                )
-                            edit_video = await self.runners.prepare(
-                                str(task.render_video_path)
+                    async with self._media_file_transaction(transaction_path):
+                        prepared_state = self.resume_probe(task.render_video_path)
+                        if prepared_state is None:
+                            render_snapshot = capture_file_snapshot(
+                                task.render_video_path
                             )
-                        prepared_state = write_prepare_state(
-                            task.render_video_path,
-                            edit_video,
-                            expected_render_snapshot=render_snapshot,
-                        )
+                            async with self._nvenc_slots:
+                                if not self.control.stage_advancement_open:
+                                    raise StageAdvancementStopped(
+                                        "batch interrupted before prepare"
+                                    )
+                                edit_video = await self.runners.prepare(
+                                    str(task.render_video_path)
+                                )
+                            if (
+                                expected_edit is not None
+                                and Path(edit_video).resolve()
+                                != expected_edit.resolve()
+                            ):
+                                raise StageCommandError(
+                                    "prepare returned an unexpected edit-video path"
+                                )
+                            prepared_state = write_prepare_state_unlocked(
+                                task.render_video_path,
+                                edit_video,
+                                expected_render_snapshot=render_snapshot,
+                            )
+                        if (
+                            expected_edit is not None
+                            and Path(prepared_state.edit_snapshot.path).resolve()
+                            != expected_edit.resolve()
+                        ):
+                            raise StageCommandError(
+                                "prepare state points to an unexpected edit-video path"
+                            )
                     edit_video = Path(prepared_state.edit_snapshot.path)
                     task.media_generation = prepared_state.generation
             else:
@@ -1430,20 +1505,47 @@ class AcquisitionScheduler:
                 raise StageAdvancementStopped("batch interrupted after prepare")
 
             task.advance("extract_audio")
-            async with self._cpu_io_slots:
-                if not self.control.stage_advancement_open:
-                    raise StageAdvancementStopped(
-                        "batch interrupted before extract_audio"
-                    )
-                wav_path = await self.runners.extract_audio(str(task.edit_video_path))
-            task.wav_path = Path(wav_path)
-            _validate_wav_output(task.wav_path)
             if prepared_state is not None:
-                task.wav_artifact = bind_wav_artifact(
-                    task.edit_video_path,
-                    task.wav_path,
-                    prepared_state.generation,
-                )
+                async with self._media_transaction(task.edit_video_path):
+                    async with self._media_file_transaction(task.edit_video_path):
+                        current_state = read_valid_prepare_state_unlocked(
+                            task.render_video_path,
+                            task.edit_video_path,
+                        )
+                        if (
+                            current_state is None
+                            or current_state.generation
+                            != prepared_state.generation
+                        ):
+                            raise MediaGenerationMismatch(
+                                "media generation changed before WAV extraction"
+                            )
+                        async with self._cpu_io_slots:
+                            if not self.control.stage_advancement_open:
+                                raise StageAdvancementStopped(
+                                    "batch interrupted before extract_audio"
+                                )
+                            wav_path = await self.runners.extract_audio(
+                                str(task.edit_video_path)
+                            )
+                        task.wav_path = Path(wav_path)
+                        _validate_wav_output(task.wav_path)
+                        task.wav_artifact = bind_wav_artifact_unlocked(
+                            task.edit_video_path,
+                            task.wav_path,
+                            prepared_state.generation,
+                        )
+            else:
+                async with self._cpu_io_slots:
+                    if not self.control.stage_advancement_open:
+                        raise StageAdvancementStopped(
+                            "batch interrupted before extract_audio"
+                        )
+                    wav_path = await self.runners.extract_audio(
+                        str(task.edit_video_path)
+                    )
+                task.wav_path = Path(wav_path)
+                _validate_wav_output(task.wav_path)
             task.succeed(stage="wav_ready")
         except asyncio.CancelledError:
             if task.state not in TERMINAL_STATES:

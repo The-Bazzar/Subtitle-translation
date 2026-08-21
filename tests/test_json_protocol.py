@@ -143,6 +143,20 @@ class JsonProtocolTests(unittest.TestCase):
     def test_transcript_context_exposes_web_evidence_sidecar_path(self):
         self.assertTrue(self.ctx.web_evidence_json.endswith("video.web_evidence.json"))
 
+    def test_transcript_context_can_override_only_beautified_storage(self):
+        candidate = os.path.join("cache", ".video.beautified.candidate.json")
+        ctx = t.TranscriptContext.from_json(
+            "video.json",
+            "",
+            "en",
+            "zh",
+            candidate,
+        )
+
+        self.assertEqual(ctx.beautified_json, os.path.abspath(candidate))
+        self.assertTrue(ctx.bilingual_ass.endswith("video.en-zh.ass"))
+        self.assertEqual(ctx.base, "video")
+
     def test_subtitle_layout_threshold_defaults_match_1080p_template(self):
         self.assertEqual(t.DEFAULT_SPLIT_MAX_CHARS, 72)
         self.assertEqual(t.DEFAULT_SPLIT_MAX_DURATION, 3.8)

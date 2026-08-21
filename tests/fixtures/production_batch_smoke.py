@@ -75,12 +75,14 @@ $inputPath = $Arguments[0]
 $videoIndex = [Array]::IndexOf($Arguments, '--video')
 if ($videoIndex -lt 0) { exit 92 }
 $editVideo = $Arguments[$videoIndex + 1]
+$beautifiedIndex = [Array]::IndexOf($Arguments, '--beautified-json')
+if ($beautifiedIndex -lt 0) { exit 94 }
+$beautified = $Arguments[$beautifiedIndex + 1]
 $name = [IO.Path]::GetFileNameWithoutExtension($editVideo)
 $mediaDir = [IO.Path]::GetDirectoryName($editVideo)
 $stageLog = Join-Path $mediaDir 'stage.log'
 if ($Arguments -contains '--only-beautify') {
     Add-Content -LiteralPath $stageLog -Value 'beautify' -Encoding utf8
-    $beautified = Join-Path ([IO.Path]::GetDirectoryName($inputPath)) "$([IO.Path]::GetFileNameWithoutExtension($inputPath)).beautified.json"
     Copy-Item -LiteralPath $inputPath -Destination $beautified -Force
     exit 0
 }
@@ -172,22 +174,25 @@ set -euo pipefail
 input_path="$1"
 shift
 edit_video=""
+beautified_json=""
 mode=translate
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --video) edit_video="$2"; shift 2 ;;
+        --beautified-json) beautified_json="$2"; shift 2 ;;
         --only-beautify) mode=beautify; shift ;;
         --only-glossary) mode=glossary; shift ;;
         *) shift ;;
     esac
 done
 [ -n "$edit_video" ] || exit 92
+[ -n "$beautified_json" ] || exit 94
 media_dir="$(dirname "$edit_video")"
 name="$(basename "${edit_video%.*}")"
 case "$mode" in
     beautify)
         printf 'beautify\n' >> "$media_dir/stage.log"
-        cp "$input_path" "${input_path%.json}.beautified.json"
+        cp "$input_path" "$beautified_json"
         ;;
     glossary)
         printf 'glossary\n' >> "$media_dir/stage.log"

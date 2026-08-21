@@ -27,6 +27,7 @@ from batch import (
     write_report,
 )
 from batch_cache import (
+    asr_cache_lock,
     bind_wav_artifact,
     build_asr_fingerprint,
     capture_file_snapshot,
@@ -937,6 +938,95 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("align", "restart.asr.json", "en"), second_worker_calls)
         self.assertFalse(wav_path.exists())
 
+    async def test_prepare_waits_for_cross_invocation_media_lock(self):
+        render_video, edit_video, wav_path = self.create_media("prepare-lock", "en")
+        edit_video.unlink()
+        lock_ready = threading.Event()
+        release_lock = threading.Event()
+        prepare_started = asyncio.Event()
+
+        def hold_media_lock():
+            with asr_cache_lock(edit_video):
+                lock_ready.set()
+                if not release_lock.wait(2.0):
+                    raise AssertionError("test did not release media lock")
+
+        async def download(_url):
+            return render_video
+
+        async def prepare(_render_video):
+            prepare_started.set()
+            edit_video.write_bytes(b"prepared-edit")
+            return edit_video
+
+        async def extract_audio(_edit_video):
+            wav_path.write_bytes(b"wav")
+            return wav_path
+
+        holder = asyncio.create_task(asyncio.to_thread(hold_media_lock))
+        await asyncio.to_thread(lock_ready.wait, 1.0)
+        scheduler = AcquisitionScheduler(
+            urls=["prepare-lock"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=AcquisitionRunners(download, prepare, extract_audio),
+            asr_config=self.config,
+            resume_probe=lambda _path: None,
+        )
+        task_run = asyncio.create_task(scheduler._run_task(scheduler.tasks[0]))
+        try:
+            await asyncio.sleep(0.1)
+            self.assertFalse(prepare_started.is_set())
+        finally:
+            release_lock.set()
+            await holder
+            await asyncio.wait_for(task_run, 2.0)
+        self.assertTrue(prepare_started.is_set())
+        self.assertIs(scheduler.tasks[0].state, TaskState.SUCCEEDED)
+
+    async def test_extract_waits_for_cross_invocation_media_lock(self):
+        render_video, edit_video, wav_path = self.create_media("extract-lock", "en")
+        prepared_state = write_prepare_state(render_video, edit_video)
+        lock_ready = threading.Event()
+        release_lock = threading.Event()
+        extract_started = asyncio.Event()
+
+        def hold_media_lock():
+            with asr_cache_lock(edit_video):
+                lock_ready.set()
+                if not release_lock.wait(2.0):
+                    raise AssertionError("test did not release media lock")
+
+        async def download(_url):
+            return render_video
+
+        async def prepare(_render_video):
+            raise AssertionError("valid prepared media must skip prepare")
+
+        async def extract_audio(_edit_video):
+            extract_started.set()
+            wav_path.write_bytes(b"wav")
+            return wav_path
+
+        holder = asyncio.create_task(asyncio.to_thread(hold_media_lock))
+        await asyncio.to_thread(lock_ready.wait, 1.0)
+        scheduler = AcquisitionScheduler(
+            urls=["extract-lock"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=AcquisitionRunners(download, prepare, extract_audio),
+            asr_config=self.config,
+            resume_probe=lambda _path: prepared_state,
+        )
+        task_run = asyncio.create_task(scheduler._run_task(scheduler.tasks[0]))
+        try:
+            await asyncio.sleep(0.1)
+            self.assertFalse(extract_started.is_set())
+        finally:
+            release_lock.set()
+            await holder
+            await asyncio.wait_for(task_run, 2.0)
+        self.assertTrue(extract_started.is_set())
+        self.assertIs(scheduler.tasks[0].state, TaskState.SUCCEEDED)
+
     async def test_resume_probe_rejects_changed_recovery_inputs(self):
         cases = ("fingerprint", "model", "language", "original")
         for case in cases:
@@ -1716,6 +1806,39 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(media["generation"][2].exists())
 
+    async def test_parent_rejects_alignment_when_bound_wav_changes_before_commit(self):
+        media = {"wav-race": self.create_media("wav-race", "en")}
+        edit_video = media["wav-race"][1]
+        wav_path = media["wav-race"][2]
+        postprocess = mock.AsyncMock()
+
+        def mutate_wav_after_backend(_sidecar_path):
+            wav_path.write_bytes(b"changed-after-backend")
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                [],
+                after_align=mutate_wav_after_backend,
+            ),
+            postprocess_runner=postprocess,
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "alignment")
+        self.assertIn("WAV artifact changed", tasks[0].error_detail)
+        self.assertTrue(edit_video.with_suffix(".asr.json").is_file())
+        self.assertTrue(wav_path.is_file())
+        self.assertFalse(edit_video.with_suffix(".json").exists())
+        self.assertEqual(list(self.root.glob(".*.candidate.json")), [])
+        postprocess.assert_not_awaited()
+
     async def test_postprocess_rejects_beautified_from_another_alignment_generation(self):
         _render_video, edit_video, _wav_path = self.create_media("stale-cache", "en")
         current_generation = str(uuid.uuid4())
@@ -1751,10 +1874,14 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(aligned_payload(old_generation)),
             encoding="utf-8",
         )
+        stale_beautified = beautified_path.read_bytes()
 
         async def postprocess(_task):
-            self.assertFalse(beautified_path.exists())
-            beautified_path.write_text(final_path.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertEqual(beautified_path.read_bytes(), stale_beautified)
+            _task.beautified_candidate_path.write_text(
+                final_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
 
         scheduler = AcquisitionScheduler(
             urls=[],
@@ -1852,6 +1979,92 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(commit_started.is_set())
         self.assertFalse(beautified_path.exists())
+        self.assertEqual(
+            json.loads(final_path.read_text(encoding="utf-8"))["_batch_artifact"][
+                "alignment_generation"
+            ],
+            new_generation,
+        )
+
+    async def test_cross_invocation_postprocess_cannot_publish_stale_beautified(self):
+        _render_video, edit_video, _wav_path = self.create_media(
+            "cross-invocation",
+            "en",
+        )
+        old_generation = str(uuid.uuid4())
+        new_generation = str(uuid.uuid4())
+        media_generation = str(uuid.uuid4())
+        final_path = edit_video.with_suffix(".json")
+        beautified_path = edit_video.with_suffix(".beautified.json")
+        postprocess_started = asyncio.Event()
+        release_postprocess = asyncio.Event()
+
+        def aligned_payload(generation, text):
+            return {
+                "language": "en",
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": text,
+                        "words": [
+                            {"word": text, "start": 0.0, "end": 1.0}
+                        ],
+                    }
+                ],
+                "_batch_artifact": {
+                    "alignment_generation": generation,
+                    "media_generation": media_generation,
+                },
+            }
+
+        old_payload = aligned_payload(old_generation, "old")
+        new_payload = aligned_payload(new_generation, "new")
+        final_path.write_text(json.dumps(old_payload), encoding="utf-8")
+
+        async def postprocess(task):
+            postprocess_started.set()
+            await release_postprocess.wait()
+            self.assertIsNotNone(task.beautified_candidate_path)
+            task.beautified_candidate_path.write_text(
+                json.dumps(old_payload),
+                encoding="utf-8",
+            )
+
+        scheduler = AcquisitionScheduler(
+            urls=[],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for({}, []),
+            postprocess_runner=postprocess,
+        )
+        task = BatchTask(index=1, url="old-invocation")
+        task.state = TaskState.RUNNING
+        task.stage = "postprocess_waiting"
+        task.edit_video_path = edit_video
+        task.json_path = final_path
+        task.asr_generation = old_generation
+        task.media_generation = media_generation
+
+        postprocess_task = asyncio.create_task(scheduler._run_postprocess(task))
+        await postprocess_started.wait()
+
+        def publish_new_invocation():
+            with asr_cache_lock(edit_video):
+                final_path.write_text(json.dumps(new_payload), encoding="utf-8")
+                beautified_path.write_text(
+                    json.dumps(new_payload),
+                    encoding="utf-8",
+                )
+
+        await asyncio.to_thread(publish_new_invocation)
+        expected_beautified = beautified_path.read_bytes()
+        release_postprocess.set()
+        await postprocess_task
+
+        self.assertIs(task.state, TaskState.FAILED)
+        self.assertIn("generation", task.error_detail)
+        self.assertEqual(beautified_path.read_bytes(), expected_beautified)
+        self.assertFalse(task.beautified_candidate_path.exists())
         self.assertEqual(
             json.loads(final_path.read_text(encoding="utf-8"))["_batch_artifact"][
                 "alignment_generation"
@@ -2967,6 +3180,9 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 url="url",
                 edit_video_path=edit_video,
                 json_path=json_path,
+                beautified_candidate_path=(
+                    script_dir / ".video.beautified.json.generation.candidate.json"
+                ),
                 detected_language="ja",
             )
 
@@ -2983,7 +3199,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 async def fake_stage_command(command, **kwargs):
                     commands.append((command, kwargs))
                     if kwargs["stage"] == "beautify":
-                        script_dir.joinpath("video.beautified.json").write_text(
+                        task.beautified_candidate_path.write_text(
                             "{}",
                             encoding="utf-8",
                         )
@@ -3011,7 +3227,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                             await runner(task)
 
                 wrapper = str(script_dir / wrapper_name)
-                beautified = str(script_dir / "video.beautified.json")
+                beautified = str(task.beautified_candidate_path)
                 self.assertEqual(
                     [entry[1]["stage"] for entry in commands],
                     ["beautify", "glossary", "translate"],
@@ -3025,6 +3241,8 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                         "--video",
                         str(edit_video),
                         "--only-beautify",
+                        "--beautified-json",
+                        beautified,
                     ],
                 )
                 self.assertEqual(
@@ -3032,11 +3250,13 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                     expected_prefix
                     + [
                         wrapper,
-                        beautified,
+                        str(json_path),
                         "--video",
                         str(edit_video),
                         "--only-glossary",
                         "--skip-beautify",
+                        "--beautified-json",
+                        beautified,
                     ],
                 )
                 self.assertEqual(
@@ -3044,11 +3264,13 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                     expected_prefix
                     + [
                         wrapper,
-                        beautified,
+                        str(json_path),
                         "--video",
                         str(edit_video),
                         "--skip-beautify",
                         "--skip-knowledge",
+                        "--beautified-json",
+                        beautified,
                     ],
                 )
                 self.assertTrue(

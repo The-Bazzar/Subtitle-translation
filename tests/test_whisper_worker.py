@@ -112,6 +112,17 @@ class FakeBackend:
         return aligned
 
 
+class MutatingAlignmentBackend(FakeBackend):
+    def align(self, wav_path, segments):
+        wav_path = pathlib.Path(wav_path).resolve()
+        pathlib.Path(os.environ["WHISPER_WORKER_TEST_ALIGN_PATH"]).write_text(
+            str(wav_path),
+            encoding="utf-8",
+        )
+        wav_path.write_bytes(wav_path.read_bytes() + b"-changed-during-align")
+        return super().align(str(wav_path), segments)
+
+
 def hang_on_command_target(
     request_queue,
     _response_connection,
@@ -831,6 +842,78 @@ class WorkerProtocolTests(unittest.TestCase):
             self.log_path.read_text(encoding="utf-8").splitlines(),
         )
         self.assertTrue(sidecar_path.is_file())
+
+    def test_alignment_uses_bound_wav_and_rejects_post_backend_snapshot_change(self):
+        render_video = self.root / "snapshot.original.mkv"
+        edit_video = self.root / "snapshot.mkv"
+        bound_wav = self.root / "immutable-input.custom.wav"
+        observed_path = self.root / "alignment-input.txt"
+        render_video.write_bytes(b"original-video")
+        edit_video.write_bytes(b"edit-video")
+        bound_wav.write_bytes(b"bound-wav")
+        (self.root / "snapshot.info.json").write_text(
+            json.dumps({"language": "en"}),
+            encoding="utf-8",
+        )
+        prepare_state = write_prepare_state(render_video, edit_video)
+        artifact = bind_wav_artifact(
+            edit_video,
+            bound_wav,
+            prepare_state.generation,
+        )
+        sidecar_path = write_asr_cache(
+            edit_video,
+            build_asr_fingerprint(
+                edit_video,
+                model=self.config.model,
+                compute_type=self.config.compute_type,
+                source_language="en",
+                asr_options=self.config.options_dict(),
+            ),
+            {
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": "snapshot"}
+                ],
+                "language": "en",
+            },
+            media_generation=artifact.media_generation,
+            wav_snapshot=artifact.wav_snapshot,
+        )
+        generation = json.loads(sidecar_path.read_text(encoding="utf-8"))[
+            "generation"
+        ]
+
+        with mock.patch.dict(
+            os.environ,
+            {"WHISPER_WORKER_TEST_ALIGN_PATH": str(observed_path)},
+        ):
+            with AsrWorkerController(
+                self.config,
+                backend_factory=(
+                    "tests.test_whisper_worker:MutatingAlignmentBackend"
+                ),
+            ) as controller:
+                controller.load_align("en")
+                result = controller.align(
+                    sidecar_path,
+                    generation,
+                    artifact,
+                )
+                controller.unload_align()
+
+        self.assertEqual(
+            pathlib.Path(observed_path.read_text(encoding="utf-8")),
+            bound_wav.resolve(),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_type, "MediaGenerationMismatch")
+        self.assertIn("WAV artifact changed", result.error)
+        self.assertTrue(sidecar_path.is_file())
+        self.assertFalse(edit_video.with_suffix(".json").exists())
+        self.assertEqual(
+            list(self.root.glob(f".snapshot.json.{generation}.*.candidate.json")),
+            [],
+        )
 
     def test_atomic_candidate_write_keeps_sidecar_for_parent_scheduler(self):
         edit_video, _wav_path = self.media_pair("atomic-align", language="en")

@@ -696,6 +696,8 @@ def _worker_main(
                 elif command is WorkerCommand.ALIGN:
                     if backend is None or not alignment_language:
                         raise RuntimeError("alignment model is not loaded")
+                    if artifact is None:
+                        raise ValueError("ALIGN requires a bound WAV artifact")
                     sidecar_path = Path(path).resolve()
                     (
                         input_generation,
@@ -712,8 +714,10 @@ def _worker_main(
                             "alignment language mismatch: "
                             f"{detected_language} != {alignment_language}"
                         )
-                    wav_path = _final_json_path(sidecar_path).with_suffix(".wav")
+                    validate_wav_artifact_unlocked(artifact)
+                    wav_path = Path(artifact.wav_snapshot.path).resolve()
                     aligned = backend.align(str(wav_path), segments)
+                    validate_wav_artifact_unlocked(artifact)
                     if not isinstance(aligned, Mapping):
                         raise TypeError("alignment backend returned a non-object result")
                     final_result = dict(aligned)

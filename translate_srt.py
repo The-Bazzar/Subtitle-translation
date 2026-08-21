@@ -274,6 +274,7 @@ class TranscriptContext:
         output_ass: str = "",
         source_lang: str = "source",
         target_lang: str = "zh",
+        beautified_json: str = "",
     ) -> "TranscriptContext":
         abs_path = os.path.abspath(json_path)
         directory = os.path.dirname(abs_path)
@@ -287,7 +288,11 @@ class TranscriptContext:
             base=base,
             source_lang=source_lang,
             target_lang=target_lang,
-            beautified_json=os.path.join(directory, f"{base}.beautified.json"),
+            beautified_json=(
+                os.path.abspath(beautified_json)
+                if beautified_json
+                else os.path.join(directory, f"{base}.beautified.json")
+            ),
             split_source_srt=os.path.join(directory, f"{base}.split.{source_suffix}.srt"),
             split_target_srt=os.path.join(directory, f"{base}.split.{target_suffix}.srt"),
             proofread_ass=os.path.join(directory, f"{base}.{source_suffix}.proofread.ass"),
@@ -4832,6 +4837,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--only-beautify", action="store_true")
     parser.add_argument("--only-glossary", action="store_true")
+    parser.add_argument("--beautified-json", help=argparse.SUPPRESS)
     parser.add_argument("--skip-beautify", action="store_true")
     parser.add_argument("--skip-knowledge", action="store_true")
     parser.add_argument("--force", action="store_true", help="Rebuild beautified JSON")
@@ -4861,7 +4867,13 @@ def main() -> None:
     source = load_transcript(args.json)
     source_lang = args.source_lang or env.get("SOURCE_LANG", "") or source.language or "source"
     target_lang = args.target_lang or env.get("TARGET_LANG", "") or "zh"
-    ctx = TranscriptContext.from_json(args.json, args.output or "", source_lang, target_lang)
+    ctx = TranscriptContext.from_json(
+        args.json,
+        args.output or "",
+        source_lang,
+        target_lang,
+        args.beautified_json or "",
+    )
     embedding_config = EmbeddingConfig.from_env(env, ctx)
     embedding_active = embedding_config.enabled and embedding_enabled_for_stage(args.only_beautify, args.only_glossary)
     if args.print_output_path:

@@ -675,18 +675,28 @@ def create_platform_postprocess_runner(
         wrapper_prefix = ["bash", str(script_dir / "translate_srt.sh")]
 
     async def postprocess(task: BatchTask) -> None:
-        if task.json_path is None or task.edit_video_path is None:
+        if (
+            task.json_path is None
+            or task.edit_video_path is None
+            or task.beautified_candidate_path is None
+        ):
             raise StageCommandError(
-                "postprocess task is missing aligned JSON or edit-video path"
+                "postprocess task is missing aligned JSON, edit-video path, "
+                "or beautified candidate"
             )
         aligned_json = str(task.json_path)
         edit_video = str(task.edit_video_path)
-        beautified_json = task.json_path.with_name(
-            f"{task.json_path.stem}.beautified.json"
-        )
+        beautified_json = task.beautified_candidate_path
         await _run_stage_command(
             wrapper_prefix
-            + [aligned_json, "--video", edit_video, "--only-beautify"],
+            + [
+                aligned_json,
+                "--video",
+                edit_video,
+                "--only-beautify",
+                "--beautified-json",
+                str(beautified_json),
+            ],
             cwd=script_dir,
             env=env,
             stage="beautify",
@@ -700,11 +710,13 @@ def create_platform_postprocess_runner(
         await _run_stage_command(
             wrapper_prefix
             + [
-                str(beautified_json),
+                aligned_json,
                 "--video",
                 edit_video,
                 "--only-glossary",
                 "--skip-beautify",
+                "--beautified-json",
+                str(beautified_json),
             ],
             cwd=script_dir,
             env=env,
@@ -715,11 +727,13 @@ def create_platform_postprocess_runner(
         await _run_stage_command(
             wrapper_prefix
             + [
-                str(beautified_json),
+                aligned_json,
                 "--video",
                 edit_video,
                 "--skip-beautify",
                 "--skip-knowledge",
+                "--beautified-json",
+                str(beautified_json),
             ],
             cwd=script_dir,
             env=env,
