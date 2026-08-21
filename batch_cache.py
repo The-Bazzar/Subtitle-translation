@@ -53,20 +53,12 @@ class AsrFingerprint:
     compute_type: str
     source_language: str
     asr_options: tuple[tuple[str, str], ...]
-    media_generation: str = ""
-    wav_snapshot: FileSnapshot | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "edit_video_path": self.edit_video_path,
             "edit_video_size": self.edit_video_size,
             "edit_video_mtime_ns": self.edit_video_mtime_ns,
-            "media_generation": self.media_generation,
-            "wav_snapshot": (
-                self.wav_snapshot.to_dict()
-                if self.wav_snapshot is not None
-                else None
-            ),
             "model": self.model,
             "compute_type": self.compute_type,
             "source_language": self.source_language,
@@ -148,8 +140,6 @@ def capture_file_snapshot(path: str | os.PathLike[str]) -> FileSnapshot:
 def build_asr_fingerprint_from_snapshot(
     edit_snapshot: FileSnapshot,
     *,
-    media_generation: str = "",
-    wav_snapshot: FileSnapshot | None = None,
     model: str,
     compute_type: str,
     source_language: str,
@@ -163,27 +153,6 @@ def build_asr_fingerprint_from_snapshot(
         compute_type=compute_type,
         source_language=source_language,
         asr_options=_canonical_options(asr_options),
-        media_generation=media_generation,
-        wav_snapshot=wav_snapshot,
-    )
-
-
-def build_asr_fingerprint_for_artifact(
-    artifact: WavArtifact,
-    *,
-    model: str,
-    compute_type: str,
-    source_language: str,
-    asr_options: Mapping[str, Any],
-) -> AsrFingerprint:
-    return build_asr_fingerprint_from_snapshot(
-        artifact.edit_snapshot,
-        media_generation=artifact.media_generation,
-        wav_snapshot=artifact.wav_snapshot,
-        model=model,
-        compute_type=compute_type,
-        source_language=source_language,
-        asr_options=asr_options,
     )
 
 
@@ -210,6 +179,15 @@ def asr_sidecar_path(edit_video_path: str | os.PathLike[str]) -> Path:
 
 def prepare_state_path(edit_video_path: str | os.PathLike[str]) -> Path:
     return Path(edit_video_path).with_suffix(".prepare.json")
+
+
+def invalidate_beautified_cache(aligned_json_path: str | os.PathLike[str]) -> None:
+    aligned_path = Path(aligned_json_path)
+    beautified_path = aligned_path.with_name(
+        f"{aligned_path.stem}.beautified.json"
+    )
+    beautified_path.unlink(missing_ok=True)
+    _fsync_parent_directory(beautified_path)
 
 
 def asr_cache_lock_path(media_path: str | os.PathLike[str]) -> Path:
@@ -415,29 +393,42 @@ def write_prepare_state(
     expected_render_snapshot: FileSnapshot | None = None,
 ) -> PreparedMediaState:
     with asr_cache_lock(edit_video_path):
-        render_snapshot = capture_file_snapshot(render_video_path)
-        if (
-            expected_render_snapshot is not None
-            and render_snapshot != expected_render_snapshot
-        ):
-            raise MediaGenerationMismatch(
-                "render source changed while preparing edit media"
-            )
-        state = PreparedMediaState(
-            generation=str(uuid.uuid4()),
-            render_snapshot=render_snapshot,
-            edit_snapshot=capture_file_snapshot(edit_video_path),
+        return write_prepare_state_unlocked(
+            render_video_path,
+            edit_video_path,
+            expected_render_snapshot=expected_render_snapshot,
         )
-        _atomic_write_json(
-            prepare_state_path(edit_video_path),
-            {
-                "schema_version": PREPARE_STATE_SCHEMA_VERSION,
-                "generation": state.generation,
-                "render_source": state.render_snapshot.to_dict(),
-                "edit_media": state.edit_snapshot.to_dict(),
-            },
+
+
+def write_prepare_state_unlocked(
+    render_video_path: str | os.PathLike[str],
+    edit_video_path: str | os.PathLike[str],
+    *,
+    expected_render_snapshot: FileSnapshot | None = None,
+) -> PreparedMediaState:
+    render_snapshot = capture_file_snapshot(render_video_path)
+    if (
+        expected_render_snapshot is not None
+        and render_snapshot != expected_render_snapshot
+    ):
+        raise MediaGenerationMismatch(
+            "render source changed while preparing edit media"
         )
-        return state
+    state = PreparedMediaState(
+        generation=str(uuid.uuid4()),
+        render_snapshot=render_snapshot,
+        edit_snapshot=capture_file_snapshot(edit_video_path),
+    )
+    _atomic_write_json(
+        prepare_state_path(edit_video_path),
+        {
+            "schema_version": PREPARE_STATE_SCHEMA_VERSION,
+            "generation": state.generation,
+            "render_source": state.render_snapshot.to_dict(),
+            "edit_media": state.edit_snapshot.to_dict(),
+        },
+    )
+    return state
 
 
 def validate_wav_artifact_unlocked(artifact: WavArtifact) -> PreparedMediaState:
@@ -471,22 +462,34 @@ def bind_wav_artifact(
     media_generation: str,
 ) -> WavArtifact:
     with asr_cache_lock(edit_video_path):
-        state = _read_prepare_state_unlocked(edit_video_path)
-        if (
-            state is None
-            or state.generation != media_generation
-            or not _validate_prepare_state_unlocked(state)
-        ):
-            raise MediaGenerationMismatch(
-                "media generation changed before WAV artifact binding"
-            )
-        artifact = WavArtifact(
-            media_generation=state.generation,
-            edit_snapshot=state.edit_snapshot,
-            wav_snapshot=capture_file_snapshot(wav_path),
+        return bind_wav_artifact_unlocked(
+            edit_video_path,
+            wav_path,
+            media_generation,
         )
-        validate_wav_artifact_unlocked(artifact)
-        return artifact
+
+
+def bind_wav_artifact_unlocked(
+    edit_video_path: str | os.PathLike[str],
+    wav_path: str | os.PathLike[str],
+    media_generation: str,
+) -> WavArtifact:
+    state = _read_prepare_state_unlocked(edit_video_path)
+    if (
+        state is None
+        or state.generation != media_generation
+        or not _validate_prepare_state_unlocked(state)
+    ):
+        raise MediaGenerationMismatch(
+            "media generation changed before WAV artifact binding"
+        )
+    artifact = WavArtifact(
+        media_generation=state.generation,
+        edit_snapshot=state.edit_snapshot,
+        wav_snapshot=capture_file_snapshot(wav_path),
+    )
+    validate_wav_artifact_unlocked(artifact)
+    return artifact
 
 
 def _is_valid_asr_result(result: Any) -> bool:
@@ -546,6 +549,13 @@ def read_asr_cache_identity(
     return generation, media_generation
 
 
+def read_asr_cache_generation(
+    sidecar_path: str | os.PathLike[str],
+) -> str | None:
+    identity = read_asr_cache_identity(sidecar_path)
+    return identity[0] if identity is not None else None
+
+
 def write_asr_cache(
     edit_video_path: str | os.PathLike[str],
     fingerprint: AsrFingerprint,
@@ -575,8 +585,6 @@ def write_asr_cache_for_artifact(
             fingerprint.edit_video_path != artifact.edit_snapshot.path
             or fingerprint.edit_video_size != artifact.edit_snapshot.size
             or fingerprint.edit_video_mtime_ns != artifact.edit_snapshot.mtime_ns
-            or fingerprint.media_generation != artifact.media_generation
-            or fingerprint.wav_snapshot != artifact.wav_snapshot
         ):
             raise MediaGenerationMismatch(
                 "media generation does not match ASR fingerprint"
@@ -668,8 +676,11 @@ def read_valid_asr_cache_for_artifact(
 ) -> AsrCacheEntry | None:
     with asr_cache_lock(artifact.edit_snapshot.path):
         validate_wav_artifact_unlocked(artifact)
-        return read_valid_asr_cache_unlocked(
+        entry = read_valid_asr_cache_unlocked(
             artifact.edit_snapshot.path,
             expected_fingerprint,
             artifact.media_generation,
         )
+        if entry is None or entry.wav_snapshot != artifact.wav_snapshot:
+            return None
+        return entry
