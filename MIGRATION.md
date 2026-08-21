@@ -2,7 +2,7 @@
 
 ## Stage-aware Batch Entry
 
-`batch.ps1` / `batch.sh` 现在统一委托给 `py_launcher` 的 `batch` target，由 `batch.py` 按阶段调度资源，不再并发启动整条 `pipeline.ps1` / `pipeline.sh`。
+`batch.ps1` / `batch.sh` 现在统一委托给 `py_launcher` 的 `batch` target。`batch.py` 保留为兼容薄入口，production orchestrator 位于 `batch_runtime.py`，不再并发启动整条 `pipeline.ps1` / `pipeline.sh`。直接 `import batch` 时仍与 `batch_runtime` 使用同一 module object，既有 `from batch import ...` 和 `mock.patch("batch....")` 调用无需迁移。
 
 所有手动并发参数已删除：PowerShell 的 `-MaxJobs` / `-j`、Python 的 `-j` / `--jobs` 均不再接受，也不要替换为 `--io-jobs`。
 
@@ -46,7 +46,7 @@ worker crash 或 heartbeat timeout 不自动重启。当前 worker task 失败�
 
 ### Release smoke 限制
 
-跨平台 release smoke 经过真实 `batch.ps1/.sh -> py_launcher.ps1/.sh -> batch.py` production orchestrator，运行真实 argparse/main、自动资源检测、subprocess stage runners、marker parser 和 spawned worker protocol，并解析 JSON machine report 验证新契约；复制到隔离目录的 production modules 必须通过 SHA-256 证明 byte-identical。测试只 fake download、prepare、translate、burn、ffmpeg 和 WhisperX 外部边界。Windows 使用项目 Python 与 PowerShell 7；WSL 使用 `wsl -u root`，按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序逐一 probe，只接受 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter。没有候选时开发者测试精确 skip，不下载或安装依赖。
+跨平台 release smoke 经过真实 `batch.ps1/.sh -> py_launcher.ps1/.sh -> batch.py` 薄入口，并继续进入 `batch_runtime.py` production orchestrator，运行真实 argparse/main、自动资源检测、subprocess stage runners、marker parser 和 spawned worker protocol，并解析 JSON machine report 验证新契约；复制到隔离目录的 production modules 必须通过 SHA-256 证明 byte-identical。测试只 fake download、prepare、translate、burn、ffmpeg 和 WhisperX 外部边界。Windows 使用项目 Python 与 PowerShell 7；WSL 使用 `wsl -u root`，按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序逐一 probe，只接受 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter。没有候选时开发者测试精确 skip，不下载或安装依赖。
 
 `BATCH_SMOKE_REQUIRE_WSL=1` 是仅供 test/release gate 使用的内部变量，不是 batch 或项目用户配置。启用后缺少 WSL root 或合格 interpreter 会失败而不是 skip，因此以下 PowerShell 命令的 `OK` 结果能证明 WSL smoke 确实执行。若自动候选都不合格，先把 `BATCH_SMOKE_WSL_PYTHON` 指向一个已有的合格 WSL interpreter；不得在测试中创建环境或安装包。
 

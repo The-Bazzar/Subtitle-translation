@@ -3048,6 +3048,43 @@ class BatchCliTests(unittest.TestCase):
 
 
 class BatchWrapperTests(unittest.TestCase):
+    def test_import_batch_returns_runtime_module_identity(self):
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            sys.modules.pop("batch", None)
+            compatibility_module = importlib.import_module("batch")
+
+            self.assertIs(compatibility_module, batch)
+
+    def test_from_batch_import_keeps_legacy_runtime_symbols(self):
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            sys.modules.pop("batch", None)
+            compatibility_module = importlib.import_module("batch")
+            namespace = {}
+            try:
+                exec(
+                    "from batch import _run_stage_command, build_parser",
+                    namespace,
+                )
+            except ImportError as exc:
+                self.fail(f"legacy batch import failed: {exc}")
+
+            self.assertIs(compatibility_module, batch)
+            self.assertIs(namespace["_run_stage_command"], batch._run_stage_command)
+            self.assertIs(namespace["build_parser"], batch.build_parser)
+
+    def test_patch_batch_symbol_updates_runtime_module_object(self):
+        replacement = mock.AsyncMock()
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            sys.modules.pop("batch", None)
+            compatibility_module = importlib.import_module("batch")
+            with mock.patch(
+                "batch._run_stage_command",
+                replacement,
+                create=True,
+            ):
+                self.assertIs(compatibility_module, batch)
+                self.assertIs(batch._run_stage_command, replacement)
+
     def test_wrapper_only_imports_runtime_main_and_keeps_entrypoint_guard(self):
         wrapper_path = ROOT / "batch.py"
         tree = ast.parse(wrapper_path.read_text(encoding="utf-8"), filename="batch.py")
