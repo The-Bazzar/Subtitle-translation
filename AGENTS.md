@@ -25,10 +25,12 @@ winget install Microsoft.PowerShell
 ├── download.sh               # Linux/WSL: yt-dlp 下载视频和元数据
 ├── whisper.ps1               # Windows: WhisperX 生成词级 JSON
 ├── whisper.sh                # Linux/WSL: WhisperX 生成词级 JSON
-├── merge_ass.ps1             # Windows: 项目虚拟环境包装器
-├── merge_ass.sh              # Linux/WSL: 项目虚拟环境包装器
-├── translate_srt.ps1         # Windows: 项目虚拟环境包装器
-├── translate_srt.sh           # Linux/WSL: 项目虚拟环境包装器
+├── py_launcher.ps1           # Windows: 白名单 Python 共享启动器
+├── py_launcher.sh            # Linux/WSL: 白名单 Python 共享启动器
+├── merge_ass.ps1             # Windows: merge_ass 薄包装器
+├── merge_ass.sh              # Linux/WSL: merge_ass 薄包装器
+├── translate_srt.ps1         # Windows: translate_srt 薄包装器
+├── translate_srt.sh           # Linux/WSL: translate_srt 薄包装器
 ├── translate_srt.py          # JSON 美化 + glossary + 翻译/分割/校对 + SRT/ASS 导出
 ├── ffmpeg-burn.ps1           # Windows: ffmpeg ASS 硬压
 ├── ffmpeg-burn.sh            # Linux/WSL: ffmpeg ASS 硬压
@@ -294,7 +296,7 @@ bash "<repo>/translate_srt.sh" video.beautified.json --video video.mp4 --source-
 
 - 更新文档时以实际脚本参数和文件名为准，不保留历史 SRT 流程
 - 保持 PowerShell 和 bash 入口行为对齐
-- 独立调用 Python 功能时使用 `translate_srt.ps1/.sh` 或 `merge_ass.ps1/.sh` 包装器；包装器从自身目录定位 `.venv`，不要求用户设置系统 PATH，也不依赖当前工作目录
+- 独立调用 Python 功能时使用 `translate_srt.ps1/.sh` 或 `merge_ass.ps1/.sh` 包装器；它们委托给 `py_launcher.ps1/.sh`，共享启动器当前只允许 `translate_srt`、`merge_ass`，并从自身目录定位 `.venv`，不要求用户设置系统 PATH，也不依赖当前工作目录
 - 不要提交 `.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、`glossary_prompt.md`、`translate_prompt.md`、`proofread_prompt.md`、`split_prompt.md` 或生成产物
 - 不要回退用户本地数据或未请求的工作区改动
 - `README.md` 面向用户快速使用；`AGENTS.md` 面向维护和自动化代理；`.agents/skills/*` 面向分步骤执行
