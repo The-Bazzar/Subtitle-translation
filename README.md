@@ -98,6 +98,8 @@ active worker command 在 precommit 取消时由 controller terminate/kill，再
 
 `<name>.asr.lock` 是持久、最多 1 byte 且已被 Git 忽略的运行时协调文件，不是字幕或 cache；保留它可避免活跃进程因 unlink 后锁定不同 inode/handle 而失去互斥。
 
+发布前的跨平台 contract smoke 位于 `tests/test_batch_smoke.py`：Windows 经 `batch.ps1 -> py_launcher.ps1 -> batch.py`，WSL/Linux 经 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议。smoke 把 byte-identical production modules 复制到隔离目录并校验 SHA-256；只把 download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 作为 deterministic fake 外部边界。WSL smoke 由 `wsl -u root` 按测试环境 override、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；找不到时开发者测试精确 skip，测试不会下载或安装依赖。内部测试变量 `BATCH_SMOKE_REQUIRE_WSL=1` 用于 release gate，此时缺少 WSL root 或合格 interpreter 会失败而不是 skip；它不是项目用户配置。带时间戳的证据断言所有 acquisition 完成后才加载 ASR、ASR 与 alignment command 串行、worker shutdown 先于所有 burn，且 prepare/burn 各自峰值为 4。它不替代真实 CUDA、ffmpeg、网络、LLM 或媒体质量验证。
+
 ### 完成通知
 
 `pipeline.ps1` / `pipeline.sh` 独立运行时，任务成功响成功铃，错误退出响错误铃。stage-aware batch 直接运行阶段 runner，不再使用整条 pipeline 的内部静默协议；每个最终失败或中断任务响一次错误铃，全部任务终态后再按聚合结果响一次。任一失败时退出码为 `1`，用户中断返回 `130`；帮助和 dry-run 不响铃。Linux/WSL 使用终端 BEL，是否有声音取决于终端的响铃设置。

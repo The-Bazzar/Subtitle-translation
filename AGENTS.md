@@ -108,6 +108,7 @@ winget install Microsoft.PowerShell
 - CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；provider/model 用于 postprocess，burn 默认启用且 `--skip-burn` 可关闭
 - `batch.py` 直接读取项目 `.env`，优先级为显式 CLI / 进程环境 > `.env` > 硬编码默认；`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`
 - 任一任务失败只终止该任务的后续 acquisition 阶段，其他任务继续；存在失败时聚合退出码为 `1`
+- 跨平台 release smoke 使用 `tests/test_batch_smoke.py`：分别经过 `batch.ps1 -> py_launcher.ps1 -> batch.py` 与 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议。smoke 将 `batch.py`、production modules 和对应 wrappers byte-identical 复制到隔离目录并校验 SHA-256；只 fake download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 外部边界。WSL 路径由 `wsl -u root` 按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；没有候选时开发者测试精确 skip，测试不得下载或安装依赖。`BATCH_SMOKE_REQUIRE_WSL=1` 是仅供 test/release gate 使用的内部变量，不是项目用户配置；启用后缺少 WSL root 或合格 interpreter 必须失败而不是 skip。跨进程 wall timestamp 断言所有 acquisition 完成后才加载 ASR、prepare/burn 不与 worker ASR/alignment lifetime 重叠、ASR 与 alignment command 串行、同语言 alignment model 复用、worker shutdown 先于所有 burn，prepare 与 burn 各自峰值不超过 4。该测试不证明真实 CUDA、ffmpeg、网络、LLM 或媒体质量
 
 ### Task Notifications
 
