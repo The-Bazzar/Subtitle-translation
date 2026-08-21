@@ -89,15 +89,12 @@ $script:PipelineNotificationActive = $false
 function Exit-Pipeline {
     param([int]$Code)
 
-    if ($script:PipelineNotificationActive -and $env:PIPELINE_BATCH_CHILD -ne '1') {
+    if ($script:PipelineNotificationActive) {
         if ($Code -ne 0) {
             Invoke-TaskBell -Kind Error
         } else {
             Invoke-TaskBell -Kind Success
         }
-    }
-    if ($env:PIPELINE_BATCH_CHILD -eq '1') {
-        Write-Output "__PIPELINE_BATCH_EXIT__=$Code"
     }
     exit $Code
 }
@@ -196,7 +193,7 @@ pipeline.ps1 — 超级流水线: YouTube URL → burned.mkv
 $DownloadPs1  = Join-Path $ScriptDir "download.ps1"
 $PrepareVideoScript = Join-Path $ScriptDir "prepare-video.ps1"
 $WhisperPs1   = Join-Path $ScriptDir "whisper.ps1"
-$TranslatePs1 = Join-Path $ScriptDir "translate_srt.ps1"
+$PyLauncherPs1 = Join-Path $ScriptDir "py_launcher.ps1"
 $BurnPs1      = Join-Path $ScriptDir "ffmpeg-burn.ps1"
 
 # ── 启动信息 ──────────────────────────────────────────────────────────────────
@@ -320,7 +317,7 @@ if ($ExistingAss) {
     $LangArgs = @()
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
-    $AssOutput = & $TranslatePs1 $JsonPath @LangArgs --print-output-path
+    $AssOutput = & $PyLauncherPs1 translate_srt $JsonPath @LangArgs --print-output-path
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
     $AssPath = ($AssOutput | Where-Object { $_ -match '^OUTPUT_ASS=' } | Select-Object -Last 1) -replace '^OUTPUT_ASS=', ''
 }
@@ -338,7 +335,7 @@ if ($SkipBeautify) {
 } else {
     Write-Host ""
     Write-Host "Step 4/7: Beautify JSON" -ForegroundColor Cyan
-    & $TranslatePs1 $JsonPath --video $VideoPath --only-beautify
+    & $PyLauncherPs1 translate_srt $JsonPath --video $VideoPath --only-beautify
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
@@ -357,7 +354,7 @@ if ($SkipKnowledge) {
 } else {
     Write-Host ""
     Write-Host "Step 5/7: Knowledge" -ForegroundColor Cyan
-    & $TranslatePs1 $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
+    & $PyLauncherPs1 translate_srt $TranslateSrc --video $VideoPath --only-glossary --skip-beautify
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 
@@ -378,7 +375,7 @@ if ($SkipTranslate) {
     $LangArgs = @()
     if ($SourceLang) { $LangArgs += @('--source-lang', $SourceLang) }
     $LangArgs += @('--target-lang', $TargetLang)
-    & $TranslatePs1 $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
+    & $PyLauncherPs1 translate_srt $TranslateSrc --video $VideoPath --skip-beautify --skip-knowledge @LangArgs
     if ($LASTEXITCODE -ne 0) { Exit-Pipeline $LASTEXITCODE }
 }
 

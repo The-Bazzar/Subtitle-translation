@@ -401,8 +401,6 @@ function Invoke-FakeFfmpeg {
             encoding="utf-8",
         )
         shutil.copy2(ROOT / ".env.ps1", self.sandbox / ".env.ps1")
-        env = os.environ.copy()
-        env["PIPELINE_BATCH_CHILD"] = "1"
         result = subprocess.run(
             [
                 PWSH,
@@ -414,7 +412,6 @@ function Invoke-FakeFfmpeg {
                 "-SkipBurn",
             ],
             cwd=self.work_dir,
-            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -660,7 +657,7 @@ exit {exit_code}
             encoding="utf-8",
             newline="\n",
         )
-        (self.sandbox / "translate_srt.sh").write_text(
+        (self.sandbox / "py_launcher.sh").write_text(
             "#!/bin/bash\nexit 0\n",
             encoding="utf-8",
             newline="\n",
@@ -668,15 +665,9 @@ exit {exit_code}
         self.write_env()
         with (self.sandbox / ".env").open("a", encoding="utf-8", newline="\n") as env_file:
             env_file.write("TRANSLATE_PROVIDER=fake\n")
-        env = os.environ.copy()
-        env["PIPELINE_BATCH_CHILD"] = "1"
-        if os.name == "nt" and BASH and "system32" in BASH.lower():
-            inherited = env.get("WSLENV", "")
-            env["WSLENV"] = f"{inherited}:PIPELINE_BATCH_CHILD" if inherited else "PIPELINE_BATCH_CHILD"
         result = self.run_bash_script(
             self.sandbox / "pipeline.sh",
             "https://example.invalid/video",
-            env=env,
         )
         return result, downstream_sentinel
 
@@ -918,6 +909,185 @@ class DownloadPipelineScriptTests(unittest.TestCase):
         self.assertLess(capture, guard)
         self.assertLess(guard, prepare)
         self.assertIn('exit "$download_exit"', content[guard:prepare])
+    def test_download_and_prepare_output_markers_are_separate_and_matched(self):
+        for suffix in ("ps1", "sh"):
+            with self.subTest(platform=suffix, stage="download"):
+                download = read_script(f"download.{suffix}")
+                self.assertIn("OUTPUT_RENDER_VIDEO=", download)
+                self.assertNotIn("OUTPUT_VIDEO=", download)
+                self.assertNotRegex(download, r"(?:&|bash)\s+[^\r\n]*prepare-video")
+
+            with self.subTest(platform=suffix, stage="prepare"):
+                prepare = read_script(f"prepare-video.{suffix}")
+                self.assertIn("OUTPUT_VIDEO=", prepare)
+                self.assertNotIn("OUTPUT_RENDER_VIDEO=", prepare)
+
+    def test_standalone_pipeline_stage_order_matches_across_platforms(self):
+        stage_tokens = {
+            "pipeline.ps1": (
+                ">>> Step 1/7: Download",
+                ">>> Step 2/7: Prepare edit video",
+                "Step 3/7: WhisperX",
+                "Step 4/7: Beautify JSON",
+                "Step 5/7: Knowledge",
+                "Step 6/7: Translate",
+                "Step 7/7: Burn",
+            ),
+            "pipeline.sh": (
+                "pipeline — 步骤 1/7: 下载视频",
+                "pipeline — 步骤 2/7: 准备编辑视频",
+                "pipeline — 步骤 3/7: WhisperX 生成 JSON",
+                "pipeline — 步骤 4/7: JSON 时间码美化",
+                "pipeline — 步骤 5/7: AI Agent 生成术语知识库",
+                "pipeline — 步骤 6/7: LLM 翻译",
+                "pipeline — 步骤 7/7: 字幕硬压",
+            ),
+        }
+
+        for script, tokens in stage_tokens.items():
+            content = read_script(script)
+            positions = [content.index(token) for token in tokens]
+            with self.subTest(script=script):
+                self.assertEqual(positions, sorted(positions))
+
+    def test_standalone_pipeline_remains_independent_of_batch_worker_protocol(self):
+        for script in ("whisper.ps1", "whisper.sh"):
+            content = read_script(script)
+            with self.subTest(script=script, contract="standalone-json"):
+                self.assertIn("--output_format", content)
+                self.assertIn("json", content)
+
+    def test_powershell_pipeline_checks_each_stage_exit_and_output_contract(self):
+        powershell = read_script("pipeline.ps1")
+        stage_patterns = {
+            "download": (
+                r"&\s+\$DownloadPs1\s+\$Url\s+2>&1\s+\|\s+ForEach-Object\s+\{"
+                r"[\s\S]*?OUTPUT_RENDER_VIDEO=\(\.\+\)\$[\s\S]*?"
+                r"\$DownloadExitCode\s*=\s*\$LASTEXITCODE\s*"
+                r"if\s*\(\$DownloadExitCode\s+-ne\s+0\)\s*\{[\s\S]*?"
+                r"Exit-Pipeline\s+\$DownloadExitCode[\s\S]*?\}\s*"
+                r"if\s*\(-not\s+\$RenderVideoPath\s+-or\s+-not\s+"
+                r"\(Test-Path\s+\$RenderVideoPath\)\)\s*\{[\s\S]*?"
+                r"Exit-Pipeline\s+1"
+            ),
+            "prepare": (
+                r"&\s+\$PrepareVideoScript\s+\$RenderVideoPath\s+2>&1\s+\|\s+"
+                r"ForEach-Object\s+\{[\s\S]*?OUTPUT_VIDEO=\(\.\+\)\$[\s\S]*?"
+                r"\$PrepareExitCode\s*=\s*\$LASTEXITCODE\s*"
+                r"if\s*\(\$PrepareExitCode\s+-ne\s+0\)\s*\{[\s\S]*?"
+                r"Exit-Pipeline\s+\$PrepareExitCode[\s\S]*?\}\s*"
+                r"if\s*\(-not\s+\$VideoPath\s+-or\s+-not\s+"
+                r"\(Test-Path\s+\$VideoPath\)\)\s*\{[\s\S]*?Exit-Pipeline\s+1"
+            ),
+            "whisper": (
+                r"&\s+\$WhisperPs1\s+\$VideoPath\s*"
+                r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*"
+                r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
+            ),
+            "beautify": (
+                r"&\s+\$PyLauncherPs1\s+translate_srt\s+\$JsonPath\s+--video\s+\$VideoPath\s+"
+                r"--only-beautify\s*if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*"
+                r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
+            ),
+            "glossary": (
+                r"&\s+\$PyLauncherPs1\s+translate_srt\s+\$TranslateSrc\s+--video\s+\$VideoPath\s+"
+                r"--only-glossary\s+--skip-beautify\s*"
+                r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*"
+                r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
+            ),
+            "translate": (
+                r"&\s+\$PyLauncherPs1\s+translate_srt\s+\$TranslateSrc\s+--video\s+\$VideoPath\s+"
+                r"--skip-beautify\s+--skip-knowledge\s+@LangArgs\s*"
+                r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*"
+                r"\{\s*Exit-Pipeline\s+\$LASTEXITCODE\s*\}"
+            ),
+            "burn": (
+                r"if\s*\(\$FfmpegExtra\.Count\s+-gt\s+0\)\s*\{\s*"
+                r"&\s+\$BurnPs1\s+@BurnParams\s+@FfmpegExtra\s*\}\s*else\s*\{\s*"
+                r"&\s+\$BurnPs1\s+@BurnParams\s*\}\s*"
+                r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)\s*\{[\s\S]*?"
+                r"Exit-Pipeline\s+\$LASTEXITCODE"
+            ),
+        }
+
+        for stage, pattern in stage_patterns.items():
+            with self.subTest(stage=stage):
+                self.assertRegex(powershell, pattern)
+
+        self.assertRegex(
+            powershell,
+            r"\$AssOutput\s*=\s*&\s+\$PyLauncherPs1\s+translate_srt[\s\S]*?--print-output-path\s*"
+            r"if\s*\(\$LASTEXITCODE\s+-ne\s+0\)[\s\S]*?OUTPUT_ASS=",
+        )
+        self.assertRegex(
+            powershell,
+            r"if\s*\(-not\s+\(Test-Path\s+\$AssPath\)\)\s*\{[\s\S]*?"
+            r"Exit-Pipeline\s+1",
+        )
+
+    def test_bash_pipeline_checks_each_stage_under_errexit_and_marker_contracts(self):
+        shell = read_script("pipeline.sh")
+        self.assertRegex(shell, r"(?m)^set -euo pipefail$")
+
+        explicit_failure_patterns = {
+            "download": (
+                r"if ! bash \"\$DOWNLOAD_SCRIPT\" \"\$URL\" 2>&1 \| tee "
+                r"\"\$DOWNLOAD_LOG\"; then[\s\S]*?exit 1[\s\S]*?fi"
+            ),
+            "prepare": (
+                r"set \+e\s+bash \"\$PREPARE_VIDEO_SCRIPT\" "
+                r"\"\$RENDER_VIDEO_PATH\" 2>&1 \| tee \"\$PREPARE_LOG\"\s+"
+                r"PREPARE_STATUS=\$\{PIPESTATUS\[0\]\}\s+set -e\s+"
+                r"if \[ \"\$PREPARE_STATUS\" -ne 0 \]; then[\s\S]*?"
+                r"exit \"\$PREPARE_STATUS\"[\s\S]*?fi"
+            ),
+            "whisper": (
+                r"if ! bash \"\$WHISPER_SCRIPT\" \"\$VIDEO_PATH\"; then"
+                r"[\s\S]*?exit 1[\s\S]*?fi"
+            ),
+        }
+        errexit_stage_patterns = {
+            "beautify": (
+                r"(?m)^\s*bash \"\$PY_LAUNCHER\" translate_srt \"\$JSON_PATH\" --video "
+                r"\"\$VIDEO_PATH\" --only-beautify \"\$\{BEAUTIFY_ARGS\[@\]\}\"$"
+            ),
+            "glossary": (
+                r"(?m)^\s*bash \"\$PY_LAUNCHER\" translate_srt \"\$TRANSLATE_SRC\" --video "
+                r"\"\$VIDEO_PATH\" --only-glossary --skip-beautify$"
+            ),
+            "translate": (
+                r"(?m)^\s*bash \"\$PY_LAUNCHER\" translate_srt \"\$TRANSLATE_SRC\" --video "
+                r"\"\$VIDEO_PATH\" --skip-beautify --skip-knowledge \\$"
+            ),
+            "burn": (
+                r"(?m)^\s*bash \"\$BURN_SCRIPT\" \"\$RENDER_VIDEO_PATH\" \\$"
+            ),
+        }
+        for stage, pattern in {
+            **explicit_failure_patterns,
+            **errexit_stage_patterns,
+        }.items():
+            with self.subTest(stage=stage):
+                self.assertRegex(shell, pattern)
+
+        marker_contracts = {
+            "download": (
+                r"OUTPUT_RENDER_VIDEO=[\s\S]*?"
+                r"if \[ -z \"\$RENDER_VIDEO_PATH\" \] \|\| "
+                r"\[ ! -f \"\$RENDER_VIDEO_PATH\" \]"
+            ),
+            "prepare": (
+                r"OUTPUT_VIDEO=[\s\S]*?if \[ -z \"\$VIDEO_PATH\" \] \|\| "
+                r"\[ ! -f \"\$VIDEO_PATH\" \]"
+            ),
+            "ass": (
+                r"--print-output-path \\[\s\S]*?OUTPUT_ASS=[\s\S]*?"
+                r"if \[ -z \"\$\{ASS_PATH:-\}\" \] \|\| \[ ! -f \"\$ASS_PATH\" \]"
+            ),
+        }
+        for stage, pattern in marker_contracts.items():
+            with self.subTest(marker=stage):
+                self.assertRegex(shell, pattern)
 
 
 if __name__ == "__main__":

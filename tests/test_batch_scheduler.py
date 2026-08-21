@@ -3186,7 +3186,6 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tasks[0].error_detail, "fake translate failure")
 
 
-@unittest.skip("public batch entrypoints are integrated in PR7")
 class BatchCliTests(unittest.TestCase):
     def test_manual_job_arguments_do_not_exist(self):
         parser = build_parser()
@@ -3200,7 +3199,7 @@ class BatchCliTests(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         parser.parse_args(arguments)
 
-        self.assertNotIn("MaxJobs", (ROOT / "batch.ps1").read_text(encoding="utf-8"))
+        self.assertNotIn("MaxJobs", (ROOT / "py_launcher.ps1").read_text(encoding="utf-8"))
 
     def test_existing_batch_options_remain_representable(self):
         args = build_parser().parse_args([
@@ -3228,7 +3227,6 @@ class BatchCliTests(unittest.TestCase):
         self.assertEqual(stage_environment["TRANSLATE_MODEL"], "deepseek-chat")
 
 
-@unittest.skip("public batch entrypoints are integrated in PR7")
 class BatchWrapperTests(unittest.TestCase):
     def test_import_batch_returns_runtime_module_identity(self):
         with mock.patch.dict(sys.modules, {}, clear=False):
@@ -3462,7 +3460,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(commands[0][0], "ffmpeg")
 
-    async def test_postprocess_runner_uses_existing_wrappers_for_all_three_stages(self):
+    async def test_postprocess_runner_uses_shared_launcher_for_all_three_stages(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             script_dir = pathlib.Path(temp_dir)
             edit_video = script_dir / "video.mkv"
@@ -3480,13 +3478,13 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 detected_language="ja",
             )
 
-            for platform, expected_prefix, wrapper_name in (
+            for platform, expected_prefix, launcher_name in (
                 (
                     "nt",
                     ["pwsh", "-NoProfile", "-File"],
-                    "translate_srt.ps1",
+                    "py_launcher.ps1",
                 ),
-                ("posix", ["bash"], "translate_srt.sh"),
+                ("posix", ["bash"], "py_launcher.sh"),
             ):
                 commands = []
 
@@ -3520,7 +3518,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                             )
                             await runner(task)
 
-                wrapper = str(script_dir / wrapper_name)
+                launcher = str(script_dir / launcher_name)
                 beautified = str(task.beautified_candidate_path)
                 self.assertEqual(
                     [entry[1]["stage"] for entry in commands],
@@ -3530,7 +3528,8 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                     commands[0][0],
                     expected_prefix
                     + [
-                        wrapper,
+                        launcher,
+                        "translate_srt",
                         str(json_path),
                         "--video",
                         str(edit_video),
@@ -3543,7 +3542,8 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                     commands[1][0],
                     expected_prefix
                     + [
-                        wrapper,
+                        launcher,
+                        "translate_srt",
                         str(json_path),
                         "--video",
                         str(edit_video),
@@ -3557,7 +3557,8 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                     commands[2][0],
                     expected_prefix
                     + [
-                        wrapper,
+                        launcher,
+                        "translate_srt",
                         str(json_path),
                         "--video",
                         str(edit_video),

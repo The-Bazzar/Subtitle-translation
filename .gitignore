@@ -6,6 +6,8 @@ providers.json
 tavily_domains.json
 cookies.txt
 batch-result.txt
+batch-result.json
+batch-worker-failure-*.log
 *.asr.lock
 *.prepare.json
 proofread_prompt.md
