@@ -204,7 +204,7 @@ class ProjectLauncherTests(unittest.TestCase):
 
     def test_python_batch_ast_has_no_thread_pool_or_pipeline_executor(self):
         findings = []
-        for script_name in ("batch.py", "batch_scheduler.py"):
+        for script_name in ("batch.py", "batch_runtime.py", "batch_scheduler.py"):
             tree = ast.parse(read_script(script_name), filename=script_name)
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom) and node.module == "concurrent.futures":
@@ -350,7 +350,7 @@ foreach ($node in $ast.FindAll({ param($candidate) $candidate -is [System.Manage
         self.assertFalse(any(re.search(r"(^|[;&|])\s*(wait|parallel|xargs)\b", line) for line in commands))
 
     def test_batch_stage_contract_and_standalone_entrypoints_are_distinct(self):
-        batch = read_script("batch.py")
+        batch = read_script("batch_runtime.py")
         scheduler = read_script("batch_scheduler.py")
         powershell_pipeline = read_script("pipeline.ps1")
         bash_pipeline = read_script("pipeline.sh")

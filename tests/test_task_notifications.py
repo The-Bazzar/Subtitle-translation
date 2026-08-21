@@ -16,8 +16,11 @@ def read_script(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-def load_batch_module():
-    spec = importlib.util.spec_from_file_location("batch_module", ROOT / "batch.py")
+def load_batch_runtime():
+    spec = importlib.util.spec_from_file_location(
+        "batch_runtime_test_module",
+        ROOT / "batch_runtime.py",
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -61,7 +64,7 @@ class TaskNotificationTests(TestCase):
         self.assertNotIn("pipeline.sh", bash)
         self.assertRegex(
             python,
-            r"raise\s+SystemExit\(main\(\)\)",
+            r"raise\s+SystemExit\(main\(_notify_unhandled=True\)\)",
         )
 
     def test_burn_wrappers_emit_the_same_success_marker(self):
@@ -72,7 +75,7 @@ class TaskNotificationTests(TestCase):
         self.assertIn('OUTPUT_BURNED_VIDEO=', bash)
 
     def test_python_bell_patterns_are_distinct(self):
-        batch = load_batch_module()
+        batch = load_batch_runtime()
         success = io.StringIO()
         error = io.StringIO()
 
@@ -86,7 +89,7 @@ class TaskNotificationTests(TestCase):
     def test_help_and_dry_run_paths_stay_silent(self):
         pipeline_powershell = read_script("pipeline.ps1")
         pipeline_bash = read_script("pipeline.sh")
-        batch = load_batch_module()
+        batch = load_batch_runtime()
 
         self.assertLess(
             pipeline_powershell.index("if ($DryRun)"),
@@ -107,7 +110,7 @@ class TaskNotificationTests(TestCase):
         run_acquisition.assert_not_called()
 
     def test_python_batch_notifies_each_terminal_failure_and_aggregate_result(self):
-        batch = load_batch_module()
+        batch = load_batch_runtime()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             report = str(pathlib.Path(temp_dir) / "batch-result.txt")
@@ -130,7 +133,7 @@ class TaskNotificationTests(TestCase):
         )
 
     def test_python_batch_success_only_notifies_aggregate_success(self):
-        batch = load_batch_module()
+        batch = load_batch_runtime()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             report = str(pathlib.Path(temp_dir) / "batch-result.txt")
@@ -148,7 +151,7 @@ class TaskNotificationTests(TestCase):
         )
 
     def test_python_batch_interrupt_reports_tasks_and_returns_130(self):
-        batch = load_batch_module()
+        batch = load_batch_runtime()
         task = BatchTask(index=1, url="interrupted")
         task.start("download")
         task.cancel("batch interrupted after download")

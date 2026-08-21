@@ -1,23 +1,27 @@
 import asyncio
+import ast
 import contextlib
 import io
+import importlib
 import json
 import multiprocessing
 import os
 import pathlib
+import runpy
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import uuid
 from datetime import datetime
 from unittest import mock
 
-import batch
+import batch_runtime as batch
 import batch_scheduler
-from batch import (
+from batch_runtime import (
     _run_stage_command,
     build_parser,
     build_stage_environment,
@@ -142,7 +146,7 @@ class StageCommandCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(scheduler._cpu_io_slots._value, 1)
 
     def test_process_group_options_cover_windows_and_posix(self):
-        from batch import _process_group_kwargs
+        from batch_runtime import _process_group_kwargs
 
         self.assertEqual(_process_group_kwargs("posix"), {"start_new_session": True})
         self.assertEqual(
@@ -151,14 +155,14 @@ class StageCommandCancellationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_windows_tree_termination_falls_back_when_taskkill_fails(self):
-        from batch import _terminate_process_tree
+        from batch_runtime import _terminate_process_tree
 
         process = mock.Mock(pid=1234, returncode=None)
         process.wait = mock.AsyncMock(return_value=1)
         terminator = mock.Mock(returncode=1)
         terminator.wait = mock.AsyncMock(return_value=1)
         with mock.patch(
-            "batch.asyncio.create_subprocess_exec",
+            "batch_runtime.asyncio.create_subprocess_exec",
             new=mock.AsyncMock(return_value=terminator),
         ):
             await _terminate_process_tree(process, platform="nt")
@@ -3043,9 +3047,80 @@ class BatchCliTests(unittest.TestCase):
         self.assertEqual(stage_environment["TRANSLATE_MODEL"], "deepseek-chat")
 
 
+class BatchWrapperTests(unittest.TestCase):
+    def test_wrapper_only_imports_runtime_main_and_keeps_entrypoint_guard(self):
+        wrapper_path = ROOT / "batch.py"
+        tree = ast.parse(wrapper_path.read_text(encoding="utf-8"), filename="batch.py")
+        imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)]
+        definitions = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+
+        self.assertEqual(definitions, [])
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(imports[0].module, "batch_runtime")
+        self.assertEqual([alias.name for alias in imports[0].names], ["main"])
+        self.assertTrue(any(isinstance(node, ast.If) for node in tree.body))
+
+    def test_wrapper_delegates_runtime_return_code_to_system_exit(self):
+        fake_runtime = types.ModuleType("batch_runtime")
+        fake_runtime.main = mock.Mock(return_value=23)
+
+        with mock.patch.dict(sys.modules, {"batch_runtime": fake_runtime}):
+            with self.assertRaises(SystemExit) as caught:
+                runpy.run_path(str(ROOT / "batch.py"), run_name="__main__")
+
+        self.assertEqual(caught.exception.code, 23)
+        fake_runtime.main.assert_called_once_with(_notify_unhandled=True)
+
+    def test_runtime_main_rings_once_when_wrapper_requests_cli_notification(self):
+        runtime = importlib.import_module("batch_runtime")
+        failure = RuntimeError("runtime failure")
+
+        with mock.patch.object(runtime, "_main", side_effect=failure):
+            with mock.patch.object(runtime, "emit_task_bell") as bell:
+                with self.assertRaisesRegex(RuntimeError, "runtime failure"):
+                    runtime.main([], _notify_unhandled=True)
+
+        bell.assert_called_once_with("error")
+
+    def test_runtime_main_keeps_programmatic_exception_silent(self):
+        runtime = importlib.import_module("batch_runtime")
+        failure = RuntimeError("runtime failure")
+
+        with mock.patch.object(runtime, "_main", side_effect=failure):
+            with mock.patch.object(runtime, "emit_task_bell") as bell:
+                with self.assertRaisesRegex(RuntimeError, "runtime failure"):
+                    runtime.main([])
+
+        bell.assert_not_called()
+
+    def test_runtime_main_preserves_system_exit_without_error_bell(self):
+        runtime = importlib.import_module("batch_runtime")
+
+        with mock.patch.object(runtime, "_main", side_effect=SystemExit(7)):
+            with mock.patch.object(runtime, "emit_task_bell") as bell:
+                with self.assertRaises(SystemExit) as caught:
+                    runtime.main([], _notify_unhandled=True)
+
+        self.assertEqual(caught.exception.code, 7)
+        bell.assert_not_called()
+
+    def test_importing_wrapper_does_not_execute_runtime_main(self):
+        fake_runtime = types.ModuleType("batch_runtime")
+        fake_runtime.main = mock.Mock(return_value=0)
+
+        with mock.patch.dict(sys.modules, {"batch_runtime": fake_runtime}):
+            runpy.run_path(str(ROOT / "batch.py"), run_name="batch_import_probe")
+
+        fake_runtime.main.assert_not_called()
+
+
 class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
     def test_project_env_uses_process_values_before_dotenv(self):
-        from batch import load_project_environment
+        from batch_runtime import load_project_environment
 
         with tempfile.TemporaryDirectory() as temp_dir:
             script_dir = pathlib.Path(temp_dir)
@@ -3087,7 +3162,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env["TRANSLATE_MODEL"], "cli-model")
 
     async def test_dotenv_ffmpeg_paths_with_spaces_are_exact_argv_zero(self):
-        from batch import load_project_environment
+        from batch_runtime import load_project_environment
 
         configured_paths = {
             "nt": ("FFMPEG_PATH_WIN", r"C:\Program Files\FFmpeg Build\ffmpeg.exe"),
@@ -3110,7 +3185,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
                 with self.subTest(platform=platform):
                     with mock.patch(
-                        "batch.asyncio.create_subprocess_exec",
+                        "batch_runtime.asyncio.create_subprocess_exec",
                         new=mock.AsyncMock(return_value=process),
                     ) as create_process:
                         runners = create_platform_runners(
@@ -3131,7 +3206,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             script_dir = pathlib.Path(temp_dir)
-            with mock.patch("batch._run_stage_command", side_effect=fake_stage_command):
+            with mock.patch("batch_runtime._run_stage_command", side_effect=fake_stage_command):
                 runners = create_platform_runners(
                     script_dir,
                     {},
@@ -3142,7 +3217,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands[0][0], "ffmpeg")
 
     async def test_empty_dotenv_ffmpeg_value_uses_default(self):
-        from batch import load_project_environment
+        from batch_runtime import load_project_environment
 
         commands = []
 
@@ -3158,7 +3233,7 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             env = load_project_environment(script_dir, environ={})
-            with mock.patch("batch._run_stage_command", side_effect=fake_stage_command):
+            with mock.patch("batch_runtime._run_stage_command", side_effect=fake_stage_command):
                 runners = create_platform_runners(
                     script_dir,
                     env,
@@ -3212,10 +3287,10 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
                 with self.subTest(platform=platform):
                     with mock.patch(
-                        "batch._run_stage_command",
+                        "batch_runtime._run_stage_command",
                         side_effect=fake_stage_command,
                     ):
-                        with mock.patch("batch.shutil.which", return_value="pwsh"):
+                        with mock.patch("batch_runtime.shutil.which", return_value="pwsh"):
                             runner = create_platform_postprocess_runner(
                                 script_dir,
                                 {
@@ -3524,9 +3599,9 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
             process_finished.set()
 
         with mock.patch(
-            "batch.asyncio.create_subprocess_exec",
+            "batch_runtime.asyncio.create_subprocess_exec",
             new=mock.AsyncMock(return_value=process),
-        ), mock.patch("batch._terminate_process_tree", side_effect=terminate) as killer:
+        ), mock.patch("batch_runtime._terminate_process_tree", side_effect=terminate) as killer:
             command_task = asyncio.create_task(
                 batch._run_stage_command(
                     ["fake-command"],
@@ -3552,7 +3627,7 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
         control = batch_scheduler.BatchControl()
         control.request_interrupt()
         with mock.patch(
-            "batch.asyncio.create_subprocess_exec",
+            "batch_runtime.asyncio.create_subprocess_exec",
             new=mock.AsyncMock(),
         ) as spawn:
             with self.assertRaises(batch_scheduler.StageAdvancementStopped):
@@ -3616,7 +3691,7 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
             "reserve_command",
             side_effect=observe_reservation,
         ), mock.patch(
-            "batch.asyncio.create_subprocess_exec",
+            "batch_runtime.asyncio.create_subprocess_exec",
             side_effect=spawn,
         ) as spawn_call:
             command_task = asyncio.create_task(
@@ -3643,7 +3718,7 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_reservation_is_released_when_spawn_fails(self):
         control = batch_scheduler.BatchControl()
         with mock.patch(
-            "batch.asyncio.create_subprocess_exec",
+            "batch_runtime.asyncio.create_subprocess_exec",
             new=mock.AsyncMock(side_effect=OSError("fake spawn failure")),
         ):
             with self.assertRaisesRegex(OSError, "fake spawn failure"):
@@ -3996,9 +4071,9 @@ class BurnRunnerTests(unittest.IsolatedAsyncioTestCase):
 
                 with self.subTest(platform=platform):
                     with mock.patch(
-                        "batch._run_stage_command",
+                        "batch_runtime._run_stage_command",
                         side_effect=fake_stage_command,
-                    ), mock.patch("batch.shutil.which", return_value="pwsh"):
+                    ), mock.patch("batch_runtime.shutil.which", return_value="pwsh"):
                         runner = batch.create_platform_burn_runner(
                             script_dir,
                             {"TARGET_LANG": "Chinese"},

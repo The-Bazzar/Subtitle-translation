@@ -13,6 +13,7 @@ import unittest
 
 PRODUCTION_MODULES = (
     "batch.py",
+    "batch_runtime.py",
     "batch_cache.py",
     "batch_scheduler.py",
     "whisper_worker.py",

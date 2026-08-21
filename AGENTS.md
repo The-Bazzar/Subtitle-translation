@@ -40,7 +40,8 @@ winget install Microsoft.PowerShell
 ├── mpv-burn.sh               # Linux/WSL: mpv 硬压备选
 ├── batch.ps1                 # Windows: batch.py 参数透传包装器
 ├── batch.sh                  # Linux/WSL: batch.py 参数透传包装器
-├── batch.py                  # stage-aware batch CLI 与平台 runner
+├── batch.py                  # stage-aware batch CLI 薄入口
+├── batch_runtime.py          # batch CLI 实现与平台 runner
 ├── batch_scheduler.py        # 任务状态、资源容量、acquisition 与 ASR wave scheduler
 ├── batch_cache.py            # ASR fingerprint 与原子 recovery sidecar
 ├── whisper_worker.py         # spawn WhisperX worker 与 parent controller
@@ -88,7 +89,7 @@ prepare 失败时，`pipeline.sh` 精确透传 `prepare-video.sh 的原始退出
 
 ### Stage-aware Batch ASR
 
-- `batch.ps1` / `batch.sh` 只负责把参数透传给 `py_launcher.ps1/.sh` 的 `batch` target；跨平台调度逻辑统一位于 `batch.py` / `batch_scheduler.py`
+- `batch.ps1` / `batch.sh` 只负责把参数透传给 `py_launcher.ps1/.sh` 的 `batch` target；`batch.py` 是只委托 `batch_runtime.main` 的薄入口，跨平台调度逻辑统一位于 `batch_runtime.py` / `batch_scheduler.py`
 - CPU/IO capacity 自动设为 `max(1, (os.cpu_count() or 1) // 4)`，用于 download、WAV 提取和 postprocess；prepare 与最终 burn 共用固定 `4` 路 NVENC capacity
 - 不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，启动时打印自动检测出的 CPU/IO 和 NVENC capacity
 - acquisition 按任务流水执行 `download -> prepare-video -> extract-audio`；任务完成 download 后可立即等待 prepare，完成 prepare 后可立即提取 mono 16kHz WAV。prepare 和 WAV 提取/替换都持有同一媒体的 `<base>.asr.lock`，与 alignment 校验/提交串行，但不同媒体仍独立并发
@@ -111,15 +112,15 @@ prepare 失败时，`pipeline.sh` 精确透传 `prepare-video.sh 的原始退出
 - 外部命令 stdout/stderr reader 使用 64 KiB `read()` chunk，按 `\n`、`\r` progress 或 EOF partial framing，不使用 `readline()`；超过 64 KiB 的逻辑行拆成 bounded continuation `LogEvent`，确保 pipe 持续实时排空。唯一 printer 保持 queue 顺序与 `[02][prepare]` 前缀。queue 有固定上限并为 sentinel 预留一格；每个 task/stream 只保留 256 KiB tail，failure report 对截断显式写 marker
 - 第一次 `Ctrl+C` 同步关闭 command admission 和 stage advancement。`_run_stage_command()` 必须在首次 spawn await 前取得同步 reservation：reservation 成功返回是 scheduler 的线性化点，该 command 计为 active 并可自然结束；没有 reservation 的 command 绝不调用 OS spawn API。这里不宣称 Python 与操作系统进程创建之间存在不可能的原子性。第二次 `Ctrl+C` 终止已注册的 child process trees、abort worker 并等待真实退出。precommit interrupt 使用 Task 5 的 cancel-wins/commit-wins 仲裁，保留完成输出和未消费 `.asr.json`；batch 中断返回 `130`
 - CLI 保留多 URL、`-B/--burn`、`--skip-burn`、`-r/--report`、`-n/--dry-run`、`-p/--translate-provider`、`-tm/--translate-model`；provider/model 用于 postprocess，burn 默认启用且 `--skip-burn` 可关闭
-- `batch.py` 直接读取项目 `.env`，优先级为显式 CLI / 进程环境 > `.env` > 硬编码默认；`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`
+- `batch_runtime.py` 直接读取项目 `.env`，优先级为显式 CLI / 进程环境 > `.env` > 硬编码默认；`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`
 - 任一任务失败只终止该任务的后续 acquisition 阶段，其他任务继续；存在失败时聚合退出码为 `1`
-- 跨平台 release smoke 使用 `tests/test_batch_smoke.py`：分别经过 `batch.ps1 -> py_launcher.ps1 -> batch.py` 与 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言字段契约。smoke 将 `batch.py`、production modules 和对应 wrappers byte-identical 复制到隔离目录并校验 SHA-256；只 fake download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 外部边界。WSL 路径由 `wsl -u root` 按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；没有候选时开发者测试精确 skip，测试不得下载或安装依赖。`BATCH_SMOKE_REQUIRE_WSL=1` 是仅供 test/release gate 使用的内部变量，不是项目用户配置；启用后缺少 WSL root 或合格 interpreter 必须失败而不是 skip。跨进程 wall timestamp 断言所有 acquisition 完成后才加载 ASR、prepare/burn 不与 worker ASR/alignment lifetime 重叠、ASR 与 alignment command 串行、同语言 alignment model 复用、worker shutdown 先于所有 burn，prepare 与 burn 各自峰值不超过 4。该测试不证明真实 CUDA、ffmpeg、网络、LLM 或媒体质量
+- 跨平台 release smoke 使用 `tests/test_batch_smoke.py`：分别经过 `batch.ps1 -> py_launcher.ps1 -> batch.py` 与 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言字段契约。smoke 将 `batch.py`、`batch_runtime.py`、production modules 和对应 wrappers byte-identical 复制到隔离目录并校验 SHA-256；只 fake download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 外部边界。WSL 路径由 `wsl -u root` 按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；没有候选时开发者测试精确 skip，测试不得下载或安装依赖。`BATCH_SMOKE_REQUIRE_WSL=1` 是仅供 test/release gate 使用的内部变量，不是项目用户配置；启用后缺少 WSL root 或合格 interpreter 必须失败而不是 skip。跨进程 wall timestamp 断言所有 acquisition 完成后才加载 ASR、prepare/burn 不与 worker ASR/alignment lifetime 重叠、ASR 与 alignment command 串行、同语言 alignment model 复用、worker shutdown 先于所有 burn，prepare 与 burn 各自峰值不超过 4。该测试不证明真实 CUDA、ffmpeg、网络、LLM 或媒体质量
 
 ### Task Notifications
 
 - 独立运行 `pipeline.ps1` / `pipeline.sh` 时，成功响成功铃，错误退出响错误铃
 - stage-aware batch 直接运行阶段 runner，不使用 pipeline 内部静默或退出码 marker 协议；每个进入失败或中断终态的任务各响一次错误铃
-- `batch.py` 在全部任务终态后按聚合结果再响一次；全部成功响成功铃，任一失败响错误铃并以退出码 `1` 结束，用户中断以错误铃和退出码 `130` 结束
+- `batch_runtime.py` 在全部任务终态后按聚合结果再响一次；全部成功响成功铃，任一失败响错误铃并以退出码 `1` 结束，用户中断以错误铃和退出码 `130` 结束
 - help 和 dry-run 路径保持静默；Linux/WSL 使用终端 BEL，是否可听取决于终端设置
 
 ### Output Chain

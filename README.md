@@ -31,6 +31,7 @@
 ├── batch.ps1
 ├── batch.sh
 ├── batch.py
+├── batch_runtime.py
 ├── batch_scheduler.py
 ├── batch_cache.py
 ├── whisper_worker.py
@@ -82,7 +83,7 @@ SKIP_BURN=1 ./pipeline.sh "https://www.youtube.com/watch?v=xxxxx"
 ./batch.sh --dry-run --report batch-result.txt "URL1" "URL2"
 ```
 
-`batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，实际调度由 `batch.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 与最终 burn 共用固定 `4` 路 NVENC capacity，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。
+`batch.ps1` / `batch.sh` 都是 `py_launcher` 的参数透传包装器，`batch.py` 是薄入口，实际调度由 `batch_runtime.py` / `batch_scheduler.py` 完成。容量自动检测：CPU/IO 槽位为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 与最终 burn 共用固定 `4` 路 NVENC capacity，不提供 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`。batch 会直接读取项目 `.env`；进程环境和显式 CLI 优先于 `.env`，`FFMPEG_PATH_WIN` / `FFMPEG_PATH_LINUX` 为空或缺失时使用 `ffmpeg`。
 
 当前 stage-aware 入口先并行流水执行 `download -> prepare-video -> mono 16kHz WAV`，等待 acquisition 全部到达终态后，再启动一个 `spawn` worker。prepare 与 WAV 提取/替换都在同一媒体的 `<name>.asr.lock` 内完成；prepare 成功后原子写 `<name>.prepare.json`，用 UUID `generation` 绑定原片和编辑版各自的 resolved path、size、mtime，准备前后原片快照不一致时拒绝认证该编辑版。worker 加载一次 WhisperX ASR 模型并串行识别所有未缓存 WAV；每个 WAV 绑定到不可变 media generation，ASR 写 sidecar 前会在同一锁内重新验证 prepare state、编辑版和 WAV 快照。
 
@@ -106,7 +107,7 @@ active worker command 在 precommit 取消时由 controller terminate/kill，再
 
 单任务 `pipeline.sh` 在 prepare 失败时精确透传 `prepare-video.sh 的原始退出码`，与 PowerShell pipeline 的行为一致，不再把所有 prepare 错误折叠为 `1`。
 
-发布前的跨平台 contract smoke 位于 `tests/test_batch_smoke.py`：Windows 经 `batch.ps1 -> py_launcher.ps1 -> batch.py`，WSL/Linux 经 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言报告契约。smoke 把 byte-identical production modules 复制到隔离目录并校验 SHA-256；只把 download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 作为 deterministic fake 外部边界。WSL smoke 由 `wsl -u root` 按测试环境 override、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；找不到时开发者测试精确 skip，测试不会下载或安装依赖。内部测试变量 `BATCH_SMOKE_REQUIRE_WSL=1` 用于 release gate，此时缺少 WSL root 或合格 interpreter 会失败而不是 skip；它不是项目用户配置。带时间戳的证据断言所有 acquisition 完成后才加载 ASR、ASR 与 alignment command 串行、worker shutdown 先于所有 burn，且 prepare/burn 各自峰值为 4。它不替代真实 CUDA、ffmpeg、网络、LLM 或媒体质量验证。
+发布前的跨平台 contract smoke 位于 `tests/test_batch_smoke.py`：Windows 经 `batch.ps1 -> py_launcher.ps1 -> batch.py`，WSL/Linux 经 `batch.sh -> py_launcher.sh -> batch.py`，运行真实 argparse/main、`ResourceLimits.detect`、subprocess stage runners、marker parser 和 spawned `WhisperWorkerController` 协议，并解析 JSON machine report 断言报告契约。smoke 把 `batch.py`、`batch_runtime.py` 及其他 byte-identical production modules 复制到隔离目录并校验 SHA-256；只把 download、prepare、translate、burn、ffmpeg 和 child 内 import 的 WhisperX 作为 deterministic fake 外部边界。WSL smoke 由 `wsl -u root` 按测试环境 override、仓库 `.venv/bin/python`、`command -v python3` 的顺序选择 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter；找不到时开发者测试精确 skip，测试不会下载或安装依赖。内部测试变量 `BATCH_SMOKE_REQUIRE_WSL=1` 用于 release gate，此时缺少 WSL root 或合格 interpreter 会失败而不是 skip；它不是项目用户配置。带时间戳的证据断言所有 acquisition 完成后才加载 ASR、ASR 与 alignment command 串行、worker shutdown 先于所有 burn，且 prepare/burn 各自峰值为 4。它不替代真实 CUDA、ffmpeg、网络、LLM 或媒体质量验证。
 
 ### 完成通知
 

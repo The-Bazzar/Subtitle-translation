@@ -75,6 +75,7 @@ class ProductionBatchSmokeMixin:
             set(evidence["production_hashes"]),
             {
                 "batch.py",
+                "batch_runtime.py",
                 "batch_cache.py",
                 "batch_scheduler.py",
                 "whisper_worker.py",
