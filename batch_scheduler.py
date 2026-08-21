@@ -8,8 +8,8 @@ import stat
 import tempfile
 import threading
 import traceback
-from collections.abc import Awaitable, Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -19,13 +19,19 @@ from typing import TypeAlias, TypeVar
 
 from batch_cache import (
     AsrFingerprint,
+    PreparedMediaState,
+    WavArtifact,
     _fsync_parent_directory,
     asr_cache_lock,
     asr_sidecar_path,
-    build_asr_fingerprint,
+    bind_wav_artifact,
+    build_asr_fingerprint_from_snapshot,
+    capture_file_snapshot,
     invalidate_beautified_cache,
-    read_asr_cache_generation,
-    read_valid_asr_cache,
+    read_asr_cache_identity,
+    read_valid_asr_cache_for_artifact,
+    read_valid_prepare_state,
+    write_prepare_state,
 )
 from whisper_worker import (
     AsrWorkerConfig,
@@ -278,6 +284,8 @@ class BatchTask:
     render_video_path: Path | None = None
     edit_video_path: Path | None = None
     wav_path: Path | None = None
+    wav_artifact: WavArtifact | None = None
+    media_generation: str = ""
     asr_path: Path | None = None
     asr_generation: str = ""
     json_path: Path | None = None
@@ -354,7 +362,7 @@ WorkerFactory: TypeAlias = Callable[[AsrWorkerConfig], AsrWorkerController]
 PostprocessRunner: TypeAlias = Callable[[BatchTask], Awaitable[None]]
 BurnRunner: TypeAlias = Callable[[BatchTask], Awaitable[None]]
 LogSnapshotProvider: TypeAlias = Callable[[int], tuple[str, str]]
-ResumeProbe: TypeAlias = Callable[[Path, AsrWorkerConfig], Path | None]
+ResumeProbe: TypeAlias = Callable[[Path], PreparedMediaState | None]
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -382,31 +390,11 @@ def _expected_edit_video_path(render_video_path: Path) -> Path | None:
     return render_video_path.with_name(f"{stem.removesuffix('.original')}.mkv")
 
 
-def probe_asr_recovery_edit(
-    render_video_path: Path,
-    asr_config: AsrWorkerConfig,
-) -> Path | None:
+def probe_prepared_media(render_video_path: Path) -> PreparedMediaState | None:
     edit_video_path = _expected_edit_video_path(render_video_path)
     if edit_video_path is None:
         return None
-    try:
-        render_stat = render_video_path.stat()
-        edit_stat = edit_video_path.stat()
-        if render_stat.st_mtime_ns > edit_stat.st_mtime_ns:
-            return None
-        source_language = resolve_source_language(edit_video_path)
-        fingerprint = build_asr_fingerprint(
-            edit_video_path,
-            model=asr_config.model,
-            compute_type=asr_config.compute_type,
-            source_language=source_language,
-            asr_options=asr_config.options_dict(),
-        )
-    except (OSError, ValueError):
-        return None
-    if read_valid_asr_cache(edit_video_path, fingerprint) is None:
-        return None
-    return edit_video_path
+    return read_valid_prepare_state(render_video_path, edit_video_path)
 
 
 @dataclass(frozen=True)
@@ -429,7 +417,7 @@ class AcquisitionScheduler:
         control: BatchControl | None = None,
         failure_log_dir: Path | None = None,
         log_snapshot_provider: LogSnapshotProvider | None = None,
-        resume_probe: ResumeProbe = probe_asr_recovery_edit,
+        resume_probe: ResumeProbe = probe_prepared_media,
     ) -> None:
         self.limits = limits
         self.runners = runners
@@ -460,10 +448,21 @@ class AcquisitionScheduler:
         self._worker_failure_detail: str | None = None
         self._worker_abort_attempted = False
         self._worker_calls: set[asyncio.Task] = set()
+        self._media_transaction_locks: dict[str, asyncio.Lock] = {}
         self._active_alignment_commit: _AlignmentCommitState | None = None
         self._force_callback_token = self.control.register_force_callback(
             self._force_abort_worker
         )
+
+    @asynccontextmanager
+    async def _media_transaction(
+        self,
+        media_path: str | os.PathLike[str],
+    ) -> AsyncIterator[None]:
+        key = str(Path(media_path).resolve())
+        lock = self._media_transaction_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            yield
 
     def request_interrupt(self) -> int:
         count = self.control.request_interrupt()
@@ -504,15 +503,22 @@ class AcquisitionScheduler:
             try:
                 if task.edit_video_path is None or task.wav_path is None:
                     raise StageCommandError("ASR task is missing edit-video or WAV path")
-                source_language = resolve_source_language(task.edit_video_path)
-                fingerprint = build_asr_fingerprint(
-                    task.edit_video_path,
+                if task.wav_artifact is None:
+                    raise StageCommandError("ASR task is missing bound WAV artifact")
+                source_language = resolve_source_language(
+                    task.wav_artifact.edit_snapshot.path
+                )
+                fingerprint = build_asr_fingerprint_from_snapshot(
+                    task.wav_artifact.edit_snapshot,
                     model=self.asr_config.model,
                     compute_type=self.asr_config.compute_type,
                     source_language=source_language,
                     asr_options=self.asr_config.options_dict(),
                 )
-                cached_entry = read_valid_asr_cache(task.edit_video_path, fingerprint)
+                cached_entry = read_valid_asr_cache_for_artifact(
+                    task.wav_artifact,
+                    fingerprint,
+                )
             except Exception as exc:
                 task.fail(stage="asr_cache", detail=str(exc))
                 continue
@@ -620,17 +626,24 @@ class AcquisitionScheduler:
                 result = await self._worker_call(
                     worker,
                     worker.transcribe,
-                    task.wav_path,
+                    task.wav_artifact,
                 )
             except (WorkerExitedError, WorkerUnresponsiveError) as exc:
                 self._handle_worker_failure(task, "asr", exc)
                 worker_failed = True
                 break
+            except Exception as exc:
+                task.fail(stage="asr", detail=str(exc))
+                self._active_worker_task = None
+                continue
             self._active_worker_task = None
             if not result.ok:
                 task.fail(stage="asr", detail=self._worker_result_error(result))
                 continue
-            cached_entry = read_valid_asr_cache(task.edit_video_path, fingerprint)
+            cached_entry = read_valid_asr_cache_for_artifact(
+                task.wav_artifact,
+                fingerprint,
+            )
             if cached_entry is None:
                 task.fail(
                     stage="asr",
@@ -713,15 +726,16 @@ class AcquisitionScheduler:
                 commit_state = _AlignmentCommitState()
                 self._active_alignment_commit = commit_state
                 try:
-                    result = await self._worker_call(
-                        worker,
-                        self._run_locked_alignment_transaction,
-                        worker,
-                        task,
-                        candidate_path,
-                        commit_state,
-                        commit_state=commit_state,
-                    )
+                    async with self._media_transaction(task.edit_video_path):
+                        result = await self._worker_call(
+                            worker,
+                            self._run_locked_alignment_transaction,
+                            worker,
+                            task,
+                            candidate_path,
+                            commit_state,
+                            commit_state=commit_state,
+                        )
                 except (WorkerExitedError, WorkerUnresponsiveError) as exc:
                     self._handle_worker_failure(task, "alignment", exc)
                     return
@@ -795,10 +809,16 @@ class AcquisitionScheduler:
         token = CURRENT_TASK_INDEX.set(task.index)
         try:
             task.advance("postprocess")
-            async with self._cpu_io_slots:
-                if not self.control.stage_advancement_open:
-                    raise StageAdvancementStopped("batch interrupted before postprocess")
-                await self.postprocess_runner(task)
+            async with self._media_transaction(task.edit_video_path):
+                self._validate_postprocess_generation(task)
+                self._invalidate_stale_beautified(task)
+                async with self._cpu_io_slots:
+                    if not self.control.stage_advancement_open:
+                        raise StageAdvancementStopped(
+                            "batch interrupted before postprocess"
+                        )
+                    await self.postprocess_runner(task)
+                self._validate_postprocess_output_generation(task)
             if not self.control.stage_advancement_open:
                 raise StageAdvancementStopped("batch interrupted after postprocess")
             if self.burn_runner is None:
@@ -827,6 +847,61 @@ class AcquisitionScheduler:
         finally:
             CURRENT_TASK_INDEX.reset(token)
 
+    @staticmethod
+    def _beautified_path(task: BatchTask) -> Path:
+        return task.json_path.with_name(f"{task.json_path.stem}.beautified.json")
+
+    def _validate_postprocess_generation(self, task: BatchTask) -> None:
+        if task.json_path is None:
+            raise StageCommandError("postprocess task is missing aligned JSON")
+        read_aligned_json(
+            task.json_path,
+            expected_media_generation=task.media_generation,
+            expected_alignment_generation=task.asr_generation,
+        )
+
+    def _invalidate_stale_beautified(self, task: BatchTask) -> None:
+        beautified_path = self._beautified_path(task)
+        if not beautified_path.exists():
+            return
+        try:
+            read_aligned_json(
+                beautified_path,
+                expected_media_generation=task.media_generation,
+                expected_alignment_generation=task.asr_generation,
+            )
+        except (OSError, ValueError):
+            try:
+                invalidate_beautified_cache(task.json_path)
+            except Exception as exc:
+                self._record_cleanup_diagnostic(
+                    "beautified_cache_invalidation",
+                    exc,
+                )
+                raise
+
+    def _validate_postprocess_output_generation(self, task: BatchTask) -> None:
+        beautified_path = self._beautified_path(task)
+        if not beautified_path.exists():
+            return
+        try:
+            read_aligned_json(
+                beautified_path,
+                expected_media_generation=task.media_generation,
+                expected_alignment_generation=task.asr_generation,
+            )
+        except (OSError, ValueError) as exc:
+            try:
+                invalidate_beautified_cache(task.json_path)
+            except Exception as cleanup_error:
+                self._record_cleanup_diagnostic(
+                    "beautified_cache_invalidation",
+                    cleanup_error,
+                )
+            raise StageCommandError(
+                "postprocess produced beautified JSON for another generation"
+            ) from exc
+
     def _run_locked_alignment_transaction(
         self,
         worker: AsrWorkerController,
@@ -845,6 +920,7 @@ class AcquisitionScheduler:
                 result = worker.align(
                     task.asr_path,
                     task.asr_generation,
+                    task.wav_artifact,
                     candidate,
                 )
                 candidate_written = candidate.is_file()
@@ -868,11 +944,18 @@ class AcquisitionScheduler:
                     raise StageCommandError(
                         f"Whisper worker returned unexpected candidate: {response_candidate}"
                     )
-                if read_asr_cache_generation(task.asr_path) != task.asr_generation:
+                if read_asr_cache_identity(task.asr_path) != (
+                    task.asr_generation,
+                    task.media_generation,
+                ):
                     raise StageCommandError(
-                        "stale alignment result: ASR sidecar generation changed"
+                        "stale alignment result: ASR sidecar identity changed"
                     )
-                read_aligned_json(candidate)
+                read_aligned_json(
+                    candidate,
+                    expected_media_generation=task.media_generation,
+                    expected_alignment_generation=task.asr_generation,
+                )
                 with commit_state.commit_section():
                     final_path = task.edit_video_path.with_suffix(".json").resolve()
                     try:
@@ -1314,12 +1397,30 @@ class AcquisitionScheduler:
 
             task.advance("prepare")
             edit_video = None
+            prepared_state = None
             if self.asr_config is not None:
-                edit_video = self.resume_probe(
-                    task.render_video_path,
-                    self.asr_config,
-                )
-            if edit_video is None:
+                expected_edit = _expected_edit_video_path(task.render_video_path)
+                transaction_path = expected_edit or task.render_video_path
+                async with self._media_transaction(transaction_path):
+                    prepared_state = self.resume_probe(task.render_video_path)
+                    if prepared_state is None:
+                        render_snapshot = capture_file_snapshot(task.render_video_path)
+                        async with self._nvenc_slots:
+                            if not self.control.stage_advancement_open:
+                                raise StageAdvancementStopped(
+                                    "batch interrupted before prepare"
+                                )
+                            edit_video = await self.runners.prepare(
+                                str(task.render_video_path)
+                            )
+                        prepared_state = write_prepare_state(
+                            task.render_video_path,
+                            edit_video,
+                            expected_render_snapshot=render_snapshot,
+                        )
+                    edit_video = Path(prepared_state.edit_snapshot.path)
+                    task.media_generation = prepared_state.generation
+            else:
                 async with self._nvenc_slots:
                     if not self.control.stage_advancement_open:
                         raise StageAdvancementStopped("batch interrupted before prepare")
@@ -1337,6 +1438,12 @@ class AcquisitionScheduler:
                 wav_path = await self.runners.extract_audio(str(task.edit_video_path))
             task.wav_path = Path(wav_path)
             _validate_wav_output(task.wav_path)
+            if prepared_state is not None:
+                task.wav_artifact = bind_wav_artifact(
+                    task.edit_video_path,
+                    task.wav_path,
+                    prepared_state.generation,
+                )
             task.succeed(stage="wav_ready")
         except asyncio.CancelledError:
             if task.state not in TERMINAL_STATES:

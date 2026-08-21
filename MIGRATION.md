@@ -28,9 +28,11 @@ batch 自动使用 `max(1, (os.cpu_count() or 1) // 4)` 个 CPU/IO 槽位；prep
 
 ### ASR 恢复与锁
 
-每个 ASR 成功任务原子写 `<base>.asr.json`。其 fingerprint 包含编辑版 resolved path、size、mtime、Whisper model、compute type、源语言和 ASR options；每次写入还生成唯一 UUID generation。损坏、缺少或非法 generation、旧 schema、fingerprint 不匹配都视为 cache miss 并重跑 ASR。
+prepare 成功后新增 `<base>.prepare.json`，其中的 UUID media generation 绑定原片和编辑版各自的 resolved path、size、mtime。升级前没有该 state 的项目会进行一次 prepare 以建立可信身份；文件已加入 `.gitignore`。即使原片 mtime 相同或更早，只要 path/size/mtime 任一变化都不会误命中。
 
-正常重启时，若既有编辑版 `<base>.mkv` 与当前 sidecar fingerprint 匹配，batch 会跳过 prepare，避免重编码改变 size/mtime 后让可恢复 sidecar 失效；原片更新或任一 fingerprint 输入变化时仍走完整 prepare。新的 alignment generation 提交前先删除旧 `<base>.beautified.json`；删除失败会阻止 final JSON commit 并记录 `cleanup_diagnostics`。alignment 成功后删除 WAV，alignment 失败、取消或 worker crash 时保留 WAV。
+`<base>.asr.json` 升级为 schema v2，记录 media generation、唯一 ASR generation、WAV snapshot 和 fingerprint。fingerprint 仍包含编辑版 resolved path、size、mtime、Whisper model、compute type、源语言和 ASR options；旧 schema 明确视为 cache miss。正常重启根据 prepare state 跳过 prepare，模型、语言或 options 变化只重跑 ASR。WAV 在提取后绑定 media generation；worker 在识别前与 sidecar 写入前复核，编辑版变化后不能把旧 WAV 结果认证为新媒体。
+
+alignment candidate、最终 `<base>.json` 与 `<base>.beautified.json` 新增 `_batch_artifact.media_generation` 和 `_batch_artifact.alignment_generation`。旧 final/beautified cache 缺少该字段时不会在 batch recovery 中复用。同一进程内，同一媒体的 prepare、alignment commit 与 postprocess 串行；postprocess 前后都复核 generation。新 alignment 提交前删除旧 beautified cache，删除失败会阻止 final JSON commit 并记录 `cleanup_diagnostics`。alignment 成功后删除 WAV，alignment 失败、取消或 worker crash 时保留 WAV。
 
 所有 sidecar 写与 alignment commit 使用持久 `<base>.asr.lock` 跨进程互斥。parent 持锁 dispatch，child 只写 generation-specific candidate，parent 持锁复核 ownership、candidate 与 schema。取消先赢时只清 candidate 并保留 `<base>.asr.json` 供下次恢复；destructive commit 先赢时先原子 promote final `<base>.json`，再删除自己持有 generation 的 `<base>.asr.json`，然后继续 postprocess。`<base>.asr.lock` 最多 1 byte、已加入 `.gitignore`，活跃任务间不得 unlink。
 
@@ -44,7 +46,7 @@ worker crash 或 heartbeat timeout 不自动重启。当前 worker task 失败�
 
 ### Release smoke 限制
 
-跨平台 release smoke 经过真实 `batch.ps1/.sh -> py_launcher.ps1/.sh -> batch.py` production orchestrator，运行真实 argparse/main、自动资源检测、subprocess stage runners、marker parser 和 spawned worker protocol；复制到隔离目录的 production modules 必须通过 SHA-256 证明 byte-identical。测试只 fake download、prepare、translate、burn、ffmpeg 和 WhisperX 外部边界。Windows 使用项目 Python 与 PowerShell 7；WSL 使用 `wsl -u root`，按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序逐一 probe，只接受 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter。没有候选时开发者测试精确 skip，不下载或安装依赖。
+跨平台 release smoke 经过真实 `batch.ps1/.sh -> py_launcher.ps1/.sh -> batch.py` production orchestrator，运行真实 argparse/main、自动资源检测、subprocess stage runners、marker parser 和 spawned worker protocol，并解析 JSON machine report 验证新契约；复制到隔离目录的 production modules 必须通过 SHA-256 证明 byte-identical。测试只 fake download、prepare、translate、burn、ffmpeg 和 WhisperX 外部边界。Windows 使用项目 Python 与 PowerShell 7；WSL 使用 `wsl -u root`，按 `BATCH_SMOKE_WSL_PYTHON`、仓库 `.venv/bin/python`、`command -v python3` 的顺序逐一 probe，只接受 Python `>=3.10,<3.14` 且能 import `langcodes` 的现有 Linux interpreter。没有候选时开发者测试精确 skip，不下载或安装依赖。
 
 `BATCH_SMOKE_REQUIRE_WSL=1` 是仅供 test/release gate 使用的内部变量，不是 batch 或项目用户配置。启用后缺少 WSL root 或合格 interpreter 会失败而不是 skip，因此以下 PowerShell 命令的 `OK` 结果能证明 WSL smoke 确实执行。若自动候选都不合格，先把 `BATCH_SMOKE_WSL_PYTHON` 指向一个已有的合格 WSL interpreter；不得在测试中创建环境或安装包。
 

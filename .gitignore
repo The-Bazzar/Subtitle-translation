@@ -7,6 +7,7 @@ tavily_domains.json
 cookies.txt
 batch-result.txt
 *.asr.lock
+*.prepare.json
 proofread_prompt.md
 translate_prompt.md
 glossary_prompt.md

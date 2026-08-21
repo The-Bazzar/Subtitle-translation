@@ -505,6 +505,8 @@ def _collect_evidence(
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     report = report_path.read_text(encoding="utf-8")
+    machine_report_path = report_path.with_suffix(".json")
+    machine_report = json.loads(machine_report_path.read_text(encoding="utf-8"))
     events = [
         json.loads(line)
         for line in events_path.read_text(encoding="utf-8").splitlines()
@@ -555,6 +557,7 @@ def _collect_evidence(
         "task_count": summary_count,
         "report_success_count": report.count("[OK]"),
         "report_failure_count": report.count("[FAIL]"),
+        "machine_report": machine_report,
         "aggregate_notification_bells": result.stderr.count("\a"),
         "peak_prepare_nvenc": _peak(prepare_intervals),
         "peak_burn_nvenc": _peak(burn_intervals),
@@ -582,6 +585,7 @@ def _collect_evidence(
         ),
         "recovery_sidecars_remaining": len(list(workspace.rglob("*.asr.json"))),
         "persistent_lock_files": len(list(workspace.rglob("*.asr.lock"))),
+        "prepare_state_files": len(list(workspace.rglob("*.prepare.json"))),
         "stdout": result.stdout,
         "stderr": result.stderr,
         "report": report,

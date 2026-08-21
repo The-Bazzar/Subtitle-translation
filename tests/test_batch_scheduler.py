@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime
 from unittest import mock
 
@@ -25,7 +26,14 @@ from batch import (
     run_acquisition,
     write_report,
 )
-from batch_cache import build_asr_fingerprint, read_valid_asr_cache, write_asr_cache
+from batch_cache import (
+    bind_wav_artifact,
+    build_asr_fingerprint,
+    capture_file_snapshot,
+    write_asr_cache,
+    write_asr_cache_for_artifact,
+    write_prepare_state,
+)
 from batch_scheduler import (
     AcquisitionRunners,
     AcquisitionScheduler,
@@ -58,7 +66,13 @@ def write_asr_cache_process_target(
 ):
     started.set()
     try:
-        write_asr_cache(edit_video_path, fingerprint, result)
+        write_asr_cache(
+            edit_video_path,
+            fingerprint,
+            result,
+            media_generation=str(uuid.uuid4()),
+            wav_snapshot=capture_file_snapshot(edit_video_path),
+        )
     finally:
         finished.set()
 
@@ -510,6 +524,7 @@ class FakeAsrController:
         close_error=None,
         before_align=None,
         after_align=None,
+        before_transcribe=None,
     ):
         self.config = config
         self.calls = calls
@@ -530,6 +545,7 @@ class FakeAsrController:
         self.close_error = close_error
         self.before_align = before_align
         self.after_align = after_align
+        self.before_transcribe = before_transcribe
         self.is_alive = False
         self.alignment_language = ""
 
@@ -575,9 +591,11 @@ class FakeAsrController:
         self.calls.append(("load_asr",))
         return WorkerResult(command=WorkerCommand.LOAD_ASR, ok=True)
 
-    def transcribe(self, wav_path):
-        wav_path = pathlib.Path(wav_path).resolve()
+    def transcribe(self, artifact):
+        wav_path = pathlib.Path(artifact.wav_snapshot.path).resolve()
         self.calls.append(("transcribe", wav_path.name))
+        if self.before_transcribe is not None:
+            self.before_transcribe(wav_path)
         if wav_path.name == self.crash_name:
             self.is_alive = False
             raise WorkerExitedError(17, WorkerCommand.TRANSCRIBE)
@@ -589,7 +607,7 @@ class FakeAsrController:
                 error_type="ValueError",
                 error="fake ASR failure",
             )
-        edit_video = wav_path.with_suffix(".mkv")
+        edit_video = pathlib.Path(artifact.edit_snapshot.path).resolve()
         source_language = resolve_source_language(edit_video)
         fingerprint = build_asr_fingerprint(
             edit_video,
@@ -598,8 +616,8 @@ class FakeAsrController:
             source_language=source_language,
             asr_options=self.config.options_dict(),
         )
-        output_path = write_asr_cache(
-            edit_video,
+        output_path = write_asr_cache_for_artifact(
+            artifact,
             fingerprint,
             {
                 "segments": [
@@ -634,7 +652,7 @@ class FakeAsrController:
             language=language,
         )
 
-    def align(self, sidecar_path, generation, candidate_path=None):
+    def align(self, sidecar_path, generation, artifact, candidate_path=None):
         sidecar_path = pathlib.Path(sidecar_path).resolve()
         candidate_path = pathlib.Path(candidate_path).resolve()
         self.calls.append(("align", sidecar_path.name, self.alignment_language))
@@ -694,6 +712,7 @@ class FakeAsrController:
                     for segment in result["segments"]
                 ],
             },
+            media_generation=artifact.media_generation,
         )
         if self.after_align is not None:
             self.after_align(sidecar_path)
@@ -828,6 +847,16 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     def write_recovery_sidecar(self, edit_video, *, config=None):
         config = config or self.config
+        render_video = edit_video.with_name(
+            f"{edit_video.stem}.original{edit_video.suffix}"
+        )
+        wav_path = edit_video.with_suffix(".wav")
+        prepared_state = write_prepare_state(render_video, edit_video)
+        artifact = bind_wav_artifact(
+            edit_video,
+            wav_path,
+            prepared_state.generation,
+        )
         return write_asr_cache(
             edit_video,
             build_asr_fingerprint(
@@ -841,6 +870,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 "segments": [{"start": 0.0, "end": 1.0, "text": edit_video.stem}],
                 "language": resolve_source_language(edit_video),
             },
+            media_generation=prepared_state.generation,
+            wav_snapshot=artifact.wav_snapshot,
         )
 
     async def test_restart_reuses_edit_and_valid_sidecar_without_prepare(self):
@@ -964,21 +995,79 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 tasks = await scheduler.run()
 
                 self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
-                prepare.assert_awaited_once_with(str(render_video))
+                if case in {"fingerprint", "original"}:
+                    prepare.assert_awaited_once_with(str(render_video))
+                else:
+                    prepare.assert_not_awaited()
+
+    async def test_restart_reprepares_when_render_size_changes_with_same_mtime(self):
+        media = {"source-change": self.create_media("source-change", "en")}
+        render_video, edit_video, wav_path = media["source-change"]
+        shared_mtime = min(
+            render_video.stat().st_mtime_ns,
+            edit_video.stat().st_mtime_ns,
+        )
+        os.utime(render_video, ns=(shared_mtime, shared_mtime))
+        os.utime(edit_video, ns=(shared_mtime, shared_mtime))
+        self.write_recovery_sidecar(edit_video)
+        render_video.write_bytes(b"different-original-content")
+        os.utime(render_video, ns=(shared_mtime, shared_mtime))
+        prepare = mock.AsyncMock(return_value=edit_video)
+
+        async def download(_url):
+            return render_video
+
+        async def extract_audio(_edit_video):
+            wav_path.write_bytes(b"wav")
+            return wav_path
+
+        scheduler = AcquisitionScheduler(
+            urls=["source-change"],
+            limits=ResourceLimits(cpu_io=1),
+            runners=AcquisitionRunners(download, prepare, extract_audio),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(config, []),
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
+        prepare.assert_awaited_once_with(str(render_video))
+
+    async def test_edit_change_after_wav_extraction_cannot_certify_asr_sidecar(self):
+        media = {"changed-after-wav": self.create_media("changed-after-wav", "en")}
+        _render_video, edit_video, _wav_path = media["changed-after-wav"]
+
+        def replace_edit(_wav_path):
+            replacement = edit_video.with_name(".changed-after-wav.mkv")
+            replacement.write_bytes(b"new-edit-generation")
+            os.replace(replacement, edit_video)
+
+        scheduler = AcquisitionScheduler(
+            urls=list(media),
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for(media, []),
+            asr_config=self.config,
+            worker_factory=lambda config: FakeAsrController(
+                config,
+                [],
+                before_transcribe=replace_edit,
+            ),
+        )
+
+        tasks = await scheduler.run()
+
+        self.assertIs(tasks[0].state, TaskState.FAILED)
+        self.assertEqual(tasks[0].stage, "asr")
+        self.assertIn("media generation", tasks[0].error_detail)
+        self.assertFalse(edit_video.with_suffix(".asr.json").exists())
 
     async def test_asr_starts_after_acquisition_and_skips_valid_cache(self):
         media = {
             "cached": self.create_media("cached", "en-US"),
             "fresh": self.create_media("fresh", "ja"),
         }
-        write_asr_cache(
-            media["cached"][1],
-            self.fingerprint(media["cached"][1]),
-            {
-                "segments": [{"start": 0.0, "end": 1.0, "text": "cached"}],
-                "language": "en",
-            },
-        )
+        self.write_recovery_sidecar(media["cached"][1])
         acquisition_calls = []
         worker_calls = []
 
@@ -1023,14 +1112,7 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_cached_tasks_still_open_and_close_reusable_controller(self):
         media = {"cached": self.create_media("cached")}
-        write_asr_cache(
-            media["cached"][1],
-            self.fingerprint(media["cached"][1]),
-            {
-                "segments": [{"start": 0.0, "end": 1.0, "text": "cached"}],
-                "language": "en",
-            },
-        )
+        self.write_recovery_sidecar(media["cached"][1])
         worker_calls = []
         scheduler = AcquisitionScheduler(
             urls=["cached"],
@@ -1450,14 +1532,7 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             "ja-second": self.create_media("ja-second", "ja"),
             "en-fresh": self.create_media("en-fresh", "en-GB"),
         }
-        write_asr_cache(
-            media["en-cached"][1],
-            self.fingerprint(media["en-cached"][1]),
-            {
-                "segments": [{"start": 0.0, "end": 1.0, "text": "cached"}],
-                "language": "en-US",
-            },
-        )
+        self.write_recovery_sidecar(media["en-cached"][1])
         worker_calls = []
         postprocess_calls = []
 
@@ -1616,7 +1691,10 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         async def postprocess(_task):
             self.assertFalse(beautified_path.exists())
-            beautified_path.write_text('{"generation": "new"}', encoding="utf-8")
+            beautified_path.write_text(
+                _task.json_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
 
         scheduler = AcquisitionScheduler(
             urls=list(media),
@@ -1631,10 +1709,155 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(tasks[0].state, TaskState.SUCCEEDED)
         self.assertEqual(
-            json.loads(beautified_path.read_text(encoding="utf-8"))["generation"],
-            "new",
+            json.loads(beautified_path.read_text(encoding="utf-8"))[
+                "_batch_artifact"
+            ]["alignment_generation"],
+            tasks[0].asr_generation,
         )
         self.assertFalse(media["generation"][2].exists())
+
+    async def test_postprocess_rejects_beautified_from_another_alignment_generation(self):
+        _render_video, edit_video, _wav_path = self.create_media("stale-cache", "en")
+        current_generation = str(uuid.uuid4())
+        old_generation = str(uuid.uuid4())
+        media_generation = str(uuid.uuid4())
+        final_path = edit_video.with_suffix(".json")
+        beautified_path = edit_video.with_suffix(".beautified.json")
+
+        def aligned_payload(generation):
+            return {
+                "language": "en",
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "hello",
+                        "words": [
+                            {"word": "hello", "start": 0.0, "end": 1.0}
+                        ],
+                    }
+                ],
+                "_batch_artifact": {
+                    "alignment_generation": generation,
+                    "media_generation": media_generation,
+                },
+            }
+
+        final_path.write_text(
+            json.dumps(aligned_payload(current_generation)),
+            encoding="utf-8",
+        )
+        beautified_path.write_text(
+            json.dumps(aligned_payload(old_generation)),
+            encoding="utf-8",
+        )
+
+        async def postprocess(_task):
+            self.assertFalse(beautified_path.exists())
+            beautified_path.write_text(final_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        scheduler = AcquisitionScheduler(
+            urls=[],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for({}, []),
+            postprocess_runner=postprocess,
+        )
+        task = BatchTask(index=1, url="stale-cache")
+        task.state = TaskState.RUNNING
+        task.stage = "postprocess_waiting"
+        task.edit_video_path = edit_video
+        task.json_path = final_path
+        task.asr_generation = current_generation
+        task.media_generation = media_generation
+
+        await scheduler._run_postprocess(task)
+
+        self.assertIs(task.state, TaskState.SUCCEEDED)
+        self.assertEqual(task.stage, "translated")
+        payload = json.loads(beautified_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["_batch_artifact"]["alignment_generation"],
+            current_generation,
+        )
+
+    async def test_new_alignment_waits_for_same_media_postprocess_generation(self):
+        _render_video, edit_video, _wav_path = self.create_media(
+            "generation-race",
+            "en",
+        )
+        old_generation = str(uuid.uuid4())
+        new_generation = str(uuid.uuid4())
+        media_generation = str(uuid.uuid4())
+        final_path = edit_video.with_suffix(".json")
+        beautified_path = edit_video.with_suffix(".beautified.json")
+        postprocess_started = asyncio.Event()
+        release_postprocess = asyncio.Event()
+        commit_started = asyncio.Event()
+
+        def aligned_payload(generation):
+            return {
+                "language": "en",
+                "segments": [],
+                "_batch_artifact": {
+                    "alignment_generation": generation,
+                    "media_generation": media_generation,
+                },
+            }
+
+        final_path.write_text(
+            json.dumps(aligned_payload(old_generation)),
+            encoding="utf-8",
+        )
+
+        async def postprocess(_task):
+            postprocess_started.set()
+            await release_postprocess.wait()
+            beautified_path.write_text(
+                json.dumps(aligned_payload(old_generation)),
+                encoding="utf-8",
+            )
+
+        scheduler = AcquisitionScheduler(
+            urls=[],
+            limits=ResourceLimits(cpu_io=1),
+            runners=self.runners_for({}, []),
+            postprocess_runner=postprocess,
+        )
+        old_task = BatchTask(index=1, url="old-generation")
+        old_task.state = TaskState.RUNNING
+        old_task.stage = "postprocess_waiting"
+        old_task.edit_video_path = edit_video
+        old_task.json_path = final_path
+        old_task.asr_generation = old_generation
+        old_task.media_generation = media_generation
+
+        async def commit_new_generation():
+            async with scheduler._media_transaction(edit_video):
+                commit_started.set()
+                final_path.write_text(
+                    json.dumps(aligned_payload(new_generation)),
+                    encoding="utf-8",
+                )
+                beautified_path.unlink(missing_ok=True)
+
+        postprocess_task = asyncio.create_task(scheduler._run_postprocess(old_task))
+        await postprocess_started.wait()
+        commit_task = asyncio.create_task(commit_new_generation())
+        await asyncio.sleep(0)
+
+        self.assertFalse(commit_started.is_set())
+        release_postprocess.set()
+        await postprocess_task
+        await commit_task
+
+        self.assertTrue(commit_started.is_set())
+        self.assertFalse(beautified_path.exists())
+        self.assertEqual(
+            json.loads(final_path.read_text(encoding="utf-8"))["_batch_artifact"][
+                "alignment_generation"
+            ],
+            new_generation,
+        )
 
     async def test_beautified_invalidation_failure_blocks_commit_and_postprocess(self):
         media = {"blocked": self.create_media("blocked", "en")}
@@ -1933,8 +2156,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         postprocess = mock.AsyncMock()
         real_read_aligned_json = batch_scheduler.read_aligned_json
 
-        def block_before_commit(candidate_path):
-            result = real_read_aligned_json(candidate_path)
+        def block_before_commit(candidate_path, **kwargs):
+            result = real_read_aligned_json(candidate_path, **kwargs)
             precommit_ready.set()
             if not precommit_release.wait(2.0):
                 raise AssertionError("precommit barrier was not released")
@@ -2212,8 +2435,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         postprocess = mock.AsyncMock()
         real_read_aligned_json = batch_scheduler.read_aligned_json
 
-        def block_before_commit(candidate_path):
-            result = real_read_aligned_json(candidate_path)
+        def block_before_commit(candidate_path, **kwargs):
+            result = real_read_aligned_json(candidate_path, **kwargs)
             precommit_ready.set()
             if not precommit_release.wait(2.0):
                 raise AssertionError("precommit barrier was not released")
@@ -2287,8 +2510,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         real_read_aligned_json = batch_scheduler.read_aligned_json
         real_unlink = pathlib.Path.unlink
 
-        def block_before_commit(candidate_path):
-            result = real_read_aligned_json(candidate_path)
+        def block_before_commit(candidate_path, **kwargs):
+            result = real_read_aligned_json(candidate_path, **kwargs)
             precommit_ready.set()
             if not precommit_release.wait(2.0):
                 raise AssertionError("precommit barrier was not released")
@@ -2373,6 +2596,7 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(("load_align", "ja", "auto"), worker_calls)
         self.assertTrue(scheduler.worker_released.is_set())
         self.assertFalse(scheduler._worker.is_alive)
+        self.assertTrue(media["crash"][2].is_file())
 
     async def test_slow_alignment_cancellation_aborts_worker_and_keeps_sidecar(self):
         media = {"slow": self.create_media("slow-align", "en")}
@@ -2880,6 +3104,36 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         return AcquisitionRunners(download, prepare, extract_audio)
 
+    def write_recovery_sidecar(self, edit_video):
+        render_video = edit_video.with_name(
+            f"{edit_video.stem}.original{edit_video.suffix}"
+        )
+        wav_path = edit_video.with_suffix(".wav")
+        prepared_state = write_prepare_state(render_video, edit_video)
+        artifact = bind_wav_artifact(
+            edit_video,
+            wav_path,
+            prepared_state.generation,
+        )
+        return write_asr_cache(
+            edit_video,
+            build_asr_fingerprint(
+                edit_video,
+                model=self.config.model,
+                compute_type=self.config.compute_type,
+                source_language=resolve_source_language(edit_video),
+                asr_options=self.config.options_dict(),
+            ),
+            {
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": edit_video.stem}
+                ],
+                "language": resolve_source_language(edit_video),
+            },
+            media_generation=prepared_state.generation,
+            wav_snapshot=artifact.wav_snapshot,
+        )
+
     async def test_burn_waits_for_worker_release_caps_four_and_accepts_late_translation(self):
         media = {
             f"video-{index}": self.create_media(f"video-{index}")
@@ -3229,25 +3483,7 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
         }
         sidecars = []
         for name, (_render_video, edit_video, _wav_path) in media.items():
-            fingerprint = build_asr_fingerprint(
-                edit_video,
-                model=self.config.model,
-                compute_type=self.config.compute_type,
-                source_language=resolve_source_language(edit_video),
-                asr_options=self.config.options_dict(),
-            )
-            sidecars.append(
-                write_asr_cache(
-                    edit_video,
-                    fingerprint,
-                    {
-                        "segments": [
-                            {"start": 0.0, "end": 1.0, "text": name}
-                        ],
-                        "language": "en",
-                    },
-                )
-            )
+            sidecars.append(self.write_recovery_sidecar(edit_video))
         align_started = threading.Event()
         align_release = threading.Event()
         controllers = []

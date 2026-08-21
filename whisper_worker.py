@@ -23,10 +23,13 @@ import langcodes
 
 from batch_cache import (
     ASR_CACHE_SCHEMA_VERSION,
+    WavArtifact,
     _fsync_parent_directory,
-    build_asr_fingerprint,
+    build_asr_fingerprint_from_snapshot,
     is_valid_asr_generation,
-    write_asr_cache,
+    validate_wav_artifact,
+    validate_wav_artifact_unlocked,
+    write_asr_cache_for_artifact,
 )
 
 
@@ -112,6 +115,7 @@ class _WorkerRequest:
     language: str = ""
     generation: str = ""
     candidate_path: str = ""
+    artifact: WavArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -329,7 +333,8 @@ def _validate_timed_text_segment(segment: Any) -> dict[str, Any]:
 def read_alignment_input(
     sidecar_path: str | os.PathLike[str],
     expected_generation: str = "",
-) -> tuple[str, str, list[dict[str, Any]]]:
+    artifact: WavArtifact | None = None,
+) -> tuple[str, str, str, list[dict[str, Any]]]:
     path = Path(sidecar_path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -344,6 +349,15 @@ def read_alignment_input(
         raise ValueError("ASR recovery sidecar generation is invalid")
     if expected_generation and generation != expected_generation:
         raise ValueError("ASR recovery sidecar generation changed before alignment")
+    media_generation = payload.get("media_generation")
+    if not is_valid_asr_generation(media_generation):
+        raise ValueError("ASR recovery sidecar media generation is invalid")
+    if artifact is not None:
+        validate_wav_artifact_unlocked(artifact)
+        if media_generation != artifact.media_generation:
+            raise ValueError(
+                "ASR recovery sidecar media generation changed before alignment"
+            )
     if not isinstance(payload.get("fingerprint"), dict):
         raise ValueError("ASR recovery sidecar fingerprint is invalid")
     result = payload.get("result")
@@ -357,6 +371,7 @@ def read_alignment_input(
         raise ValueError("ASR recovery sidecar segments must be a list")
     return (
         generation,
+        media_generation,
         language.strip(),
         [_validate_timed_text_segment(item) for item in segments],
     )
@@ -393,7 +408,12 @@ def _validate_aligned_result(result: Mapping[str, Any]) -> dict[str, Any]:
     return dict(result)
 
 
-def read_aligned_json(path: str | os.PathLike[str]) -> dict[str, Any]:
+def read_aligned_json(
+    path: str | os.PathLike[str],
+    *,
+    expected_media_generation: str = "",
+    expected_alignment_generation: str = "",
+) -> dict[str, Any]:
     final_path = Path(path)
     try:
         result = json.loads(final_path.read_text(encoding="utf-8"))
@@ -401,7 +421,16 @@ def read_aligned_json(path: str | os.PathLike[str]) -> dict[str, Any]:
         raise ValueError(f"invalid aligned JSON: {final_path}") from exc
     if not isinstance(result, Mapping):
         raise ValueError("aligned JSON must be an object")
-    return _validate_aligned_result(result)
+    validated = _validate_aligned_result(result)
+    if expected_media_generation or expected_alignment_generation:
+        artifact = validated.get("_batch_artifact")
+        if not isinstance(artifact, Mapping):
+            raise ValueError("aligned JSON batch artifact is missing")
+        if artifact.get("media_generation") != expected_media_generation:
+            raise ValueError("aligned JSON media generation does not match task")
+        if artifact.get("alignment_generation") != expected_alignment_generation:
+            raise ValueError("aligned JSON alignment generation does not match task")
+    return validated
 
 
 def _final_json_path(sidecar_path: Path) -> Path:
@@ -449,13 +478,21 @@ def write_aligned_candidate_json(
     generation: str,
     candidate_path: str | os.PathLike[str],
     result: Mapping[str, Any],
+    *,
+    media_generation: str,
 ) -> Path:
     destination = validate_alignment_candidate_path(
         sidecar_path,
         generation,
         candidate_path,
     )
+    if not is_valid_asr_generation(media_generation):
+        raise ValueError("alignment media generation is invalid")
     validated_result = _validate_aligned_result(result)
+    validated_result["_batch_artifact"] = {
+        "media_generation": media_generation,
+        "alignment_generation": generation,
+    }
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -575,6 +612,7 @@ def _worker_main(
             language = str(request.language or "").strip()
             generation = str(request.generation or "").strip()
             candidate_path = str(request.candidate_path or "").strip()
+            artifact = request.artifact
             heartbeat_stop = threading.Event()
 
             def send_heartbeats() -> None:
@@ -603,21 +641,24 @@ def _worker_main(
                 elif command is WorkerCommand.TRANSCRIBE:
                     if backend is None:
                         raise RuntimeError("ASR model is not loaded")
-                    wav_path = Path(path).resolve()
-                    edit_video_path = wav_path.with_suffix(".mkv")
+                    if artifact is None:
+                        raise ValueError("TRANSCRIBE requires a bound WAV artifact")
+                    validate_wav_artifact(artifact)
+                    wav_path = Path(artifact.wav_snapshot.path).resolve()
+                    edit_video_path = Path(artifact.edit_snapshot.path).resolve()
                     source_language = resolve_source_language(edit_video_path)
                     transcription = backend.transcribe(str(wav_path), source_language)
                     if not isinstance(transcription, Mapping):
                         raise TypeError("ASR backend returned a non-object result")
-                    fingerprint = build_asr_fingerprint(
-                        edit_video_path,
+                    fingerprint = build_asr_fingerprint_from_snapshot(
+                        artifact.edit_snapshot,
                         model=config.model,
                         compute_type=config.compute_type,
                         source_language=source_language,
                         asr_options=config.options_dict(),
                     )
-                    output_path = write_asr_cache(
-                        edit_video_path,
+                    output_path = write_asr_cache_for_artifact(
+                        artifact,
                         fingerprint,
                         transcription,
                     )
@@ -658,9 +699,10 @@ def _worker_main(
                     sidecar_path = Path(path).resolve()
                     (
                         input_generation,
+                        media_generation,
                         detected_language,
                         segments,
-                    ) = read_alignment_input(sidecar_path, generation)
+                    ) = read_alignment_input(sidecar_path, generation, artifact)
                     detected_language = normalize_language_code(
                         detected_language,
                         fallback=alignment_language,
@@ -681,6 +723,7 @@ def _worker_main(
                         input_generation,
                         candidate_path,
                         final_result,
+                        media_generation=media_generation,
                     )
                     result = WorkerResult(
                         command=command,
@@ -1030,6 +1073,7 @@ class AsrWorkerController:
         language: str = "",
         generation: str = "",
         candidate_path: str = "",
+        artifact: WavArtifact | None = None,
     ) -> WorkerResult:
         if self._process is None:
             raise RuntimeError("Whisper worker has not been started")
@@ -1047,6 +1091,7 @@ class AsrWorkerController:
                 language=language,
                 generation=generation,
                 candidate_path=candidate_path,
+                artifact=artifact,
             )
         )
         operation_started = time.monotonic()
@@ -1121,10 +1166,11 @@ class AsrWorkerController:
             self._asr_unload_attempted = False
         return result
 
-    def transcribe(self, wav_path: str | os.PathLike[str]) -> WorkerResult:
+    def transcribe(self, artifact: WavArtifact) -> WorkerResult:
         return self._request(
             WorkerCommand.TRANSCRIBE,
-            str(Path(wav_path).resolve()),
+            artifact.wav_snapshot.path,
+            artifact=artifact,
         )
 
     def unload_asr(self) -> WorkerResult:
@@ -1156,6 +1202,7 @@ class AsrWorkerController:
         self,
         sidecar_path: str | os.PathLike[str],
         generation: str,
+        artifact: WavArtifact,
         candidate_path: str | os.PathLike[str] | None = None,
     ) -> WorkerResult:
         if not self._align_loaded:
@@ -1177,6 +1224,7 @@ class AsrWorkerController:
             str(recovery_path),
             generation=generation,
             candidate_path=str(candidate),
+            artifact=artifact,
         )
 
     def unload_align(self) -> WorkerResult:

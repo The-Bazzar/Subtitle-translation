@@ -15,9 +15,11 @@ import whisper_worker
 from batch_cache import (
     _fsync_parent_directory,
     asr_sidecar_path,
+    bind_wav_artifact,
     build_asr_fingerprint,
     read_valid_asr_cache,
     write_asr_cache,
+    write_prepare_state,
 )
 from whisper_worker import (
     AsrWorkerConfig,
@@ -149,7 +151,20 @@ class AsrCacheTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.root = pathlib.Path(self.temp_dir.name)
         self.edit_video = self.root / "episode.mkv"
+        self.render_video = self.root / "episode.original.mkv"
+        self.wav_path = self.root / "episode.wav"
         self.edit_video.write_bytes(b"edit-video")
+        self.render_video.write_bytes(b"original-video")
+        self.wav_path.write_bytes(b"wav")
+        self.prepare_state = write_prepare_state(
+            self.render_video,
+            self.edit_video,
+        )
+        self.artifact = bind_wav_artifact(
+            self.edit_video,
+            self.wav_path,
+            self.prepare_state.generation,
+        )
 
     def fingerprint(self, **overrides):
         values = {
@@ -171,6 +186,22 @@ class AsrCacheTests(unittest.TestCase):
             "language": "en",
         }
 
+    def write_cache(self, fingerprint, result):
+        return write_asr_cache(
+            self.edit_video,
+            fingerprint,
+            result,
+            media_generation=self.prepare_state.generation,
+            wav_snapshot=self.artifact.wav_snapshot,
+        )
+
+    def read_cache(self, fingerprint):
+        return read_valid_asr_cache(
+            self.edit_video,
+            fingerprint,
+            self.prepare_state.generation,
+        )
+
     def test_fingerprint_is_immutable_and_contains_all_asr_inputs(self):
         fingerprint = self.fingerprint()
 
@@ -188,6 +219,77 @@ class AsrCacheTests(unittest.TestCase):
             serialized["asr_options"],
             {"batch_size": 16, "vad": {"offset": 0.363, "onset": 0.5}},
         )
+
+    def test_prepare_state_rejects_render_size_change_with_preserved_mtime(self):
+        write_prepare_state = getattr(batch_cache, "write_prepare_state", None)
+        read_valid_prepare_state = getattr(
+            batch_cache,
+            "read_valid_prepare_state",
+            None,
+        )
+        self.assertIsNotNone(write_prepare_state, "prepare state writer is missing")
+        self.assertIsNotNone(
+            read_valid_prepare_state,
+            "prepare state validator is missing",
+        )
+        render_video = self.root / "episode.original.mkv"
+        render_video.write_bytes(b"original")
+        state = write_prepare_state(render_video, self.edit_video)
+        original_mtime = render_video.stat().st_mtime_ns
+
+        render_video.write_bytes(b"different-original-content")
+        os.utime(render_video, ns=(original_mtime, original_mtime))
+
+        self.assertIsNone(
+            read_valid_prepare_state(render_video, self.edit_video)
+        )
+        self.assertTrue(state.generation)
+
+    def test_asr_sidecar_write_rejects_edit_changed_after_wav_snapshot(self):
+        write_prepare_state = getattr(batch_cache, "write_prepare_state", None)
+        bind_wav_artifact = getattr(batch_cache, "bind_wav_artifact", None)
+        write_for_artifact = getattr(
+            batch_cache,
+            "write_asr_cache_for_artifact",
+            None,
+        )
+        build_from_snapshot = getattr(
+            batch_cache,
+            "build_asr_fingerprint_from_snapshot",
+            None,
+        )
+        mismatch_error = getattr(batch_cache, "MediaGenerationMismatch", RuntimeError)
+        for value, name in (
+            (write_prepare_state, "prepare state writer"),
+            (bind_wav_artifact, "WAV artifact binder"),
+            (write_for_artifact, "artifact sidecar writer"),
+            (build_from_snapshot, "snapshot fingerprint builder"),
+        ):
+            self.assertIsNotNone(value, f"{name} is missing")
+
+        render_video = self.root / "episode.original.mkv"
+        wav_path = self.root / "episode.wav"
+        render_video.write_bytes(b"original")
+        wav_path.write_bytes(b"wav")
+        prepare_state = write_prepare_state(render_video, self.edit_video)
+        artifact = bind_wav_artifact(
+            self.edit_video,
+            wav_path,
+            prepare_state.generation,
+        )
+        fingerprint = build_from_snapshot(
+            artifact.edit_snapshot,
+            model="large-v3-turbo",
+            compute_type="float16",
+            source_language="en",
+            asr_options={"batch_size": 16},
+        )
+        self.edit_video.write_bytes(b"changed-edit-generation")
+
+        with self.assertRaisesRegex(mismatch_error, "media generation"):
+            write_for_artifact(artifact, fingerprint, self.asr_result())
+
+        self.assertFalse(asr_sidecar_path(self.edit_video).exists())
 
     def test_cache_round_trip_uses_atomic_sibling_replacement(self):
         fingerprint = self.fingerprint()
@@ -213,10 +315,10 @@ class AsrCacheTests(unittest.TestCase):
                     "batch_cache._fsync_parent_directory",
                     side_effect=fsync_parent_spy,
                 ) as fsync_parent:
-                    cache_path = write_asr_cache(self.edit_video, fingerprint, result)
+                    cache_path = self.write_cache(fingerprint, result)
 
         self.assertEqual(cache_path, asr_sidecar_path(self.edit_video))
-        self.assertEqual(read_valid_asr_cache(self.edit_video, fingerprint).result, result)
+        self.assertEqual(self.read_cache(fingerprint).result, result)
         self.assertEqual(replace_calls[0][1], cache_path)
         fsync.assert_called_once()
         fsync_parent.assert_called_once_with(cache_path)
@@ -225,36 +327,40 @@ class AsrCacheTests(unittest.TestCase):
     def test_cache_write_uses_unique_valid_generation_and_loader_retains_it(self):
         fingerprint = self.fingerprint()
 
-        cache_path = write_asr_cache(
-            self.edit_video,
-            fingerprint,
-            self.asr_result("first"),
-        )
+        cache_path = self.write_cache(fingerprint, self.asr_result("first"))
         first_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        first_cache = read_valid_asr_cache(self.edit_video, fingerprint)
-        write_asr_cache(
-            self.edit_video,
-            fingerprint,
-            self.asr_result("second"),
-        )
+        first_cache = self.read_cache(fingerprint)
+        self.write_cache(fingerprint, self.asr_result("second"))
         second_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        second_cache = read_valid_asr_cache(self.edit_video, fingerprint)
+        second_cache = self.read_cache(fingerprint)
 
         self.assertEqual(str(uuid.UUID(first_payload["generation"])), first_payload["generation"])
         self.assertEqual(str(uuid.UUID(second_payload["generation"])), second_payload["generation"])
         self.assertNotEqual(first_payload["generation"], second_payload["generation"])
+        self.assertEqual(
+            second_payload["media_generation"],
+            self.prepare_state.generation,
+        )
+        self.assertEqual(
+            second_payload["wav_snapshot"],
+            self.artifact.wav_snapshot.to_dict(),
+        )
         self.assertEqual(first_cache.generation, first_payload["generation"])
         self.assertEqual(second_cache.generation, second_payload["generation"])
         self.assertEqual(second_cache.result["segments"][0]["text"], "second")
 
     def test_cache_lock_artifact_is_persistent_and_gitignored(self):
-        write_asr_cache(self.edit_video, self.fingerprint(), self.asr_result())
+        self.write_cache(self.fingerprint(), self.asr_result())
 
         lock_path = self.edit_video.with_suffix(".asr.lock")
         self.assertTrue(lock_path.is_file())
         self.assertLessEqual(lock_path.stat().st_size, 1)
         self.assertIn(
             "*.asr.lock",
+            (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines(),
+        )
+        self.assertIn(
+            "*.prepare.json",
             (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines(),
         )
 
@@ -277,16 +383,16 @@ class AsrCacheTests(unittest.TestCase):
 
         for result in invalid_results:
             with self.subTest(result=result):
-                write_asr_cache(self.edit_video, fingerprint, result)
-                self.assertIsNone(read_valid_asr_cache(self.edit_video, fingerprint))
+                self.write_cache(fingerprint, result)
+                self.assertIsNone(self.read_cache(fingerprint))
 
     def test_matching_fingerprint_accepts_empty_segments_with_language(self):
         fingerprint = self.fingerprint()
         result = {"segments": [], "language": "ja"}
 
-        write_asr_cache(self.edit_video, fingerprint, result)
+        self.write_cache(fingerprint, result)
 
-        self.assertEqual(read_valid_asr_cache(self.edit_video, fingerprint).result, result)
+        self.assertEqual(self.read_cache(fingerprint).result, result)
 
     def test_cache_schema_handles_arbitrary_json_integers(self):
         fingerprint = self.fingerprint()
@@ -296,9 +402,9 @@ class AsrCacheTests(unittest.TestCase):
             "language": "en",
         }
 
-        write_asr_cache(self.edit_video, fingerprint, result)
+        self.write_cache(fingerprint, result)
 
-        self.assertEqual(read_valid_asr_cache(self.edit_video, fingerprint).result, result)
+        self.assertEqual(self.read_cache(fingerprint).result, result)
 
     def test_parent_directory_fsync_uses_directory_descriptor_on_posix(self):
         cache_path = asr_sidecar_path(self.edit_video)
@@ -363,18 +469,14 @@ class AsrCacheTests(unittest.TestCase):
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
                 cache_path.write_text(json.dumps(payload), encoding="utf-8")
-                self.assertIsNone(read_valid_asr_cache(self.edit_video, expected))
+                self.assertIsNone(self.read_cache(expected))
 
         cache_path.write_text("{not-json", encoding="utf-8")
-        self.assertIsNone(read_valid_asr_cache(self.edit_video, expected))
+        self.assertIsNone(self.read_cache(expected))
 
         old_fingerprint = self.fingerprint(model="large-v2")
-        write_asr_cache(
-            self.edit_video,
-            old_fingerprint,
-            {"segments": [], "language": "en"},
-        )
-        self.assertIsNone(read_valid_asr_cache(self.edit_video, expected))
+        self.write_cache(old_fingerprint, {"segments": [], "language": "en"})
+        self.assertIsNone(self.read_cache(expected))
 
 
 class WorkerProtocolTests(unittest.TestCase):
@@ -390,17 +492,45 @@ class WorkerProtocolTests(unittest.TestCase):
             asr_options={"batch_size": 2},
             hf_token="fake-hf-token",
         )
+        self.artifacts = {}
 
     def media_pair(self, name, language="en"):
+        render_video = self.root / f"{name}.original.mkv"
         edit_video = self.root / f"{name}.mkv"
         wav_path = self.root / f"{name}.wav"
+        render_video.write_bytes(b"original-video")
         edit_video.write_bytes(b"edit-video")
         wav_path.write_bytes(b"wav")
         (self.root / f"{name}.info.json").write_text(
             json.dumps({"language": language}),
             encoding="utf-8",
         )
+        prepare_state = write_prepare_state(render_video, edit_video)
+        self.artifacts[edit_video.resolve()] = bind_wav_artifact(
+            edit_video,
+            wav_path,
+            prepare_state.generation,
+        )
         return edit_video, wav_path
+
+    def artifact_for(self, path):
+        return self.artifacts[pathlib.Path(path).with_suffix(".mkv").resolve()]
+
+    def write_cache(self, edit_video, result):
+        artifact = self.artifacts[pathlib.Path(edit_video).resolve()]
+        return write_asr_cache(
+            edit_video,
+            build_asr_fingerprint(
+                edit_video,
+                model=self.config.model,
+                compute_type=self.config.compute_type,
+                source_language=normalize_language_code(result["language"]),
+                asr_options=self.config.options_dict(),
+            ),
+            result,
+            media_generation=artifact.media_generation,
+            wav_snapshot=artifact.wav_snapshot,
+        )
 
     def controller(self, **overrides):
         return AsrWorkerController(
@@ -488,8 +618,8 @@ class WorkerProtocolTests(unittest.TestCase):
         ):
             with self.controller() as controller:
                 self.assertTrue(controller.load_asr().ok)
-                first_result = controller.transcribe(first_wav)
-                second_result = controller.transcribe(second_wav)
+                first_result = controller.transcribe(self.artifact_for(first_wav))
+                second_result = controller.transcribe(self.artifact_for(second_wav))
                 self.assertTrue(controller.unload_asr().ok)
 
         self.assertTrue(first_result.ok)
@@ -515,8 +645,18 @@ class WorkerProtocolTests(unittest.TestCase):
             source_language="ja",
             asr_options=self.config.options_dict(),
         )
-        first_cache = read_valid_asr_cache(first_video, first_fingerprint)
-        second_cache = read_valid_asr_cache(second_video, second_fingerprint)
+        first_artifact = self.artifact_for(first_video)
+        second_artifact = self.artifact_for(second_video)
+        first_cache = read_valid_asr_cache(
+            first_video,
+            first_fingerprint,
+            first_artifact.media_generation,
+        )
+        second_cache = read_valid_asr_cache(
+            second_video,
+            second_fingerprint,
+            second_artifact.media_generation,
+        )
         self.assertEqual(first_cache.result["language"], "en")
         self.assertEqual(second_cache.result["language"], "ja")
         self.assertEqual(
@@ -533,7 +673,8 @@ class WorkerProtocolTests(unittest.TestCase):
         ):
             with self.controller() as controller:
                 controller.load_asr()
-                transcription = controller.transcribe(wav_path)
+                artifact = self.artifact_for(wav_path)
+                transcription = controller.transcribe(artifact)
                 with self.assertRaises(RuntimeError):
                     controller.load_align("en")
                 controller.unload_asr()
@@ -544,6 +685,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 alignment = controller.align(
                     transcription.output_path,
                     sidecar_payload["generation"],
+                    artifact,
                 )
                 controller.unload_align()
 
@@ -571,13 +713,18 @@ class WorkerProtocolTests(unittest.TestCase):
 
         with self.controller() as controller:
             controller.load_asr()
-            transcription = controller.transcribe(wav_path)
+            artifact = self.artifact_for(wav_path)
+            transcription = controller.transcribe(artifact)
             controller.unload_asr()
             controller.load_align("ja")
             generation = json.loads(
                 pathlib.Path(transcription.output_path).read_text(encoding="utf-8")
             )["generation"]
-            alignment = controller.align(transcription.output_path, generation)
+            alignment = controller.align(
+                transcription.output_path,
+                generation,
+                artifact,
+            )
             controller.unload_align()
 
         self.assertFalse(alignment.ok)
@@ -586,15 +733,8 @@ class WorkerProtocolTests(unittest.TestCase):
 
     def test_alignment_accepts_region_tagged_detected_language_in_iso_group(self):
         edit_video, _wav_path = self.media_pair("region-tagged", language="en-US")
-        sidecar_path = write_asr_cache(
+        sidecar_path = self.write_cache(
             edit_video,
-            build_asr_fingerprint(
-                edit_video,
-                model=self.config.model,
-                compute_type=self.config.compute_type,
-                source_language="en",
-                asr_options=self.config.options_dict(),
-            ),
             {
                 "segments": [
                     {"start": 0.0, "end": 1.0, "text": "region tagged"}
@@ -608,7 +748,11 @@ class WorkerProtocolTests(unittest.TestCase):
             generation = json.loads(sidecar_path.read_text(encoding="utf-8"))[
                 "generation"
             ]
-            alignment = controller.align(sidecar_path, generation)
+            alignment = controller.align(
+                sidecar_path,
+                generation,
+                self.artifact_for(edit_video),
+            )
             controller.unload_align()
 
         self.assertTrue(alignment.ok)
@@ -642,7 +786,11 @@ class WorkerProtocolTests(unittest.TestCase):
             generation = json.loads(sidecar_path.read_text(encoding="utf-8"))[
                 "generation"
             ]
-            result = controller.align(sidecar_path, generation)
+            result = controller.align(
+                sidecar_path,
+                generation,
+                self.artifact_for(edit_video),
+            )
             controller.unload_align()
 
         self.assertFalse(result.ok)
@@ -652,15 +800,8 @@ class WorkerProtocolTests(unittest.TestCase):
 
     def test_alignment_rejects_stale_expected_generation_before_backend_work(self):
         edit_video, _wav_path = self.media_pair("stale-generation", language="en")
-        sidecar_path = write_asr_cache(
+        sidecar_path = self.write_cache(
             edit_video,
-            build_asr_fingerprint(
-                edit_video,
-                model=self.config.model,
-                compute_type=self.config.compute_type,
-                source_language="en",
-                asr_options=self.config.options_dict(),
-            ),
             {
                 "segments": [
                     {"start": 0.0, "end": 1.0, "text": "stale"}
@@ -675,7 +816,11 @@ class WorkerProtocolTests(unittest.TestCase):
         ):
             with self.controller() as controller:
                 controller.load_align("en")
-                result = controller.align(sidecar_path, str(uuid.uuid4()))
+                result = controller.align(
+                    sidecar_path,
+                    str(uuid.uuid4()),
+                    self.artifact_for(edit_video),
+                )
                 controller.unload_align()
 
         self.assertFalse(result.ok)
@@ -718,6 +863,7 @@ class WorkerProtocolTests(unittest.TestCase):
                     generation,
                     candidate_path,
                     aligned_result,
+                    media_generation=self.artifact_for(edit_video).media_generation,
                 )
 
         self.assertTrue(sidecar_path.is_file())
@@ -739,6 +885,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 generation,
                 candidate_path,
                 aligned_result,
+                media_generation=self.artifact_for(edit_video).media_generation,
             )
 
         self.assertEqual(written_candidate, candidate_path)
@@ -747,7 +894,15 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertFalse(edit_video.with_suffix(".json").exists())
         self.assertEqual(
             json.loads(candidate_path.read_text(encoding="utf-8")),
-            aligned_result,
+            {
+                **aligned_result,
+                "_batch_artifact": {
+                    "media_generation": self.artifact_for(
+                        edit_video
+                    ).media_generation,
+                    "alignment_generation": generation,
+                },
+            },
         )
 
     def test_final_schema_accepts_whisperx_words_without_timestamps(self):
@@ -776,11 +931,20 @@ class WorkerProtocolTests(unittest.TestCase):
             generation,
             candidate_path,
             aligned_result,
+            media_generation=self.artifact_for(edit_video).media_generation,
         )
 
         self.assertEqual(
             json.loads(written_candidate.read_text(encoding="utf-8")),
-            aligned_result,
+            {
+                **aligned_result,
+                "_batch_artifact": {
+                    "media_generation": self.artifact_for(
+                        edit_video
+                    ).media_generation,
+                    "alignment_generation": generation,
+                },
+            },
         )
 
     def test_task_exception_returns_structured_failure_and_worker_continues(self):
@@ -793,8 +957,8 @@ class WorkerProtocolTests(unittest.TestCase):
         ):
             with self.controller() as controller:
                 controller.load_asr()
-                failed = controller.transcribe(failed_wav)
-                succeeded = controller.transcribe(good_wav)
+                failed = controller.transcribe(self.artifact_for(failed_wav))
+                succeeded = controller.transcribe(self.artifact_for(good_wav))
                 controller.unload_asr()
 
         self.assertFalse(failed.ok)
@@ -814,7 +978,7 @@ class WorkerProtocolTests(unittest.TestCase):
         with controller:
             self.assertTrue(controller.load_asr().ok)
             controller._max_heartbeat_silence = 0.05
-            result = controller.transcribe(slow_wav)
+            result = controller.transcribe(self.artifact_for(slow_wav))
             self.assertTrue(controller.unload_asr().ok)
 
         self.assertTrue(result.ok)
@@ -899,7 +1063,7 @@ class WorkerProtocolTests(unittest.TestCase):
         controller._operation_timeout = 0.15
 
         with self.assertRaises(whisper_worker.WorkerUnresponsiveError) as raised:
-            controller.transcribe(hang_wav)
+            controller.transcribe(self.artifact_for(hang_wav))
 
         self.assertEqual(raised.exception.command, WorkerCommand.TRANSCRIBE)
         self.assertIn("operation timeout", str(raised.exception))
@@ -919,7 +1083,7 @@ class WorkerProtocolTests(unittest.TestCase):
         controller._max_heartbeat_silence = 0.05
 
         with self.assertRaises(whisper_worker.WorkerUnresponsiveError) as raised:
-            controller.transcribe(hang_wav)
+            controller.transcribe(self.artifact_for(hang_wav))
 
         self.assertEqual(raised.exception.command, WorkerCommand.TRANSCRIBE)
         self.assertIn("heartbeat silence", str(raised.exception))
@@ -1012,7 +1176,7 @@ class WorkerProtocolTests(unittest.TestCase):
             original_pid = controller.pid
             controller.load_asr()
             with self.assertRaises(WorkerExitedError) as raised:
-                controller.transcribe(crash_wav)
+                controller.transcribe(self.artifact_for(crash_wav))
 
             self.assertEqual(raised.exception.exitcode, 23)
             self.assertEqual(controller.pid, original_pid)

@@ -10,6 +10,41 @@ from unittest.mock import patch
 import translate_srt as t
 
 
+class BatchArtifactRoundTripTests(unittest.TestCase):
+    def test_transcript_round_trip_preserves_batch_artifact_generation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "video.json")
+            output_path = os.path.join(temp_dir, "video.beautified.json")
+            artifact = {
+                "media_generation": "media-generation",
+                "alignment_generation": "alignment-generation",
+            }
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                json.dump(
+                    {
+                        "language": "en",
+                        "segments": [
+                            {
+                                "id": 1,
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "hello",
+                                "words": [],
+                            }
+                        ],
+                        "_batch_artifact": artifact,
+                    },
+                    source_file,
+                )
+
+            transcript = t.load_transcript(source_path)
+            t.save_transcript(transcript, output_path)
+
+            with open(output_path, "r", encoding="utf-8") as output_file:
+                payload = json.load(output_file)
+            self.assertEqual(payload["_batch_artifact"], artifact)
+
+
 class FakeSDKMessage:
     def __init__(self, content="", tool_calls=None, role="assistant", **extra):
         self.content = content

@@ -97,6 +97,9 @@ class BatchMigrationDocumentationTests(unittest.TestCase):
         }
         required_facts = (
             "跳过 prepare",
+            ".prepare.json",
+            "media generation",
+            "_batch_artifact",
             ".beautified.json",
             "alignment 成功后删除 WAV",
             "worker_failure_root_cause",

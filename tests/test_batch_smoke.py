@@ -95,6 +95,23 @@ class ProductionBatchSmokeMixin:
         self.assertEqual(evidence["task_count"], 6)
         self.assertEqual(evidence["report_success_count"], 6)
         self.assertEqual(evidence["report_failure_count"], 0)
+        machine_report = evidence["machine_report"]
+        self.assertEqual(machine_report["schema_version"], 1)
+        self.assertFalse(machine_report["worker_failure"])
+        self.assertIsNone(machine_report["worker_failure_log"])
+        self.assertIsNone(machine_report["worker_failure_root_cause"])
+        self.assertIsNone(machine_report["worker_failure_detail"])
+        self.assertTrue(machine_report["output_directory"])
+        self.assertEqual(machine_report["cleanup_diagnostics"], [])
+        self.assertEqual(
+            machine_report["summary"],
+            {"total": 6, "success": 6, "failed": 0},
+        )
+        self.assertEqual(len(machine_report["tasks"]), 6)
+        for task_report in machine_report["tasks"]:
+            self.assertEqual(task_report["state"], "succeeded")
+            self.assertEqual(task_report["stage"], "burned")
+            self.assertTrue(task_report["output_directory"])
         self.assertEqual(evidence["aggregate_notification_bells"], 2)
         self.assertEqual(evidence["peak_prepare_nvenc"], 4)
         self.assertEqual(evidence["peak_burn_nvenc"], 4)
@@ -105,6 +122,7 @@ class ProductionBatchSmokeMixin:
         self.assertEqual(evidence["worker_process_names"], ["batch-whisper-worker"])
         self.assertEqual(evidence["recovery_sidecars_remaining"], 0)
         self.assertEqual(evidence["persistent_lock_files"], 6)
+        self.assertEqual(evidence["prepare_state_files"], 6)
         self.assertEqual(
             evidence["relative_output_paths"],
             [f"video-{index}/burned.mkv" for index in range(1, 7)],
