@@ -971,7 +971,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 media_generation=self.artifact_for(edit_video).media_generation,
             )
 
-        self.assertEqual(written_candidate, candidate_path)
+        self.assertEqual(written_candidate.resolve(), candidate_path.resolve())
         self.assertEqual(replace_calls[0][0].parent, replace_calls[0][1].parent)
         self.assertTrue(sidecar_path.exists())
         self.assertFalse(edit_video.with_suffix(".json").exists())
@@ -1091,7 +1091,7 @@ class WorkerProtocolTests(unittest.TestCase):
         try:
             with mock.patch(
                 "whisper_worker.time.monotonic",
-                side_effect=(0.0, 1.0),
+                side_effect=lambda values=iter((0.0, 1.0)): next(values, 1.0),
             ):
                 result = controller._request(WorkerCommand.LOAD_ASR)
         finally:

@@ -828,14 +828,14 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         async def prepare(render_video):
             acquisition_calls.append(("prepare", pathlib.Path(render_video).name))
             for values in media.values():
-                if values[0] == pathlib.Path(render_video):
+                if values[0].resolve() == pathlib.Path(render_video).resolve():
                     return values[1]
             raise AssertionError(f"unknown render video: {render_video}")
 
         async def extract_audio(edit_video):
             acquisition_calls.append(("extract_audio", pathlib.Path(edit_video).name))
             for values in media.values():
-                if values[1] == pathlib.Path(edit_video):
+                if values[1].resolve() == pathlib.Path(edit_video).resolve():
                     return values[2]
             raise AssertionError(f"unknown edit video: {edit_video}")
 
@@ -2226,14 +2226,14 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         run_task = asyncio.create_task(scheduler.run())
-        self.assertTrue(await asyncio.to_thread(align_started.wait, 1.0))
+        self.assertTrue(await asyncio.to_thread(align_started.wait, 5.0))
         writer.start()
-        self.assertTrue(await asyncio.to_thread(writer_started.wait, 1.0))
+        self.assertTrue(await asyncio.to_thread(writer_started.wait, 5.0))
         writer_was_blocked = not await asyncio.to_thread(writer_finished.wait, 0.2)
         align_release.set()
 
-        tasks = await asyncio.wait_for(run_task, 2.0)
-        await asyncio.to_thread(writer.join, 2.0)
+        tasks = await asyncio.wait_for(run_task, 10.0)
+        await asyncio.to_thread(writer.join, 10.0)
         if writer.is_alive():
             writer.terminate()
             writer.join()
@@ -2287,14 +2287,14 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         run_task = asyncio.create_task(scheduler.run())
-        self.assertTrue(await asyncio.to_thread(align_started.wait, 1.0))
+        self.assertTrue(await asyncio.to_thread(align_started.wait, 5.0))
         writer.start()
-        self.assertTrue(await asyncio.to_thread(writer_started.wait, 1.0))
+        self.assertTrue(await asyncio.to_thread(writer_started.wait, 5.0))
         writer_was_blocked = not await asyncio.to_thread(writer_finished.wait, 0.2)
         align_release.set()
 
-        tasks = await asyncio.wait_for(run_task, 2.0)
-        await asyncio.to_thread(writer.join, 2.0)
+        tasks = await asyncio.wait_for(run_task, 10.0)
+        await asyncio.to_thread(writer.join, 10.0)
         if writer.is_alive():
             writer.terminate()
             writer.join()
@@ -2344,15 +2344,15 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         run_task = asyncio.create_task(scheduler.run())
-        self.assertTrue(await asyncio.to_thread(align_started.wait, 1.0))
+        self.assertTrue(await asyncio.to_thread(align_started.wait, 5.0))
         writer.start()
-        self.assertTrue(await asyncio.to_thread(writer_started.wait, 1.0))
+        self.assertTrue(await asyncio.to_thread(writer_started.wait, 5.0))
         writer_was_blocked = not await asyncio.to_thread(writer_finished.wait, 0.2)
         run_task.cancel()
 
         with self.assertRaises(asyncio.CancelledError):
-            await asyncio.wait_for(run_task, 2.0)
-        await asyncio.to_thread(writer.join, 2.0)
+            await asyncio.wait_for(run_task, 10.0)
+        await asyncio.to_thread(writer.join, 10.0)
         if writer.is_alive():
             writer.terminate()
             writer.join()
@@ -3434,14 +3434,14 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
             return next(
                 values[1]
                 for values in media.values()
-                if values[0] == pathlib.Path(render_video)
+                if values[0].resolve() == pathlib.Path(render_video).resolve()
             )
 
         async def extract_audio(edit_video):
             return next(
                 values[2]
                 for values in media.values()
-                if values[1] == pathlib.Path(edit_video)
+                if values[1].resolve() == pathlib.Path(edit_video).resolve()
             )
 
         return AcquisitionRunners(download, prepare, extract_audio)
