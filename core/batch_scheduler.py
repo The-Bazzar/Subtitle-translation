@@ -523,6 +523,11 @@ class AcquisitionScheduler:
             elif self.control.interrupted:
                 self._cancel_tasks_waiting_for_worker("batch interrupted")
             return self.tasks
+        except asyncio.CancelledError:
+            for task in self.tasks:
+                if task.state not in TERMINAL_STATES:
+                    task.cancel(detail="batch acquisition canceled")
+            raise
         finally:
             if self._worker is None:
                 self.worker_released.set()
