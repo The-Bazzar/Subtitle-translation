@@ -29,7 +29,7 @@
 subtitle_translation/
 ├── cli.py              # 统一 argparse 入口和 command dispatch
 ├── config.py           # CLI > process env > .env > defaults
-├── process.py          # 参数数组、实时输出、超时、进程树终止
+├── process.py          # 参数数组、实时输出、活动进程注册和进程树终止
 ├── notifications.py    # success/error bell
 ├── stages.py           # download/prepare/whisper/burn stage runner
 └── pipeline.py         # pipeline 阶段编排
@@ -74,7 +74,7 @@ Python CLI 使用标准的 kebab-case 长选项。
 - translate 返回 ASS、split SRT、beautified JSON、glossary 和 description 路径。
 - burn 返回非空输出视频路径，并验证输出存在。
 
-stdout/stderr 仍实时显示给用户，同时保存有界诊断 tail；stdout 不再承担进程间协议。
+stdout/stderr 仍由活动子进程实时继承到当前终端；stdout 不再承担进程间协议。
 
 ## Pipeline and batch
 
@@ -120,7 +120,7 @@ subtitle-translation = "subtitle_translation.cli:main"
 - CLI parser 测试覆盖所有 command、帮助、未知参数和退出码。
 - stage runner 使用 mock subprocess，验证参数数组、实时输出、失败透传和非空输出检查。
 - pipeline contract 测试验证阶段顺序、结构化 output 传递和 skip 行为。
-- batch smoke 改为通过 `subtitle_translation batch`，继续覆盖资源容量、worker 协议和报告。
+- batch smoke 通过 `subtitle_translation batch` 的 dry-run 和 direct runner，scheduler 测试继续覆盖资源容量、worker 协议和报告。
 - Windows PowerShell 与 WSL wrapper parity 测试只验证兼容包装器调用同一 CLI。
 - 网络、LLM、ffmpeg、yt-dlp 和 WhisperX 均不得在 unittest 中真实调用。
 

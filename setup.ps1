@@ -183,6 +183,11 @@ Write-Host "验证安装" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 $WhisperXExe = Join-Path $ScriptDir ".venv\Scripts\whisperx.exe"
 & $PythonExe -c "import openai, langcodes; from tavily import TavilyClient; print('  openai/langcodes/tavily: OK')"
+& $PythonExe -m subtitle_translation --version | ForEach-Object { Write-Host "  subtitle-translation: $_" -ForegroundColor Gray }
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Error: subtitle-translation CLI verification failed." -ForegroundColor Red
+    exit $LASTEXITCODE
+}
 & $WhisperXExe --version 2>&1 | Select-Object -First 1 | ForEach-Object { Write-Host "  whisperx: $_" -ForegroundColor Gray }
 Write-Host "  yt-dlp $(yt-dlp --version 2>&1 | Select-Object -First 1)" -ForegroundColor Gray
 Write-Host "  ffmpeg $(ffmpeg -version 2>&1 | Select-Object -First 1)" -ForegroundColor Gray

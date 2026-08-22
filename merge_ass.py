@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -204,18 +205,19 @@ def merge_ass_files(zh_path: str, en_path: str, output_path: str | None = None) 
     return os.path.abspath(final_output)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Merge a .zh.ass and .en.ass pair into a bilingual .en-zh.ass file."
     )
     parser.add_argument("zh_ass", help="Path to the target-language .zh.ass file.")
     parser.add_argument("en_ass", help="Path to the source-language .en.ass file.")
     parser.add_argument("-o", "--output", help="Optional output path for the merged .en-zh.ass file.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     output_path = merge_ass_files(args.zh_ass, args.en_ass, args.output)
     print(output_path)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,34 +1,38 @@
-$target = if ($args.Count -gt 0) { [string] $args[0] } else { '' }
-[string[]] $pythonArgs = if ($args.Count -gt 1) {
-    @($args[1..($args.Count - 1)])
-} else {
-    @()
-}
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0, Mandatory = $true)][string]$Target,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments
+)
 
-switch -CaseSensitive -Exact ($target) {
-    'translate_srt' { $scriptName = 'translate_srt.py'; break }
-    'merge_ass' { $scriptName = 'merge_ass.py'; break }
-    'batch' { $scriptName = 'batch.py'; break }
-    default {
-        [Console]::Error.WriteLine("Error: unsupported Python target: $target")
-        exit 2
-    }
+$ErrorActionPreference = "Stop"
+$ScriptDir = Split-Path -Parent $PSCommandPath
+$PythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+    Write-Error "Project Python environment not found: $PythonExe. Run setup.ps1 first."
+    exit 127
 }
-
-$python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
-$configuredPython = $env:PYTHON_PATH_WIN
-if (-not $configuredPython -and (Test-Path (Join-Path $PSScriptRoot '.env.ps1'))) {
-    . (Join-Path $PSScriptRoot '.env.ps1')
-    $configuredPython = Get-EnvValue 'PYTHON_PATH_WIN' ''
+$Targets = @{
+    pipeline = "pipeline"
+    batch = "batch"
+    translate = "translate"
+    translate_srt = "translate"
+    "merge-ass" = "merge-ass"
+    merge_ass = "merge-ass"
+    download = "download"
+    "prepare-video" = "prepare-video"
+    prepare_video = "prepare-video"
+    whisper = "whisper"
+    burn = "burn"
+    "ffmpeg-burn" = "burn"
+    "mpv-burn" = "burn"
+    init = "init"
 }
-if ($configuredPython) {
-    $python = $configuredPython
+if (-not $Targets.ContainsKey($Target)) {
+    Write-Error "unsupported Python target: $Target"
+    exit 2
 }
-if (-not (Test-Path $python -PathType Leaf)) {
-    Write-Error "Python executable not found: $python. Run setup.ps1 first."
-    exit 1
-}
-
-$script = Join-Path $PSScriptRoot $scriptName
-& $python $script @pythonArgs
+$Command = $Targets[$Target]
+$Extra = @()
+if ($Target -eq "mpv-burn") { $Extra = @("--backend", "mpv") }
+& $PythonExe -m subtitle_translation $Command @Extra @Arguments
 exit $LASTEXITCODE

@@ -1276,14 +1276,10 @@ class StandaloneWhisperScriptTests(unittest.TestCase):
         powershell = (ROOT / "whisper.ps1").read_text(encoding="utf-8")
         bash = (ROOT / "whisper.sh").read_text(encoding="utf-8")
 
-        self.assertIn("$BatchSize = 8", powershell)
-        self.assertIn("BATCH_SIZE=8", bash)
-        self.assertIn("'--batch_size', $BatchSize", powershell)
-        self.assertIn('--batch_size "$BATCH_SIZE"', bash)
-        self.assertIn("'--compute_type', $ComputeType", powershell)
-        self.assertIn('--compute_type "$COMPUTE_TYPE"', bash)
-        self.assertIn("OUTPUT_JSON=", powershell)
-        self.assertIn("OUTPUT_JSON=", bash)
+        self.assertIn("-m subtitle_translation whisper", powershell)
+        self.assertIn("-m subtitle_translation whisper", bash)
+        stages = (ROOT / "subtitle_translation" / "stages.py").read_text(encoding="utf-8")
+        self.assertIn("OUTPUT_JSON=", stages)
         self.assertNotIn(".asr.json", powershell)
         self.assertNotIn(".asr.json", bash)
 

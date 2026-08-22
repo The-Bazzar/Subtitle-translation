@@ -1,0 +1,130 @@
+{
+  "global_domains": [
+    "wikipedia.org",
+    "wikidata.org",
+    "baike.baidu.com",
+    "baike.sogou.com",
+    "baike.so.com",
+    "fandom.com"
+  ],
+  "topics": [
+    {
+      "name": "anime",
+      "keywords": [
+        "anime",
+        "animation",
+        "manga",
+        "acg",
+        "动画",
+        "动漫",
+        "漫画",
+        "番剧",
+        "二次元"
+      ],
+      "domains": [
+        "mzh.moegirl.org.cn",
+        "moegirl.org.cn",
+        "zh.moegirl.org.cn",
+        "mzh.moegirl.org.cn",
+        "bgm.tv",
+        "bangumi.tv",
+        "fandom.com"
+      ]
+    },
+    {
+      "name": "game",
+      "keywords": [
+        "game",
+        "gaming",
+        "video game",
+        "games",
+        "游戏",
+        "电子游戏",
+        "主机游戏",
+        "手游"
+      ],
+      "domains": [
+        "wiki.gg",
+        "fandom.com",
+        "miraheze.org",
+        "indienova.com"
+      ]
+    },
+    {
+      "name": "film",
+      "keywords": [
+        "film",
+        "movie",
+        "cinema",
+        "director",
+        "screenplay",
+        "电影",
+        "影视",
+        "导演",
+        "剧本"
+      ],
+      "domains": [
+        "imdb.com",
+        "douban.com",
+        "themoviedb.org"
+      ]
+    },
+    {
+      "name": "philosophy",
+      "keywords": [
+        "philosophy",
+        "stoicism",
+        "ethics",
+        "plato",
+        "seneca",
+        "哲学",
+        "伦理学"
+      ],
+      "domains": [
+        "plato.stanford.edu",
+        "iep.utm.edu"
+      ]
+    },
+    {
+      "name": "technology",
+      "keywords": [
+        "technology",
+        "software",
+        "ai",
+        "artificial intelligence",
+        "machine learning",
+        "computer",
+        "科技",
+        "软件",
+        "人工智能",
+        "机器学习",
+        "计算机"
+      ],
+      "domains": [
+        "arxiv.org",
+        "paperswithcode.com",
+        "developer.mozilla.org",
+        "docs.python.org"
+      ]
+    },
+    {
+      "name": "history",
+      "keywords": [
+        "history",
+        "historical",
+        "war",
+        "empire",
+        "dynasty",
+        "历史",
+        "战争",
+        "帝国",
+        "王朝"
+      ],
+      "domains": [
+        "britannica.com",
+        "history.com",
+        "worldhistory.org"
+      ]
+    }
+  ]
+}

@@ -23,7 +23,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, Sequence
 from urllib.parse import urlparse
 
 import langcodes
@@ -463,9 +463,7 @@ class LLMConfig:
 
     def resolve_key(self) -> str:
         if self.api_key is None:
-            self.api_key = get_api_key(
-                self.provider, load_env(os.path.dirname(os.path.abspath(__file__)))
-            )
+            self.api_key = get_api_key(self.provider, load_env(_config_root()))
         return self.api_key
 
     def cfg(self) -> dict:
@@ -1342,6 +1340,7 @@ _BUILTIN_PROVIDERS = {
 }
 
 _providers_cache = None
+_providers_cache_root = None
 
 _TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
 
@@ -1648,11 +1647,19 @@ Do not output Source: or Target: labels inside values. Do not use separators lik
 Do not merge, split, or reorder items."""
 
 
+def _config_root() -> str:
+    configured = os.environ.get("SUBTITLE_TRANSLATION_PROJECT_DIR", "").strip()
+    if configured:
+        return os.path.abspath(configured)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def load_providers() -> dict:
-    global _providers_cache
-    if _providers_cache is not None:
+    global _providers_cache, _providers_cache_root
+    root = _config_root()
+    if _providers_cache is not None and _providers_cache_root == root:
         return _providers_cache
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "providers.json")
+    config_path = os.path.join(root, "providers.json")
     if os.path.isfile(config_path):
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -1661,10 +1668,12 @@ def load_providers() -> dict:
                 providers = dict(_BUILTIN_PROVIDERS)
                 providers.update(loaded)
                 _providers_cache = providers
+                _providers_cache_root = root
                 return _providers_cache
         except (json.JSONDecodeError, OSError):
             pass
     _providers_cache = dict(_BUILTIN_PROVIDERS)
+    _providers_cache_root = root
     return _providers_cache
 
 
@@ -1695,7 +1704,7 @@ def get_api_key(provider: str, env: dict[str, str]) -> str:
 
 
 def load_prompt(filename: str, fallback: str) -> str:
-    base = os.path.dirname(os.path.abspath(__file__))
+    base = _config_root()
     for suffix in (".md", ".example.md"):
         path = os.path.join(base, filename + suffix)
         if os.path.isfile(path):
@@ -2379,7 +2388,7 @@ class TavilyDomainPreferences:
 
 
 def load_tavily_domain_preferences(base_dir: str = "") -> TavilyDomainPreferences:
-    root = base_dir or os.path.dirname(os.path.abspath(__file__))
+    root = base_dir or _config_root()
     preferences = TavilyDomainPreferences()
     for filename in ("tavily_domains.example.json", "tavily_domains.json"):
         path = os.path.join(root, filename)
@@ -4813,8 +4822,8 @@ def infer_video_path(ctx: TranscriptContext) -> str:
     return ""
 
 
-def main() -> None:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+def main(argv: Sequence[str] | None = None) -> int:
+    script_dir = _config_root()
     env = load_env(script_dir)
 
     parser = argparse.ArgumentParser(
@@ -4858,7 +4867,7 @@ def main() -> None:
     parser.add_argument("--aggressive", action="store_true")
     parser.add_argument("--no-scene-snap", action="store_true")
     parser.add_argument("-q", "--quiet", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not os.path.isfile(args.json):
         print(f"Error: JSON file not found: {args.json}", file=sys.stderr)
@@ -5057,4 +5066,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

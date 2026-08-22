@@ -1,6 +1,6 @@
 [project]
 name = "subtitle-translation"
-version = "1.5.0"
+version = "1.8.0.dev0"
 description = "JSON-first WhisperX subtitle translation pipeline"
 requires-python = ">=3.10,<3.14"
 dependencies = [
@@ -18,5 +18,24 @@ asr = [
     "whisperx @ git+https://github.com/m-bain/whisperx.git",
 ]
 
-[tool.uv]
-package = false
+[project.scripts]
+subtitle-translation = "subtitle_translation.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["subtitle_translation", "subtitle_translation.examples"]
+py-modules = [
+    "batch",
+    "batch_cache",
+    "batch_runtime",
+    "batch_scheduler",
+    "merge_ass",
+    "translate_srt",
+    "whisper_worker",
+]
+
+[tool.setuptools.package-data]
+subtitle_translation = ["examples/*"]
