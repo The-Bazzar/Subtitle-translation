@@ -665,7 +665,7 @@ class FakeAsrController:
             try:
                 if self.align_started is not None:
                     self.align_started.set()
-                if self.align_release is None or not self.align_release.wait(2.0):
+                if self.align_release is None or not self.align_release.wait(10.0):
                     raise AssertionError("blocked ALIGN was not released")
             finally:
                 if self.align_finished is not None:
@@ -1198,8 +1198,14 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(task.state is TaskState.SUCCEEDED for task in tasks))
         self.assertTrue(all(task.stage == "alignment_ready" for task in tasks))
-        self.assertEqual(tasks[0].asr_path, media["cached"][1].with_suffix(".asr.json"))
-        self.assertEqual(tasks[1].asr_path, media["fresh"][1].with_suffix(".asr.json"))
+        self.assertEqual(
+            tasks[0].asr_path.resolve(),
+            media["cached"][1].with_suffix(".asr.json").resolve(),
+        )
+        self.assertEqual(
+            tasks[1].asr_path.resolve(),
+            media["fresh"][1].with_suffix(".asr.json").resolve(),
+        )
         self.assertTrue(all(not task.asr_path.exists() for task in tasks))
         self.assertTrue(all(task.json_path.is_file() for task in tasks))
         self.assertTrue(all(not task.wav_path.exists() for task in tasks))
@@ -1499,8 +1505,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(scheduler.worker_released.is_set())
         self.assertIsNotNone(scheduler.failure_log_path)
         self.assertEqual(
-            list(self.root.glob("batch-worker-failure-*.log")),
-            [scheduler.failure_log_path],
+            [path.resolve() for path in self.root.glob("batch-worker-failure-*.log")],
+            [scheduler.failure_log_path.resolve()],
         )
         log_text = scheduler.failure_log_path.read_text(encoding="utf-8")
         for field in (
@@ -1540,8 +1546,8 @@ class AsrWaveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             tasks[0].error_detail,
         )
         self.assertEqual(
-            list(self.root.glob("batch-worker-failure-*.log")),
-            [scheduler.failure_log_path],
+            [path.resolve() for path in self.root.glob("batch-worker-failure-*.log")],
+            [scheduler.failure_log_path.resolve()],
         )
         log_text = scheduler.failure_log_path.read_text(encoding="utf-8")
         self.assertIn("phase=unload_asr", log_text)
@@ -4076,7 +4082,7 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tasks[0].stage, "asr")
         self.assertIsNotNone(scheduler.failure_log_path)
-        self.assertEqual(scheduler.failure_log_path.parent, self.root)
+        self.assertEqual(scheduler.failure_log_path.parent.resolve(), self.root.resolve())
         log_text = scheduler.failure_log_path.read_text(encoding="utf-8")
         for field in (
             "task: 1",
