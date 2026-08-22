@@ -14,10 +14,10 @@ platform: Agent + Script
 
 ## 自动脚本行为
 
-当前自动 glossary 已集成到 `translate_srt.py`：
+当前自动 glossary 已集成到 `core/translate_srt.py`，通过统一 CLI 调用：
 
 ```bash
-./.venv/bin/python translate_srt.py video.beautified.json --video video.webm --only-glossary --skip-beautify
+subtitle-translation translate video.beautified.json --video video.webm --only-glossary --skip-beautify
 ```
 
 输入：
@@ -54,9 +54,9 @@ platform: Agent + Script
 
 Prompt：
 
-- `glossary_prompt.md` 或 `glossary_prompt.example.md`
+- `glossary_prompt.md` 或 `misc/examples/glossary_prompt.example.md`
 - 只用于微调 glossary 内容策略
-- JSON 输出格式由 `translate_srt.py` 内置规则追加，不要在 prompt 文件里改返回格式
+- JSON 输出格式由 `core/translate_srt.py` 内置规则追加，不要在 prompt 文件里改返回格式
 
 ## 外部 agent 工作要求
 

@@ -7,11 +7,12 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 BASH = shutil.which("bash")
 
 
 def read(name: str) -> str:
-    return (ROOT / name).read_text(encoding="utf-8")
+    return (SCRIPTS / name).read_text(encoding="utf-8")
 
 
 class ProjectLauncherTests(unittest.TestCase):
@@ -43,8 +44,10 @@ class ProjectLauncherTests(unittest.TestCase):
         }
         for name, command in expected.items():
             with self.subTest(name=name):
-                self.assertIn(f"-m subtitle_translation {command}", read(f"{name}.ps1"))
-                self.assertIn(f"-m subtitle_translation {command}", read(f"{name}.sh"))
+                for content in (read(f"{name}.ps1"), read(f"{name}.sh")):
+                    self.assertIn("-m subtitle_translation", content)
+                    self.assertIn("--project-dir", content)
+                    self.assertRegex(content, rf"\b{re.escape(command)}\b")
 
     def test_mpv_wrappers_select_mpv_backend(self):
         self.assertIn("--backend mpv", read("mpv-burn.ps1"))
@@ -64,7 +67,7 @@ class ProjectLauncherTests(unittest.TestCase):
     def test_bash_wrappers_are_syntactically_valid(self):
         if not BASH or sys.platform == "win32":
             self.skipTest("requires bash")
-        for path in ROOT.glob("*.sh"):
+        for path in SCRIPTS.glob("*.sh"):
             with self.subTest(path=path.name):
                 result = subprocess.run([BASH, "-n", str(path)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)

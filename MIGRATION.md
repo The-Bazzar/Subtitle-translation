@@ -24,14 +24,14 @@ console entry point 和 `python -m subtitle_translation` 使用同一份实现�
 
 ## 旧入口
 
-`pipeline.ps1/.sh`、`batch.ps1/.sh`、`download.ps1/.sh`、`prepare-video.ps1/.sh`、`whisper.ps1/.sh`、`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh`、`ffmpeg-burn.ps1/.sh` 和 `mpv-burn.ps1/.sh` 仍存在，但都只是定位项目 `.venv` 后执行 `python -m subtitle_translation ...`。它们不再解析 `OUTPUT_*` marker，也不再互相调用。
+兼容 wrapper 已统一移入 `scripts/`。其中的 pipeline、batch、download、prepare-video、whisper、translate、merge-ass 和 burn 脚本都只定位项目 `.venv` 后执行 `python -m subtitle_translation ...`，不再解析 `OUTPUT_*` marker，也不再互相调用。
 
 `py_launcher.ps1/.sh` 的旧 target 仍可用：
 
 ```powershell
-.\py_launcher.ps1 translate_srt video.json
-.\py_launcher.ps1 merge_ass video.zh.ass video.en.ass
-.\py_launcher.ps1 batch URL1 URL2
+.\scripts\py_launcher.ps1 translate_srt video.json
+.\scripts\py_launcher.ps1 merge_ass video.zh.ass video.en.ass
+.\scripts\py_launcher.ps1 batch URL1 URL2
 ```
 
 推荐新代码直接使用 `subtitle-translation translate`、`subtitle-translation merge-ass` 和 `subtitle-translation batch`。
@@ -60,7 +60,19 @@ prepare_result = prepare_video(render_path, config)
 edit_path = Path(prepare_result.outputs["edit_video"])
 ```
 
-batch runner 使用相同 stage functions，不再依赖平台 shell、PowerShell、marker 或共享 launcher。`batch_runtime.py` 只负责把 `StageResult` 转为 scheduler 的阶段结果；`process.py` 统一管理 argv、工具环境和活动子进程。
+batch runner 使用相同 stage functions，不再依赖平台 shell、PowerShell、marker 或共享 launcher。`core/batch_runtime.py` 只负责把 `StageResult` 转为 scheduler 的阶段结果；`core/subtitle_translation/process.py` 统一管理 argv、工具环境和活动子进程。
+
+## 仓库布局迁移
+
+源码布局已集中整理：
+
+```text
+core/          Python package 与核心模块
+scripts/       PowerShell/bash 安装和兼容脚本
+misc/examples/ 配置与模板样例
+```
+
+旧自动化若直接引用根目录脚本，需要为路径加上 `scripts/`。Python import 和 `subtitle-translation` CLI 名称保持不变。
 
 batch 的 CPU/IO capacity 为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 与 burn 共用固定 4 路 NVENC。
 
@@ -76,7 +88,7 @@ batch 的第一次 `Ctrl+C` 停止接纳新任务并停止推进新的阶段，�
 
 ## 迁移检查
 
-1. 运行 `setup.ps1` 或 `setup.sh`，让 uv 重建项目 `.venv` 并安装 package。
+1. 运行 `scripts/setup.ps1` 或 `scripts/setup.sh`，让 uv 重建项目 `.venv` 并安装 package。
 2. 把自动化中的全局 `python` / `python3` 替换为项目 CLI 或 `.venv` 解释器。
 3. 删除自定义的 `OUTPUT_*` 解析和 stage 间 shell 串联；Python API 返回 `StageResult.outputs`。
 4. 不再传递 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，并发由 scheduler 自动检测。

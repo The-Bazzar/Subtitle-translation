@@ -19,8 +19,11 @@ platform: Win + Linux
 
 ## 当前实现
 
-- Windows：`whisper.ps1`
-- Linux：`whisper.sh`
+```text
+subtitle-translation whisper "video.mkv"
+```
+
+实现位于 `core/subtitle_translation/stages.py`。
 
 ## 关键行为
 
@@ -41,6 +44,6 @@ platform: Win + Linux
 ## 注意
 
 - 当前项目不再依赖 SRT
-- `translate_srt.py` 以 WhisperX `.json` 为入口
+- `core/translate_srt.py` 以 WhisperX `.json` 为入口
 - 翻译、校对、分割使用 JSON 里的整句 segment
 - 分割后再用 `words[]` 对齐每条字幕事件的起止时间

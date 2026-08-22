@@ -26,19 +26,22 @@
 ## Architecture
 
 ```text
-subtitle_translation/
-├── cli.py              # 统一 argparse 入口和 command dispatch
-├── config.py           # CLI > process env > .env > defaults
-├── process.py          # 参数数组、实时输出、活动进程注册和进程树终止
-├── notifications.py    # success/error bell
-├── stages.py           # download/prepare/whisper/burn stage runner
-└── pipeline.py         # pipeline 阶段编排
+core/
+├── subtitle_translation/
+│   ├── cli.py              # 统一 argparse 入口和 command dispatch
+│   ├── config.py           # CLI > process env > .env > defaults
+│   ├── process.py          # 参数数组、实时输出、活动进程注册和进程树终止
+│   ├── notifications.py    # success/error bell
+│   ├── stages.py           # download/prepare/whisper/burn stage runner
+│   └── pipeline.py         # pipeline 阶段编排
+├── batch_runtime.py        # 复用 batch scheduler，调用 Python stage runner
+├── batch_scheduler.py      # 任务状态和资源调度
+├── whisper_worker.py       # spawn worker 与 WhisperX 生命周期
+├── translate_srt.py        # JSON 美化、glossary、翻译、分割、校对、ASS
+└── merge_ass.py            # ASS 合并
 
-batch_runtime.py        # 复用 batch scheduler，改为调用 Python stage runner
-batch_scheduler.py      # 任务状态和资源调度
-whisper_worker.py       # spawn worker 与 WhisperX 生命周期
-translate_srt.py        # JSON 美化、glossary、翻译、分割、校对、ASS
-merge_ass.py            # ASS 合并
+scripts/                    # setup 与兼容包装器
+misc/examples/              # 用户配置和模板样例
 ```
 
 `subtitle_translation.cli` 是唯一公开 console entry point。旧的根目录 Python 模块在迁移
@@ -107,8 +110,7 @@ subtitle-translation = "subtitle_translation.cli:main"
 
 ## Compatibility and migration
 
-- `pipeline.ps1/.sh`、`batch.ps1/.sh`、`translate_srt.ps1/.sh`、`merge_ass.ps1/.sh`、
-  `download.ps1/.sh`、`prepare-video.ps1/.sh`、`whisper.ps1/.sh` 和 burn 脚本暂时保留为
+- `scripts/` 下的 pipeline、batch、translate、merge-ass、download、prepare-video、whisper 和 burn 脚本暂时保留为
   薄包装器，内部只调用 Python CLI。
 - 包装器不再包含独立业务逻辑；下一次 major release 才考虑删除。
 - `py_launcher` 标记为 deprecated，迁移文档提供新旧命令对照。

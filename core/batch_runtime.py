@@ -193,7 +193,7 @@ def build_stage_environment(
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     env = load_project_environment(
-        script_dir or Path(__file__).resolve().parent,
+        script_dir or Path.cwd(),
         environ=environ,
     )
     env["BURN"] = "1" if args.burn else "0"

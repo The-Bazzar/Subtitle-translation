@@ -30,7 +30,8 @@ platform: Win + Linux
 
 ## 当前实现
 
-- 核心脚本：`translate_srt.py`
+- 核心实现：`core/translate_srt.py`
+- 正式入口：`subtitle-translation translate`
 
 ## 流程
 
@@ -46,9 +47,9 @@ platform: Win + Linux
 
 ## Prompt 来源
 
-- `translate_prompt.md` 或 `translate_prompt.example.md`
-- `proofread_prompt.md` 或 `proofread_prompt.example.md`
-- `split_prompt.md` 或 `split_prompt.example.md` 仅用于微调分割风格；`translate_srt.py` 会在其后追加内置 `_SPLIT_FORMAT`
+- `translate_prompt.md` 或 `misc/examples/translate_prompt.example.md`
+- `proofread_prompt.md` 或 `misc/examples/proofread_prompt.example.md`
+- `split_prompt.md` 或 `misc/examples/split_prompt.example.md` 仅用于微调分割风格；`core/translate_srt.py` 会在其后追加内置 `_SPLIT_FORMAT`
 - prompt 文件可使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量
 
 ## 关键点

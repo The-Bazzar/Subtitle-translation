@@ -2,13 +2,14 @@
 # .env.ps1 — 共享模块: 从 .env 文件读取配置
 #
 # 用法 (dot-source):
-#   . "$PSScriptRoot\.env.ps1"
+#   . "<repo>\scripts\.env.ps1"
 #   $val = Get-EnvValue 'KEY' 'default'
 #
 # 优先级: CLI 参数 > .env > 硬编码默认值
 # =============================================================================
 
-$script:__EnvPath = Join-Path $PSScriptRoot '.env'
+$script:__ProjectRoot = Split-Path -Parent $PSScriptRoot
+$script:__EnvPath = Join-Path $script:__ProjectRoot '.env'
 
 function Get-EnvValue([string]$Key, [string]$Default) {
     if (-not (Test-Path $script:__EnvPath)) { return $Default }

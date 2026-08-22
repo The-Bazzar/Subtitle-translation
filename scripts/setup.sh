@@ -5,12 +5,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXAMPLES_DIR="$PROJECT_ROOT/misc/examples"
 
 copy_config_if_missing() {
     local example_name="$1"
     local target_name="$2"
-    local example_path="$SCRIPT_DIR/$example_name"
-    local target_path="$SCRIPT_DIR/$target_name"
+    local example_path="$EXAMPLES_DIR/$example_name"
+    local target_path="$PROJECT_ROOT/$target_name"
     if [ -f "$example_path" ] && [ ! -f "$target_path" ]; then
         cp "$example_path" "$target_path"
         echo "  created $target_name from $example_name"
@@ -18,8 +20,8 @@ copy_config_if_missing() {
 }
 
 update_env_from_example() {
-    local example_path="$SCRIPT_DIR/.env.example"
-    local env_path="$SCRIPT_DIR/.env"
+    local example_path="$EXAMPLES_DIR/.env.example"
+    local env_path="$PROJECT_ROOT/.env"
     [ -f "$example_path" ] || return 0
     if [ ! -f "$env_path" ]; then
         cp "$example_path" "$env_path"
@@ -87,7 +89,7 @@ copy_config_if_missing "proofread_prompt.example.md" "proofread_prompt.md"
 copy_config_if_missing "split_prompt.example.md" "split_prompt.md"
 copy_config_if_missing "template.ass.example" "template.ass"
 
-[ -f "$SCRIPT_DIR/.env" ] && set -a && source <(tr -d '\r' < "$SCRIPT_DIR/.env") && set +a
+[ -f "$PROJECT_ROOT/.env" ] && set -a && source <(tr -d '\r' < "$PROJECT_ROOT/.env") && set +a
 
 echo "============================================="
 echo "setup — 字幕流水线环境安装 (Linux/WSL)"
@@ -130,7 +132,7 @@ fi
 
 # ── Python venv ────────────────────────────────────────────────────────────
 echo ">>> 创建/复用项目 .venv..."
-cd "$SCRIPT_DIR"
+cd "$PROJECT_ROOT"
 uv venv .venv --clear --python 3.13.12
 
 # ── PyTorch backend ────────────────────────────────────────────────────────
@@ -166,11 +168,11 @@ fi
 
 echo ">>> 安装 PyTorch backend: $TORCH_BACKEND ($TORCH_REASON)"
 if [ "$TORCH_BACKEND" = "cuda128" ]; then
-    uv pip install --python "$SCRIPT_DIR/.venv/bin/python" \
+    uv pip install --python "$PROJECT_ROOT/.venv/bin/python" \
         torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
         --index-url https://download.pytorch.org/whl/cu128
 else
-    uv pip install --python "$SCRIPT_DIR/.venv/bin/python" \
+    uv pip install --python "$PROJECT_ROOT/.venv/bin/python" \
         torch==2.8.0 torchaudio==2.8.0 \
         --index-url https://download.pytorch.org/whl/cpu
 fi
@@ -180,9 +182,9 @@ echo ""
 echo "============================================="
 echo "验证安装"
 echo "============================================="
-"$SCRIPT_DIR/.venv/bin/python" -c "import openai, langcodes; from tavily import TavilyClient; print('  openai/langcodes/tavily: OK')"
-echo "  subtitle-translation: $("$SCRIPT_DIR/.venv/bin/python" -m subtitle_translation --version)"
-"$SCRIPT_DIR/.venv/bin/whisperx" --version 2>&1 | head -1 | sed 's/^/  whisperx: /' || echo "  whisperx: installed"
+"$PROJECT_ROOT/.venv/bin/python" -c "import openai, langcodes; from tavily import TavilyClient; print('  openai/langcodes/tavily: OK')"
+echo "  subtitle-translation: $("$PROJECT_ROOT/.venv/bin/python" -m subtitle_translation --version)"
+"$PROJECT_ROOT/.venv/bin/whisperx" --version 2>&1 | head -1 | sed 's/^/  whisperx: /' || echo "  whisperx: installed"
 echo "  yt-dlp $(yt-dlp --version 2>&1 | head -1)"
 echo "  ffmpeg $(ffmpeg -version 2>&1 | head -1 | cut -d' ' -f3)"
 echo "  node $(node --version)"

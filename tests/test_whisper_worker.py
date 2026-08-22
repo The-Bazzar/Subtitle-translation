@@ -1273,12 +1273,12 @@ class WorkerProtocolTests(unittest.TestCase):
 
 class StandaloneWhisperScriptTests(unittest.TestCase):
     def test_powershell_and_bash_share_asr_defaults_and_final_json_contract(self):
-        powershell = (ROOT / "whisper.ps1").read_text(encoding="utf-8")
-        bash = (ROOT / "whisper.sh").read_text(encoding="utf-8")
+        powershell = (ROOT / "scripts" / "whisper.ps1").read_text(encoding="utf-8")
+        bash = (ROOT / "scripts" / "whisper.sh").read_text(encoding="utf-8")
 
-        self.assertIn("-m subtitle_translation whisper", powershell)
-        self.assertIn("-m subtitle_translation whisper", bash)
-        stages = (ROOT / "subtitle_translation" / "stages.py").read_text(encoding="utf-8")
+        self.assertIn(" whisper ", powershell)
+        self.assertIn(" whisper ", bash)
+        stages = (ROOT / "core" / "subtitle_translation" / "stages.py").read_text(encoding="utf-8")
         self.assertIn("OUTPUT_JSON=", stages)
         self.assertNotIn(".asr.json", powershell)
         self.assertNotIn(".asr.json", bash)

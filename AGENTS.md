@@ -40,45 +40,34 @@ subtitle-translation translate "path/to/video.json"
 "<repo>/.venv/bin/python" -m subtitle_translation pipeline "URL"
 ```
 
-`pipeline`、`batch`、`translate`、`merge-ass`、`download`、`prepare-video`、`whisper` 和 `burn` 都是正式子命令。`subtitle_translation.cli` 只负责参数分派；业务逻辑位于 package、`translate_srt.py` 和 batch scheduler。
+`pipeline`、`batch`、`translate`、`merge-ass`、`download`、`prepare-video`、`whisper` 和 `burn` 都是正式子命令。`subtitle_translation.cli` 只负责参数分派；业务逻辑位于 `core/` 下的 package、`translate_srt.py` 和 batch scheduler。
 
 ## Repository Layout
 
 ```text
 ├── pyproject.toml
-├── subtitle_translation/
-│   ├── cli.py                 # console entry point and dispatch
-│   ├── config.py              # .env/project configuration
-│   ├── process.py             # argv process execution and active process registry
-│   ├── stages.py              # download, prepare, whisper, burn
-│   ├── pipeline.py            # single URL orchestration
-│   └── notifications.py       # dependency-free bells
-├── translate_srt.py           # JSON beautify + glossary + LLM stages + ASS export
-├── merge_ass.py               # ASS merge implementation
-├── batch.py                   # compatibility Python entry point
-├── batch_runtime.py           # batch CLI and direct Python stage runners
-├── batch_scheduler.py         # resource and ASR wave scheduler
-├── batch_cache.py             # ASR fingerprint and recovery sidecars
-├── whisper_worker.py          # spawned WhisperX worker
-├── pipeline.ps1/.sh           # compatibility wrappers -> Python CLI
-├── batch.ps1/.sh              # compatibility wrappers -> Python CLI
-├── py_launcher.ps1/.sh        # legacy target mapper -> Python CLI
-├── download.ps1/.sh           # compatibility wrappers
-├── prepare-video.ps1/.sh
-├── whisper.ps1/.sh
-├── translate_srt.ps1/.sh
-├── merge_ass.ps1/.sh
-├── ffmpeg-burn.ps1/.sh
-├── mpv-burn.ps1/.sh
-├── setup.ps1/.sh
-├── .env.example
-├── providers.example.json
-├── tavily_domains.example.json
-├── template.ass.example
-└── docs/superpowers/specs/2026-08-21-python-cli-rewrite-design.md
+├── core/
+│   ├── subtitle_translation/
+│   │   ├── cli.py             # console entry point and dispatch
+│   │   ├── config.py          # .env/project configuration
+│   │   ├── process.py         # argv process execution and active process registry
+│   │   ├── stages.py          # download, prepare, whisper, burn
+│   │   ├── pipeline.py        # single URL orchestration
+│   │   └── notifications.py   # dependency-free bells
+│   ├── translate_srt.py       # JSON beautify + glossary + LLM stages + ASS export
+│   ├── merge_ass.py           # ASS merge implementation
+│   ├── batch.py               # compatibility Python import entry point
+│   ├── batch_runtime.py       # batch CLI and direct Python stage runners
+│   ├── batch_scheduler.py     # resource and ASR wave scheduler
+│   ├── batch_cache.py         # ASR fingerprint and recovery sidecars
+│   └── whisper_worker.py      # spawned WhisperX worker
+├── scripts/                   # all PowerShell/bash setup and compatibility wrappers
+├── misc/examples/             # env, provider, domain, prompt and ASS examples
+├── docs/
+└── tests/
 ```
 
-PowerShell/bash 文件只负责定位项目 `.venv`、转发参数和返回退出码，不得重新实现 stage、解析 marker 或启动整条 pipeline。不能要求用户设置 PATH，也不能在脚本中调用全局 Python。
+所有 PowerShell/bash 文件必须位于 `scripts/`。它们只负责安装、定位项目 `.venv`、转发参数和返回退出码，不得重新实现 stage、解析 marker 或启动整条 pipeline。不能要求用户设置 PATH，也不能在脚本中调用全局 Python。
 
 ## Pipeline
 
@@ -117,7 +106,7 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 ## Configuration and Local Files
 
-`setup.ps1` / `setup.sh` 会从 example 创建缺失的 `.env`、provider、domain、prompt 和 template 文件；旧 `.env` 只追加缺失变量，不覆盖已有值。setup 使用 `uv` 创建并清空项目 `.venv`，然后同步 pyproject 依赖和用户选定的 torch backend。
+`scripts/setup.ps1` / `scripts/setup.sh` 会从 `misc/examples/` 创建缺失的 `.env`、provider、domain、prompt 和 template 文件；旧 `.env` 只追加缺失变量，不覆盖已有值。setup 使用 `uv` 创建并清空项目 `.venv`，然后同步 pyproject 依赖和用户选定的 torch backend。
 
 本地文件和生成物禁止提交：`.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、本地 prompt、`template.ass`、视频、字幕、glossary、sidecar、`chroma_db` 和 batch report。
 
@@ -125,7 +114,7 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 ## Testing and Documentation
 
-网络、LLM、yt-dlp、ffmpeg、WhisperX 必须 mock。修改 `translate_srt.py`、setup、入口、缓存或并发调度时运行全量：
+网络、LLM、yt-dlp、ffmpeg、WhisperX 必须 mock。修改 `core/translate_srt.py`、setup、入口、缓存或并发调度时运行全量：
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests

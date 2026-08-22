@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${PYTHON_PATH_LINUX:-$SCRIPT_DIR/.venv/bin/python}"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_BIN="${PYTHON_PATH_LINUX:-$PROJECT_ROOT/.venv/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then
-    echo "Error: project Python environment not found: $PYTHON_BIN. Run setup.sh first." >&2
+    echo "Error: project Python environment not found: $PYTHON_BIN. Run scripts/setup.sh first." >&2
     exit 127
 fi
 if [ "$#" -lt 1 ]; then
@@ -42,4 +43,4 @@ case "$TARGET" in
         exit 2
         ;;
 esac
-exec "$PYTHON_BIN" -m subtitle_translation "$COMMAND" "${EXTRA[@]}" "$@"
+exec "$PYTHON_BIN" -m subtitle_translation --project-dir "$PROJECT_ROOT" "$COMMAND" "${EXTRA[@]}" "$@"

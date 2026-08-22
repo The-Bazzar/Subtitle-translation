@@ -1651,7 +1651,7 @@ def _config_root() -> str:
     configured = os.environ.get("SUBTITLE_TRANSLATION_PROJECT_DIR", "").strip()
     if configured:
         return os.path.abspath(configured)
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.getcwd())
 
 
 def load_providers() -> dict:
@@ -4830,10 +4830,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Translate WhisperX JSON to proofread/target-language/bilingual ASS.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  .\\.venv\\Scripts\\python.exe translate_srt.py video.json --video video.webm
-  .\\.venv\\Scripts\\python.exe translate_srt.py video.json --source-lang en --target-lang zh
-  .\\.venv\\Scripts\\python.exe translate_srt.py video.json -o video.en-zh.ass
-  .\\.venv\\Scripts\\python.exe translate_srt.py video.json --only-beautify --video video.webm
+  subtitle-translation translate video.json --video video.webm
+  subtitle-translation translate video.json --source-lang en --target-lang zh
+  subtitle-translation translate video.json -o video.en-zh.ass
+  subtitle-translation translate video.json --only-beautify --video video.webm
 """,
     )
     parser.add_argument("json", help="WhisperX .json transcript path")

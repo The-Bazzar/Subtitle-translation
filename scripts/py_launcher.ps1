@@ -6,9 +6,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $PSCommandPath
-$PythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+$ProjectRoot = Split-Path -Parent $ScriptDir
+$PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
-    Write-Error "Project Python environment not found: $PythonExe. Run setup.ps1 first."
+    Write-Error "Project Python environment not found: $PythonExe. Run scripts/setup.ps1 first."
     exit 127
 }
 $Targets = @{
@@ -34,5 +35,5 @@ if (-not $Targets.ContainsKey($Target)) {
 $Command = $Targets[$Target]
 $Extra = @()
 if ($Target -eq "mpv-burn") { $Extra = @("--backend", "mpv") }
-& $PythonExe -m subtitle_translation $Command @Extra @Arguments
+& $PythonExe -m subtitle_translation --project-dir $ProjectRoot $Command @Extra @Arguments
 exit $LASTEXITCODE

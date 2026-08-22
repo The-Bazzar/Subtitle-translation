@@ -5,14 +5,16 @@
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ScriptDir = Split-Path $PSCommandPath -Parent
+$ProjectRoot = Split-Path -Parent $ScriptDir
+$ExamplesDir = Join-Path $ProjectRoot "misc\examples"
 
 function Copy-ConfigIfMissing {
     param(
         [string]$ExampleName,
         [string]$TargetName
     )
-    $ExamplePath = Join-Path $ScriptDir $ExampleName
-    $TargetPath = Join-Path $ScriptDir $TargetName
+    $ExamplePath = Join-Path $ExamplesDir $ExampleName
+    $TargetPath = Join-Path $ProjectRoot $TargetName
     if ((Test-Path $ExamplePath) -and -not (Test-Path $TargetPath)) {
         Copy-Item -LiteralPath $ExamplePath -Destination $TargetPath
         Write-Host "  created $TargetName from $ExampleName" -ForegroundColor Gray
@@ -20,8 +22,8 @@ function Copy-ConfigIfMissing {
 }
 
 function Update-EnvFromExample {
-    $ExamplePath = Join-Path $ScriptDir ".env.example"
-    $EnvPath = Join-Path $ScriptDir ".env"
+    $ExamplePath = Join-Path $ExamplesDir ".env.example"
+    $EnvPath = Join-Path $ProjectRoot ".env"
     if (-not (Test-Path $ExamplePath)) {
         return
     }
@@ -115,7 +117,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 
 # ── Python venv ────────────────────────────────────────────────────────────
 Write-Host ">>> 创建/复用项目 .venv..." -ForegroundColor Yellow
-Push-Location $ScriptDir
+Push-Location $ProjectRoot
 uv venv .venv --clear --python 3.13.12
 Pop-Location
 
@@ -152,11 +154,11 @@ switch ($TorchBackend.ToLowerInvariant()) {
     }
 }
 
-$PythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+$PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 
 # ── Python packages ────────────────────────────────────────────────────────
 Write-Host ">>> 同步 pyproject.toml Python packages (asr)..." -ForegroundColor Yellow
-Push-Location $ScriptDir
+Push-Location $ProjectRoot
 uv sync --inexact --extra asr
 $SyncExitCode = $LASTEXITCODE
 Pop-Location
@@ -181,7 +183,7 @@ Write-Host ""
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host "验证安装" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
-$WhisperXExe = Join-Path $ScriptDir ".venv\Scripts\whisperx.exe"
+$WhisperXExe = Join-Path $ProjectRoot ".venv\Scripts\whisperx.exe"
 & $PythonExe -c "import openai, langcodes; from tavily import TavilyClient; print('  openai/langcodes/tavily: OK')"
 & $PythonExe -m subtitle_translation --version | ForEach-Object { Write-Host "  subtitle-translation: $_" -ForegroundColor Gray }
 if ($LASTEXITCODE -ne 0) {

@@ -1934,7 +1934,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in session.messages], ["system", "user", "assistant"])
 
     def test_provider_example_uses_request_kwargs_for_sdk_options(self):
-        with open("providers.example.json", "r", encoding="utf-8") as f:
+        with open("misc/examples/providers.example.json", "r", encoding="utf-8") as f:
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
@@ -2007,12 +2007,15 @@ class JsonProtocolTests(unittest.TestCase):
                 )
 
             old_cache = t._providers_cache
+            old_cache_root = t._providers_cache_root
             try:
                 t._providers_cache = None
-                with patch.object(t.os.path, "dirname", return_value=tmp):
+                t._providers_cache_root = None
+                with patch.dict(t.os.environ, {"SUBTITLE_TRANSLATION_PROJECT_DIR": tmp}):
                     providers = t.load_providers()
             finally:
                 t._providers_cache = old_cache
+                t._providers_cache_root = old_cache_root
 
             self.assertIn("openai", providers)
             self.assertIn("llama", providers)
@@ -2843,7 +2846,9 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("discipline: 定译为自律", captured["system_prompt"])
 
     def test_write_ass_uses_named_output_modes(self):
-        template = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "template.ass.example"))
+        template = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "misc", "examples", "template.ass.example")
+        )
         event = t.SplitEvent(1.0, 2.0, "source line", "目标行")
 
         with tempfile.TemporaryDirectory() as tmp:

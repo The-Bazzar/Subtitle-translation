@@ -3022,7 +3022,7 @@ class BatchCliTests(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         parser.parse_args(arguments)
 
-        self.assertNotIn("MaxJobs", (ROOT / "py_launcher.ps1").read_text(encoding="utf-8"))
+        self.assertNotIn("MaxJobs", (ROOT / "scripts" / "py_launcher.ps1").read_text(encoding="utf-8"))
 
     def test_existing_batch_options_remain_representable(self):
         args = build_parser().parse_args([
@@ -3090,7 +3090,7 @@ class BatchWrapperTests(unittest.TestCase):
                 self.assertIs(batch._run_stage_command, replacement)
 
     def test_wrapper_only_imports_runtime_main_and_keeps_entrypoint_guard(self):
-        wrapper_path = ROOT / "batch.py"
+        wrapper_path = ROOT / "core" / "batch.py"
         tree = ast.parse(wrapper_path.read_text(encoding="utf-8"), filename="batch.py")
         imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)]
         definitions = [
@@ -3111,7 +3111,7 @@ class BatchWrapperTests(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {"batch_runtime": fake_runtime}):
             with self.assertRaises(SystemExit) as caught:
-                runpy.run_path(str(ROOT / "batch.py"), run_name="__main__")
+                runpy.run_path(str(ROOT / "core" / "batch.py"), run_name="__main__")
 
         self.assertEqual(caught.exception.code, 23)
         fake_runtime.main.assert_called_once_with(_notify_unhandled=True)
@@ -3154,7 +3154,7 @@ class BatchWrapperTests(unittest.TestCase):
         fake_runtime.main = mock.Mock(return_value=0)
 
         with mock.patch.dict(sys.modules, {"batch_runtime": fake_runtime}):
-            runpy.run_path(str(ROOT / "batch.py"), run_name="batch_import_probe")
+            runpy.run_path(str(ROOT / "core" / "batch.py"), run_name="batch_import_probe")
 
         fake_runtime.main.assert_not_called()
 

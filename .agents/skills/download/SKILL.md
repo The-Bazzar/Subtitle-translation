@@ -8,37 +8,21 @@ platform: Win + Linux
 
 使用 yt-dlp 下载 YouTube 视频及相关元数据。**不包含**语音识别。
 
-## Win — PowerShell
+## 执行
 
-```powershell
-.\download.ps1 "https://www.youtube.com/watch?v=xxxxx"
+```text
+subtitle-translation download "https://www.youtube.com/watch?v=xxxxx"
 ```
 
 成功输出 `OUTPUT_RENDER_VIDEO=<原片绝对路径>`。脚本在原片与元数据落盘后结束，不创建编辑版，也不运行 ffmpeg 重编码。
 
 需要编辑版时，将该 marker 的路径显式传给独立准备脚本：
 
-```powershell
-.\prepare-video.ps1 "<OUTPUT_RENDER_VIDEO>"
+```text
+subtitle-translation prepare-video "<OUTPUT_RENDER_VIDEO>"
 ```
 
-`prepare-video.ps1` 成功输出 `OUTPUT_VIDEO=<编辑版 mkv 绝对路径>`，供 `whisper.ps1` 使用；`pipeline.ps1` 已自动串联这两个步骤。
-
-## Linux — Bash
-
-```bash
-./download.sh "https://www.youtube.com/watch?v=xxxxx"
-```
-
-成功输出 `OUTPUT_RENDER_VIDEO=<原片绝对路径>`。脚本在原片与元数据落盘后结束，不创建编辑版，也不运行 ffmpeg 重编码。
-
-需要编辑版时，将该 marker 的路径显式传给独立准备脚本：
-
-```bash
-./prepare-video.sh "<OUTPUT_RENDER_VIDEO>"
-```
-
-`prepare-video.sh` 成功输出 `OUTPUT_VIDEO=<编辑版 mkv 绝对路径>`，供 `whisper.sh` 使用；`pipeline.sh` 已自动串联这两个步骤。
+`prepare-video` 成功输出 `OUTPUT_VIDEO=<编辑版 mkv 绝对路径>`，供 `subtitle-translation whisper` 使用；`subtitle-translation pipeline` 已自动串联这两个步骤。
 
 ## 输出
 
@@ -56,5 +40,5 @@ platform: Win + Linux
 - 需要 `cookies.txt` (YouTube 凭证, gitignored)
 - yt-dlp 从 `.env` 的 `YTDLP_PATH_WIN` / `YTDLP_PATH_LINUX` 读取
 - 如果输出目录中已有 `视频标题.original.mkv`，脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`
-- `download.ps1/.sh` 不调用 `prepare-video`；direct download 用户必须按仓库根目录 `MIGRATION.md` 显式增加准备步骤
-- 时间戳抚平、`h264_nvenc` / `libx264` 选择、FLAC 音频与 metadata removal 均归独立 `prepare-video.ps1/.sh` 负责
+- `download` 不调用 `prepare-video`；direct download 用户必须按仓库根目录 `MIGRATION.md` 显式增加准备步骤
+- 时间戳抚平、`h264_nvenc` / `libx264` 选择、FLAC 音频与 metadata removal 均归独立 `prepare-video` stage 负责
