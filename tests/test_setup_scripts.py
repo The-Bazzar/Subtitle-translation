@@ -26,6 +26,11 @@ class SetupAndDocumentationTests(unittest.TestCase):
                 self.assertIn("misc", content)
                 self.assertIn("examples", content)
 
+    def test_setup_sh_uses_posix_awk_for_env_upgrade(self):
+        content = (SCRIPTS / "setup.sh").read_text(encoding="utf-8")
+        self.assertNotRegex(content, r"match\([^\n]+,[^\n]+,[^\n]+\)")
+        self.assertIn('existing[key] = 1', content)
+
     def test_packaged_and_setup_examples_stay_identical(self):
         setup_examples = ROOT / "misc" / "examples"
         package_examples = ROOT / "core" / "subtitle_translation" / "examples"

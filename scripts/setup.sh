@@ -34,8 +34,11 @@ update_env_from_example() {
     awk -v env_path="$env_path" '
         BEGIN {
             while ((getline line < env_path) > 0) {
-                if (match(line, /^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=/, m)) {
-                    existing[m[1]] = 1
+                key = line
+                sub(/^[[:space:]]*/, "", key)
+                if (key ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=/) {
+                    sub(/[[:space:]]*=.*/, "", key)
+                    existing[key] = 1
                 }
             }
             close(env_path)
