@@ -8,7 +8,7 @@
   <img alt="Python 3.10-3.13" src="https://img.shields.io/badge/Python-3.10--3.13-3776AB?logo=python&logoColor=white">
   <img alt="PowerShell 7" src="https://img.shields.io/badge/PowerShell-7-5391FE?logo=powershell&logoColor=white">
   <img alt="Windows Linux WSL" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL-555555">
-  <img alt="Version 1.8 preview" src="https://img.shields.io/badge/Version-1.8.0--preview-orange">
+  <img alt="Version 2.0 preview" src="https://img.shields.io/badge/Version-2.0.0--preview-orange">
   <a href="LICENSE"><img alt="GPL-3.0 license" src="https://img.shields.io/badge/License-GPL--3.0-2ea44f"></a>
 </p>
 
