@@ -22,7 +22,7 @@
 | merge_queue | `ALLGREEN`，5/1/5，min wait 5min | 普通合并必须通过 merge queue，不得绕过 |
 
 **当前已落地的自动化：**
-- 全量 unittest：`main` 基线必须 `Ran 286 tests / OK`。
+- 全量 unittest：`main` 基线必须 `Ran 287 tests / OK`。
 - CodeQL：`.github/workflows/codeql.yml` 已启用。
 - Copilot code review：每次 push 自动触发。
 - merge queue：`ALLGREEN` 通过后才允许合并。
@@ -116,7 +116,7 @@ uv run python -m unittest discover -s tests
 ```
 
 **测试基线：**
-`main` 当前基线为 `Ran 286 tests` 且必须 `OK`。历史 `v1.7.9` 的 3 个基线问题（2 个 `-crf 19` 断言、1 个 `template.ass` 路径错误）已由 PR #8 修复，**不再保留任何基线豁免**；任何 PR 出现失败/错误即为阻断项。
+`main` 当前基线为 `Ran 287 tests` 且必须 `OK`。历史 `v1.7.9` 的 3 个基线问题（2 个 `-crf 19` 断言、1 个 `template.ass` 路径错误）已由 PR #8 修复，**不再保留任何基线豁免**；任何 PR 出现失败/错误即为阻断项。
 
 **其他强制要求：**
 - 修改 `core/translate_srt.py`：必须跑全量 unittest，且至少有一个新增/调整的测试直接覆盖改动行为。
@@ -150,7 +150,7 @@ uv run python -m unittest discover -s tests
 
 ## Validation
 - 命令：`.venv/bin/python -m unittest discover -s tests`
-- 结果：Ran N tests；新增失败/错误 0；`main` 基线当前为 `Ran 286 tests / OK`
+- 结果：Ran N tests；新增失败/错误 0；`main` 基线当前为 `Ran 287 tests / OK`
 - 新增测试名称及覆盖点
 - 人工验证步骤（涉及脚本/CLI 时）
 

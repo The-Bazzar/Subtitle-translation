@@ -58,14 +58,14 @@
 
 ```powershell
 .\scripts\setup.ps1
-& .\.venv\Scripts\subtitle-translation.exe pipeline "https://www.youtube.com/watch?v=*"
+subtitle-translation pipeline "https://www.youtube.com/watch?v=*"
 ```
 
 ### 🐧 Linux / WSL
 
 ```bash
 ./scripts/setup.sh
-./.venv/bin/subtitle-translation pipeline "https://www.youtube.com/watch?v=*"
+subtitle-translation pipeline "https://www.youtube.com/watch?v=*"
 ```
 
 setup 会完成以下工作：
@@ -73,9 +73,9 @@ setup 会完成以下工作：
 - 创建项目 `.venv`。
 - 从 example 创建缺失的本地配置。
 - 安装项目、WhisperX 和所选 CPU/CUDA PyTorch 后端。
-- 验证 `subtitle-translation` CLI 是否可用。
+- 安装并验证全局 `subtitle-translation` 命令 shim。
 
-不需要把 Python 或项目目录手动加入 PATH。
+shim 始终转发到当前项目 `.venv`，不创建第二套 Python 环境。用户不需要手动配置 PATH。
 
 <a id="commands"></a>
 

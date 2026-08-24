@@ -72,6 +72,39 @@ function Update-EnvFromExample {
     }
 }
 
+function Install-CliShim {
+    param(
+        [string]$PythonPath,
+        [string]$ProjectPath
+    )
+
+    $ShimDir = Join-Path $env:LOCALAPPDATA "SubtitleTranslation\bin"
+    $ShimPath = Join-Path $ShimDir "subtitle-translation.cmd"
+    New-Item -ItemType Directory -Path $ShimDir -Force | Out-Null
+
+    $ShimContent = @"
+@echo off
+"$PythonPath" -m subtitle_translation --project-dir "$ProjectPath" %*
+exit /b %ERRORLEVEL%
+"@
+    Set-Content -LiteralPath $ShimPath -Value $ShimContent -Encoding utf8NoBOM
+
+    $PathComparison = [StringComparer]::OrdinalIgnoreCase
+    $ProcessSegments = @($env:Path -split ';' | Where-Object { $_ })
+    if (-not ($ProcessSegments | Where-Object { $PathComparison.Equals($_.TrimEnd('\'), $ShimDir.TrimEnd('\')) })) {
+        $env:Path = "$ShimDir;$env:Path"
+    }
+
+    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $UserSegments = @($UserPath -split ';' | Where-Object { $_ })
+    if (-not ($UserSegments | Where-Object { $PathComparison.Equals($_.TrimEnd('\'), $ShimDir.TrimEnd('\')) })) {
+        $NewUserPath = if ($UserPath) { "$ShimDir;$UserPath" } else { $ShimDir }
+        [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+    }
+
+    return $ShimPath
+}
+
 Write-Host ">>> 准备本地配置文件..." -ForegroundColor Yellow
 Update-EnvFromExample
 Copy-ConfigIfMissing "providers.example.json" "providers.json"
@@ -178,6 +211,9 @@ if ($TorchBackend -eq 'cuda128') {
         --index-url "https://download.pytorch.org/whl/cpu"
 }
 
+Write-Host ">>> 安装 subtitle-translation 命令..." -ForegroundColor Yellow
+$CliShim = Install-CliShim -PythonPath $PythonExe -ProjectPath $ProjectRoot
+
 # ── 验证 ────────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -185,7 +221,7 @@ Write-Host "验证安装" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 $WhisperXExe = Join-Path $ProjectRoot ".venv\Scripts\whisperx.exe"
 & $PythonExe -c "import openai, langcodes; from tavily import TavilyClient; print('  openai/langcodes/tavily: OK')"
-& $PythonExe -m subtitle_translation --version | ForEach-Object { Write-Host "  subtitle-translation: $_" -ForegroundColor Gray }
+& $CliShim --version | ForEach-Object { Write-Host "  subtitle-translation: $_" -ForegroundColor Gray }
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Error: subtitle-translation CLI verification failed." -ForegroundColor Red
     exit $LASTEXITCODE

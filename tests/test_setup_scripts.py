@@ -26,6 +26,18 @@ class SetupAndDocumentationTests(unittest.TestCase):
                 self.assertIn("misc", content)
                 self.assertIn("examples", content)
 
+    def test_setup_installs_project_cli_shim(self):
+        powershell = (SCRIPTS / "setup.ps1").read_text(encoding="utf-8")
+        shell = (SCRIPTS / "setup.sh").read_text(encoding="utf-8")
+
+        self.assertIn("subtitle-translation.cmd", powershell)
+        self.assertIn("SubtitleTranslation\\bin", powershell)
+        self.assertIn("SetEnvironmentVariable", powershell)
+        self.assertIn('--project-dir "$ProjectPath"', powershell)
+        self.assertIn("/usr/local/bin/subtitle-translation", shell)
+        self.assertIn('install_cli_shim', shell)
+        self.assertIn('--project-dir %q', shell)
+
     def test_setup_sh_uses_posix_awk_for_env_upgrade(self):
         content = (SCRIPTS / "setup.sh").read_text(encoding="utf-8")
         self.assertNotRegex(content, r"match\([^\n]+,[^\n]+,[^\n]+\)")

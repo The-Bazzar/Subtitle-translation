@@ -82,6 +82,22 @@ update_env_from_example() {
     rm -f "$tmp"
 }
 
+install_cli_shim() {
+    local python_bin="$PROJECT_ROOT/.venv/bin/python"
+    local shim_path="/usr/local/bin/subtitle-translation"
+    local shim_temp
+    shim_temp="$(mktemp)"
+    printf '#!/usr/bin/env bash\nexec %q -m subtitle_translation --project-dir %q "$@"\n' \
+        "$python_bin" "$PROJECT_ROOT" > "$shim_temp"
+    chmod 0755 "$shim_temp"
+    if [ "$(id -u)" -eq 0 ]; then
+        install -m 0755 "$shim_temp" "$shim_path"
+    else
+        sudo install -m 0755 "$shim_temp" "$shim_path"
+    fi
+    rm -f "$shim_temp"
+}
+
 echo ">>> 准备本地配置文件..."
 update_env_from_example
 copy_config_if_missing "providers.example.json" "providers.json"
@@ -180,13 +196,16 @@ else
         --index-url https://download.pytorch.org/whl/cpu
 fi
 
+echo ">>> 安装 subtitle-translation 命令..."
+install_cli_shim
+
 # ── 验证 ────────────────────────────────────────────────────────────────────
 echo ""
 echo "============================================="
 echo "验证安装"
 echo "============================================="
 "$PROJECT_ROOT/.venv/bin/python" -c "import openai, langcodes; from tavily import TavilyClient; print('  openai/langcodes/tavily: OK')"
-echo "  subtitle-translation: $("$PROJECT_ROOT/.venv/bin/python" -m subtitle_translation --version)"
+echo "  subtitle-translation: $(subtitle-translation --version)"
 "$PROJECT_ROOT/.venv/bin/whisperx" --version 2>&1 | head -1 | sed 's/^/  whisperx: /' || echo "  whisperx: installed"
 echo "  yt-dlp $(yt-dlp --version 2>&1 | head -1)"
 echo "  ffmpeg $(ffmpeg -version 2>&1 | head -1 | cut -d' ' -f3)"

@@ -22,6 +22,8 @@ subtitle-translation translate input.json
 
 console entry point 和 `python -m subtitle_translation` 使用同一份实现，退出码约定为：`0` 成功，`1` 任务失败，`2` 参数/配置错误，`130` 用户中断。
 
+新版 `scripts/setup.ps1` / `scripts/setup.sh` 会安装全局 `subtitle-translation` shim。shim 只转发到当前仓库 `.venv` 并自动附带 `--project-dir`，不会复制第二套 Python/WhisperX 环境，也不要求用户手动设置 PATH。切换仓库位置后重新运行 setup 即可刷新 shim。
+
 ## 旧入口
 
 兼容 wrapper 已统一移入 `scripts/`。其中的 pipeline、batch、download、prepare-video、whisper、translate、merge-ass 和 burn 脚本都只定位项目 `.venv` 后执行 `python -m subtitle_translation ...`，不再解析 `OUTPUT_*` marker，也不再互相调用。
