@@ -249,4 +249,5 @@ subtitle-translation --project-dir "G:/Subtitle translation/.code" pipeline "URL
 - [技术与协作约束](AGENTS.md)
 - [迁移说明](MIGRATION.md)
 - [Python CLI 重构设计](docs/superpowers/specs/2026-08-21-python-cli-rewrite-design.md)
+- [v2.1.0 ASR Provider 候选设计](docs/superpowers/specs/2026-08-25-v2.1.0-asr-provider-design.md)
 - [GPL-3.0 许可证](LICENSE)
