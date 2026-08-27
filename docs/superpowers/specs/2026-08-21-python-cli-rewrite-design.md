@@ -41,7 +41,6 @@ core/
 └── merge_ass.py            # ASS 合并
 
 scripts/                    # setup 与兼容包装器
-misc/examples/              # 用户配置和模板样例
 ```
 
 `subtitle_translation.cli` 是唯一公开 console entry point。旧的根目录 Python 模块在迁移

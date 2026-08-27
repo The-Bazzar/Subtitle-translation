@@ -132,7 +132,6 @@ subtitle-translation <command> --help
 ```text
 core/          Python package 与核心运行模块
 scripts/       setup 和平台兼容启动脚本
-misc/examples/ 用户配置、provider、prompt 与 ASS 模板样例
 tests/         自动化测试
 docs/          架构与设计文档
 ```

@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ScriptDir = Split-Path $PSCommandPath -Parent
 $ProjectRoot = Split-Path -Parent $ScriptDir
-$ExamplesDir = Join-Path $ProjectRoot "misc\examples"
+$ExamplesDir = Join-Path $ProjectRoot "core\subtitle_translation\examples"
 
 function Copy-ConfigIfMissing {
     param(

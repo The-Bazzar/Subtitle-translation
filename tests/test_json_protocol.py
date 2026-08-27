@@ -1934,7 +1934,11 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in session.messages], ["system", "user", "assistant"])
 
     def test_provider_example_uses_request_kwargs_for_sdk_options(self):
-        with open("misc/examples/providers.example.json", "r", encoding="utf-8") as f:
+        with open(
+            "core/subtitle_translation/examples/providers.example.json",
+            "r",
+            encoding="utf-8",
+        ) as f:
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
@@ -2847,7 +2851,14 @@ class JsonProtocolTests(unittest.TestCase):
 
     def test_write_ass_uses_named_output_modes(self):
         template = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "misc", "examples", "template.ass.example")
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "core",
+                "subtitle_translation",
+                "examples",
+                "template.ass.example",
+            )
         )
         event = t.SplitEvent(1.0, 2.0, "source line", "目标行")
 

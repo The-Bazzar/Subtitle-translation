@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-EXAMPLES_DIR="$PROJECT_ROOT/misc/examples"
+EXAMPLES_DIR="$PROJECT_ROOT/core/subtitle_translation/examples"
 
 copy_config_if_missing() {
     local example_name="$1"

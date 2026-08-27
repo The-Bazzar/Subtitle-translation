@@ -54,7 +54,7 @@ subtitle-translation translate video.beautified.json --video video.webm --only-g
 
 Prompt：
 
-- `glossary_prompt.md` 或 `misc/examples/glossary_prompt.example.md`
+- `glossary_prompt.md` 或 `core/subtitle_translation/examples/glossary_prompt.example.md`
 - 只用于微调 glossary 内容策略
 - JSON 输出格式由 `core/translate_srt.py` 内置规则追加，不要在 prompt 文件里改返回格式
 

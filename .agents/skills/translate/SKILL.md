@@ -47,9 +47,9 @@ platform: Win + Linux
 
 ## Prompt 来源
 
-- `translate_prompt.md` 或 `misc/examples/translate_prompt.example.md`
-- `proofread_prompt.md` 或 `misc/examples/proofread_prompt.example.md`
-- `split_prompt.md` 或 `misc/examples/split_prompt.example.md` 仅用于微调分割风格；`core/translate_srt.py` 会在其后追加内置 `_SPLIT_FORMAT`
+- `translate_prompt.md` 或 `core/subtitle_translation/examples/translate_prompt.example.md`
+- `proofread_prompt.md` 或 `core/subtitle_translation/examples/proofread_prompt.example.md`
+- `split_prompt.md` 或 `core/subtitle_translation/examples/split_prompt.example.md` 仅用于微调分割风格；`core/translate_srt.py` 会在其后追加内置 `_SPLIT_FORMAT`
 - prompt 文件可使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量
 
 ## 关键点

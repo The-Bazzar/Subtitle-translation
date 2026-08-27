@@ -71,7 +71,6 @@ batch runner 使用相同 stage functions，不再依赖平台 shell、PowerShel
 ```text
 core/          Python package 与核心模块
 scripts/       PowerShell/bash 安装和兼容脚本
-misc/examples/ 配置与模板样例
 ```
 
 旧自动化若直接引用根目录脚本，需要为路径加上 `scripts/`。Python import 和 `subtitle-translation` CLI 名称保持不变。

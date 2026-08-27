@@ -53,7 +53,8 @@ subtitle-translation translate "path/to/video.json"
 │   │   ├── process.py         # argv process execution and active process registry
 │   │   ├── stages.py          # download, prepare, whisper, burn
 │   │   ├── pipeline.py        # single URL orchestration
-│   │   └── notifications.py   # dependency-free bells
+│   │   ├── notifications.py   # dependency-free bells
+│   │   └── examples/          # packaged env, provider, prompt and ASS examples
 │   ├── translate_srt.py       # JSON beautify + glossary + LLM stages + ASS export
 │   ├── merge_ass.py           # ASS merge implementation
 │   ├── batch.py               # compatibility Python import entry point
@@ -62,7 +63,6 @@ subtitle-translation translate "path/to/video.json"
 │   ├── batch_cache.py         # ASR fingerprint and recovery sidecars
 │   └── whisper_worker.py      # spawned WhisperX worker
 ├── scripts/                   # all PowerShell/bash setup and compatibility wrappers
-├── misc/examples/             # env, provider, domain, prompt and ASS examples
 ├── docs/
 └── tests/
 ```
@@ -106,7 +106,7 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 ## Configuration and Local Files
 
-`scripts/setup.ps1` / `scripts/setup.sh` 会从 `misc/examples/` 创建缺失的 `.env`、provider、domain、prompt 和 template 文件；旧 `.env` 只追加缺失变量，不覆盖已有值。setup 使用 `uv` 创建并清空项目 `.venv`，同步 pyproject 依赖和用户选定的 torch backend，并安装一个转发到项目 `.venv` 的全局 `subtitle-translation` shim。不能要求用户手动设置 PATH，也不能为 CLI 复制第二套 Python 环境。
+`scripts/setup.ps1` / `scripts/setup.sh` 会从 `core/subtitle_translation/examples/` 创建缺失的 `.env`、provider、domain、prompt 和 template 文件；同一目录也作为 wheel package data，是 example 的唯一权威。旧 `.env` 只追加缺失变量，不覆盖已有值。setup 使用 `uv` 创建并清空项目 `.venv`，同步 pyproject 依赖和用户选定的 torch backend，并安装一个转发到项目 `.venv` 的全局 `subtitle-translation` shim。不能要求用户手动设置 PATH，也不能为 CLI 复制第二套 Python 环境。
 
 本地文件和生成物禁止提交：`.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、本地 prompt、`template.ass`、视频、字幕、glossary、sidecar、`chroma_db` 和 batch report。
 
