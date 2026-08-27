@@ -66,14 +66,14 @@ def download_video(url: str, config: ProjectConfig) -> StageResult:
     ytdlp = config.resolve_tool("YTDLP_PATH_WIN" if os.name == "nt" else "YTDLP_PATH_LINUX", "yt-dlp")
     if not ytdlp:
         return StageResult.fail(127, "yt-dlp command not found")
-    title_result = capture_command([ytdlp, "--get-title", url], cwd=config.project_dir)
+    title_result = capture_command([ytdlp, "--get-title", url], cwd=config.output_dir)
     if title_result.returncode != 0:
         return StageResult.fail(title_result.returncode, "failed to get video title", title_result.args)
     title_lines = [line.strip() for line in title_result.stdout.splitlines() if line.strip()]
     if not title_lines:
         return StageResult.fail(1, "yt-dlp returned an empty video title", title_result.args)
     folder_name = _safe_folder_name(title_lines[-1])
-    folder = config.project_dir / folder_name
+    folder = config.output_dir / folder_name
     folder.mkdir(parents=True, exist_ok=True)
     existing = folder / f"{folder_name}.original.mkv"
     cookies = config.project_dir / "cookies.txt"
@@ -113,7 +113,7 @@ def download_video(url: str, config: ProjectConfig) -> StageResult:
             url,
         ]
         render_video = None
-    result = run_command([ytdlp, *ytdlp_args], cwd=config.project_dir, label="yt-dlp")
+    result = run_command([ytdlp, *ytdlp_args], cwd=config.output_dir, label="yt-dlp")
     failed = _run_failed(result, "yt-dlp")
     if failed:
         return failed

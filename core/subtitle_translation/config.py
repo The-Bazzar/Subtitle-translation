@@ -26,14 +26,24 @@ def _read_env_file(path: Path) -> dict[str, str]:
 class ProjectConfig:
     project_dir: Path
     values: dict[str, str]
+    invocation_dir: Path | None = None
 
     @classmethod
-    def load(cls, project_dir: str | Path | None = None) -> "ProjectConfig":
+    def load(
+        cls,
+        project_dir: str | Path | None = None,
+        invocation_dir: str | Path | None = None,
+    ) -> "ProjectConfig":
+        invocation_root = Path(invocation_dir or os.getcwd()).expanduser().resolve()
         configured_root = os.environ.get("SUBTITLE_TRANSLATION_PROJECT_DIR", "").strip()
-        root = Path(project_dir or configured_root or os.getcwd()).expanduser().resolve()
+        root = Path(project_dir or configured_root or invocation_root).expanduser().resolve()
         values = _read_env_file(root / ".env")
         values.update({key: value for key, value in os.environ.items()})
-        return cls(root, values)
+        return cls(root, values, invocation_root)
+
+    @property
+    def output_dir(self) -> Path:
+        return self.invocation_dir or self.project_dir
 
     def get(self, key: str, default: str = "") -> str:
         return self.values.get(key, default)

@@ -244,7 +244,7 @@ def create_platform_runners(
     control: BatchControl | None = None,
 ) -> AcquisitionRunners:
     del platform, terminal
-    config = ProjectConfig(script_dir, dict(env))
+    config = ProjectConfig(script_dir, dict(env), Path.cwd().resolve())
 
     async def download(url: str) -> str:
         result = await _run_python_stage(
@@ -288,7 +288,7 @@ def create_platform_postprocess_runner(
     control: BatchControl | None = None,
 ) -> PostprocessRunner:
     del platform, terminal
-    config = ProjectConfig(script_dir, dict(env))
+    config = ProjectConfig(script_dir, dict(env), Path.cwd().resolve())
     os.environ["SUBTITLE_TRANSLATION_PROJECT_DIR"] = str(script_dir)
     for key in (
         "TRANSLATE_PROVIDER",
@@ -353,7 +353,7 @@ def create_platform_burn_runner(
     control: BatchControl | None = None,
 ) -> BurnRunner:
     del platform, terminal
-    config = ProjectConfig(script_dir, dict(env))
+    config = ProjectConfig(script_dir, dict(env), Path.cwd().resolve())
 
     async def burn(task: BatchTask) -> None:
         if task.render_video_path is None or task.edit_video_path is None:
@@ -589,7 +589,7 @@ def write_report(
 def _main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     script_dir = Path(os.environ.get("SUBTITLE_TRANSLATION_PROJECT_DIR") or os.getcwd()).resolve()
-    report_path = Path(args.report) if args.report else script_dir / "batch-result.txt"
+    report_path = Path(args.report) if args.report else Path.cwd() / "batch-result.txt"
     limits = ResourceLimits.detect()
     started_at = datetime.now()
 

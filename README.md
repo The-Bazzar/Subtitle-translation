@@ -210,7 +210,9 @@ glossary 位于翻译之前：
 
 ### 📁 项目目录
 
-`cookies.txt` 从项目根目录读取。从其他目录运行时，请在主命令前指定配置根：
+`--project-dir` 只指定 `.env`、cookies、provider 和 template 的配置根，不改变输出位置。pipeline 下载项目默认创建在执行命令时的当前目录。
+
+`cookies.txt` 从项目配置根读取。从其他目录运行时，可以在主命令前显式指定：
 
 ```text
 subtitle-translation --project-dir "G:/Subtitle translation/.code" pipeline "URL"

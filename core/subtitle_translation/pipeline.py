@@ -122,8 +122,28 @@ def _translate_main(
     return StageResult.ok(ass=str(ass_path))
 
 
+def _env_skip(config: ProjectConfig, stage: str) -> bool:
+    legacy_key = f"SKIP_{stage}"
+    if config.get(legacy_key, "").strip():
+        return config.flag(legacy_key)
+    return config.flag(f"PIPELINE_SKIP_{stage}")
+
+
+def _apply_env_skip_defaults(args: argparse.Namespace, config: ProjectConfig) -> None:
+    for attribute, stage in (
+        ("skip_download", "DOWNLOAD"),
+        ("skip_whisper", "WHISPER"),
+        ("skip_beautify", "BEAUTIFY"),
+        ("skip_knowledge", "KNOWLEDGE"),
+        ("skip_translate", "TRANSLATE"),
+        ("skip_burn", "BURN"),
+    ):
+        setattr(args, attribute, bool(getattr(args, attribute) or _env_skip(config, stage)))
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     config = ProjectConfig.load(args.project_dir)
+    _apply_env_skip_defaults(args, config)
     if args.dry_run:
         print("[DRY RUN] Python pipeline stages:")
         print("  download -> prepare-video -> whisper -> translate -> burn")

@@ -24,6 +24,8 @@ console entry point 和 `python -m subtitle_translation` 使用同一份实现�
 
 新版 `scripts/setup.ps1` / `scripts/setup.sh` 会安装全局 `subtitle-translation` shim。shim 只转发到当前仓库 `.venv` 并自动附带 `--project-dir`，不会复制第二套 Python/WhisperX 环境，也不要求用户手动设置 PATH。切换仓库位置后重新运行 setup 即可刷新 shim。
 
+`--project-dir` 从输出目录语义中拆出：它只用于读取 `.env`、cookies、provider 和 template。download/pipeline 的新项目默认写入执行命令时的当前目录，batch 默认报告也写入当前目录。
+
 ## 旧入口
 
 兼容 wrapper 已统一移入 `scripts/`。其中的 pipeline、batch、download、prepare-video、whisper、translate、merge-ass 和 burn 脚本都只定位项目 `.venv` 后执行 `python -m subtitle_translation ...`，不再解析 `OUTPUT_*` marker，也不再互相调用。

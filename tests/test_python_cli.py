@@ -78,6 +78,18 @@ class PythonCliTests(unittest.TestCase):
         self.assertEqual(config.project_dir, root.resolve())
         self.assertEqual(config.get("TARGET_LANG"), "ja")
 
+    def test_project_config_separates_config_and_output_directories(self):
+        with tempfile.TemporaryDirectory() as config_directory, tempfile.TemporaryDirectory() as output_directory:
+            config_root = pathlib.Path(config_directory)
+            output_root = pathlib.Path(output_directory)
+            (config_root / ".env").write_text("TARGET_LANG=ja\n", encoding="utf-8")
+
+            config = ProjectConfig.load(config_root, output_root)
+
+        self.assertEqual(config.project_dir, config_root.resolve())
+        self.assertEqual(config.output_dir, output_root.resolve())
+        self.assertEqual(config.get("TARGET_LANG"), "ja")
+
     def test_pipeline_translation_output_uses_requested_language_suffixes(self):
         from argparse import Namespace
 
@@ -138,6 +150,61 @@ class PythonCliTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(pathlib.Path(result.outputs["render_video"]).suffix, ".mp4")
         self.assertTrue(pathlib.Path(result.outputs["render_video"]).name.endswith(".original.mp4"))
+
+    def test_download_stage_writes_to_invocation_directory(self):
+        from subtitle_translation import stages
+
+        with tempfile.TemporaryDirectory() as config_directory, tempfile.TemporaryDirectory() as output_directory:
+            config_root = pathlib.Path(config_directory)
+            output_root = pathlib.Path(output_directory)
+            config = ProjectConfig(config_root, {}, output_root)
+
+            def fake_run(args, **kwargs):
+                output_template = pathlib.Path(args[args.index("-o") + 1])
+                output_template.parent.mkdir(parents=True, exist_ok=True)
+                output_template.with_name(output_template.name.replace("%(ext)s", "mkv")).write_bytes(b"video")
+                return CommandResult(tuple(args), 0)
+
+            with mock.patch("subtitle_translation.config.ProjectConfig.resolve_tool", return_value="yt-dlp"), mock.patch(
+                "subtitle_translation.stages.capture_command",
+                return_value=CommandResult(("yt-dlp", "--get-title"), 0, "Output title\n"),
+            ), mock.patch("subtitle_translation.stages.run_command", side_effect=fake_run):
+                result = stages.download_video("https://example.invalid/video", config)
+
+        output_path = pathlib.Path(result.outputs["render_video"])
+        self.assertTrue(result.success)
+        self.assertEqual(output_path.parent.parent, output_root.resolve())
+        self.assertFalse((config_root / "Output title").exists())
+
+    def test_pipeline_honors_env_skip_burn_aliases(self):
+        from subtitle_translation import pipeline
+        from subtitle_translation.stages import StageResult
+
+        for key in ("SKIP_BURN", "PIPELINE_SKIP_BURN"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                render_video = root / "video.original.mkv"
+                edit_video = root / "video.mkv"
+                json_path = root / "video.json"
+                ass_path = root / "video.en-zh.ass"
+                config = ProjectConfig(root, {key: "1"}, root)
+                args = pipeline.build_parser().parse_args(["https://example.invalid/video"])
+
+                with mock.patch.object(pipeline.ProjectConfig, "load", return_value=config), mock.patch.object(
+                    pipeline, "download_video", return_value=StageResult.ok(render_video=str(render_video))
+                ), mock.patch.object(
+                    pipeline, "prepare_video", return_value=StageResult.ok(edit_video=str(edit_video))
+                ), mock.patch.object(
+                    pipeline, "transcribe_video", return_value=StageResult.ok(json=str(json_path))
+                ), mock.patch.object(
+                    pipeline, "_translate_main", return_value=StageResult.ok(ass=str(ass_path))
+                ), mock.patch.object(pipeline, "burn_video") as burn, mock.patch.object(
+                    pipeline, "emit_bell"
+                ):
+                    code = pipeline.run_pipeline(args)
+
+                self.assertEqual(code, 0)
+                burn.assert_not_called()
 
     def test_prepare_stage_uses_argument_vector_and_structured_output(self):
         from subtitle_translation import stages

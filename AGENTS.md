@@ -112,6 +112,8 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 `cookies.txt` 仍按项目根目录相对位置读取；从任意工作目录调用 CLI 时，使用 `--project-dir` 或在目标项目目录运行，让配置根明确可见。
 
+`--project-dir` 只决定配置根，不得改变输出根。download/pipeline 默认把新项目创建在用户执行命令时的当前目录；batch 默认报告也写入当前目录。
+
 ## Testing and Documentation
 
 网络、LLM、yt-dlp、ffmpeg、WhisperX 必须 mock。修改 `core/translate_srt.py`、setup、入口、缓存或并发调度时运行全量：
