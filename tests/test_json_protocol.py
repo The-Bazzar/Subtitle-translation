@@ -262,6 +262,10 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(data["zh"], "current target")
         self.assertEqual(data["context_before"], [{"id": 11, "en": "before source", "zh": "before target"}])
         self.assertEqual(data["context_after"], [{"id": 13, "en": "after source", "zh": "after target"}])
+        self.assertNotIn("translation_review", data)
+        self.assertNotIn("terminology_constraints", data)
+        self.assertNotIn("evidence_conflicts", data)
+        self.assertNotIn("sentence_context", data)
 
     def test_typed_proofread_result_parses_language_values(self):
         result = t.LanguageTextResult.from_json_value(
@@ -272,12 +276,16 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(result.target_text, "corrected target")
 
     def test_typed_proofread_item_serializes_retrieved_context(self):
-        item = t.make_pair_item(
+        item = t.make_proofread_item(
             3,
             self.ctx,
             "source text",
             "target text",
             retrieved_context=[{"id": "transcript:2", "text": "nearby context"}],
+            review_hint={"needs_human": True, "categories": ["timing"], "reasons": ["check split"]},
+            terminology_constraints=[{"source": "Northwind", "target": "北风", "source_variants": []}],
+            evidence_conflicts=[{"source": "Northwind", "targets": ["北风", "诺斯风"]}],
+            sentence_context={"current_part": 1, "part_count": 2},
         )
         self.assertEqual(
             item.to_json_value(),
@@ -286,6 +294,14 @@ class JsonProtocolTests(unittest.TestCase):
                 "en": "source text",
                 "zh": "target text",
                 "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
+                "translation_review": {
+                    "needs_human": True,
+                    "categories": ["timing"],
+                    "reasons": ["check split"],
+                },
+                "terminology_constraints": [{"source": "Northwind", "target": "北风"}],
+                "evidence_conflicts": [{"source": "Northwind", "targets": ["北风", "诺斯风"]}],
+                "sentence_context": {"current_part": 1, "part_count": 2},
             },
         )
 
@@ -494,7 +510,8 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("MANDATORY JSON PROTOCOL", captured["system_prompt"])
         self.assertIn("Return a JSON object.", captured["system_prompt"])
         self.assertIn("MANDATORY GLOSSARY JSON PROTOCOL", captured["system_prompt"])
-        self.assertIn('Return exactly one top-level key: "markdown".', captured["system_prompt"])
+        self.assertIn('optional top-level key "confirmed_terms"', captured["system_prompt"])
+        self.assertIn("copy exact evidence URLs", captured["system_prompt"])
         self.assertIn("Treat web search results as the primary evidence", captured["system_prompt"])
         self.assertIn("actively correct likely ASR errors", captured["system_prompt"])
         self.assertIn("Do not copy ASR mistakes into the glossary", captured["system_prompt"])
@@ -580,18 +597,44 @@ class JsonProtocolTests(unittest.TestCase):
     def test_glossary_options_ignore_deprecated_tool_rounds_env(self):
         deprecated_env_key = "GLOSSARY_" + "TOOL_MAX_ROUNDS"
         deprecated_attr = "tavily_" + "tool_rounds"
-        options = t.GlossaryBuildOptions.from_env(
-            {
-                "TAVILY_API_KEY": "tk",
-                "TAVILY_MAX_QUERIES": "4",
-                deprecated_env_key: "0",
-            },
-            quiet=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"glossary_max_queries": 4}, f)
+            options = t.GlossaryBuildOptions.from_env(
+                {"TAVILY_API_KEY": "tk", deprecated_env_key: "0"},
+                quiet=True,
+                config_path=config_path,
+            )
 
         self.assertEqual(options.tavily_max_queries, 4)
         self.assertTrue(options.use_tool_session())
         self.assertFalse(hasattr(options, deprecated_attr))
+
+    def test_glossary_search_budgets_accept_zero_without_enabling_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"glossary_max_queries": 0}, f)
+            options = t.GlossaryBuildOptions.from_env(
+                {"TAVILY_API_KEY": "tk"}, quiet=True, config_path=config_path
+            )
+            self.assertEqual(options.tavily_max_queries, 0)
+            self.assertFalse(options.use_tool_session())
+
+        transcript = t.Transcript(
+            path="video.json", language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "Source")],
+        )
+        options = t.GlossaryBuildOptions(
+            tavily_key="tk", tavily_max_queries=0, quiet=True
+        )
+        with patch.object(t, "tavily_search") as online:
+            sidecar = t.build_tavily_search_evidence(
+                transcript, self.ctx, FakeProviderLLM(), {}, options
+            )
+        online.assert_not_called()
+        self.assertFalse(sidecar.has_records())
 
     def test_build_glossary_tool_session_retries_malformed_tool_call_message(self):
         calls = []
@@ -1522,6 +1565,18 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("# 术语知识库", fallback)
         self.assertEqual(resident, fallback)
 
+    def test_glossary_prompt_context_never_truncates_for_retrieval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            glossary = os.path.join(tmp, "glossary.md")
+            content = "# 术语知识库\n\n" + ("- Stable term: 稳定译名\n" * 700)
+            with open(glossary, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            self.assertEqual(
+                t.load_glossary_prompt_context(glossary, retriever=object()),
+                t.load_glossary(glossary),
+            )
+
     def test_translate_segments_omits_retrieved_context_without_retriever(self):
         captured = {}
 
@@ -1637,6 +1692,36 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("must apply that correction to the source-language field", captured["system_prompt"])
         self.assertIn("Baudrillard", transcript.segments[0].split_events[0].en)
 
+    def test_runtime_proofread_prompt_adds_safety_not_language_policy(self):
+        captured = {}
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
+            captured["system_prompt"] = session.system_prompt
+            item = request.items[0]
+            return [{"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"], "edit": {}, "review": {}}]
+
+        event = t.SplitEvent(0.0, 1.0, "source", "译文")
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.proofread_split_events(
+                transcript,
+                self.ctx,
+                FakeBatchLLM(10),
+                "USER LANGUAGE POLICY",
+                quiet=True,
+                enhanced=True,
+                safety_mode=True,
+            )
+
+        prompt = captured["system_prompt"]
+        self.assertIn("USER LANGUAGE POLICY", prompt)
+        self.assertIn("PROOFREAD SAFETY CONSTRAINTS", prompt)
+        self.assertIn("PROOFREAD WEB SEARCH PROTOCOL", prompt)
+
     def test_proofread_retrieval_query_asks_for_asr_corrections(self):
         class FakeRetriever:
             def retrieve_texts(self, texts, top_k=None):
@@ -1699,7 +1784,7 @@ class JsonProtocolTests(unittest.TestCase):
         with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
             t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
 
-        self.assertEqual(calls, [2, 1])
+        self.assertEqual(calls, [3])
 
     def test_proofread_split_events_splits_batch_on_context_length_error(self):
         calls = []
@@ -1734,9 +1819,10 @@ class JsonProtocolTests(unittest.TestCase):
             changed = t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
 
         self.assertTrue(changed)
-        self.assertEqual(calls, [2, 1, 1])
-        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
-        self.assertEqual(transcript.segments[0].split_events[1].zh, "译文二 fixed")
+        self.assertEqual(calls, [2])
+        self.assertEqual(transcript.segments[0].split_events[0].en, "source one")
+        self.assertEqual(transcript.segments[0].split_events[1].zh, "译文二")
+        self.assertTrue(transcript.segments[0].split_events[0].review["needs_human"])
 
     def test_proofread_split_events_drops_retrieved_context_when_single_item_is_too_large(self):
         class FakeRetriever:
@@ -1819,6 +1905,39 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(calls[0]["model"], "fake-model")
         self.assertEqual(calls[0]["temperature"], 0.3)
 
+    def test_chat_session_can_disable_provider_native_search_without_mutating_config(self):
+        calls = []
+        cfg = {
+            "request_kwargs": {
+                "extra_body": {
+                    "extra_body": {
+                        "google": {
+                            "tools": [
+                                {"google_search": {}},
+                                {"function_declarations": [{"name": "lookup_local"}]},
+                            ]
+                        }
+                    }
+                },
+                "seed": 7,
+            }
+        }
+        llm = FakeChatLLM(
+            calls=calls,
+            cfg=cfg,
+            responses=[FakeSDKResponse(FakeSDKMessage(content='{"markdown": "ok"}'))],
+        )
+
+        t.ChatSession(llm, "system", disable_provider_search=True).ask("{}")
+
+        tools = calls[0]["extra_body"]["extra_body"]["google"]["tools"]
+        self.assertEqual(tools, [{"function_declarations": [{"name": "lookup_local"}]}])
+        self.assertEqual(calls[0]["seed"], 7)
+        self.assertEqual(
+            cfg["request_kwargs"]["extra_body"]["extra_body"]["google"]["tools"][0],
+            {"google_search": {}},
+        )
+
     def test_chat_session_disable_response_format_wins_after_extra_kwargs(self):
         calls = []
         llm = FakeChatLLM(
@@ -1889,6 +2008,7 @@ class JsonProtocolTests(unittest.TestCase):
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
+        self.assertEqual(deepseek["default_model"], "deepseek-v4-pro")
         self.assertNotIn("response_format", deepseek)
         self.assertEqual(
             deepseek["request_kwargs"]["response_format"],
@@ -1939,6 +2059,22 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("completion_tokens=200", message)
         self.assertIn("total_tokens=300", message)
         self.assertIn("reasoning_tokens=128", message)
+
+    def test_chat_session_partial_content_with_length_is_output_exhaustion(self):
+        llm = FakeChatLLM(
+            responses=[
+                FakeSDKResponse(
+                    FakeSDKMessage(content='{"items": [{"id": 1'),
+                    finish_reason="length",
+                )
+            ]
+        )
+
+        with self.assertRaises(t.LLMOutputLengthError) as raised:
+            t.ChatSession(llm, "system").ask("{}")
+
+        self.assertIn("finish_reason=length", str(raised.exception))
+        self.assertIn("content_chars=19", str(raised.exception))
 
     def test_load_providers_merges_local_config_with_builtins(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2002,6 +2138,8 @@ class JsonProtocolTests(unittest.TestCase):
                 "PROOFREAD_PROVIDER": "openrouter",
                 "PROOFREAD_MODEL": "anthropic/claude-sonnet-4-6",
                 "PROOFREAD_BATCH_SIZE": "3",
+                "PROOFREAD_THINKING": "enabled",
+                "PROOFREAD_REASONING_EFFORT": "high",
             },
             batch_size=12,
         )
@@ -2009,6 +2147,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(llm.provider, "deepseek")
         self.assertEqual(llm.model, "deepseek-chat")
         self.assertEqual(llm.batch_size, 12)
+        self.assertEqual(llm.request_overrides, {})
         self.assertFalse(hasattr(llm, "proofread_provider"))
         self.assertFalse(hasattr(llm, "proofread_model"))
 
@@ -2030,7 +2169,25 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIsNone(proofread_llm.api_key)
         self.assertEqual(proofread_llm.batch_size, 3)
 
-    def test_proofread_llm_from_env_reuses_translate_provider_when_unset(self):
+    def test_explicit_proofread_reasoning_overrides_replace_provider_defaults(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="translate", batch_size=12)
+        proofread_llm = t.proofread_llm_from_env(
+            {
+                "PROOFREAD_BATCH_SIZE": "4",
+                "PROOFREAD_THINKING": "disabled",
+                "PROOFREAD_REASONING_EFFORT": "max",
+            },
+            translate_llm,
+            batch_size=12,
+        )
+
+        self.assertEqual(proofread_llm.batch_size, 4)
+        self.assertEqual(proofread_llm.request_overrides["extra_body"]["thinking"]["type"], "disabled")
+        self.assertEqual(proofread_llm.request_overrides["reasoning_effort"], "max")
+        self.assertNotIn("max_tokens", proofread_llm.request_overrides)
+        self.assertEqual(translate_llm.request_overrides, {})
+
+    def test_known_proofread_provider_gets_reasoning_defaults_without_affecting_translation(self):
         translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", api_key="shared-key", batch_size=12)
 
         proofread_llm = t.proofread_llm_from_env({}, translate_llm, batch_size=12)
@@ -2039,6 +2196,32 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(proofread_llm.model, "deepseek-chat")
         self.assertEqual(proofread_llm.api_key, "shared-key")
         self.assertEqual(proofread_llm.batch_size, 6)
+        self.assertEqual(
+            proofread_llm.request_overrides,
+            {"extra_body": {"thinking": {"type": "enabled"}}, "reasoning_effort": "high"},
+        )
+        self.assertEqual(translate_llm.request_overrides, {})
+
+    def test_unknown_proofread_provider_does_not_receive_reasoning_parameters(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="deepseek-chat", batch_size=12)
+
+        proofread_llm = t.proofread_llm_from_env(
+            {"PROOFREAD_PROVIDER": "openrouter", "PROOFREAD_MODEL": "some-model"},
+            translate_llm,
+            batch_size=12,
+        )
+
+        self.assertEqual(proofread_llm.provider, "openrouter")
+        self.assertEqual(proofread_llm.request_overrides, {})
+        self.assertEqual(translate_llm.request_overrides, {})
+
+    def test_proofread_reasoning_defaults_are_limited_to_known_provider_capabilities(self):
+        self.assertEqual(
+            t.proofread_reasoning_defaults_for_provider("DeepSeek"),
+            {"thinking": "enabled", "reasoning_effort": "high"},
+        )
+        self.assertEqual(t.proofread_reasoning_defaults_for_provider("openrouter"), {})
+        self.assertEqual(t.proofread_reasoning_defaults_for_provider("unknown"), {})
 
     def test_only_glossary_does_not_require_translate_provider(self):
         class Args:
