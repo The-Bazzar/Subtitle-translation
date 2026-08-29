@@ -262,6 +262,10 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(data["zh"], "current target")
         self.assertEqual(data["context_before"], [{"id": 11, "en": "before source", "zh": "before target"}])
         self.assertEqual(data["context_after"], [{"id": 13, "en": "after source", "zh": "after target"}])
+        self.assertNotIn("translation_review", data)
+        self.assertNotIn("terminology_constraints", data)
+        self.assertNotIn("evidence_conflicts", data)
+        self.assertNotIn("sentence_context", data)
 
     def test_typed_proofread_result_parses_language_values(self):
         result = t.LanguageTextResult.from_json_value(
@@ -272,12 +276,16 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(result.target_text, "corrected target")
 
     def test_typed_proofread_item_serializes_retrieved_context(self):
-        item = t.make_pair_item(
+        item = t.make_proofread_item(
             3,
             self.ctx,
             "source text",
             "target text",
             retrieved_context=[{"id": "transcript:2", "text": "nearby context"}],
+            review_hint={"needs_human": True, "categories": ["timing"], "reasons": ["check split"]},
+            terminology_constraints=[{"source": "Northwind", "target": "北风", "source_variants": []}],
+            evidence_conflicts=[{"source": "Northwind", "targets": ["北风", "诺斯风"]}],
+            sentence_context={"current_part": 1, "part_count": 2},
         )
         self.assertEqual(
             item.to_json_value(),
@@ -286,6 +294,14 @@ class JsonProtocolTests(unittest.TestCase):
                 "en": "source text",
                 "zh": "target text",
                 "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
+                "translation_review": {
+                    "needs_human": True,
+                    "categories": ["timing"],
+                    "reasons": ["check split"],
+                },
+                "terminology_constraints": [{"source": "Northwind", "target": "北风"}],
+                "evidence_conflicts": [{"source": "Northwind", "targets": ["北风", "诺斯风"]}],
+                "sentence_context": {"current_part": 1, "part_count": 2},
             },
         )
 
@@ -494,7 +510,8 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("MANDATORY JSON PROTOCOL", captured["system_prompt"])
         self.assertIn("Return a JSON object.", captured["system_prompt"])
         self.assertIn("MANDATORY GLOSSARY JSON PROTOCOL", captured["system_prompt"])
-        self.assertIn('Return exactly one top-level key: "markdown".', captured["system_prompt"])
+        self.assertIn('optional top-level key "confirmed_terms"', captured["system_prompt"])
+        self.assertIn("copy exact evidence URLs", captured["system_prompt"])
         self.assertIn("Treat web search results as the primary evidence", captured["system_prompt"])
         self.assertIn("actively correct likely ASR errors", captured["system_prompt"])
         self.assertIn("Do not copy ASR mistakes into the glossary", captured["system_prompt"])
@@ -580,18 +597,44 @@ class JsonProtocolTests(unittest.TestCase):
     def test_glossary_options_ignore_deprecated_tool_rounds_env(self):
         deprecated_env_key = "GLOSSARY_" + "TOOL_MAX_ROUNDS"
         deprecated_attr = "tavily_" + "tool_rounds"
-        options = t.GlossaryBuildOptions.from_env(
-            {
-                "TAVILY_API_KEY": "tk",
-                "TAVILY_MAX_QUERIES": "4",
-                deprecated_env_key: "0",
-            },
-            quiet=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"glossary_max_queries": 4}, f)
+            options = t.GlossaryBuildOptions.from_env(
+                {"TAVILY_API_KEY": "tk", deprecated_env_key: "0"},
+                quiet=True,
+                config_path=config_path,
+            )
 
         self.assertEqual(options.tavily_max_queries, 4)
         self.assertTrue(options.use_tool_session())
         self.assertFalse(hasattr(options, deprecated_attr))
+
+    def test_glossary_search_budgets_accept_zero_without_enabling_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"glossary_max_queries": 0}, f)
+            options = t.GlossaryBuildOptions.from_env(
+                {"TAVILY_API_KEY": "tk"}, quiet=True, config_path=config_path
+            )
+            self.assertEqual(options.tavily_max_queries, 0)
+            self.assertFalse(options.use_tool_session())
+
+        transcript = t.Transcript(
+            path="video.json", language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "Source")],
+        )
+        options = t.GlossaryBuildOptions(
+            tavily_key="tk", tavily_max_queries=0, quiet=True
+        )
+        with patch.object(t, "tavily_search") as online:
+            sidecar = t.build_tavily_search_evidence(
+                transcript, self.ctx, FakeProviderLLM(), {}, options
+            )
+        online.assert_not_called()
+        self.assertFalse(sidecar.has_records())
 
     def test_build_glossary_tool_session_retries_malformed_tool_call_message(self):
         calls = []
@@ -1522,6 +1565,18 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("# 术语知识库", fallback)
         self.assertEqual(resident, fallback)
 
+    def test_glossary_prompt_context_never_truncates_for_retrieval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            glossary = os.path.join(tmp, "glossary.md")
+            content = "# 术语知识库\n\n" + ("- Stable term: 稳定译名\n" * 700)
+            with open(glossary, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            self.assertEqual(
+                t.load_glossary_prompt_context(glossary, retriever=object()),
+                t.load_glossary(glossary),
+            )
+
     def test_translate_segments_omits_retrieved_context_without_retriever(self):
         captured = {}
 
@@ -1636,6 +1691,36 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("glossary or retrieved_context identifies a source-language ASR error", captured["system_prompt"])
         self.assertIn("must apply that correction to the source-language field", captured["system_prompt"])
         self.assertIn("Baudrillard", transcript.segments[0].split_events[0].en)
+
+    def test_runtime_proofread_prompt_adds_safety_not_language_policy(self):
+        captured = {}
+
+        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
+            captured["system_prompt"] = session.system_prompt
+            item = request.items[0]
+            return [{"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"], "edit": {}, "review": {}}]
+
+        event = t.SplitEvent(0.0, 1.0, "source", "译文")
+        transcript = t.Transcript(
+            "sample.json",
+            "en",
+            [t.TranscriptSegment(1, 0.0, 1.0, event.en, split_events=[event])],
+        )
+        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
+            t.proofread_split_events(
+                transcript,
+                self.ctx,
+                FakeBatchLLM(10),
+                "USER LANGUAGE POLICY",
+                quiet=True,
+                enhanced=True,
+                safety_mode=True,
+            )
+
+        prompt = captured["system_prompt"]
+        self.assertIn("USER LANGUAGE POLICY", prompt)
+        self.assertIn("PROOFREAD SAFETY CONSTRAINTS", prompt)
+        self.assertIn("PROOFREAD WEB SEARCH PROTOCOL", prompt)
 
     def test_proofread_retrieval_query_asks_for_asr_corrections(self):
         class FakeRetriever:
@@ -1889,6 +1974,7 @@ class JsonProtocolTests(unittest.TestCase):
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
+        self.assertEqual(deepseek["default_model"], "deepseek-v4-pro")
         self.assertNotIn("response_format", deepseek)
         self.assertEqual(
             deepseek["request_kwargs"]["response_format"],
