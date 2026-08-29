@@ -580,18 +580,44 @@ class JsonProtocolTests(unittest.TestCase):
     def test_glossary_options_ignore_deprecated_tool_rounds_env(self):
         deprecated_env_key = "GLOSSARY_" + "TOOL_MAX_ROUNDS"
         deprecated_attr = "tavily_" + "tool_rounds"
-        options = t.GlossaryBuildOptions.from_env(
-            {
-                "TAVILY_API_KEY": "tk",
-                "TAVILY_MAX_QUERIES": "4",
-                deprecated_env_key: "0",
-            },
-            quiet=True,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"glossary_max_queries": 4}, f)
+            options = t.GlossaryBuildOptions.from_env(
+                {"TAVILY_API_KEY": "tk", deprecated_env_key: "0"},
+                quiet=True,
+                config_path=config_path,
+            )
 
         self.assertEqual(options.tavily_max_queries, 4)
         self.assertTrue(options.use_tool_session())
         self.assertFalse(hasattr(options, deprecated_attr))
+
+    def test_glossary_search_budgets_accept_zero_without_enabling_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "web_search.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"glossary_max_queries": 0}, f)
+            options = t.GlossaryBuildOptions.from_env(
+                {"TAVILY_API_KEY": "tk"}, quiet=True, config_path=config_path
+            )
+            self.assertEqual(options.tavily_max_queries, 0)
+            self.assertFalse(options.use_tool_session())
+
+        transcript = t.Transcript(
+            path="video.json", language="en",
+            segments=[t.TranscriptSegment(1, 0.0, 1.0, "Source")],
+        )
+        options = t.GlossaryBuildOptions(
+            tavily_key="tk", tavily_max_queries=0, quiet=True
+        )
+        with patch.object(t, "tavily_search") as online:
+            sidecar = t.build_tavily_search_evidence(
+                transcript, self.ctx, FakeProviderLLM(), {}, options
+            )
+        online.assert_not_called()
+        self.assertFalse(sidecar.has_records())
 
     def test_build_glossary_tool_session_retries_malformed_tool_call_message(self):
         calls = []
@@ -1889,6 +1915,7 @@ class JsonProtocolTests(unittest.TestCase):
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
+        self.assertEqual(deepseek["default_model"], "deepseek-v4-pro")
         self.assertNotIn("response_format", deepseek)
         self.assertEqual(
             deepseek["request_kwargs"]["response_format"],

@@ -73,6 +73,7 @@ function Update-EnvFromExample {
 Write-Host ">>> 准备本地配置文件..." -ForegroundColor Yellow
 Update-EnvFromExample
 Copy-ConfigIfMissing "providers.example.json" "providers.json"
+Copy-ConfigIfMissing "web_search.example.json" "web_search.json"
 Copy-ConfigIfMissing "tavily_domains.example.json" "tavily_domains.json"
 Copy-ConfigIfMissing "glossary_prompt.example.md" "glossary_prompt.md"
 Copy-ConfigIfMissing "translate_prompt.example.md" "translate_prompt.md"
