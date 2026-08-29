@@ -130,14 +130,14 @@ winget install Microsoft.PowerShell
 - 已合并到 `translate_srt.py`
 - 位于 beautify 之后、translate 之前
 - 普通 pipeline 中如果 `glossary.md` 已存在且非空，直接复用，不重新总结
-- 如果 `glossary.md` 已缓存但 `<base>.web_evidence.json` 缺失，且 Tavily 可用，会补建 sidecar 而不重写 glossary
+- 如果 `glossary.md` 已缓存但 sidecar 缺失，且已配置 Tavily 或 Exa，会补建 sidecar 而不重写 glossary
 - 手动运行 `--only-glossary` 时忽略已有缓存，重新生成并覆盖 `glossary.md`
 - 读取 transcript、`.description`、`.tags.txt`、`.info.json`
 - 本地脚本会把 YouTube 原视频元信息前置写入 `glossary.md`，包括标题、作者、上传时间、原简介和标签；这部分不交给远端 LLM 合成
 - 配置 `TAVILY_API_KEY` 时联网搜索，未配置时离线总结
 - 联网搜索结果是 glossary 的优先证据来源；远端 LLM 应用搜索结果校正 transcript 中可能的 ASR 人名、标题、引文和术语错误
-- Tavily 搜索默认由 glossary agent 在同一个 ChatSession 中通过 `tavily_search` tool calls 发起；脚本执行搜索后将 tool result 回喂同一 session，并把收集到的网页证据交给无工具 finalizer 生成最终 glossary
-- Tavily 原始网页证据会规范化写入 `<base>.web_evidence.json` sidecar；它独立于 `glossary.md`，用于后续 embedding 检索，不作为常驻硬规则 prompt
+- 联网搜索默认由 glossary agent 在同一个 ChatSession 中通过搜索 tool calls 发起；运行时按 `web_search.json` 的 `provider` 路由 Tavily 或 Exa，并把结果回喂同一 session
+- 原始网页证据会规范化写入 `<base>.web_evidence.json` sidecar；它独立于 `glossary.md`，用于后续检索和复核
 - 第一轮 glossary user JSON 会包含 metadata、transcript/retrieved context 和合并后的 `tavily_domains.json` 域名偏好
 - Tavily tool 本地先按 `tavily_domains.json` 的全局百科域名和题材站点执行 `include_domains` 搜索；结果不足时再执行普通搜索；合并时优先百科/知识库域名
 - 使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 指定术语知识库专用 LLM；空则回退到 `TRANSLATE_PROVIDER` / `TRANSLATE_MODEL`
@@ -213,23 +213,29 @@ ${TARGET_LANG_CODE}
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | OpenAI SDK 兼容 embedding provider 和模型，可指向本地 llama.cpp / Ollama / OpenAI-compatible 服务 |
 | `EMBEDDING_STORE` / `EMBEDDING_CHROMA_DIR` | 当前仅支持 `chroma`；目录空则使用项目目录下 `chroma_db` |
 | `EMBEDDING_TOP_K` / `EMBEDDING_CHUNK_CHARS` / `EMBEDDING_BATCH_SIZE` | embedding 检索、切块和批量调用参数 |
+| `LOCAL_EVIDENCE_RETRIEVAL_ENABLED` / `LOCAL_EVIDENCE_TOP_K` | 显式可选的无 embedding lexical evidence 检索，默认 `0`；关闭时不得注入该动态 `retrieved_context` |
 | `PROOFREAD` | `1` / `0` 控制 split event 校对 |
 | `PROOFREAD_PROVIDER` | 校对 provider，空则复用翻译 provider |
 | `PROOFREAD_MODEL` | 校对模型，空则复用翻译模型 |
+| `PROOFREAD_ENHANCED` | `1` 显式启用证据增强校对和按需联网；默认 `0`，选择 provider/model 不会隐式开启 |
 | `PROOFREAD_BATCH_SIZE` | 校对批量；空则使用 `--batch-size` 的一半，长视频建议 `2-10` |
 | `PROOFREAD_RETRIEVAL_TOP_K` | 校对阶段 RAG 每条字幕检索片段数，默认 `1` |
 | `PIPELINE_SKIP_*` | 各阶段默认跳过开关 |
 | `BURN_OVC` / `BURN_OVCOPTS` / `BURN_OAC` / `BURN_RES` | 硬压参数 |
 | `OPENAI_API_KEY` / `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY` | LLM / embedding API keys |
-| `TAVILY_API_KEY` / `TAVILY_MAX_RESULTS` / `TAVILY_MAX_QUERIES` | glossary 联网搜索配置；`TAVILY_MAX_QUERIES` 在 tool-call 路径下是最大 Tavily tool 查询次数，在 fallback 路径下是单一语言 query 上限，`0` 禁用 Tavily |
+| `TAVILY_API_KEY` / `EXA_API_KEY` | Tavily/Exa 搜索 API keys；key 为空时对应 provider 禁用 |
+
+非敏感联网搜索配置位于本地 gitignored `web_search.json`（由 `web_search.example.json` 初始化）：`provider`、统一 `max_results`、`glossary_max_queries` 和 `proofread_max_queries`。不要把这些配置放回 `.env`。
+
+proofread 联网能力只由 `PROOFREAD_ENHANCED=1` 显式启用；`PROOFREAD_PROVIDER` / `PROOFREAD_MODEL` 只选择模型。增强模式复用 Tavily、Exa 或既有 evidence cache，并由 `web_search.json` 的 `proofread_max_queries` 限制实际新搜索次数；值为 `0` 时只禁止新联网请求，既有 exact cache 仍可离线复用。
 
 `BURN_OVCOPTS=source-bitrate` 是默认硬压策略：burn 脚本用 `ffprobe` 读取源视频码率，生成 VBR 的 `b/maxrate/bufsize` 参数，让输出尽量接近源码率；显式 `qp=20`、`crf=23` 等会覆盖自动模式。`BURN_OAC` 默认 `aac`，兼容 ffmpeg 和 mpv 的硬字幕压制。
 
-配置 `TAVILY_API_KEY` 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求 `tavily_search`，脚本执行 Tavily 后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。tool-call 路径下，`TAVILY_MAX_QUERIES` 控制最多执行多少次 Tavily 查询；fallback query-agent 路径下，它仍表示每种语言最多生成多少条 query。Tavily tool 会结合 metadata、模型给出的 `topic_hints` 和 `tavily_domains.json` 做域名优先搜索，并在最终合并时给百科/知识库域名加权。该阶段使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL`，不要为了省成本使用弱模型。
+配置联网 provider 时，glossary 阶段默认使用两段式 tool calling：脚本第一轮把 metadata、transcript/retrieved context 和 `tavily_domains.json` 域名偏好一起交给 glossary 模型；模型按需请求搜索，脚本执行后把结果作为 tool message 喂回同一 session。搜索完成后，脚本新建无工具 finalizer session，只喂用户 JSON、transcript/retrieved context 和已收集的 `web_evidence`，要求模型生成最终 glossary。`web_search.json` 的 `glossary_max_queries` 控制新网络请求，设为 `0` 时不发起新请求但不删除或屏蔽已有 sidecar evidence。Tavily tool 会结合 metadata、模型给出的 `topic_hints` 和 `tavily_domains.json` 做域名优先搜索，并在最终合并时给百科/知识库域名加权。该阶段使用 `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL`，不要为了省成本使用弱模型。
 
 glossary tool 阶段会强制移除 provider `request_kwargs.response_format` 中的 JSON mode 参数，以免干扰 tool calling；finalizer 首选返回 `{"markdown": "..."}` JSON object，若 provider 无法稳定输出 JSON，可返回 `<GLOSSARY_MARKDOWN>...</GLOSSARY_MARKDOWN>` 标签块。普通散文和伪 tool call 文本都会被拒绝并重试。
 
-`glossary.md` 是全局硬规则：一旦存在，会完整常驻注入后续翻译、校对和视频简介翻译的 system prompt，不会因为启用 embedding 而省略。启用 `EMBEDDING_ENABLED=1` 时，Chroma 索引同时包含 `glossary:*` 项目知识 chunk、`web_evidence:*` Tavily 网页证据 chunk、`transcript:*` 源文 chunk 和翻译/分割后生成的双语 `translation_memory:*` chunk；这些按当前字幕逐条召回为 `retrieved_context`，只作为动态补充记忆。proofread 阶段用源文+译文 query 检索，优先获得历史译法和术语一致性参考。`glossary:*` 包含本地组合的视频元信息和 glossary 内容，并按 Markdown 标题切分；`web_evidence:*` 由 `<base>.web_evidence.json` 中的规范化 Tavily 结果构建，保留 query、域名、标题、URL 和证据摘要；`transcript:*` 使用干净字幕文本建向量，retrieved context 返回带时间码的字幕行，并按字符数、时间跨度、segment 数量切块，按末尾时间窗口自动 overlap；每次重建索引前会清理当前项目旧 chunk，避免残留向量污染检索。
+`glossary.md` 是完整常驻的全局硬规则；retrieved_context 只能补充。glossary evidence 可参与构建全局术语，proofread `confirmed_terms` 只在 sidecar 持久化为局部约束。自动 evidence→structured hard promotion 仅支持拉丁字母源语言→中文目标语言；其他方向保留 raw evidence、模型判断和 human review。`web_evidence:*` 由规范化 Tavily/Exa 结果构建。
 
 `providers.json` 是 OpenAI SDK 兼容配置，`url` 是 SDK `base_url`，不包含 `/chat/completions`。`request_kwargs` 会原样合并进 `chat.completions.create(**kwargs)`，用于 DeepSeek JSON mode、Gemini Google Search 等 provider 专用参数；Gemini 内置联网需要 Gemini 3 或更新模型。
 
@@ -288,6 +294,7 @@ bash "<repo>/translate_srt.sh" video.beautified.json --video video.mp4 --source-
 | `chromadb` | 本地持久化向量库 |
 | `langcodes[data]` | 语言名/标签规范为 ISO 639 输出后缀 |
 | `tavily-python` | glossary 可选联网搜索 SDK |
+| `exa-py>=2.0.0` | Exa 可选联网搜索 SDK；2.0.0 起 `search(..., contents=...)` 支持当前调用协议 |
 | `torch` / `torchaudio` | setup 按 `.env` 的 `TORCH_BACKEND` 安装 CUDA 12.8 或 CPU wheel |
 
 ## Working Notes

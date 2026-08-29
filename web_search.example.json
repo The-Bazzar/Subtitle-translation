@@ -1,0 +1,6 @@
+{
+  "provider": "auto",
+  "max_results": 10,
+  "glossary_max_queries": 15,
+  "proofread_max_queries": 5
+}
