@@ -74,21 +74,12 @@ Examples:
         """,
     )
     parser.add_argument("urls", nargs="+", help="YouTube 链接列表")
-    burn_group = parser.add_mutually_exclusive_group()
-    burn_group.add_argument(
-        "-B",
-        "--burn",
-        dest="burn",
-        type=int,
-        choices=(0, 1),
-        default=1,
-        help="硬压开关: 1=启用, 0=跳过 (默认: 1)",
-    )
-    burn_group.add_argument(
+    parser.add_argument(
         "--skip-burn",
         "-SkipBurn",
         dest="burn",
         action="store_false",
+        default=None,
         help="跳过后续硬压阶段",
     )
     parser.add_argument(
@@ -186,6 +177,22 @@ def load_project_environment(
     return env
 
 
+def _optional_env_flag(values: Mapping[str, str], key: str) -> bool | None:
+    raw = str(values.get(key, "") or "").strip().strip('"').strip("'").lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def resolve_batch_burn(cli_burn: bool | None, values: Mapping[str, str]) -> bool:
+    if cli_burn is not None:
+        return bool(cli_burn)
+    skip = _optional_env_flag(values, "PIPELINE_SKIP_BURN")
+    return True if skip is None else not skip
+
+
 def build_stage_environment(
     args: argparse.Namespace,
     *,
@@ -196,6 +203,7 @@ def build_stage_environment(
         script_dir or Path.cwd(),
         environ=environ,
     )
+    args.burn = resolve_batch_burn(args.burn, env)
     env["BURN"] = "1" if args.burn else "0"
     env["PIPELINE_SKIP_BURN"] = "0" if args.burn else "1"
     if args.translate_provider:
@@ -589,6 +597,7 @@ def write_report(
 def _main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     script_dir = Path(os.environ.get("SUBTITLE_TRANSLATION_PROJECT_DIR") or os.getcwd()).resolve()
+    args.burn = resolve_batch_burn(args.burn, load_project_environment(script_dir))
     report_path = Path(args.report) if args.report else Path.cwd() / "batch-result.txt"
     limits = ResourceLimits.detect()
     started_at = datetime.now()

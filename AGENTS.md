@@ -93,6 +93,7 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 - worker 意外退出立即 fail-fast：关闭新 worker-stage admission，当前任务失败，等待 ASR/alignment 的任务 blocked；已完成 alignment 的任务仍可 postprocess/burn。
 - 第一次 Ctrl+C 停止接纳新 stage 并等待当前 stage；第二次终止活动进程树和 worker，返回 `130`。
 - 每个失败任务响一次错误铃，batch 最终再按聚合结果响一次；全部成功响成功铃。
+- batch 与 pipeline 都只提供 `--skip-burn`。优先级：显式 `--skip-burn` > `PIPELINE_SKIP_BURN` > 默认启用。
 
 `.prepare.json`、`.asr.json`、`.asr.lock` 和 generation candidate 是恢复协调文件。cache fingerprint、media generation、alignment generation、锁和原子 publish 语义不得改变；损坏、旧版或 fingerprint 不匹配必须视为 cache miss。
 

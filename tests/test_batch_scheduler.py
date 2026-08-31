@@ -26,6 +26,7 @@ from batch_runtime import (
     build_stage_environment,
     create_platform_postprocess_runner,
     create_platform_runners,
+    resolve_batch_burn,
     run_acquisition,
     write_report,
 )
@@ -3054,6 +3055,37 @@ class BatchCliTests(unittest.TestCase):
         self.assertEqual(stage_environment["PIPELINE_SKIP_BURN"], "1")
         self.assertEqual(stage_environment["TRANSLATE_PROVIDER"], "deepseek")
         self.assertEqual(stage_environment["TRANSLATE_MODEL"], "deepseek-chat")
+
+    def test_batch_burn_precedence_matches_pipeline(self):
+        cases = (
+            (None, {}, True),
+            (None, {"PIPELINE_SKIP_BURN": "1"}, False),
+            (None, {"PIPELINE_SKIP_BURN": "0"}, True),
+            (False, {"PIPELINE_SKIP_BURN": "0"}, False),
+        )
+        for cli_burn, environment, expected in cases:
+            with self.subTest(cli_burn=cli_burn, environment=environment):
+                self.assertIs(resolve_batch_burn(cli_burn, environment), expected)
+
+        self.assertIsNone(build_parser().parse_args(["url"]).burn)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / ".env").write_text("PIPELINE_SKIP_BURN=1\n", encoding="utf-8")
+            args = build_parser().parse_args(["url"])
+            stage_environment = build_stage_environment(
+                args,
+                script_dir=root,
+                environ={},
+            )
+        self.assertFalse(args.burn)
+        self.assertEqual(stage_environment["PIPELINE_SKIP_BURN"], "1")
+
+    def test_batch_rejects_removed_burn_option(self):
+        for option in ("--burn", "-B"):
+            with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args([option, "url"])
 
 
 @unittest.skip("legacy batch.py module alias replaced by the package CLI")

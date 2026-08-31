@@ -176,35 +176,34 @@ class PythonCliTests(unittest.TestCase):
         self.assertEqual(output_path.parent.parent, output_root.resolve())
         self.assertFalse((config_root / "Output title").exists())
 
-    def test_pipeline_honors_env_skip_burn_aliases(self):
+    def test_pipeline_honors_pipeline_skip_burn(self):
         from subtitle_translation import pipeline
         from subtitle_translation.stages import StageResult
 
-        for key in ("SKIP_BURN", "PIPELINE_SKIP_BURN"):
-            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
-                root = pathlib.Path(directory)
-                render_video = root / "video.original.mkv"
-                edit_video = root / "video.mkv"
-                json_path = root / "video.json"
-                ass_path = root / "video.en-zh.ass"
-                config = ProjectConfig(root, {key: "1"}, root)
-                args = pipeline.build_parser().parse_args(["https://example.invalid/video"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            render_video = root / "video.original.mkv"
+            edit_video = root / "video.mkv"
+            json_path = root / "video.json"
+            ass_path = root / "video.en-zh.ass"
+            config = ProjectConfig(root, {"PIPELINE_SKIP_BURN": "1"}, root)
+            args = pipeline.build_parser().parse_args(["https://example.invalid/video"])
 
-                with mock.patch.object(pipeline.ProjectConfig, "load", return_value=config), mock.patch.object(
-                    pipeline, "download_video", return_value=StageResult.ok(render_video=str(render_video))
-                ), mock.patch.object(
-                    pipeline, "prepare_video", return_value=StageResult.ok(edit_video=str(edit_video))
-                ), mock.patch.object(
-                    pipeline, "transcribe_video", return_value=StageResult.ok(json=str(json_path))
-                ), mock.patch.object(
-                    pipeline, "_translate_main", return_value=StageResult.ok(ass=str(ass_path))
-                ), mock.patch.object(pipeline, "burn_video") as burn, mock.patch.object(
-                    pipeline, "emit_bell"
-                ):
-                    code = pipeline.run_pipeline(args)
+            with mock.patch.object(pipeline.ProjectConfig, "load", return_value=config), mock.patch.object(
+                pipeline, "download_video", return_value=StageResult.ok(render_video=str(render_video))
+            ), mock.patch.object(
+                pipeline, "prepare_video", return_value=StageResult.ok(edit_video=str(edit_video))
+            ), mock.patch.object(
+                pipeline, "transcribe_video", return_value=StageResult.ok(json=str(json_path))
+            ), mock.patch.object(
+                pipeline, "_translate_main", return_value=StageResult.ok(ass=str(ass_path))
+            ), mock.patch.object(pipeline, "burn_video") as burn, mock.patch.object(
+                pipeline, "emit_bell"
+            ):
+                code = pipeline.run_pipeline(args)
 
-                self.assertEqual(code, 0)
-                burn.assert_not_called()
+            self.assertEqual(code, 0)
+            burn.assert_not_called()
 
     def test_prepare_stage_uses_argument_vector_and_structured_output(self):
         from subtitle_translation import stages

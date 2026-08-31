@@ -123,9 +123,6 @@ def _translate_main(
 
 
 def _env_skip(config: ProjectConfig, stage: str) -> bool:
-    legacy_key = f"SKIP_{stage}"
-    if config.get(legacy_key, "").strip():
-        return config.flag(legacy_key)
     return config.flag(f"PIPELINE_SKIP_{stage}")
 
 

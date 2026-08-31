@@ -157,6 +157,8 @@ batch 使用 Python scheduler 按阶段调度任务，不会并行启动多条�
 
 batch 会同时输出文本报告和同基名 JSON machine report。
 
+batch 与 pipeline 都只提供 `--skip-burn`。未传入时读取 `.env` 的 `PIPELINE_SKIP_BURN`；未配置则默认启用硬压。
+
 通知音效使用终端 BEL：
 
 - 成功：一组短响。
