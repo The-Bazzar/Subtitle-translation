@@ -159,6 +159,8 @@ batch 会同时输出文本报告和同基名 JSON machine report。
 
 batch 与 pipeline 都只提供 `--skip-burn`。未传入时读取 `.env` 的 `PIPELINE_SKIP_BURN`；未配置则默认启用硬压。
 
+batch 同样读取 `PIPELINE_SKIP_BEAUTIFY`、`PIPELINE_SKIP_KNOWLEDGE` 和 `PIPELINE_SKIP_TRANSLATE`。跳过 translate 时，每个项目目录必须已有约定命名的双语 ASS。URL batch 无法表达已有下载/JSON 映射，因此 `PIPELINE_SKIP_DOWNLOAD=1` 或 `PIPELINE_SKIP_WHISPER=1` 会在启动前明确报错。
+
 通知音效使用终端 BEL：
 
 - 成功：一组短响。

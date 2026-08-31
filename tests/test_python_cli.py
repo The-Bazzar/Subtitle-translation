@@ -204,6 +204,7 @@ class PythonCliTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             burn.assert_not_called()
+            self.assertNotIn("burn", pipeline.pipeline_stage_plan(args))
 
     def test_prepare_stage_uses_argument_vector_and_structured_output(self):
         from subtitle_translation import stages

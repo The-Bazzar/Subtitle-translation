@@ -26,6 +26,8 @@ console entry point 和 `python -m subtitle_translation` 使用同一份实现�
 
 `--project-dir` 从输出目录语义中拆出：它只用于读取 `.env`、cookies、provider 和 template。download/pipeline 的新项目默认写入执行命令时的当前目录，batch 默认报告也写入当前目录。
 
+batch 与 pipeline 现在共享 postprocess skip 语义：`PIPELINE_SKIP_BEAUTIFY`、`PIPELINE_SKIP_KNOWLEDGE`、`PIPELINE_SKIP_TRANSLATE` 和 `PIPELINE_SKIP_BURN` 均生效。batch 复用已有 glossary；skip translate 时从每个项目目录读取约定命名的双语 ASS。URL batch 无法映射 per-task 现有视频/JSON，因此配置 `PIPELINE_SKIP_DOWNLOAD=1` 或 `PIPELINE_SKIP_WHISPER=1` 会明确返回配置错误。
+
 ## 旧入口
 
 兼容 wrapper 已统一移入 `scripts/`。其中的 pipeline、batch、download、prepare-video、whisper、translate、merge-ass 和 burn 脚本都只定位项目 `.venv` 后执行 `python -m subtitle_translation ...`，不再解析 `OUTPUT_*` marker，也不再互相调用。

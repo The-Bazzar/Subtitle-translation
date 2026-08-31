@@ -94,6 +94,8 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 - 第一次 Ctrl+C 停止接纳新 stage 并等待当前 stage；第二次终止活动进程树和 worker，返回 `130`。
 - 每个失败任务响一次错误铃，batch 最终再按聚合结果响一次；全部成功响成功铃。
 - batch 与 pipeline 都只提供 `--skip-burn`。优先级：显式 `--skip-burn` > `PIPELINE_SKIP_BURN` > 默认启用。
+- batch 必须读取 `PIPELINE_SKIP_BEAUTIFY`、`PIPELINE_SKIP_KNOWLEDGE` 和 `PIPELINE_SKIP_TRANSLATE`；skip translate 要求项目目录已有约定命名的双语 ASS。URL batch 无法表达 per-task 现有输入，`PIPELINE_SKIP_DOWNLOAD` / `PIPELINE_SKIP_WHISPER` 为 `1` 时必须启动前报错。
+- batch glossary 与 pipeline 使用相同缓存语义；只有用户显式执行普通 `--only-glossary` 时才强制重建。
 
 `.prepare.json`、`.asr.json`、`.asr.lock` 和 generation candidate 是恢复协调文件。cache fingerprint、media generation、alignment generation、锁和原子 publish 语义不得改变；损坏、旧版或 fingerprint 不匹配必须视为 cache miss。
 

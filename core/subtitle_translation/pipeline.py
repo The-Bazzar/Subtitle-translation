@@ -138,12 +138,32 @@ def _apply_env_skip_defaults(args: argparse.Namespace, config: ProjectConfig) ->
         setattr(args, attribute, bool(getattr(args, attribute) or _env_skip(config, stage)))
 
 
+def pipeline_stage_plan(args: argparse.Namespace) -> list[str]:
+    stages: list[str] = []
+    if not args.skip_download:
+        stages.append("download")
+    stages.append("prepare")
+    if not args.skip_whisper:
+        stages.append("whisper")
+    if args.skip_translate:
+        stages.append("existing_ass")
+    else:
+        if not args.skip_beautify:
+            stages.append("beautify")
+        if not args.skip_knowledge:
+            stages.append("glossary")
+        stages.append("translate")
+    if not args.skip_burn:
+        stages.append("burn")
+    return stages
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     config = ProjectConfig.load(args.project_dir)
     _apply_env_skip_defaults(args, config)
     if args.dry_run:
         print("[DRY RUN] Python pipeline stages:")
-        print("  download -> prepare-video -> whisper -> translate -> burn")
+        print(f"  {' -> '.join(pipeline_stage_plan(args))}")
         return 0
     if args.skip_download:
         if not args.video:

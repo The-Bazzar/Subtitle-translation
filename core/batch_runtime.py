@@ -193,6 +193,38 @@ def resolve_batch_burn(cli_burn: bool | None, values: Mapping[str, str]) -> bool
     return True if skip is None else not skip
 
 
+def batch_stage_skipped(values: Mapping[str, str], stage: str) -> bool:
+    return _optional_env_flag(values, f"PIPELINE_SKIP_{stage}") is True
+
+
+def validate_batch_stage_environment(values: Mapping[str, str]) -> None:
+    unsupported = [
+        stage
+        for stage in ("DOWNLOAD", "WHISPER")
+        if batch_stage_skipped(values, stage)
+    ]
+    if unsupported:
+        names = ", ".join(f"PIPELINE_SKIP_{stage}" for stage in unsupported)
+        raise ValueError(
+            f"batch cannot use {names}; per-task existing inputs are only supported by pipeline"
+        )
+
+
+def batch_stage_plan(burn: bool, values: Mapping[str, str]) -> list[str]:
+    stages = ["download", "prepare", "extract_audio", "asr", "align"]
+    if batch_stage_skipped(values, "TRANSLATE"):
+        stages.append("existing_ass")
+    else:
+        if not batch_stage_skipped(values, "BEAUTIFY"):
+            stages.append("beautify")
+        if not batch_stage_skipped(values, "KNOWLEDGE"):
+            stages.append("glossary")
+        stages.append("translate")
+    if burn:
+        stages.append("burn")
+    return stages
+
+
 def build_stage_environment(
     args: argparse.Namespace,
     *,
@@ -203,6 +235,7 @@ def build_stage_environment(
         script_dir or Path.cwd(),
         environ=environ,
     )
+    validate_batch_stage_environment(env)
     args.burn = resolve_batch_burn(args.burn, env)
     env["BURN"] = "1" if args.burn else "0"
     env["PIPELINE_SKIP_BURN"] = "0" if args.burn else "1"
@@ -297,6 +330,9 @@ def create_platform_postprocess_runner(
 ) -> PostprocessRunner:
     del platform, terminal
     config = ProjectConfig(script_dir, dict(env), Path.cwd().resolve())
+    skip_beautify = batch_stage_skipped(env, "BEAUTIFY")
+    skip_knowledge = batch_stage_skipped(env, "KNOWLEDGE")
+    skip_translate = batch_stage_skipped(env, "TRANSLATE")
     os.environ["SUBTITLE_TRANSLATION_PROJECT_DIR"] = str(script_dir)
     for key in (
         "TRANSLATE_PROVIDER",
@@ -336,15 +372,34 @@ def create_platform_postprocess_runner(
         aligned_json = str(task.json_path)
         edit_video = str(task.edit_video_path)
         beautified_json = str(task.beautified_candidate_path)
+        source_code = _language_suffix(
+            env.get("SOURCE_LANG") or task.detected_language,
+            task.detected_language or "source",
+        )
+        target_code = _language_suffix(env.get("TARGET_LANG") or "zh", "zh")
+        ass_path = task.edit_video_path.with_name(
+            f"{task.edit_video_path.stem}.{source_code}-{target_code}.ass"
+        )
+        if skip_translate:
+            if not ass_path.is_file() or ass_path.stat().st_size <= 0:
+                raise StageCommandError(
+                    f"PIPELINE_SKIP_TRANSLATE requires an existing bilingual ASS: {ass_path}"
+                )
+            task.ass_path = ass_path
+            return
         common = [aligned_json, "--video", edit_video, "--beautified-json", beautified_json]
-        await invoke_translate(common + ["--only-beautify"], "beautify")
+        beautify_arguments = common + ["--only-beautify"]
+        if skip_beautify:
+            beautify_arguments.append("--skip-beautify")
+        await invoke_translate(beautify_arguments, "beautify")
         if not task.beautified_candidate_path.is_file():
             raise StageCommandError(f"beautify did not write expected output: {beautified_json}")
-        await invoke_translate(common + ["--only-glossary", "--skip-beautify"], "glossary")
+        if not skip_knowledge:
+            await invoke_translate(
+                common + ["--only-glossary", "--reuse-glossary", "--skip-beautify"],
+                "glossary",
+            )
         await invoke_translate(common + ["--skip-beautify", "--skip-knowledge"], "translate")
-        source_code = _language_suffix(env.get("SOURCE_LANG") or task.detected_language, task.detected_language or "source")
-        target_code = _language_suffix(env.get("TARGET_LANG") or "zh", "zh")
-        ass_path = task.edit_video_path.with_name(f"{task.edit_video_path.stem}.{source_code}-{target_code}.ass")
         if not ass_path.is_file() or ass_path.stat().st_size <= 0:
             raise StageCommandError(f"translate did not write expected bilingual ASS: {ass_path}")
         task.ass_path = ass_path
@@ -597,7 +652,14 @@ def write_report(
 def _main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     script_dir = Path(os.environ.get("SUBTITLE_TRANSLATION_PROJECT_DIR") or os.getcwd()).resolve()
-    args.burn = resolve_batch_burn(args.burn, load_project_environment(script_dir))
+    project_environment = load_project_environment(script_dir)
+    try:
+        validate_batch_stage_environment(project_environment)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
+    args.burn = resolve_batch_burn(args.burn, project_environment)
+    plan = batch_stage_plan(args.burn, project_environment)
     report_path = Path(args.report) if args.report else Path.cwd() / "batch-result.txt"
     limits = ResourceLimits.detect()
     started_at = datetime.now()
@@ -613,15 +675,14 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(f"Provider: {args.translate_provider}")
     if args.translate_model:
         print(f"Model:    {args.translate_model}")
-    print("Current:  download -> prepare -> ASR -> align -> translate -> burn")
+    print(f"Current:  {' -> '.join(plan)}")
     print("=" * 60)
 
     if args.dry_run:
         for index, url in enumerate(args.urls, start=1):
             print(
                 f"[DRY RUN][{index:02d}] "
-                "download -> prepare -> extract_audio -> asr -> align -> translate"
-                f"{' -> burn' if args.burn else ''} <- {url}"
+                f"{' -> '.join(plan)} <- {url}"
             )
         return 0
 

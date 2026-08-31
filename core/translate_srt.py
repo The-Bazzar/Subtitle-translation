@@ -4846,6 +4846,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--only-beautify", action="store_true")
     parser.add_argument("--only-glossary", action="store_true")
+    parser.add_argument("--reuse-glossary", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--beautified-json", help=argparse.SUPPRESS)
     parser.add_argument("--skip-beautify", action="store_true")
     parser.add_argument("--skip-knowledge", action="store_true")
@@ -4960,7 +4961,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             transcript,
             ctx,
             glossary_llm,
-            GlossaryBuildOptions.from_env(env, quiet=args.quiet, retriever=retriever, force=args.only_glossary),
+            GlossaryBuildOptions.from_env(
+                env,
+                quiet=args.quiet,
+                retriever=retriever,
+                force=args.only_glossary and not args.reuse_glossary,
+            ),
         )
         if embedding_active:
             updated_retriever = refresh_embedding_retriever(

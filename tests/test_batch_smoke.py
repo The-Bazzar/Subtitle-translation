@@ -1,11 +1,12 @@
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 import batch_runtime
-from batch_scheduler import ResourceLimits
+from batch_scheduler import BatchTask, ResourceLimits
 from subtitle_translation.stages import StageResult
 
 
@@ -52,6 +53,103 @@ class PythonCliSmokeTests(unittest.TestCase):
         limits = ResourceLimits.detect(logical_cpus=32)
         self.assertEqual(limits.cpu_io, 8)
         self.assertEqual(limits.nvenc, 4)
+
+    def test_batch_postprocess_reuses_glossary_cache(self):
+        task, root, temporary_directory = self._postprocess_task()
+        self.addCleanup(temporary_directory.cleanup)
+        calls = []
+
+        def fake_main(arguments):
+            calls.append(list(arguments))
+            if "--only-beautify" in arguments:
+                pathlib.Path(arguments[arguments.index("--beautified-json") + 1]).write_text(
+                    "{}", encoding="utf-8"
+                )
+            elif "--only-glossary" not in arguments:
+                (root / "video.en-zh.ass").write_text("ass", encoding="utf-8")
+            return 0
+
+        with mock.patch.dict("os.environ", {}, clear=False), mock.patch.object(
+            batch_runtime.translate_srt, "main", side_effect=fake_main
+        ):
+            runner = batch_runtime.create_platform_postprocess_runner(
+                root,
+                {"SOURCE_LANG": "en", "TARGET_LANG": "zh"},
+            )
+            asyncio_run(runner(task))
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("--reuse-glossary", calls[1])
+        self.assertEqual(task.ass_path, root / "video.en-zh.ass")
+
+    def test_batch_postprocess_honors_beautify_and_knowledge_skips(self):
+        task, root, temporary_directory = self._postprocess_task()
+        self.addCleanup(temporary_directory.cleanup)
+        calls = []
+
+        def fake_main(arguments):
+            calls.append(list(arguments))
+            if "--only-beautify" in arguments:
+                pathlib.Path(arguments[arguments.index("--beautified-json") + 1]).write_text(
+                    "{}", encoding="utf-8"
+                )
+            else:
+                (root / "video.en-zh.ass").write_text("ass", encoding="utf-8")
+            return 0
+
+        env = {
+            "SOURCE_LANG": "en",
+            "TARGET_LANG": "zh",
+            "PIPELINE_SKIP_BEAUTIFY": "1",
+            "PIPELINE_SKIP_KNOWLEDGE": "1",
+        }
+        with mock.patch.dict("os.environ", {}, clear=False), mock.patch.object(
+            batch_runtime.translate_srt, "main", side_effect=fake_main
+        ):
+            runner = batch_runtime.create_platform_postprocess_runner(root, env)
+            asyncio_run(runner(task))
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--skip-beautify", calls[0])
+        self.assertFalse(any("--only-glossary" in call for call in calls))
+
+    def test_batch_skip_translate_requires_existing_bilingual_ass(self):
+        task, root, temporary_directory = self._postprocess_task()
+        self.addCleanup(temporary_directory.cleanup)
+        ass_path = root / "video.en-zh.ass"
+        ass_path.write_text("ass", encoding="utf-8")
+        env = {
+            "SOURCE_LANG": "en",
+            "TARGET_LANG": "zh",
+            "PIPELINE_SKIP_TRANSLATE": "1",
+        }
+        with mock.patch.dict("os.environ", {}, clear=False), mock.patch.object(
+            batch_runtime.translate_srt, "main"
+        ) as translate:
+            runner = batch_runtime.create_platform_postprocess_runner(root, env)
+            asyncio_run(runner(task))
+
+        translate.assert_not_called()
+        self.assertEqual(task.ass_path, ass_path)
+
+    @staticmethod
+    def _postprocess_task():
+        temporary_directory = tempfile.TemporaryDirectory()
+        root = pathlib.Path(temporary_directory.name)
+        edit_video = root / "video.mkv"
+        json_path = root / "video.json"
+        candidate_path = root / ".video.beautified.candidate.json"
+        edit_video.write_bytes(b"edit")
+        json_path.write_text('{"language":"en","segments":[]}', encoding="utf-8")
+        task = BatchTask(
+            index=1,
+            url="url",
+            edit_video_path=edit_video,
+            json_path=json_path,
+            beautified_candidate_path=candidate_path,
+            detected_language="en",
+        )
+        return task, root, temporary_directory
 
 
 def asyncio_run(awaitable):

@@ -22,12 +22,14 @@ from unittest import mock
 import batch_runtime as batch
 import batch_scheduler
 from batch_runtime import (
+    batch_stage_plan,
     build_parser,
     build_stage_environment,
     create_platform_postprocess_runner,
     create_platform_runners,
     resolve_batch_burn,
     run_acquisition,
+    validate_batch_stage_environment,
     write_report,
 )
 from batch_cache import (
@@ -3080,6 +3082,11 @@ class BatchCliTests(unittest.TestCase):
             )
         self.assertFalse(args.burn)
         self.assertEqual(stage_environment["PIPELINE_SKIP_BURN"], "1")
+        self.assertNotIn("burn", batch_stage_plan(args.burn, stage_environment))
+
+        for key in ("PIPELINE_SKIP_DOWNLOAD", "PIPELINE_SKIP_WHISPER"):
+            with self.subTest(unsupported=key), self.assertRaisesRegex(ValueError, key):
+                validate_batch_stage_environment({key: "1"})
 
     def test_batch_rejects_removed_burn_option(self):
         for option in ("--burn", "-B"):
