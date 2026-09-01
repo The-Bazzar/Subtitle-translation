@@ -111,6 +111,8 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 `scripts/setup.ps1` / `scripts/setup.sh` 会从 `core/subtitle_translation/examples/` 创建缺失的 `.env`、provider、domain、prompt 和 template 文件；同一目录也作为 wheel package data，是 example 的唯一权威。旧 `.env` 只追加缺失变量，不覆盖已有值。setup 使用 `uv` 创建并清空项目 `.venv`，同步 pyproject 依赖和用户选定的 torch backend，并安装一个转发到项目 `.venv` 的全局 `subtitle-translation` shim。不能要求用户手动设置 PATH，也不能为 CLI 复制第二套 Python 环境。
 
+模型解析统一遵循 `非空 *_MODEL > 对应 provider.default_model`。glossary / proofread 只有在专用 provider 也留空时才复用翻译 provider 和 model；embedding 不得硬编码跨 provider 的默认模型。
+
 本地文件和生成物禁止提交：`.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、本地 prompt、`template.ass`、视频、字幕、glossary、sidecar、`chroma_db` 和 batch report。
 
 `cookies.txt` 仍按项目根目录相对位置读取；从任意工作目录调用 CLI 时，使用 `--project-dir` 或在目标项目目录运行，让配置根明确可见。

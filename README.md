@@ -208,6 +208,12 @@ glossary 位于翻译之前：
 
 ## 🔧 配置提醒
 
+### 🧠 Provider 与模型
+
+模型解析遵循固定优先级：非空的 `TRANSLATE_MODEL`、`GLOSSARY_MODEL`、`PROOFREAD_MODEL` 或 `EMBEDDING_MODEL` 是显式覆盖；对应变量留空时，使用所选 provider 在 `providers.json` 中的 `default_model`。glossary / proofread 的 provider 也留空时，才整体复用翻译配置。
+
+因此，修改 provider 的默认模型后，需要同时清空 `.env` 中该角色已有的 `*_MODEL`，否则显式值仍会优先。
+
 ### 🌐 语言
 
 `SOURCE_LANG` / `TARGET_LANG` 支持 ISO 639、BCP-47 或语言名。输出文件后缀会通过 `langcodes` 规范为 ISO 639 代码。

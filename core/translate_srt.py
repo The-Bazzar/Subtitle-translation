@@ -454,6 +454,14 @@ class GlossaryBuildArtifact:
     web_evidence: WebEvidenceSidecar = field(default_factory=WebEvidenceSidecar)
 
 
+def resolve_provider_model(provider: str, configured_model: str = "") -> str:
+    model = configured_model.strip()
+    if model:
+        return model
+    provider_config = load_providers().get(provider, {})
+    return str(provider_config.get("default_model", "")).strip()
+
+
 @dataclass
 class LLMConfig:
     provider: str
@@ -475,7 +483,8 @@ class LLMConfig:
         return providers[self.provider]
 
     def model_name(self) -> str:
-        return self.model or self.cfg().get("default_model", "")
+        model = self.model.strip()
+        return model or str(self.cfg().get("default_model", "")).strip()
 
     def _client(self):
         provider_cfg = self.cfg()
@@ -550,7 +559,7 @@ def proofread_retrieval_top_k_from_env(env: dict[str, str]) -> int:
 class EmbeddingConfig:
     enabled: bool = False
     provider: str = "openai"
-    model: str = "text-embedding-3-small"
+    model: str = ""
     store: str = "chroma"
     chroma_dir: str = ""
     top_k: int = 6
@@ -560,8 +569,8 @@ class EmbeddingConfig:
     @staticmethod
     def from_env(env: dict[str, str], ctx: TranscriptContext) -> "EmbeddingConfig":
         enabled = env_flag(env.get("EMBEDDING_ENABLED", "0"))
-        provider = env.get("EMBEDDING_PROVIDER", "openai") or "openai"
-        model = env.get("EMBEDDING_MODEL", "text-embedding-3-small") or "text-embedding-3-small"
+        provider = (env.get("EMBEDDING_PROVIDER", "openai") or "openai").strip()
+        model = resolve_provider_model(provider, env.get("EMBEDDING_MODEL", ""))
         store = (env.get("EMBEDDING_STORE", "chroma") or "chroma").lower()
         chroma_dir = env.get("EMBEDDING_CHROMA_DIR", "") or os.path.join(ctx.dir, "chroma_db")
         return EmbeddingConfig(
@@ -641,6 +650,11 @@ def embedding_function(config: EmbeddingConfig, env: dict[str, str]) -> OpenAIEm
     if config.provider not in providers:
         raise ValueError(f"unknown embedding provider: {config.provider}")
     provider_cfg = providers[config.provider]
+    if not config.model:
+        raise ValueError(
+            f"embedding model is empty for provider {config.provider}; "
+            "set EMBEDDING_MODEL or provider.default_model"
+        )
     key_name = provider_cfg["env_key"]
     api_key = env.get(key_name, "")
     if not api_key:

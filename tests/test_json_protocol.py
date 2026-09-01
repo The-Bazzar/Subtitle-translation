@@ -2050,6 +2050,18 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(glossary_llm.model, "deepseek-v4-pro")
         self.assertEqual(glossary_llm.api_key, "shared-key")
 
+    def test_glossary_llm_uses_dedicated_provider_default_when_model_is_empty(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="translate-model")
+        providers = {"glossary": {"default_model": "glossary-default"}}
+
+        with patch.object(t, "load_providers", return_value=providers):
+            glossary_llm = t.glossary_llm_from_env(
+                {"GLOSSARY_PROVIDER": "glossary", "GLOSSARY_MODEL": ""},
+                translate_llm,
+            )
+
+            self.assertEqual(glossary_llm.model_name(), "glossary-default")
+
     def test_translate_llm_from_env_does_not_carry_proofread_config(self):
         llm = t.translate_llm_from_env(
             {
@@ -2096,6 +2108,19 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(proofread_llm.api_key, "shared-key")
         self.assertEqual(proofread_llm.batch_size, 6)
 
+    def test_proofread_llm_uses_dedicated_provider_default_when_model_is_empty(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="translate-model")
+        providers = {"proofread": {"default_model": "proofread-default"}}
+
+        with patch.object(t, "load_providers", return_value=providers):
+            proofread_llm = t.proofread_llm_from_env(
+                {"PROOFREAD_PROVIDER": "proofread", "PROOFREAD_MODEL": ""},
+                translate_llm,
+                batch_size=12,
+            )
+
+            self.assertEqual(proofread_llm.model_name(), "proofread-default")
+
     def test_only_glossary_does_not_require_translate_provider(self):
         class Args:
             only_glossary = True
@@ -2130,6 +2155,24 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertEqual(cfg.top_k, 8)
             self.assertEqual(cfg.chunk_chars, 900)
             self.assertEqual(cfg.chroma_dir, os.path.join(tmp, "chroma_db"))
+
+    def test_embedding_config_uses_provider_default_when_model_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+            providers = {"custom-embedding": {"default_model": "provider-default-embedding"}}
+
+            with patch.object(t, "load_providers", return_value=providers):
+                cfg = t.EmbeddingConfig.from_env(
+                    {
+                        "EMBEDDING_ENABLED": "1",
+                        "EMBEDDING_PROVIDER": "custom-embedding",
+                        "EMBEDDING_MODEL": "",
+                    },
+                    ctx,
+                )
+
+            self.assertEqual(cfg.provider, "custom-embedding")
+            self.assertEqual(cfg.model, "provider-default-embedding")
 
     def test_embedding_config_ignores_legacy_pipeline_use_embedding(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2215,6 +2258,19 @@ class JsonProtocolTests(unittest.TestCase):
             default_headers={"X-Test": "1"},
             check_embedding_ctx_length=False,
         )
+
+    def test_embedding_function_rejects_missing_model(self):
+        cfg = t.EmbeddingConfig(provider="custom", model="")
+        providers = {
+            "custom": {
+                "url": "https://example.test/v1",
+                "env_key": "CUSTOM_API_KEY",
+            }
+        }
+
+        with patch.object(t, "load_providers", return_value=providers):
+            with self.assertRaisesRegex(ValueError, "EMBEDDING_MODEL or provider.default_model"):
+                t.embedding_function(cfg, {"CUSTOM_API_KEY": "secret"})
 
     def test_embedding_stage_enabled_skips_only_beautify(self):
         self.assertFalse(t.embedding_enabled_for_stage(True, False))
