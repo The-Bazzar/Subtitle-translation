@@ -1,6 +1,6 @@
 # Python CLI Migration
 
-方案 2 将项目从“脚本之间互相调用”迁移为“Python package 统一编排”。这是一项 breaking change，但保留了 PowerShell/bash 薄包装器，已有快捷方式可以逐步迁移。
+v2.0.0 将项目从“脚本之间互相调用”迁移为“Python package 统一编排”。这是一项 breaking change，但保留了 PowerShell/bash 薄包装器，已有快捷方式可以逐步迁移。
 
 ## 新入口
 
@@ -27,6 +27,10 @@ console entry point 和 `python -m subtitle_translation` 使用同一份实现�
 `--project-dir` 从输出目录语义中拆出：它只用于读取 `.env`、cookies、provider 和 template。download/pipeline 的新项目默认写入执行命令时的当前目录，batch 默认报告也写入当前目录。
 
 batch 与 pipeline 现在共享 postprocess skip 语义：`PIPELINE_SKIP_BEAUTIFY`、`PIPELINE_SKIP_KNOWLEDGE`、`PIPELINE_SKIP_TRANSLATE` 和 `PIPELINE_SKIP_BURN` 均生效。batch 复用已有 glossary；skip translate 时从每个项目目录读取约定命名的双语 ASS。URL batch 无法映射 per-task 现有视频/JSON，因此配置 `PIPELINE_SKIP_DOWNLOAD=1` 或 `PIPELINE_SKIP_WHISPER=1` 会明确返回配置错误。
+
+两个入口都只接受 `--skip-burn`，已移除 `--burn`。示例配置为 `PIPELINE_SKIP_BURN=1`，留出人工校对时间；需要硬压时将其改为 `0`。setup 保留已有 `.env` 值，升级时请核对本地设置。
+
+非空 `*_MODEL` 覆盖所选 provider 的 `default_model`；embedding 模型留空时也遵循此规则。glossary / proofread 的 provider 和 model 都留空时复用翻译配置。更换 embedding 模型后应使用独立的向量库目录，避免复用旧模型的向量空间。
 
 ## 旧入口
 
