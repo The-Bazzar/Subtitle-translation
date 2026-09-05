@@ -329,7 +329,6 @@ def create_platform_postprocess_runner(
     control: BatchControl | None = None,
 ) -> PostprocessRunner:
     del platform, terminal
-    config = ProjectConfig(script_dir, dict(env), Path.cwd().resolve())
     skip_beautify = batch_stage_skipped(env, "BEAUTIFY")
     skip_knowledge = batch_stage_skipped(env, "KNOWLEDGE")
     skip_translate = batch_stage_skipped(env, "TRANSLATE")

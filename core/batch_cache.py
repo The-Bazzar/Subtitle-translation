@@ -235,6 +235,7 @@ def _release_cache_lock(lock_file) -> None:
         else:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     except OSError:
+        # Closing the file in asr_cache_lock also releases the OS lock.
         pass
 
 
@@ -285,6 +286,7 @@ def _fsync_parent_directory(
             try:
                 os.close(descriptor)
             except OSError:
+                # Directory cleanup must not mask the original publish failure.
                 pass
 
 

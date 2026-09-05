@@ -488,6 +488,7 @@ class AcquisitionScheduler:
                     await _await_uninterruptibly(acquire_task)
                     acquired = True
                 except AsrCacheLockCancelled:
+                    # Preserve the asyncio cancellation that stopped acquisition.
                     pass
                 finally:
                     _clear_current_task_cancellation()
@@ -1079,6 +1080,7 @@ class AcquisitionScheduler:
                     ),
                 )
             except Exception:
+                # Aborting the worker can fail the pending call; propagate cancellation.
                 pass
             raise cancellation
 
@@ -1370,6 +1372,7 @@ class AcquisitionScheduler:
                 try:
                     temporary_path.unlink(missing_ok=True)
                 except OSError:
+                    # The failure-log write error is already recorded above.
                     pass
 
     @staticmethod

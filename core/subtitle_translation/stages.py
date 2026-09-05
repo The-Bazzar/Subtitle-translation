@@ -321,6 +321,7 @@ def transcribe_video(video: str | Path, config: ProjectConfig, *, model: str = "
         if wav_path.exists():
             wav_path.unlink()
     except OSError:
+        # A locked temporary WAV must not replace the WhisperX result.
         pass
     failed = _run_failed(result, "whisperx")
     if failed:

@@ -925,6 +925,7 @@ class AsrWorkerController:
             try:
                 self._cleanup_capture_files()
             except OSError:
+                # Retain the process-start error if capture cleanup also fails.
                 pass
             raise
         send_connection.close()
@@ -1347,6 +1348,7 @@ class AsrWorkerController:
                 if not getattr(cleanup_error, "stderr", ""):
                     cleanup_error.stderr = captured_stderr
             except (AttributeError, TypeError):
+                # Some exception types do not allow attaching output attributes.
                 pass
             raise cleanup_error
 

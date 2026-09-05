@@ -88,6 +88,7 @@ def terminate_active_processes() -> None:
             try:
                 process.kill()
             except OSError:
+                # A process may exit between the poll and either kill attempt.
                 pass
 
 
