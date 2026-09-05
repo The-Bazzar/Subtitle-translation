@@ -13,9 +13,9 @@ platform: Win + Linux
 ## 执行
 
 ```bash
-./.venv/bin/python translate_srt.py video.json --video video.webm --only-beautify
-./.venv/bin/python translate_srt.py video.json --video video.webm --only-beautify --scene-threshold 0.12 --snap-frames 10
-./.venv/bin/python translate_srt.py video.json --video video.webm --only-beautify --aggressive
+subtitle-translation translate video.json --video video.webm --only-beautify
+subtitle-translation translate video.json --video video.webm --only-beautify --scene-threshold 0.12 --snap-frames 10
+subtitle-translation translate video.json --video video.webm --only-beautify --aggressive
 ```
 
 ## 输出

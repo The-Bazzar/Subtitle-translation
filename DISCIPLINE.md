@@ -22,7 +22,7 @@
 | merge_queue | `ALLGREEN`，5/1/5，min wait 5min | 普通合并必须通过 merge queue，不得绕过 |
 
 **当前已落地的自动化：**
-- 全量 unittest：`main` 基线必须 `Ran 124 tests / OK`。
+- 全量 unittest：`main` 基线必须 `Ran 295 tests / OK`。
 - CodeQL：`.github/workflows/codeql.yml` 已启用。
 - Copilot code review：每次 push 自动触发。
 - merge queue：`ALLGREEN` 通过后才允许合并。
@@ -116,12 +116,12 @@ uv run python -m unittest discover -s tests
 ```
 
 **测试基线：**
-`main` 当前基线为 `Ran 124 tests` 且必须 `OK`。历史 `v1.7.9` 的 3 个基线问题（2 个 `-crf 19` 断言、1 个 `template.ass` 路径错误）已由 PR #8 修复，**不再保留任何基线豁免**；任何 PR 出现失败/错误即为阻断项。
+`main` 当前基线为 `Ran 295 tests` 且必须 `OK`。历史 `v1.7.9` 的 3 个基线问题（2 个 `-crf 19` 断言、1 个 `template.ass` 路径错误）已由 PR #8 修复，**不再保留任何基线豁免**；任何 PR 出现失败/错误即为阻断项。
 
 **其他强制要求：**
-- 修改 `translate_srt.py`：必须跑全量 unittest，且至少有一个新增/调整的测试直接覆盖改动行为。
-- 修改 `*.ps1` / `*.sh` 或 setup/env 链路：必须同时检查 Windows PowerShell 与 Linux/WSL 行为对齐，并更新 `tests/test_setup_scripts.py` 或对应脚本测试。
-- 新增环境变量：必须同步 `.env.example`、`AGENTS.md`、`README.md` 和两个 setup 的升级流程，并补测试证明旧 `.env` 能被正确升级。
+- 修改 `core/translate_srt.py`：必须跑全量 unittest，且至少有一个新增/调整的测试直接覆盖改动行为。
+- 修改 `scripts/*.ps1` / `scripts/*.sh` 或 setup/env 链路：必须同时检查 Windows PowerShell 与 Linux/WSL 行为对齐，并更新 `tests/test_setup_scripts.py` 或对应脚本测试。
+- 新增环境变量：必须同步 `core/subtitle_translation/examples/.env.example`、`AGENTS.md`、`README.md` 和两个 setup 的升级流程，并补测试证明旧 `.env` 能被正确升级。
 - 修改缓存/JSON 格式：必须包含旧格式读取兼容或显式迁移路径，并测试 round-trip。
 - 网络、LLM、ffmpeg、yt-dlp 调用必须 mock；测试不得依赖真实 API key、真实视频或真实联网。
 - 并发相关改动必须有并发/死锁/重复提交类回归测试。
@@ -150,7 +150,7 @@ uv run python -m unittest discover -s tests
 
 ## Validation
 - 命令：`.venv/bin/python -m unittest discover -s tests`
-- 结果：Ran N tests；新增失败/错误 0；`main` 基线当前为 `Ran 124 tests / OK`
+- 结果：Ran N tests；新增失败/错误 0；`main` 基线当前为 `Ran 295 tests / OK`
 - 新增测试名称及覆盖点
 - 人工验证步骤（涉及脚本/CLI 时）
 
@@ -162,7 +162,7 @@ uv run python -m unittest discover -s tests
 ## Documentation
 - [ ] README.md
 - [ ] AGENTS.md
-- [ ] .env.example / setup 链路
+- [ ] core/subtitle_translation/examples/.env.example / setup 链路
 - [ ] MIGRATION.md / CHANGELOG（破坏性变更时）
 - [ ] `.agents/skills/*`
 
@@ -279,9 +279,9 @@ uv run python -m unittest discover -s tests
 
 ### 5.3 边界说明
 
-- `translate_srt.py` 内的 `_TRANSLATE_PROMPT_FALLBACK`、`_PROOFREAD_PROMPT_FALLBACK`、`_SPLIT_PROMPT_FALLBACK`、`_GLOSSARY_PROMPT_FALLBACK` 是内置兜底文案，同样属于 prompt 策略。修改这些常量视同修改 prompt 文案，必须先在 `The-Bazzar/prompt` 完成评审。
+- `core/translate_srt.py` 内的 `_TRANSLATE_PROMPT_FALLBACK`、`_PROOFREAD_PROMPT_FALLBACK`、`_SPLIT_PROMPT_FALLBACK`、`_GLOSSARY_PROMPT_FALLBACK` 是内置兜底文案，同样属于 prompt 策略。修改这些常量视同修改 prompt 文案，必须先在 `The-Bazzar/prompt` 完成评审。
 - `_TRANSLATE_FORMAT`、`_SPLIT_FORMAT`、`_JSON_FORMAT` 等**输出格式/JSON 协议常量**属于代码契约，不属于 prompt 文案，可以在本项目通过 PR 修改，但必须附 JSON 协议回归测试。
-- `providers.example.json`、`tavily_domains.example.json`、`template.ass.example` 是配置/模板示例，不是 prompt 示例；其修改仍需遵守普通 PR 原则和 setup 兼容测试。
+- `core/subtitle_translation/examples/providers.example.json`、`core/subtitle_translation/examples/tavily_domains.example.json`、`core/subtitle_translation/examples/template.ass.example` 是配置/模板示例，不是 prompt 示例；其修改仍需遵守普通 PR 原则和 setup 兼容测试。
 
 ---
 
@@ -302,7 +302,7 @@ uv run python -m unittest discover -s tests
 
 ### 6.2 文档同步
 
-- 行为或配置变更必须同步 `AGENTS.md`、`README.md`、`.env.example` 和两个 setup 升级流程。
+- 行为或配置变更必须同步 `AGENTS.md`、`README.md`、`core/subtitle_translation/examples/.env.example` 和两个 setup 升级流程。
 - 用户可见破坏性变更必须新增/更新 `MIGRATION.md`。
 - `AGENTS.md` 是技术权威文档；PR 不得只改代码不更新文档。
 - 本 `DISCIPLINE.md` 修改原则上走 PR；只有 maintainer 明确发起的仓库治理/CI 配置调整可按 6.7 节 bypass，但必须在 commit message 中注明原因，且不得弱化任何既有规则。
@@ -321,7 +321,7 @@ git diff --cached --name-only | grep -E '(\.env$|providers\.json$|cookies\.txt$|
 
 ### 6.4 跨平台对齐检查
 
-任何修改 `*.ps1` / `*.sh` / `setup.*` / `pipeline.*` 的 PR，必须逐项确认：
+任何修改 `scripts/*.ps1` / `scripts/*.sh` / `scripts/setup.*` / `scripts/pipeline.*` 的 PR，必须逐项确认：
 
 - 环境变量名称、默认值、语义一致；
 - 路径引用使用仓库根相对路径；
@@ -334,7 +334,7 @@ git diff --cached --name-only | grep -E '(\.env$|providers\.json$|cookies\.txt$|
 
 - ruleset 已启用 code owner review，当前 `.github/CODEOWNERS` 使用 `* @oculr` 覆盖全部路径；后续细粒度拆分时，必须在新增 pattern 前先确认原 `*` 规则已被替代，不得出现无 owner 文件。
 - 没有 owner 覆盖的路径不得由非 owner 直接合并。
-- 本规范第 4 章的 design-invariant 文件（`AGENTS.md`、`translate_srt.py`、`*.example.md`、`setup.*`、`pipeline.*`）建议后续单独指定更细粒度 CODEOWNERS。
+- 本规范第 4 章的 design-invariant 文件（`AGENTS.md`、`core/translate_srt.py`、`core/subtitle_translation/examples/*`、`scripts/setup.*`、`scripts/pipeline.*`）建议后续单独指定更细粒度 CODEOWNERS。
 
 ### 6.6 Merge Queue 操作
 
@@ -377,7 +377,7 @@ ruleset 仅允许仓库 owner/maintainer 在极窄范围内 bypass。允许场�
 - [ ] PR 描述按 3.3 模板完整填写
 - [ ] 未触碰 design-invariant；或已提交 Design Change Report 并获 maintainer 批准
 - [ ] 未修改 `*_prompt.example.md`；或仅 maintainer 从 `The-Bazzar/prompt` 同步
-- [ ] 文档同步：README / AGENTS / .env.example / setup / MIGRATION（按需）
+- [ ] 文档同步：README / AGENTS / core/subtitle_translation/examples/.env.example / setup / MIGRATION（按需）
 - [ ] 无本地配置、产物、密钥进入 diff
 - [ ] 评审 thread 全部解决
 - [ ] 自动化与 merge queue 全绿

@@ -8,28 +8,27 @@ platform: Win + Linux
 
 使用 yt-dlp 下载 YouTube 视频及相关元数据。**不包含**语音识别。
 
-## Win — PowerShell
+## 执行
 
-```powershell
-.\download.ps1 "https://www.youtube.com/watch?v=xxxxx"
+```text
+subtitle-translation download "https://www.youtube.com/watch?v=xxxxx"
 ```
 
-输出 `OUTPUT_VIDEO=<编辑版 mkv 路径>` 与 `OUTPUT_RENDER_VIDEO=<原片路径>`，供 `whisper.ps1` / `pipeline.ps1` 串联。
+成功输出 `OUTPUT_RENDER_VIDEO=<原片绝对路径>`。脚本在原片与元数据落盘后结束，不创建编辑版，也不运行 ffmpeg 重编码。
 
-## Linux — Bash
+需要编辑版时，将该 marker 的路径显式传给独立准备脚本：
 
-```bash
-./download.sh "https://www.youtube.com/watch?v=xxxxx"
+```text
+subtitle-translation prepare-video "<OUTPUT_RENDER_VIDEO>"
 ```
 
-输出 `OUTPUT_VIDEO=<编辑版 mkv 路径>` 与 `OUTPUT_RENDER_VIDEO=<原片路径>`，供 `whisper.sh` / `pipeline.sh` 串联。
+`prepare-video` 成功输出 `OUTPUT_VIDEO=<编辑版 mkv 绝对路径>`，供 `subtitle-translation whisper` 使用；`subtitle-translation pipeline` 已自动串联这两个步骤。
 
 ## 输出
 
 ```
 视频目录/
 ├── 视频标题.original.webm  # 保留的原片 (供最终压制)
-├── 视频标题.mkv            # 重编码后的编辑视频 (供 WhisperX / translate)
 ├── 视频标题.png            # 封面缩略图
 ├── 视频标题.info.json      # 元数据
 ├── 视频标题.description    # 简介
@@ -40,5 +39,6 @@ platform: Win + Linux
 
 - 需要 `cookies.txt` (YouTube 凭证, gitignored)
 - yt-dlp 从 `.env` 的 `YTDLP_PATH_WIN` / `YTDLP_PATH_LINUX` 读取
-- 如果输出目录中已有 `视频标题.original.mkv`，脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`，然后直接进入编辑版重编码
-- 下载后固定做一次时间戳抚平重编码：优先使用 `h264_nvenc -cq 12` 重编码视频，未检测到可用 NVIDIA GPU 或 NVENC 编码器时回退 `libx264 -crf 12`；音频统一用 `aresample=async=1:out_sample_fmt=s16` + `flac` 重建时间轴，并清理 metadata。若 `h264_nvenc` 返回非零退出码但已输出非 0B 文件，脚本会保留该文件并继续，不再回退重编码。
+- 如果输出目录中已有 `视频标题.original.mkv`，脚本视为原片已下载，只用 `yt-dlp --skip-download` 补充封面、`.info.json`、`.description` 和 `.tags.txt`
+- `download` 不调用 `prepare-video`；direct download 用户必须按仓库根目录 `MIGRATION.md` 显式增加准备步骤
+- 时间戳抚平、`h264_nvenc` / `libx264` 选择、FLAC 音频与 metadata removal 均归独立 `prepare-video` stage 负责

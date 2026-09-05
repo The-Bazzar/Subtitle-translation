@@ -1,60 +1,42 @@
 import pathlib
-import re
+import tempfile
 import unittest
+from unittest import mock
+
+from subtitle_translation.config import ProjectConfig
+from subtitle_translation.process import CommandResult
+from subtitle_translation.stages import burn_video
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
 
 
-def read_script(name: str) -> str:
-    return (ROOT / name).read_text(encoding="utf-8")
+class BurnStageTests(unittest.TestCase):
+    def test_wrappers_select_the_expected_backend(self):
+        self.assertIn("burn --backend ffmpeg", (SCRIPTS / "ffmpeg-burn.ps1").read_text())
+        self.assertIn("burn --backend mpv", (SCRIPTS / "mpv-burn.ps1").read_text())
 
-
-class BurnScriptTests(unittest.TestCase):
-    def test_burn_scripts_default_to_source_bitrate_and_aac_audio(self):
-        expectations = {
-            "ffmpeg-burn.ps1": [
-                r'\$Ovcopts\s*=\s*"source-bitrate"',
-                r'\$Oac\s*=\s*"aac"',
-            ],
-            "mpv-burn.ps1": [
-                r'\$Ovcopts\s*=\s*"source-bitrate"',
-                r'\$Oac\s*=\s*"aac"',
-            ],
-            "ffmpeg-burn.sh": [
-                r'OVCOPTS="source-bitrate"',
-                r'OAC="aac"',
-            ],
-            "mpv-burn.sh": [
-                r'OVCOPTS="source-bitrate"',
-                r'OAC="aac"',
-            ],
-            "pipeline.ps1": [
-                r'\$Ovcopts\s*=\s*"source-bitrate"',
-                r'\$Oac\s*=\s*"aac"',
-                r"Merge-EnvDefault 'BURN_OVCOPTS' '' 'source-bitrate'",
-                r"Merge-EnvDefault 'BURN_OAC' '' 'aac'",
-            ],
-            "pipeline.sh": [
-                r'BURN_OVCOPTS="\$\{BURN_OVCOPTS:-source-bitrate\}"',
-                r'BURN_OAC="\$\{BURN_OAC:-aac\}"',
-            ],
-        }
-
-        for script, patterns in expectations.items():
-            content = read_script(script)
-            for pattern in patterns:
-                with self.subTest(script=script, pattern=pattern):
-                    self.assertRegex(content, pattern)
-
-    def test_burn_scripts_probe_source_video_bitrate(self):
-        for script in ("ffmpeg-burn.ps1", "ffmpeg-burn.sh", "mpv-burn.ps1", "mpv-burn.sh"):
-            content = read_script(script).lower()
-            with self.subTest(script=script):
-                self.assertIn("ffprobe", content)
-                self.assertIn("source-bitrate", content)
-                self.assertIn("maxrate", content)
-                self.assertIn("bufsize", content)
+    def test_mpv_stage_builds_an_argument_vector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            video = root / "video.mkv"
+            subtitle = root / "video.ass"
+            video.write_bytes(b"video")
+            subtitle.write_text("ass", encoding="utf-8")
+            with mock.patch("subtitle_translation.stages.ProjectConfig.resolve_tool", return_value="mpv"), mock.patch("subtitle_translation.stages._source_bitrate_kbps", return_value=1000), mock.patch(
+                "subtitle_translation.stages.run_command",
+                return_value=CommandResult(("mpv",), 0),
+            ) as run:
+                result = burn_video(
+                    video,
+                    subtitle,
+                    ProjectConfig(root, {"MPV_PATH_WIN": "mpv"}),
+                    backend="mpv",
+                    dry_run=True,
+                )
+        self.assertTrue(result.success)
+        self.assertFalse(run.called)
 
 
 if __name__ == "__main__":

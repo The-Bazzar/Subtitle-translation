@@ -10,6 +10,41 @@ from unittest.mock import patch
 import translate_srt as t
 
 
+class BatchArtifactRoundTripTests(unittest.TestCase):
+    def test_transcript_round_trip_preserves_batch_artifact_generation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "video.json")
+            output_path = os.path.join(temp_dir, "video.beautified.json")
+            artifact = {
+                "media_generation": "media-generation",
+                "alignment_generation": "alignment-generation",
+            }
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                json.dump(
+                    {
+                        "language": "en",
+                        "segments": [
+                            {
+                                "id": 1,
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "hello",
+                                "words": [],
+                            }
+                        ],
+                        "_batch_artifact": artifact,
+                    },
+                    source_file,
+                )
+
+            transcript = t.load_transcript(source_path)
+            t.save_transcript(transcript, output_path)
+
+            with open(output_path, "r", encoding="utf-8") as output_file:
+                payload = json.load(output_file)
+            self.assertEqual(payload["_batch_artifact"], artifact)
+
+
 class FakeSDKMessage:
     def __init__(self, content="", tool_calls=None, role="assistant", **extra):
         self.content = content
@@ -107,6 +142,20 @@ class JsonProtocolTests(unittest.TestCase):
 
     def test_transcript_context_exposes_web_evidence_sidecar_path(self):
         self.assertTrue(self.ctx.web_evidence_json.endswith("video.web_evidence.json"))
+
+    def test_transcript_context_can_override_only_beautified_storage(self):
+        candidate = os.path.join("cache", ".video.beautified.candidate.json")
+        ctx = t.TranscriptContext.from_json(
+            "video.json",
+            "",
+            "en",
+            "zh",
+            candidate,
+        )
+
+        self.assertEqual(ctx.beautified_json, os.path.abspath(candidate))
+        self.assertTrue(ctx.bilingual_ass.endswith("video.en-zh.ass"))
+        self.assertEqual(ctx.base, "video")
 
     def test_subtitle_layout_threshold_defaults_match_1080p_template(self):
         self.assertEqual(t.DEFAULT_SPLIT_MAX_CHARS, 72)
@@ -1885,7 +1934,11 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in session.messages], ["system", "user", "assistant"])
 
     def test_provider_example_uses_request_kwargs_for_sdk_options(self):
-        with open("providers.example.json", "r", encoding="utf-8") as f:
+        with open(
+            "core/subtitle_translation/examples/providers.example.json",
+            "r",
+            encoding="utf-8",
+        ) as f:
             providers = json.load(f)
 
         deepseek = providers["deepseek"]
@@ -1958,12 +2011,15 @@ class JsonProtocolTests(unittest.TestCase):
                 )
 
             old_cache = t._providers_cache
+            old_cache_root = t._providers_cache_root
             try:
                 t._providers_cache = None
-                with patch.object(t.os.path, "dirname", return_value=tmp):
+                t._providers_cache_root = None
+                with patch.dict(t.os.environ, {"SUBTITLE_TRANSLATION_PROJECT_DIR": tmp}):
                     providers = t.load_providers()
             finally:
                 t._providers_cache = old_cache
+                t._providers_cache_root = old_cache_root
 
             self.assertIn("openai", providers)
             self.assertIn("llama", providers)
@@ -1993,6 +2049,18 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(glossary_llm.provider, "deepseek")
         self.assertEqual(glossary_llm.model, "deepseek-v4-pro")
         self.assertEqual(glossary_llm.api_key, "shared-key")
+
+    def test_glossary_llm_uses_dedicated_provider_default_when_model_is_empty(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="translate-model")
+        providers = {"glossary": {"default_model": "glossary-default"}}
+
+        with patch.object(t, "load_providers", return_value=providers):
+            glossary_llm = t.glossary_llm_from_env(
+                {"GLOSSARY_PROVIDER": "glossary", "GLOSSARY_MODEL": ""},
+                translate_llm,
+            )
+
+            self.assertEqual(glossary_llm.model_name(), "glossary-default")
 
     def test_translate_llm_from_env_does_not_carry_proofread_config(self):
         llm = t.translate_llm_from_env(
@@ -2040,6 +2108,19 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(proofread_llm.api_key, "shared-key")
         self.assertEqual(proofread_llm.batch_size, 6)
 
+    def test_proofread_llm_uses_dedicated_provider_default_when_model_is_empty(self):
+        translate_llm = t.LLMConfig(provider="deepseek", model="translate-model")
+        providers = {"proofread": {"default_model": "proofread-default"}}
+
+        with patch.object(t, "load_providers", return_value=providers):
+            proofread_llm = t.proofread_llm_from_env(
+                {"PROOFREAD_PROVIDER": "proofread", "PROOFREAD_MODEL": ""},
+                translate_llm,
+                batch_size=12,
+            )
+
+            self.assertEqual(proofread_llm.model_name(), "proofread-default")
+
     def test_only_glossary_does_not_require_translate_provider(self):
         class Args:
             only_glossary = True
@@ -2074,6 +2155,24 @@ class JsonProtocolTests(unittest.TestCase):
             self.assertEqual(cfg.top_k, 8)
             self.assertEqual(cfg.chunk_chars, 900)
             self.assertEqual(cfg.chroma_dir, os.path.join(tmp, "chroma_db"))
+
+    def test_embedding_config_uses_provider_default_when_model_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = t.TranscriptContext.from_json(os.path.join(tmp, "video.json"), "", "en", "zh")
+            providers = {"custom-embedding": {"default_model": "provider-default-embedding"}}
+
+            with patch.object(t, "load_providers", return_value=providers):
+                cfg = t.EmbeddingConfig.from_env(
+                    {
+                        "EMBEDDING_ENABLED": "1",
+                        "EMBEDDING_PROVIDER": "custom-embedding",
+                        "EMBEDDING_MODEL": "",
+                    },
+                    ctx,
+                )
+
+            self.assertEqual(cfg.provider, "custom-embedding")
+            self.assertEqual(cfg.model, "provider-default-embedding")
 
     def test_embedding_config_ignores_legacy_pipeline_use_embedding(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2159,6 +2258,19 @@ class JsonProtocolTests(unittest.TestCase):
             default_headers={"X-Test": "1"},
             check_embedding_ctx_length=False,
         )
+
+    def test_embedding_function_rejects_missing_model(self):
+        cfg = t.EmbeddingConfig(provider="custom", model="")
+        providers = {
+            "custom": {
+                "url": "https://example.test/v1",
+                "env_key": "CUSTOM_API_KEY",
+            }
+        }
+
+        with patch.object(t, "load_providers", return_value=providers):
+            with self.assertRaisesRegex(ValueError, "EMBEDDING_MODEL or provider.default_model"):
+                t.embedding_function(cfg, {"CUSTOM_API_KEY": "secret"})
 
     def test_embedding_stage_enabled_skips_only_beautify(self):
         self.assertFalse(t.embedding_enabled_for_stage(True, False))
@@ -2794,7 +2906,16 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("discipline: 定译为自律", captured["system_prompt"])
 
     def test_write_ass_uses_named_output_modes(self):
-        template = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "template.ass.example"))
+        template = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "core",
+                "subtitle_translation",
+                "examples",
+                "template.ass.example",
+            )
+        )
         event = t.SplitEvent(1.0, 2.0, "source line", "目标行")
 
         with tempfile.TemporaryDirectory() as tmp:
