@@ -1,5 +1,12 @@
 # Python CLI Migration
 
+## 下载 cookies 与 yt-dlp 缓存
+
+- download、pipeline 和 batch 的 `cookies.txt` 改为从命令启动时的执行目录读取，不再从 `.code` / `--project-dir` 配置根读取，也不在缺失时回退。升级后应在实际执行目录提供 cookies；`.env`、provider 和 template 的配置位置不变。
+- 获取标题与下载/元数据刷新都携带同一 cookies。每个 yt-dlp 业务调用前，先用同一 executable 运行 `--rm-cache-dir`；清理失败则停止该任务的下载阶段，并保留失败退出码及诊断。
+- yt-dlp 缓存通常跨项目共享；清理影响其所选缓存目录，不删除项目媒体、ASR sidecar、glossary 或字幕。batch 并发容量和调度策略不变。
+- 设计说明见 [下载 cookies 与缓存清理](docs/superpowers/specs/2026-09-18-download-cookies-cache-design.md)。
+
 v2.0.0 将项目从“脚本之间互相调用”迁移为“Python package 统一编排”。这是一项 breaking change，但保留了 PowerShell/bash 薄包装器，已有快捷方式可以逐步迁移。
 
 ## 新入口
@@ -24,7 +31,7 @@ console entry point 和 `python -m subtitle_translation` 使用同一份实现�
 
 新版 `scripts/setup.ps1` / `scripts/setup.sh` 会安装全局 `subtitle-translation` shim。shim 只转发到当前仓库 `.venv` 并自动附带 `--project-dir`，不会复制第二套 Python/WhisperX 环境，也不要求用户手动设置 PATH。切换仓库位置后重新运行 setup 即可刷新 shim。
 
-`--project-dir` 从输出目录语义中拆出：它只用于读取 `.env`、cookies、provider 和 template。download/pipeline 的新项目默认写入执行命令时的当前目录，batch 默认报告也写入当前目录。
+`--project-dir` 从输出目录语义中拆出：它只用于读取 `.env`、provider 和 template。download/pipeline 的新项目默认写入执行命令时的当前目录，batch 默认报告也写入当前目录。cookies 也从执行目录读取，详见上方下载迁移说明。
 
 batch 与 pipeline 现在共享 postprocess skip 语义：`PIPELINE_SKIP_BEAUTIFY`、`PIPELINE_SKIP_KNOWLEDGE`、`PIPELINE_SKIP_TRANSLATE` 和 `PIPELINE_SKIP_BURN` 均生效。batch 复用已有 glossary；skip translate 时从每个项目目录读取约定命名的双语 ASS。URL batch 无法映射 per-task 现有视频/JSON，因此配置 `PIPELINE_SKIP_DOWNLOAD=1` 或 `PIPELINE_SKIP_WHISPER=1` 会明确返回配置错误。
 
@@ -93,7 +100,7 @@ batch 的第一次 `Ctrl+C` 停止接纳新任务并停止推进新的阶段，�
 - glossary 仍是翻译、校对的全局硬规则，网页证据仍使用独立 sidecar。
 - 整句翻译、源语言 split、word 首尾对齐、split event 校对的顺序不变。
 - batch 的 worker、generation、lock、ASR cache、CPU/IO 与 NVENC 限制不变。
-- `cookies.txt` 仍从项目根目录相对路径读取；从任意目录调用请使用 `--project-dir`。
+- `cookies.txt` 的读取位置已改为执行目录，不受 `--project-dir` 影响；详见上方下载迁移说明。
 
 ## 迁移检查
 

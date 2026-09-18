@@ -136,6 +136,8 @@ class PythonCliTests(unittest.TestCase):
             config = ProjectConfig(root, {})
 
             def fake_run(args, **kwargs):
+                if "--rm-cache-dir" in args:
+                    return CommandResult(tuple(args), 0)
                 output_template = pathlib.Path(args[args.index("-o") + 1])
                 output_template.parent.mkdir(parents=True, exist_ok=True)
                 output_template.with_name(output_template.name.replace("%(ext)s", "mp4")).write_bytes(b"video")
@@ -160,6 +162,8 @@ class PythonCliTests(unittest.TestCase):
             config = ProjectConfig(config_root, {}, output_root)
 
             def fake_run(args, **kwargs):
+                if "--rm-cache-dir" in args:
+                    return CommandResult(tuple(args), 0)
                 output_template = pathlib.Path(args[args.index("-o") + 1])
                 output_template.parent.mkdir(parents=True, exist_ok=True)
                 output_template.with_name(output_template.name.replace("%(ext)s", "mkv")).write_bytes(b"video")

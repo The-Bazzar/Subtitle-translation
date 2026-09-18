@@ -220,12 +220,14 @@ glossary 位于翻译之前：
 
 ### 📁 项目目录
 
-`--project-dir` 只指定 `.env`、cookies、provider 和 template 的配置根，不改变输出位置。pipeline 下载项目默认创建在执行命令时的当前目录。
+`--project-dir` 只指定 `.env`、provider 和 template 的配置根，不改变输出位置。pipeline 下载项目默认创建在执行命令时的当前目录。
 
-`cookies.txt` 从项目配置根读取。从其他目录运行时，可以在主命令前显式指定：
+download、pipeline 和 batch 都只读取执行命令时的当前目录下的 `cookies.txt`，包括获取标题时；不存在时不传 cookies，也不回退到安装目录或 `--project-dir`。每次获取标题、下载或刷新元数据前，先使用同一个 yt-dlp 执行 `--rm-cache-dir`；清理失败则停止该任务的下载阶段并报告错误。
+
+从其他目录运行时，仍可显式指定其余配置的根目录，但 cookies 保持从当前执行目录读取：
 
 ```text
-subtitle-translation --project-dir "G:/Subtitle translation/.code" pipeline "URL"
+subtitle-translation --project-dir "<repo>" pipeline "URL"
 ```
 
 ### 🤖 LLM 数据约束

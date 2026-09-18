@@ -115,7 +115,9 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 本地文件和生成物禁止提交：`.env`、`providers.json`、`tavily_domains.json`、`cookies.txt`、本地 prompt、`template.ass`、视频、字幕、glossary、sidecar、`chroma_db` 和 batch report。
 
-`cookies.txt` 仍按项目根目录相对位置读取；从任意工作目录调用 CLI 时，使用 `--project-dir` 或在目标项目目录运行，让配置根明确可见。
+download、pipeline 和 batch 只读取命令启动时的执行目录下的 `cookies.txt`（`ProjectConfig.output_dir`），获取标题与下载/元数据刷新使用同一 cookies。缺失时不传 `--cookies`，不得回退到安装目录或 `--project-dir` 配置根。
+
+每次 yt-dlp 获取标题、下载或刷新元数据之前，必须先使用同一 executable、同一执行目录运行 `yt-dlp --rm-cache-dir`。清理失败即返回该下载阶段失败，不执行后续 yt-dlp 操作。此缓存清理不改变 ASR、generation、glossary 或其他项目缓存协议。
 
 `--project-dir` 只决定配置根，不得改变输出根。download/pipeline 默认把新项目创建在用户执行命令时的当前目录；batch 默认报告也写入当前目录。
 

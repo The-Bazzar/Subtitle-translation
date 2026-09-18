@@ -66,7 +66,13 @@ def download_video(url: str, config: ProjectConfig) -> StageResult:
     ytdlp = config.resolve_tool("YTDLP_PATH_WIN" if os.name == "nt" else "YTDLP_PATH_LINUX", "yt-dlp")
     if not ytdlp:
         return StageResult.fail(127, "yt-dlp command not found")
-    title_result = capture_command([ytdlp, "--get-title", url], cwd=config.output_dir)
+    cookies = config.output_dir / "cookies.txt"
+    cookie_args = ["--cookies", str(cookies)] if cookies.is_file() else []
+    cache_result = run_command([ytdlp, "--rm-cache-dir"], cwd=config.output_dir, label="yt-dlp cache cleanup")
+    failed = _run_failed(cache_result, "yt-dlp cache cleanup")
+    if failed:
+        return failed
+    title_result = capture_command([ytdlp, *cookie_args, "--get-title", url], cwd=config.output_dir)
     if title_result.returncode != 0:
         return StageResult.fail(title_result.returncode, "failed to get video title", title_result.args)
     title_lines = [line.strip() for line in title_result.stdout.splitlines() if line.strip()]
@@ -76,10 +82,7 @@ def download_video(url: str, config: ProjectConfig) -> StageResult:
     folder = config.output_dir / folder_name
     folder.mkdir(parents=True, exist_ok=True)
     existing = folder / f"{folder_name}.original.mkv"
-    cookies = config.project_dir / "cookies.txt"
-    common = ["-o", str(folder / f"{folder_name}.%(ext)s")]
-    if cookies.is_file():
-        common += ["--cookies", str(cookies)]
+    common = ["-o", str(folder / f"{folder_name}.%(ext)s"), *cookie_args]
     if existing.is_file():
         ytdlp_args = common + [
             "--skip-download",
@@ -113,6 +116,10 @@ def download_video(url: str, config: ProjectConfig) -> StageResult:
             url,
         ]
         render_video = None
+    cache_result = run_command([ytdlp, "--rm-cache-dir"], cwd=config.output_dir, label="yt-dlp cache cleanup")
+    failed = _run_failed(cache_result, "yt-dlp cache cleanup")
+    if failed:
+        return failed
     result = run_command([ytdlp, *ytdlp_args], cwd=config.output_dir, label="yt-dlp")
     failed = _run_failed(result, "yt-dlp")
     if failed:
