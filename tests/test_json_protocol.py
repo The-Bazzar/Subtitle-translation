@@ -2234,7 +2234,7 @@ class JsonProtocolTests(unittest.TestCase):
             ],
         )
 
-    def test_embedding_function_uses_provider_config_and_disables_tiktoken(self):
+    def test_embedding_function_uses_provider_config_for_single_input_requests(self):
         cfg = t.EmbeddingConfig(provider="llama", model="qwen3-embedding")
         env = {"OLLAMA_API_KEY": "not-needed"}
 
@@ -2248,16 +2248,17 @@ class JsonProtocolTests(unittest.TestCase):
                     "extra_headers": {"X-Test": "1"},
                 }
             },
-        ), patch.object(t, "OpenAIEmbeddings") as fake_embeddings:
-            t.embedding_function(cfg, env)
+        ), patch.object(t, "OpenAI") as fake_client:
+            embeddings = t.embedding_function(cfg, env)
 
-        fake_embeddings.assert_called_once_with(
+        fake_client.assert_called_once_with(
             base_url="http://localhost:8080/v1",
             api_key="not-needed",
-            model="qwen3-embedding",
             default_headers={"X-Test": "1"},
-            check_embedding_ctx_length=False,
         )
+        self.assertIsInstance(embeddings, t.SingleInputEmbeddings)
+        self.assertIs(embeddings.client, fake_client.return_value)
+        self.assertEqual(embeddings.model, "qwen3-embedding")
 
     def test_embedding_function_rejects_missing_model(self):
         cfg = t.EmbeddingConfig(provider="custom", model="")
@@ -2618,7 +2619,7 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertEqual(calls, [True])
         self.assertIsInstance(retriever, FakeRetriever)
 
-    def test_build_embedding_index_adds_documents_in_configured_batches(self):
+    def test_build_embedding_index_preserves_ids_across_bounded_writes(self):
         class FakeStore:
             def __init__(self):
                 self.calls = []
@@ -2635,10 +2636,10 @@ class JsonProtocolTests(unittest.TestCase):
                 t.TranscriptSegment(3, 2.0, 3.0, "gamma"),
             ],
         )
-        cfg = t.EmbeddingConfig(enabled=True, chroma_dir="index", chunk_chars=1, batch_size=2)
+        cfg = t.EmbeddingConfig(enabled=True, chroma_dir="index", chunk_chars=1)
         fake_store = FakeStore()
 
-        with patch.object(t, "open_chroma_store", return_value=fake_store):
+        with patch.object(t, "open_chroma_store", return_value=fake_store), patch.object(t, "CHROMA_WRITE_BATCH_SIZE", 2):
             t.build_embedding_index(transcript, cfg, {}, quiet=True)
 
         self.assertEqual([ids for _, ids in fake_store.calls], [["transcript:1", "transcript:1-2"], ["transcript:2-3"]])

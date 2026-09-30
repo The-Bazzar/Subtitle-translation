@@ -1,5 +1,11 @@
 # Python CLI Migration
 
+## Embedding 单输入请求
+
+所有 embedding provider 的建索引和查询都改为每次发送一个文本字符串，避免单输入通道拒绝多文本数组。无需修改模型或 provider 配置。`EMBEDDING_BATCH_SIZE` 已删除，旧 `.env` 中残留的同名设置不再生效，可以移除。Chroma 写入批次由程序内部处理，文本按顺序逐条调用 API。请求失败仍通过原有索引错误处理报告，单次响应必须恰好包含一个向量。
+
+相比远程批量输入，请求数增加，索引可能更慢。此调整不改变文本分块、向量顺序或索引 ID；使用相同模型和向量维度的现有数据库无需为请求形式单独迁移。
+
 ## 下载 cookies 与 yt-dlp 缓存
 
 - download、pipeline 和 batch 的 `cookies.txt` 改为从命令启动时的执行目录读取，不再从 `.code` / `--project-dir` 配置根读取，也不在缺失时回退。升级后应在实际执行目录提供 cookies；`.env`、provider 和 template 的配置位置不变。

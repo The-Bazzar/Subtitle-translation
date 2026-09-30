@@ -30,7 +30,7 @@ import langcodes
 import language_data  # noqa: F401
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.embeddings import Embeddings
 from openai import OpenAI
 from tavily import TavilyClient
 
@@ -564,7 +564,6 @@ class EmbeddingConfig:
     chroma_dir: str = ""
     top_k: int = 6
     chunk_chars: int = 800
-    batch_size: int = 64
 
     @staticmethod
     def from_env(env: dict[str, str], ctx: TranscriptContext) -> "EmbeddingConfig":
@@ -581,7 +580,6 @@ class EmbeddingConfig:
             chroma_dir=chroma_dir,
             top_k=env_int(env.get("EMBEDDING_TOP_K", ""), 6),
             chunk_chars=env_int(env.get("EMBEDDING_CHUNK_CHARS", ""), 800),
-            batch_size=env_int(env.get("EMBEDDING_BATCH_SIZE", ""), 64),
         )
 
 
@@ -645,7 +643,26 @@ def documents_to_retrieved_context(documents: list[Document]) -> list[dict]:
     return contexts
 
 
-def embedding_function(config: EmbeddingConfig, env: dict[str, str]) -> OpenAIEmbeddings:
+class SingleInputEmbeddings(Embeddings):
+    def __init__(self, client: OpenAI, model: str):
+        self.client = client
+        self.model = model
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed_query(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=text,
+            encoding_format="float",
+        )
+        if len(response.data) != 1:
+            raise ValueError("Embedding response must contain exactly one vector")
+        return response.data[0].embedding
+
+
+def embedding_function(config: EmbeddingConfig, env: dict[str, str]) -> SingleInputEmbeddings:
     providers = load_providers()
     if config.provider not in providers:
         raise ValueError(f"unknown embedding provider: {config.provider}")
@@ -659,13 +676,12 @@ def embedding_function(config: EmbeddingConfig, env: dict[str, str]) -> OpenAIEm
     api_key = env.get(key_name, "")
     if not api_key:
         raise ValueError(f"{key_name} not found in environment or .env file")
-    return OpenAIEmbeddings(
+    client = OpenAI(
         base_url=provider_cfg["url"],
         api_key=api_key,
-        model=config.model,
         default_headers=provider_cfg.get("extra_headers", {}),
-        check_embedding_ctx_length=False,
     )
+    return SingleInputEmbeddings(client, config.model)
 
 
 def open_chroma_store(config: EmbeddingConfig, env: dict[str, str]) -> Chroma:
@@ -1016,6 +1032,9 @@ def clear_embedding_chunks(store, chunk_ids: Optional[list[str]] = None) -> None
     store.delete(ids=ids)
 
 
+CHROMA_WRITE_BATCH_SIZE = 64
+
+
 def build_embedding_index(
     transcript: Transcript,
     config: EmbeddingConfig,
@@ -1033,9 +1052,8 @@ def build_embedding_index(
         chunks.extend(build_translation_memory_chunks(transcript, ctx))
     store = open_chroma_store(config, env)
     clear_embedding_chunks(store, existing_chunk_ids)
-    batch_size = max(1, int(config.batch_size or 1))
-    for start in range(0, len(chunks), batch_size):
-        batch = chunks[start : start + batch_size]
+    for start in range(0, len(chunks), CHROMA_WRITE_BATCH_SIZE):
+        batch = chunks[start : start + CHROMA_WRITE_BATCH_SIZE]
         store.add_documents(
             [chunk.to_document() for chunk in batch],
             ids=[chunk.chunk_id for chunk in batch],
