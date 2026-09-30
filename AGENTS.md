@@ -106,6 +106,7 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 - 语言可为任意有效源/目标组合；代码通过 `langcodes` 规范文件后缀。
 - `.beautified.json` 保存 `translation`、`proofread_text`、`split_events`、`split_status` 和原因字段。
 - sidecar/web evidence/embedding 只能按当前项目与 generation 检索，不得污染另一个项目。
+- embedding 建索引和查询对所有模型统一使用单文本字符串 `input`，多个文本按原顺序串行请求，每次响应必须恰好有一个向量。Chroma 写入批次由内部常量控制，不提供环境变量；API 重试使用 OpenAI SDK 的默认策略，失败沿用原有索引错误处理。
 
 ## Configuration and Local Files
 
