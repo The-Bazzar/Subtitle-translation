@@ -55,7 +55,7 @@ seconds = offset * window_stride * subsampling_factor
 - `score` 保留为该后端的原生分数，不映射成跨 Provider 可比较的 0 到 1 正确率；缺少 word confidence 时不生成虚假值。
 - 参考 profile 使用显式 Hypothesis 模式。官方示例以列表取样，但不同模型路径和注释可能涉及 tuple / N-best 容器；所支持版本必须通过真实 fixture 锁定外层结构和每个输入对应的 best hypothesis。未知结构报适配错误，不能通过 `str(result)` 伪装成听录文本。
 - 不将 WhisperX 的 `language` 参数直接套给 RNNT `transcribe`；语言能力由模型声明及统一请求记录管理。
-- 原生词轴和分段仅供候选比较，不进入正式 split。既然最终统一 MFA，就不额外加载另一个模型给 Parakeet 候选补词轴。
+- 原生词轴和分段仅供候选比较，不用于正式源文事件规划。正式源文事件在 MFA/beautify 后由独立 LLM 语义断句选择边界，本地映射 MFA 词轴；不额外加载另一个模型给 Parakeet 候选补词轴，也不把原生分段当作字幕边界。
 
 依据：[NVIDIA 模型示例](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)、[Hypothesis 定义](https://github.com/NVIDIA-NeMo/Speech/blob/cd61689d41b1962d3e1957ae8faf28bf8bee0e3b/nemo/collections/asr/parts/utils/rnnt_utils.py)、[时间戳转换](https://github.com/NVIDIA-NeMo/Speech/blob/cd61689d41b1962d3e1957ae8faf28bf8bee0e3b/nemo/collections/asr/parts/utils/timestamp_utils.py)、[RNNT transcribe](https://github.com/NVIDIA-NeMo/Speech/blob/cd61689d41b1962d3e1957ae8faf28bf8bee0e3b/nemo/collections/asr/models/rnnt_models.py)。
 
@@ -135,7 +135,7 @@ seconds = offset * window_stride * subsampling_factor
 
 - `Recognizer` 的必需输出为文字、来源与输入覆盖范围；原生语言、分段及词轴都不能被假定存在。
 - 这些接口并非原生 WhisperX JSON。统一候选 `SourceResult v1` 与 MFA 后的正式 `ASR Transcript v2` 必须分开，具体字段以完整设计第 4、8 节为准。
-- 默认单一 WhisperX、单一 Parakeet、单一 Qwen 都先产生同一候选契约，再走 passthrough 和 MFA；不能因 Qwen 无原生词轴就判为不支持单来源。
+- 默认单一 WhisperX、单一 Parakeet、单一 Qwen 都先产生同一候选契约，再进入 glossary 原文校对，之后才由 MFA 对修订稿生成词轴；不能因 Qwen 无原生词轴就判为不支持单来源。ASR 只收集候选，不调用语义 LLM。
 - 所选 Provider 和 backend 共同决定 parser，schema/profile 版本纳入原始识别缓存；模型 revision 和依赖版本分别记录。
 - 引擎依赖和接口结构未知时应在 setup / capability gate 报告具体问题，不能将未知对象或异常文本当成有效听录。
 
@@ -149,5 +149,5 @@ seconds = offset * window_stride * subsampling_factor
 2. 在各自所选环境中运行相同短英文音频，采集真实的原生输出及 JSON-safe 投影，明确容器、字段、时间单位和输入对应关系。
 3. 采集纯文字、原生时间信息（仅作诊断）、空结果、多输入、异常响应和长音频合并等所支持路径，形成标为真实采样的 fixtures；人工构造 fixtures 单独标注。
 4. 单元测试使用 fixtures / mock，断言准确取文字、时间单位转换、裁剪偏移、缺字段、数量不匹配、非有限时间和未知对象拒绝；不能依赖真实模型联网。
-5. 验证单一 Parakeet / Qwen 且没有 WhisperX 和 ASR 勘误 LLM 时，能透传实际文字进入 MFA；再验证多来源对比不会假定字段结构相同。
+5. 验证单一 Parakeet / Qwen 且没有 WhisperX 或 ASR 专用 LLM 时，能透传实际文字进入 glossary，再将实际修订稿交给 MFA；多来源对比不假定字段结构相同。
 6. 通过目标平台真实基准及 setup 安装验证后，才能标记该 backend 为已支持。
