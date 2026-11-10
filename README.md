@@ -8,7 +8,7 @@
   <img alt="Python 3.10-3.13" src="https://img.shields.io/badge/Python-3.10--3.13-3776AB?logo=python&logoColor=white">
   <img alt="PowerShell 7" src="https://img.shields.io/badge/PowerShell-7-5391FE?logo=powershell&logoColor=white">
   <img alt="Windows Linux WSL" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL-555555">
-  <img alt="Version 2.0.1" src="https://img.shields.io/badge/Version-2.0.1-blue">
+  <img alt="Version 2.0.2" src="https://img.shields.io/badge/Version-2.0.2-blue">
   <a href="LICENSE"><img alt="GPL-3.0 license" src="https://img.shields.io/badge/License-GPL--3.0-2ea44f"></a>
 </p>
 
@@ -238,6 +238,8 @@ subtitle-translation --project-dir "<repo>" pipeline "URL"
 - `glossary.md` 是完整常驻的全局硬规则。
 - retrieved context 只提供动态补充，不替代 glossary。
 - split 只按源语言首尾 word 对轴；匹配失败时整句回退，不做本地强切。
+
+目标语言 `.description` 还会读取同名 `<base>.original.mkv` 的内嵌章节，沿用术语库翻译章节标题，并以 `HH:MM:SS 标题` 追加到“章节”区块。时间来自原片，不由 LLM 改写；无原简介文件也可生成章节简介。原片缺失、没有章节或提取失败时保持原有简介翻译，缺失/无效的章节译名逐项保留原标题。
 
 ### 🔒 不应提交的文件
 

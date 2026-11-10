@@ -1,5 +1,15 @@
 # Python CLI Migration
 
+## v2.0.2 原片章节简介
+
+无需新增配置。翻译元数据时从项目内同名 `<base>.original.mkv` 使用 ffprobe JSON 读取内嵌章节，优先查找已配置 ffmpeg 同目录的 ffprobe。只读取原片，不回退到编辑版或其他项目影片；探测最多等待 30 秒。
+
+章节标题与原有标题、简介、标签在同一次元数据请求中翻译，沿用完整 glossary 和当前项目检索上下文。输出至已有目标语言 description 路径（如 `.zh.description`），追加“章节”及 `HH:MM:SS 标题`。开始时间在本地保留，展示向下取整到秒；模型只返回章节 ID 和译名，不能重排或改写时间。
+
+无 `.description` 源文件但有同名原片时也会尝试输出章节简介。无章节/原片或探测失败时，其他元数据仍正常翻译；章节译名缺失、为空、ID 重复或非法时，对受影响章节保留原标题。整次元数据翻译失败时沿用已有行为，不覆盖现有目标简介。
+
+本版本不改变字幕主输入、ASR、时间轴、batch 调度和恢复 generation；不需要重新识别或删除已有字幕缓存。重新运行现有 translate/pipeline 命令即可刷新目标简介。完整边界见[设计说明](docs/superpowers/specs/2026-11-10-original-chapter-description-design.md)。
+
 ## Embedding 单输入请求
 
 所有 embedding provider 的建索引和查询都改为每次发送一个文本字符串，避免单输入通道拒绝多文本数组。无需修改模型或 provider 配置。`EMBEDDING_BATCH_SIZE` 已删除，旧 `.env` 中残留的同名设置不再生效，可以移除。Chroma 写入批次由程序内部处理，文本按顺序逐条调用 API。请求失败仍通过原有索引错误处理报告，单次响应必须恰好包含一个向量。
