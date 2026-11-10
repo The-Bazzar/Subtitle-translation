@@ -80,6 +80,7 @@ subtitle-translation translate "path/to/video.json"
 - glossary 位于翻译之前；存在非空 `glossary.md` 时普通 pipeline 复用，`--only-glossary` 强制覆盖。网页证据另存 `.web_evidence.json`。
 - 翻译使用整句，split 使用未校对源语言文本，proofread 处理 split event。split 只用源片段首尾 token 对齐 words；失败时整句 fallback，禁止本地强切。
 - 输出为 `.split.<lang>.srt`、`.<source>.proofread.ass`、`.<target>.ass`、`.<source>-<target>.ass` 和目标语言 `.description`。
+- 元数据翻译从当前项目同名 `<base>.original.mkv` 的 ffprobe JSON 读取内嵌章节，不回退到编辑版/其他项目。章节标题与标题、简介、标签在同一次请求翻译，使用完整 glossary；按本地章节 ID 恢复时间顺序，时间仅由原片提供，向下取整后以 `HH:MM:SS 标题` 写入目标 description 的“章节”区块。ffprobe 优先使用所配置 ffmpeg 同目录工具，探测超时 30 秒；无原简介但有同名原片也可触发元数据翻译。提取失败不阻塞其他简介内容，缺失/无效/重复 ID 的章节译名逐项使用原标题。该功能不改媒体、词轴或 batch generation。
 
 ## Batch Resource Rules
 

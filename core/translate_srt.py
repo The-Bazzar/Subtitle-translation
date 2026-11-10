@@ -34,6 +34,8 @@ from langchain_core.embeddings import Embeddings
 from openai import OpenAI
 from tavily import TavilyClient
 
+from subtitle_translation.chapters import original_chapter_media, read_original_chapters, translated_chapters
+
 
 # --- Data model ---------------------------------------------------------------
 
@@ -4753,11 +4755,15 @@ def write_ass(
 DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following video title, description, and tags from ${SOURCE_LANG} to ${TARGET_LANG}.
 
 Return a JSON object with exactly these keys:
-{"title": "<translated title>", "description": "<translated description>", "tags": ["<translated tag>", "..."]}
+{"title": "<translated title>", "description": "<translated description>", "tags": ["<translated tag>", "..."], "chapters": [{"id": 1, "title": "<translated chapter title>"}]}
 
 Rules:
 - Preserve URLs, email addresses, handles, and paragraph structure.
 - Translate each tag naturally and keep the tag list order.
+- Translate chapter titles using the same glossary and context; preserve every chapter id exactly once.
+- Return only id/title for each chapter. Never generate or change chapter timestamps.
+- If input chapters are absent, return an empty chapters array.
+- If chapters are supplied, put their translated list only in chapters; omit a duplicated chapter list from description while preserving unrelated prose.
 - Do not add explanations."""
 
 
@@ -4771,7 +4777,12 @@ def translate_description(
     title, webpage_url, tags = read_metadata(ctx)
     metadata_header = read_metadata_header(ctx)
     desc_text = _read_text_file(ctx.desc) if os.path.isfile(ctx.desc) else ""
-    if not desc_text.strip() and not title:
+    try:
+        chapters = read_original_chapters(ctx.dir, ctx.base)
+    except (OSError, ValueError) as error:
+        print(f"Warning: original chapter extraction failed: {error}", file=sys.stderr)
+        chapters = []
+    if not desc_text.strip() and not title and not chapters:
         if metadata_header:
             with open(ctx.target_desc, "w", encoding="utf-8") as f:
                 f.write(metadata_header)
@@ -4782,6 +4793,8 @@ def translate_description(
         "description": desc_text,
         "tags": tags,
     }
+    if chapters:
+        request_fields["chapters"] = [chapter.to_request() for chapter in chapters]
     if retriever is not None:
         query = "\n".join(
             part
@@ -4790,6 +4803,7 @@ def translate_description(
                 webpage_url,
                 desc_text,
                 " ".join(tags),
+                "\n".join(chapter.title for chapter in chapters),
             ]
             if part
         ).strip()
@@ -4823,6 +4837,7 @@ def translate_description(
             translated_tags = [tag.strip() for tag in re.split(r"[,，\n]+", translated_tags_raw) if tag.strip()]
         else:
             translated_tags = []
+        chapter_output = translated_chapters(chapters, response_obj.get("chapters"))
     except Exception as e:
         print(f"Warning: description translation failed: {e}", file=sys.stderr)
         return ctx.target_desc
@@ -4834,8 +4849,14 @@ def translate_description(
         if translated_desc:
             f.write(translated_desc)
             f.write("\n")
-        if translated_tags:
+        if chapter_output:
             if translated_desc:
+                f.write("\n")
+            f.write("章节：\n")
+            for chapter in chapter_output:
+                f.write(f"{chapter.timecode} {chapter.title}\n")
+        if translated_tags:
+            if translated_desc or chapter_output:
                 f.write("\n")
             f.write(f"标签：{', '.join(translated_tags)}\n")
     if not quiet:
@@ -5088,7 +5109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_ass(ctx.target_ass, template_path, ctx.base, events, AssOutputMode.TARGET)
     write_ass(ctx.bilingual_ass, template_path, ctx.base, events, AssOutputMode.BILINGUAL)
 
-    if os.path.isfile(ctx.desc):
+    if os.path.isfile(ctx.desc) or original_chapter_media(ctx.dir, ctx.base) is not None:
         translate_description(ctx, llm, args.quiet, retriever=retriever, glossary_path=glossary_path)
 
     if not args.quiet:
