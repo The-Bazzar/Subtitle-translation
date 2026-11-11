@@ -97,6 +97,7 @@ def capture_command(
     *,
     cwd: str | Path | None = None,
     env: Mapping[str, str] | None = None,
+    timeout: float | None = None,
 ) -> CommandResult:
     command = tuple(str(arg) for arg in args)
     try:
@@ -109,7 +110,10 @@ def capture_command(
             encoding="utf-8",
             errors="replace",
             check=False,
+            **({"timeout": timeout} if timeout is not None else {}),
         )
+    except subprocess.TimeoutExpired as error:
+        return CommandResult(command, 124, "", str(error))
     except FileNotFoundError as error:
         return CommandResult(command, 127, "", str(error))
     except OSError as error:
