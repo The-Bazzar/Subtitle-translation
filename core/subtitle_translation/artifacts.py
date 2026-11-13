@@ -10,11 +10,13 @@ from pathlib import Path
 
 
 def json_sha256(value) -> str:
+    """Fingerprint canonical artifact content, not authentication credentials."""
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def text_sha256(text: str) -> str:
+    """Identify adopted text versions; this is not a password verifier."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 

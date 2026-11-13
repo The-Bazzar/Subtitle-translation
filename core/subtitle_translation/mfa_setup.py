@@ -169,10 +169,10 @@ def locate_model(root: Path, kind: str, name: str) -> Path:
 
 
 def environment_versions(host: ToolHost, base: list[str]) -> dict:
-    output = host.capture([*base, "python", "-c",
-                           "import importlib.metadata as m,json; "
-                           "v={d.metadata['Name'].lower().replace('-','_'):d.version for d in m.distributions()}; "
-                           "print(json.dumps({k:v.get(k,'') for k in ['torch','torchaudio','speechbrain','huggingface_hub']}))"])
+    code = ("import importlib.metadata as m,json; "
+            "v={d.metadata['Name'].lower().replace('-','_'):d.version for d in m.distributions()}; "
+            "print(json.dumps({k:v.get(k,'') for k in ['torch','torchaudio','speechbrain','huggingface_hub']}))")
+    output = host.capture([*base, "python", "-c", code])
     result = json.loads(output)
     if not isinstance(result, dict):
         raise ValueError("invalid MFA dependency probe")
@@ -197,6 +197,7 @@ def prepare_vad(host: ToolHost, base: list[str]) -> tuple[Path, dict]:
                 and all(actual[key] == data[key] for key in ("revision", "files_sha256"))):
             return host.path(hf_home), data
     except (OSError, ValueError, KeyError, TypeError):
+        # Rebuild VAD resources if the ready manifest cannot be verified.
         pass
     host.run([*base, "python", tool_script, "--output", str(host.root / "vad_manifest.json"),
               "--savedir", str(host.root / "vad")], "Prepare MFA VAD",
@@ -269,10 +270,9 @@ def install_runtime(project_dir: Path, distribution: str = "") -> Path:
             host.run([*model_base, "model", "inspect", kind, tool_model_path], "Validate MFA acoustic", env=model_env)
         else:
             # MFA 3.4.3's dictionary pretty-printer passes a Path where a model is required.
-            host.run([*base, "python", "-c",
-                      "from montreal_forced_aligner.models import DictionaryModel; import sys; "
-                      "m=DictionaryModel(sys.argv[1]); assert m.load_dictionary_paths(); print('MFA dictionary: OK')",
-                      tool_model_path], "Validate MFA dictionary")
+            code = ("from montreal_forced_aligner.models import DictionaryModel; import sys; "
+                    "m=DictionaryModel(sys.argv[1]); assert m.load_dictionary_paths(); print('MFA dictionary: OK')")
+            host.run([*base, "python", "-c", code, tool_model_path], "Validate MFA dictionary")
     dictionary = locate_model(host.path(models), "dictionary", "english_us_mfa")
     acoustic = locate_model(host.path(models), "acoustic", "english_mfa")
     work = host.path(root / "work")

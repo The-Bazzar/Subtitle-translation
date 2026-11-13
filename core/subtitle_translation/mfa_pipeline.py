@@ -26,6 +26,7 @@ def canonical_audio(media: Path, config, work: Path, generation: dict, admission
             canonical_audio_duration(media)
             return media
         except (ValueError, wave.Error, EOFError):
+            # Noncanonical input must be decoded to the required audio format.
             pass
     snapshot = _media_snapshot(media, generation)
     root = work / "canonical_audio" / json_sha256(snapshot)
@@ -37,6 +38,7 @@ def canonical_audio(media: Path, config, work: Path, generation: dict, admission
             canonical_audio_duration(output)
             return output
     except (OSError, ValueError, KeyError, wave.Error, EOFError):
+        # Recreate canonical audio when the source or cache cannot be verified.
         pass
     ffmpeg = config.resolve_tool("FFMPEG_PATH_WIN" if os.name == "nt" else "FFMPEG_PATH_LINUX", "ffmpeg")
     if not ffmpeg:

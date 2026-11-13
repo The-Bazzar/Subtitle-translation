@@ -99,6 +99,7 @@ def terminate_process_tree(process: subprocess.Popen) -> None:
         try:
             process.kill()
         except OSError:
+            # The process can exit between the poll and kill attempts.
             pass
 
 

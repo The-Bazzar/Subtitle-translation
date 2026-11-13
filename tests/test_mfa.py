@@ -19,7 +19,7 @@ class MfaTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name)
+        self.root = Path(self.directory.name).resolve()
         self.audio = self.root / "input.wav"
         with wave.open(str(self.audio), "wb") as file:
             file.setnchannels(1)

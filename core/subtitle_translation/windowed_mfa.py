@@ -90,6 +90,7 @@ def load_text_checkpoint(source, review, ctx, force=False):
                             for a, b in zip(cached.segments, fresh.segments))):
                 return cached, path
         except (OSError, ValueError, TypeError, KeyError, SystemExit):
+            # Invalid checkpoints are rebuilt from the immutable adopted text.
             pass
     return fresh, path
 
@@ -298,5 +299,6 @@ def finish_timing(transcript, review, media, runtime, config, ctx, video, option
                 if all(t.source_events_are_valid(s) for s in cached.segments):
                     return cached, marker, key
         except (OSError, ValueError, TypeError, KeyError, SystemExit):
+            # A stale timed projection does not invalidate translated text.
             pass
     return timed, marker, key

@@ -68,6 +68,7 @@ class MfaConfigurationTests(unittest.TestCase):
                     try:
                         t.main([str(path)], stage_overrides={"MFA_ENABLED": value, })
                     except ValueError:
+                        # Both fixtures stop before model requests; only stage selection matters.
                         pass
                 self.assertEqual(bool(seen), expected)
 

@@ -20,6 +20,7 @@ def model_snapshot() -> Path:
                for name in ("hyperparams.yaml", "model.ckpt", "mean_var_norm.ckpt")):
             return snapshot
     except (OSError, ValueError):
+        # Setup can download a snapshot when no complete local copy is available.
         pass
     return Path(snapshot_download("speechbrain/vad-crdnn-libriparty", revision="main"))
 

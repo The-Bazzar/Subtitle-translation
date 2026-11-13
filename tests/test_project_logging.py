@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import translate_srt as t
 import batch_runtime
@@ -19,7 +19,7 @@ class ProjectLoggingTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
 
     def test_console_always_uses_level_colors_even_when_redirected(self):
         console = io.StringIO()
@@ -112,9 +112,10 @@ class ProjectLoggingTests(unittest.TestCase):
         self.assertEqual(path.read_text(encoding="utf-8"), "previous")
 
     def test_exception_releases_sink_and_does_not_dump_exception_locals(self):
+        fail = Mock(side_effect=RuntimeError("private-exception-body"))
         with patch("sys.stderr", io.StringIO()):
             with self.assertRaises(RuntimeError), project_run(self.root):
-                raise RuntimeError("private-exception-body")
+                fail()
             text = (self.root / LOG_FILENAME).read_text(encoding="utf-8")
             self.assertIn("RuntimeError", text)
             self.assertNotIn("private-exception-body", text)

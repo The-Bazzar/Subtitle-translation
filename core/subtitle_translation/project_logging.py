@@ -23,7 +23,7 @@ _session = contextvars.ContextVar("subtitle_log_session", default=None)
 _stage = contextvars.ContextVar("subtitle_log_stage", default="run")
 _project = contextvars.ContextVar("subtitle_log_project", default="")
 _lock = threading.RLock()
-_initialized = False
+_console_handlers = []
 _active = set()
 
 
@@ -42,18 +42,18 @@ def _console(message):
 
 
 def _initialize():
-    global _initialized
     with _lock:
-        if not _initialized:
+        if not _console_handlers:
             try:
                 logger.remove(0)
             except ValueError:
+                # An embedding application may already have removed the default sink.
                 pass
-            logger.add(_console, level="TRACE", format=CONSOLE_FORMAT, colorize=True,
+            handler = logger.add(_console, level="TRACE", format=CONSOLE_FORMAT, colorize=True,
                        filter=lambda r: r["extra"].get("subtitle_log", False)
                        and r["level"].no >= r["extra"]["console_level"],
                        backtrace=False, diagnose=False)
-            _initialized = True
+            _console_handlers.append(handler)
 
 
 def log(level, message, *, stage=None):

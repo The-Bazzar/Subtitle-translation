@@ -320,6 +320,7 @@ def align_window_corpus(entries: list[dict], runtime: MfaRuntime, work_root: Pat
                         and record["probe"] == probe and record["results"] == results):
                     cached_result = results
         except (OSError, ValueError, KeyError, TypeError):
+            # Invalid or incomplete corpus records are cache misses.
             pass
         check_inputs()
         if cached_result is not None:
