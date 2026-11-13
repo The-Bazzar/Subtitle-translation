@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,10 +21,6 @@ class CommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
-
-
-def _display_command(args: Sequence[str]) -> str:
-    return " ".join(str(arg) for arg in args)
 
 
 def run_command(
@@ -69,11 +64,11 @@ def run_command(
             process.wait()
         raise
     except FileNotFoundError as error:
-        print(f"Error: command not found: {command[0]}", file=sys.stderr)
-        return CommandResult(command, 127, "", str(error))
+        log("ERROR", "Managed process executable was not found")
+        return CommandResult(command, 127, "", type(error).__name__)
     except OSError as error:
-        print(f"Error: failed to start command: {error}", file=sys.stderr)
-        return CommandResult(command, 1, "", str(error))
+        log("ERROR", f"Managed process could not start: {type(error).__name__}")
+        return CommandResult(command, 1, "", type(error).__name__)
     finally:
         if process is not None:
             with _active_processes_lock:

@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import subprocess
 import sys
@@ -286,6 +287,17 @@ class MfaTests(unittest.TestCase):
 
 
 class ManagedProcessTests(unittest.TestCase):
+    def test_launch_failures_do_not_log_exception_text_or_argument_contents(self):
+        for error, code in ((FileNotFoundError("private-launch-detail"), 127), (OSError("private-launch-detail"), 1)):
+            output = io.StringIO()
+            with self.subTest(error=type(error).__name__), patch.object(process.subprocess, "Popen", side_effect=error), \
+                 patch("sys.stderr", output):
+                result = process.run_command(["tool", "private-argument"])
+            self.assertEqual(result.returncode, code)
+            self.assertEqual(result.stderr, type(error).__name__)
+            self.assertNotIn("private-launch-detail", output.getvalue())
+            self.assertNotIn("private-argument", output.getvalue())
+
     def test_timeout_terminates_own_tree_and_removes_registry_entry(self):
         child = Mock()
         child.wait.side_effect = [subprocess.TimeoutExpired(["tool"], 1), -9]
