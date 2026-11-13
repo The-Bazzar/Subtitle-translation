@@ -246,6 +246,18 @@ class PythonCliTests(unittest.TestCase):
             self.assertTrue((root / "providers.json").is_file())
             self.assertTrue((root / "template.ass").is_file())
 
+    def test_init_new_env_disables_proofreading_without_overwriting_existing_choice(self):
+        from subtitle_translation import cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            self.assertEqual(cli.main(["init", "--directory", str(root)]), 0)
+            lines = (root / ".env").read_text(encoding="utf-8").splitlines()
+            self.assertEqual([line for line in lines if line.startswith("PROOFREAD=")], ["PROOFREAD=0"])
+            (root / ".env").write_text("PROOFREAD=1\n", encoding="utf-8")
+            self.assertEqual(cli.main(["init", "--directory", str(root)]), 0)
+            self.assertEqual((root / ".env").read_text(encoding="utf-8"), "PROOFREAD=1\n")
+
 
 if __name__ == "__main__":
     unittest.main()
