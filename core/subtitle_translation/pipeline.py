@@ -8,51 +8,26 @@ from typing import Sequence
 
 import translate_srt
 
-from .config import ProjectConfig
+from .config import ProjectConfig, resolve_mfa_enabled
 from .notifications import emit_bell
 from .stages import StageResult, burn_video, download_video, prepare_video, transcribe_video
+from .project_logging import log, project_run
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the complete subtitle translation pipeline")
+    parser = argparse.ArgumentParser(prog="subtitle-translation pipeline", description="Run the complete subtitle pipeline; switches/tuning are read from .env")
     parser.add_argument("url", nargs="?")
     parser.add_argument("--project-dir")
-    parser.add_argument("--video", "-Video", help="Existing original video when download is skipped")
-    parser.add_argument("--json", "-Json", dest="json_path", help="Existing WhisperX JSON when WhisperX is skipped")
+    parser.add_argument("--video", "-Video", help="Existing original video when configured to skip download")
+    parser.add_argument("--json", "-Json", dest="json_path", help="Existing ASR JSON when configured to skip recognition")
     parser.add_argument("--existing-ass", "-ExistingAss", default="")
     parser.add_argument("--output", "-Output", default="")
-    parser.add_argument("--skip-download", "-SkipDownload", action="store_true")
-    parser.add_argument("--skip-whisper", "-SkipWhisper", action="store_true")
-    parser.add_argument("--skip-beautify", "-SkipBeautify", action="store_true")
-    parser.add_argument("--skip-knowledge", "-SkipKnowledge", action="store_true")
-    parser.add_argument("--skip-translate", "-SkipTranslate", action="store_true")
-    parser.add_argument("--no-proofread", "-NoProofread", action="store_true")
-    parser.add_argument("--skip-burn", "-SkipBurn", action="store_true")
-    parser.add_argument("--source-lang", "-SourceLang", default="")
+    parser.add_argument("--source-lang", "--lang", "-SourceLang", default="")
     parser.add_argument("--target-lang", "-TargetLang", default="")
-    parser.add_argument("--model", "-Model", default="")
-    parser.add_argument("--align-model", "-AlignModel", default="")
-    parser.add_argument("--device", "-Device", default="")
-    parser.add_argument("--ovc", "-Ovc", default="")
-    parser.add_argument("--ovcopts", "-Ovcopts", default="")
-    parser.add_argument("--oac", "-Oac", default="")
-    parser.add_argument("--res", "-Res", default="")
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--no-split", action="store_true")
-    parser.add_argument("--split-max-chars", type=int, default=None)
-    parser.add_argument("--split-max-duration", type=float, default=None)
-    parser.add_argument("--split-context-window", type=int, default=None)
-    parser.add_argument("--scene-threshold", type=float, default=None)
-    parser.add_argument("--snap-frames", type=int, default=None)
-    parser.add_argument("--end-offset-frames", type=int, default=None)
-    parser.add_argument("--min-scene-interval-frames", type=int, default=None)
-    parser.add_argument("--min-duration", type=float, default=None)
-    parser.add_argument("--min-gap", type=float, default=None)
-    parser.add_argument("--max-gap-merge", type=float, default=None)
-    parser.add_argument("--aggressive", action="store_true")
-    parser.add_argument("--no-scene-snap", action="store_true")
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--dry-run", "-DryRun", action="store_true")
+    parser.set_defaults(skip_download=False, skip_whisper=False, skip_scene_detection=False,
+                        skip_knowledge=False, skip_translate=False, skip_burn=False,
+                        mfa=None, no_proofread=False, no_split=False, dry_run=False,
+                        model="", align_model="", device="", ovc="", ovcopts="", oac="", res="")
     return parser
 
 
@@ -71,38 +46,8 @@ def _translate_main(
         translate_args += ["--source-lang", args.source_lang]
     if args.target_lang:
         translate_args += ["--target-lang", args.target_lang]
-    if args.skip_beautify:
-        translate_args.append("--skip-beautify")
-    if args.skip_knowledge:
-        translate_args.append("--skip-knowledge")
-    if args.no_proofread:
-        translate_args.append("--no-proofread")
-    if args.no_split:
-        translate_args.append("--no-split")
-    if args.quiet:
-        translate_args.append("--quiet")
-    if args.aggressive:
-        translate_args.append("--aggressive")
-    if args.no_scene_snap:
-        translate_args.append("--no-scene-snap")
-    for option_name, argument_name in (
-        ("batch_size", "--batch-size"),
-        ("split_max_chars", "--split-max-chars"),
-        ("split_max_duration", "--split-max-duration"),
-        ("split_context_window", "--split-context-window"),
-        ("scene_threshold", "--scene-threshold"),
-        ("snap_frames", "--snap-frames"),
-        ("end_offset_frames", "--end-offset-frames"),
-        ("min_scene_interval_frames", "--min-scene-interval-frames"),
-        ("min_duration", "--min-duration"),
-        ("min_gap", "--min-gap"),
-        ("max_gap_merge", "--max-gap-merge"),
-    ):
-        value = getattr(args, option_name)
-        if value is not None:
-            translate_args.extend([argument_name, str(value)])
     try:
-        code = translate_srt.main(translate_args)
+        code = translate_srt.main(translate_args, stage_overrides=config.values)
     except SystemExit as error:
         code = int(error.code or 0)
     finally:
@@ -130,7 +75,7 @@ def _apply_env_skip_defaults(args: argparse.Namespace, config: ProjectConfig) ->
     for attribute, stage in (
         ("skip_download", "DOWNLOAD"),
         ("skip_whisper", "WHISPER"),
-        ("skip_beautify", "BEAUTIFY"),
+        ("skip_scene_detection", "SCENE_DETECTION"),
         ("skip_knowledge", "KNOWLEDGE"),
         ("skip_translate", "TRANSLATE"),
         ("skip_burn", "BURN"),
@@ -147,9 +92,15 @@ def pipeline_stage_plan(args: argparse.Namespace) -> list[str]:
         stages.append("whisper")
     if args.skip_translate:
         stages.append("existing_ass")
+    elif getattr(args, "mfa", False):
+        if not args.skip_knowledge:
+            stages.append("glossary/source_review")
+        stages.extend(["translate", "mfa"])
+        if not args.skip_scene_detection:
+            stages.append("scene_detection")
     else:
-        if not args.skip_beautify:
-            stages.append("beautify")
+        if not args.skip_scene_detection:
+            stages.append("scene_detection")
         if not args.skip_knowledge:
             stages.append("glossary")
         stages.append("translate")
@@ -160,53 +111,81 @@ def pipeline_stage_plan(args: argparse.Namespace) -> list[str]:
 
 def run_pipeline(args: argparse.Namespace) -> int:
     config = ProjectConfig.load(args.project_dir)
+    try:
+        args.mfa = resolve_mfa_enabled(None, config.values)
+    except ValueError as error:
+        log("ERROR", f'Error: {error}')
+        return 2
     _apply_env_skip_defaults(args, config)
+    args.dry_run = config.flag("DRY_RUN")
+    args.model = config.get("WHISPER_MODEL", "")
+    args.align_model = config.get("WHISPER_ALIGN_MODEL", "")
+    args.device = config.get("WHISPER_DEVICE", "")
+    args.ovc, args.ovcopts = config.get("BURN_OVC", ""), config.get("BURN_OVCOPTS", "")
+    args.oac, args.res = config.get("BURN_OAC", ""), config.get("BURN_RES", "")
+    if args.source_lang:
+        config = ProjectConfig(config.project_dir, {**config.values, "SOURCE_LANG": args.source_lang}, config.invocation_dir)
+    if args.target_lang:
+        config = ProjectConfig(config.project_dir, {**config.values, "TARGET_LANG": args.target_lang}, config.invocation_dir)
     if args.dry_run:
         print("[DRY RUN] Python pipeline stages:")
         print(f"  {' -> '.join(pipeline_stage_plan(args))}")
         return 0
+    if getattr(args, "mfa", False) and not args.skip_translate:
+        from .mfa import MfaRuntime
+
+        try:
+            MfaRuntime.for_project(config.project_dir)
+        except (OSError, ValueError) as error:
+            log("ERROR", f'Error: MFA preflight failed: {error}')
+            return 2
     if args.skip_download:
         if not args.video:
-            print("Error: --video is required with --skip-download", file=sys.stderr)
+            log("ERROR", 'Error: --video is required with --skip-download')
             return 2
         download_result = StageResult.ok(render_video=str(Path(args.video).resolve()))
     else:
         if not args.url:
-            print("Error: URL is required", file=sys.stderr)
+            log("ERROR", 'Error: URL is required')
             return 2
         download_result = download_video(args.url, config)
     if not download_result.success:
-        print(f"Error: {download_result.diagnostics[0]}", file=sys.stderr)
+        log("ERROR", f'Error: {download_result.diagnostics[0]}')
         emit_bell("error")
         return download_result.exit_code
     render_video = Path(download_result.outputs["render_video"])
+    with project_run(render_video.parent, config.get("LOG_LEVEL", "INFO")):
+        return _run_project_pipeline(args, config, render_video)
+
+
+def _run_project_pipeline(args, config, render_video):
     prepare_result = prepare_video(render_video, config)
     if not prepare_result.success:
-        print(f"Error: {prepare_result.diagnostics[0]}", file=sys.stderr)
+        log("ERROR", f'Error: {prepare_result.diagnostics[0]}')
         emit_bell("error")
         return prepare_result.exit_code
     edit_video = Path(prepare_result.outputs["edit_video"])
     if args.skip_whisper:
         if not args.json_path:
-            print("Error: --json is required with --skip-whisper", file=sys.stderr)
+            log("ERROR", 'Error: --json is required with --skip-whisper')
             return 2
         json_path = Path(args.json_path).expanduser().resolve()
     else:
         whisper_result = transcribe_video(edit_video, config, model=args.model, align_model=args.align_model, device=args.device)
         if not whisper_result.success:
-            print(f"Error: {whisper_result.diagnostics[0]}", file=sys.stderr)
+            log("ERROR", f'Error: {whisper_result.diagnostics[0]}')
             emit_bell("error")
             return whisper_result.exit_code
         json_path = Path(whisper_result.outputs["json"])
     if args.skip_translate:
         if not args.existing_ass:
-            print("Error: --existing-ass is required with --skip-translate", file=sys.stderr)
+            log("ERROR", 'Error: --existing-ass is required with --skip-translate')
             return 2
         ass_path = Path(args.existing_ass).expanduser().resolve()
     else:
         translate_result = _translate_main(json_path, edit_video, config, args)
         if not translate_result.success:
-            print(f"Error: {translate_result.diagnostics[0]}", file=sys.stderr)
+            log("ERROR", f'Error: {translate_result.diagnostics[0]}')
             emit_bell("error")
             return translate_result.exit_code
         ass_path = Path(args.output).expanduser().resolve() if args.output else Path(translate_result.outputs["ass"])
@@ -215,7 +194,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return 0
     burn_result = burn_video(render_video, ass_path, config, output=args.output, ovc=args.ovc, ovcopts=args.ovcopts, oac=args.oac, resolution=args.res)
     if not burn_result.success:
-        print(f"Error: {burn_result.diagnostics[0]}", file=sys.stderr)
+        log("ERROR", f'Error: {burn_result.diagnostics[0]}')
         emit_bell("error")
         return burn_result.exit_code
     print(f"OUTPUT_BURNED_VIDEO={burn_result.outputs['burned_video']}")

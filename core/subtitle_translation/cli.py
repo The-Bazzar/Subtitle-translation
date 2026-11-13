@@ -16,6 +16,7 @@ from . import pipeline, stages
 
 
 COMMANDS = (
+    "help",
     "pipeline",
     "batch",
     "translate",
@@ -25,6 +26,7 @@ COMMANDS = (
     "whisper",
     "burn",
     "init",
+    "setup-mfa",
 )
 
 
@@ -41,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--project-dir", default=None, help="Project configuration directory")
     subparsers = parser.add_subparsers(dest="command", required=False)
+    subparsers.add_parser("help", help="Print detailed help for every public subcommand")
     _forwarding_command(subparsers, "pipeline", "Run the complete subtitle pipeline")
     _forwarding_command(subparsers, "batch", "Process multiple YouTube URLs with stage scheduling")
     _forwarding_command(subparsers, "translate", "Translate a WhisperX JSON transcript")
@@ -49,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     _forwarding_command(subparsers, "prepare-video", "Create the timestamp-stabilized edit video")
     _forwarding_command(subparsers, "whisper", "Run WhisperX and create a word-level JSON")
     _forwarding_command(subparsers, "burn", "Burn an ASS subtitle into a video with ffmpeg")
+    _forwarding_command(subparsers, "setup-mfa", "Install the managed English MFA tool environment")
     init_parser = subparsers.add_parser("init", help="Create missing project configuration files")
     init_parser.add_argument("--directory", default=".", help="Project configuration directory")
     return parser
@@ -116,6 +120,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         import os
 
         os.environ["SUBTITLE_TRANSLATION_PROJECT_DIR"] = str(Path(global_args.project_dir).expanduser().resolve())
+    if command == "help":
+        if command_args:
+            build_parser().error("help does not accept additional arguments")
+        build_parser().print_help()
+        for name in COMMANDS:
+            if name == "help":
+                continue
+            print(f"\n{'=' * 20} subtitle-translation {name} {'=' * 20}")
+            try:
+                main([name, "--help"])
+            except SystemExit as error:
+                if error.code not in (None, 0):
+                    return int(error.code)
+        return 0
     if command == "translate":
         return _normalize_result(translate_srt.main(command_args))
     if command == "merge-ass":
@@ -136,6 +154,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return stages.main_whisper(command_args)
     if command == "burn":
         return stages.main_burn(command_args)
+    if command == "setup-mfa":
+        from . import mfa_setup
+
+        return _normalize_result(mfa_setup.main(command_args))
     build_parser().error(f"unsupported command: {command}")
     return 2
 

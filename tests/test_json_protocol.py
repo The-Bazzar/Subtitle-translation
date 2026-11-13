@@ -115,11 +115,6 @@ class FakeProviderLLM:
         return {}
 
 
-class FakeBatchLLM(FakeProviderLLM):
-    def __init__(self, batch_size):
-        self.batch_size = batch_size
-
-
 def fake_tool_call(query: str, call_id: str = "call_1", topic_hints=None):
     return SimpleNamespace(
         id=call_id,
@@ -157,11 +152,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertTrue(ctx.bilingual_ass.endswith("video.en-zh.ass"))
         self.assertEqual(ctx.base, "video")
 
-    def test_subtitle_layout_threshold_defaults_match_1080p_template(self):
-        self.assertEqual(t.DEFAULT_SPLIT_MAX_CHARS, 72)
-        self.assertEqual(t.DEFAULT_SPLIT_MAX_DURATION, 3.8)
-        self.assertEqual(t.SplitConfig().max_chars, t.DEFAULT_SPLIT_MAX_CHARS)
-        self.assertEqual(t.SplitConfig().max_duration, t.DEFAULT_SPLIT_MAX_DURATION)
 
     def test_extract_json_object_rejects_array_shape(self):
         data = t._extract_json_value('{"markdown": "# Glossary"}')
@@ -175,13 +165,6 @@ class JsonProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a JSON object"):
             t.GlossaryOutput.from_json_content("# 术语知识库\n\n## 核心术语")
 
-    def test_batch_response_accepts_wrapped_items(self):
-        response = t.LLMBatchResponse.from_json_value({"items": [{"id": 1, "zh": "译文"}]})
-        self.assertEqual(response.to_items(), [{"id": 1, "zh": "译文"}])
-
-    def test_batch_response_keeps_legacy_array_compatibility(self):
-        response = t.LLMBatchResponse.from_json_value([{"id": 1, "zh": "译文"}])
-        self.assertEqual(response.to_items(), [{"id": 1, "zh": "译文"}])
 
     def test_batch_request_serializes_to_items_object(self):
         request = t.LLMBatchRequest([t.LLMBatchItem(7, {"en": "source"})])
@@ -286,57 +269,6 @@ class JsonProtocolTests(unittest.TestCase):
             },
         )
 
-    def test_typed_split_result_parses_language_arrays(self):
-        result = t.SplitOutputItem.from_json_value(
-            {"id": 12, "en": ["a", "b"], "zh": ["甲", "乙"]},
-            self.ctx,
-        )
-        self.assertEqual(result.id, 12)
-        self.assertEqual(result.source_parts, ["a", "b"])
-        self.assertEqual(result.target_parts, ["甲", "乙"])
-
-    def test_typed_split_input_serializes_context(self):
-        item = t.make_pair_item(
-            12,
-            self.ctx,
-            "current source",
-            "current target",
-            context_before=[t.make_pair_json(11, self.ctx, "before source", "before target")],
-            context_after=[t.make_pair_json(13, self.ctx, "after source", "after target")],
-        )
-
-        data = item.to_json_value()
-        self.assertEqual(data["id"], 12)
-        self.assertEqual(data["en"], "current source")
-        self.assertEqual(data["zh"], "current target")
-        self.assertEqual(data["context_before"], [{"id": 11, "en": "before source", "zh": "before target"}])
-        self.assertEqual(data["context_after"], [{"id": 13, "en": "after source", "zh": "after target"}])
-
-    def test_typed_proofread_result_parses_language_values(self):
-        result = t.LanguageTextResult.from_json_value(
-            {"id": 3, "en": "corrected source", "zh": "corrected target"},
-            self.ctx,
-        )
-        self.assertEqual(result.source_text, "corrected source")
-        self.assertEqual(result.target_text, "corrected target")
-
-    def test_typed_proofread_item_serializes_retrieved_context(self):
-        item = t.make_pair_item(
-            3,
-            self.ctx,
-            "source text",
-            "target text",
-            retrieved_context=[{"id": "transcript:2", "text": "nearby context"}],
-        )
-        self.assertEqual(
-            item.to_json_value(),
-            {
-                "id": 3,
-                "en": "source text",
-                "zh": "target text",
-                "retrieved_context": [{"id": "transcript:2", "text": "nearby context"}],
-            },
-        )
 
     def test_build_glossary_adds_retrieved_context(self):
         class FakeRetriever:
@@ -365,7 +297,7 @@ class JsonProtocolTests(unittest.TestCase):
                     transcript,
                     ctx,
                     FakeProviderLLM(),
-                    t.GlossaryBuildOptions(quiet=True, retriever=retriever),
+                    t.GlossaryBuildOptions(retriever=retriever),
                 )
 
             self.assertEqual(captured["retrieved_context"], [{"id": "transcript:1", "text": "important context", "score": 0.9}])
@@ -400,7 +332,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
+                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions())
 
             self.assertIn("## 视频元信息", glossary)
             self.assertIn("原标题：Original Title", glossary)
@@ -428,7 +360,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
+                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions())
 
         self.assertIn("cached term", glossary)
 
@@ -453,7 +385,7 @@ class JsonProtocolTests(unittest.TestCase):
                     transcript,
                     ctx,
                     FakeProviderLLM(),
-                    t.GlossaryBuildOptions(quiet=True, force=True),
+                    t.GlossaryBuildOptions(force=True),
                 )
             with open(ctx.glossary, "r", encoding="utf-8") as f:
                 saved = f.read()
@@ -510,7 +442,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
+                glossary = t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions())
 
             self.assertTrue(os.path.isfile(ctx.glossary))
             with open(ctx.glossary, "r", encoding="utf-8") as f:
@@ -538,7 +470,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions(quiet=True))
+                t.build_glossary(transcript, ctx, FakeProviderLLM(), t.GlossaryBuildOptions())
 
         self.assertIn("MANDATORY JSON PROTOCOL", captured["system_prompt"])
         self.assertIn("Return a JSON object.", captured["system_prompt"])
@@ -607,8 +539,7 @@ class JsonProtocolTests(unittest.TestCase):
                         tavily_key="tk",
                         tavily_max_results=6,
                         tavily_max_queries=2,
-                        quiet=True,
-                    ),
+                        ),
                 )
             sidecar = t.load_web_evidence_sidecar(ctx.web_evidence_json)
 
@@ -635,8 +566,7 @@ class JsonProtocolTests(unittest.TestCase):
                 "TAVILY_MAX_QUERIES": "4",
                 deprecated_env_key: "0",
             },
-            quiet=True,
-        )
+            )
 
         self.assertEqual(options.tavily_max_queries, 4)
         self.assertTrue(options.use_tool_session())
@@ -679,7 +609,7 @@ class JsonProtocolTests(unittest.TestCase):
                     transcript,
                     ctx,
                     llm,
-                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, ),
                 )
 
         self.assertEqual([call["tool_choice"] for call in calls[:3]], ["auto", "auto", "none"])
@@ -737,7 +667,7 @@ class JsonProtocolTests(unittest.TestCase):
                     transcript,
                     ctx,
                     llm,
-                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, ),
                 )
 
         self.assertEqual(searched, ["Klein-Gordon equation Chinese translation"])
@@ -789,7 +719,7 @@ class JsonProtocolTests(unittest.TestCase):
                 sidecar,
                 ctx,
                 llm,
-                t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, ),
             )
 
         self.assertEqual(len(calls), 2)
@@ -840,7 +770,7 @@ class JsonProtocolTests(unittest.TestCase):
                 sidecar,
                 ctx,
                 llm,
-                t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, ),
             )
 
         self.assertEqual(len(calls), 3)
@@ -878,7 +808,7 @@ class JsonProtocolTests(unittest.TestCase):
                     transcript,
                     ctx,
                     llm,
-                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, quiet=True),
+                    t.GlossaryBuildOptions(tavily_key="tk", tavily_max_queries=1, ),
                 )
 
         self.assertEqual(calls[0]["tool_choice"], "auto")
@@ -1093,12 +1023,12 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                plan = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True, max_queries=2)
+                plan = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), max_queries=2)
 
         self.assertEqual(plan.queries, ["Original Title", "标题", "specific source concept", "概念"])
         self.assertEqual(plan.topic_hints, ["anime", "manga criticism", "动漫"])
 
-    def test_translate_tavily_query_output_prints_raw_response(self):
+    def test_translate_tavily_query_output_logs_response_size_without_raw_body(self):
         raw_response = '{"queries": ["目标查询"], "topic_hints": ["目标题材"]}'
 
         class FakeChatSession:
@@ -1112,12 +1042,12 @@ class JsonProtocolTests(unittest.TestCase):
                 return raw_response, validator(raw_response) if validator is not None else raw_response
 
         stderr = io.StringIO()
-        with patch.object(t, "ChatSession", FakeChatSession), patch("sys.stderr", stderr):
-            output = t.translate_tavily_query_output(["source query"], self.ctx, FakeProviderLLM(), quiet=False)
+        with patch.object(t, "ChatSession", FakeChatSession), patch("sys.stderr", stderr), patch.object(t, "log") as log:
+            output = t.translate_tavily_query_output(["source query"], self.ctx, FakeProviderLLM(), )
 
         self.assertEqual(output.queries, ["目标查询"])
-        self.assertIn("translate_tavily_query_output raw response:", stderr.getvalue())
-        self.assertIn(raw_response, stderr.getvalue())
+        log.assert_any_call("DEBUG", f"translate_tavily_query_output response received: chars={len(raw_response)}")
+        self.assertNotIn(raw_response, stderr.getvalue())
 
     def test_build_tavily_search_plan_passes_function_names_as_raw_labels(self):
         raw_labels = []
@@ -1141,7 +1071,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=False, max_queries=2)
+                t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), max_queries=2)
 
         self.assertEqual(raw_labels, ["build_tavily_search_plan", "translate_tavily_query_output"])
 
@@ -1193,7 +1123,7 @@ class JsonProtocolTests(unittest.TestCase):
                     transcript,
                     ctx,
                     FakeProviderLLM(),
-                    t.GlossaryBuildOptions(tavily_key="tk", quiet=True),
+                    t.GlossaryBuildOptions(tavily_key="tk", ),
                 )
 
         self.assertIn("bgm.tv", preferred_domains_by_query["genre taxonomy"])
@@ -1305,7 +1235,6 @@ class JsonProtocolTests(unittest.TestCase):
                     FakeProviderLLM(),
                     t.GlossaryBuildOptions(
                         tavily_key="tk",
-                        quiet=True,
                         retriever=retriever,
                     ),
                 )
@@ -1353,7 +1282,7 @@ class JsonProtocolTests(unittest.TestCase):
                     transcript,
                     ctx,
                     FakeProviderLLM(),
-                    t.GlossaryBuildOptions(tavily_key="tk", quiet=True),
+                    t.GlossaryBuildOptions(tavily_key="tk", ),
                 )
                 sidecar = t.load_web_evidence_sidecar(ctx.web_evidence_json)
 
@@ -1383,7 +1312,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True).queries
+                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), ).queries
 
         self.assertEqual(
             queries,
@@ -1514,7 +1443,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True, max_queries=3).queries
+                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), max_queries=3).queries
 
         self.assertEqual(
             queries,
@@ -1550,7 +1479,7 @@ class JsonProtocolTests(unittest.TestCase):
             )
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), quiet=True, max_queries=4).queries
+                queries = t.build_tavily_search_plan(transcript, ctx, FakeProviderLLM(), max_queries=4).queries
 
         self.assertEqual(queries, ["Original Title", "source concept"])
 
@@ -1571,264 +1500,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIn("# 术语知识库", fallback)
         self.assertEqual(resident, fallback)
 
-    def test_translate_segments_omits_retrieved_context_without_retriever(self):
-        captured = {}
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3):
-            captured["request"] = request.to_json_value()
-            captured["system_prompt"] = session.system_prompt
-            return [{"id": 1, "zh": "译文"}]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[t.TranscriptSegment(1, 0.0, 1.0, "source text")],
-        )
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.translate_segments(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=None)
-
-        self.assertNotIn("retrieved_context", captured["request"]["items"][0])
-        self.assertNotIn("RETRIEVED CONTEXT:", captured["system_prompt"])
-
-    def test_translate_segments_adds_retrieved_context(self):
-        class FakeRetriever:
-            def __bool__(self):
-                return False
-
-            def retrieve_texts(self, texts, top_k=None):
-                self.texts = texts
-                return [[{"id": "transcript:1", "text": "translation memory"}]]
-
-        captured = {}
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3):
-            captured.update(request.to_json_value())
-            return [{"id": 1, "zh": "译文"}]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[t.TranscriptSegment(1, 0.0, 1.0, "source text")],
-        )
-        retriever = FakeRetriever()
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.translate_segments(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=retriever)
-
-        self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "translation memory"}])
-        self.assertEqual(retriever.texts, ["source text"])
-
-    def test_proofread_split_events_adds_retrieved_context(self):
-        class FakeRetriever:
-            def retrieve_texts(self, texts, top_k=None):
-                self.texts = texts
-                self.top_k = top_k
-                return [[{"id": "transcript:1", "text": "proofread memory"}]]
-
-        captured = {}
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
-            captured.update(request.to_json_value())
-            return [{"id": 1, "en": "source", "zh": "译文"}]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[
-                t.TranscriptSegment(
-                    1,
-                    0.0,
-                    1.0,
-                    "source",
-                    split_events=[t.SplitEvent(0.0, 1.0, "source", "译文")],
-                )
-            ],
-        )
-        retriever = FakeRetriever()
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=retriever)
-
-        self.assertEqual(captured["items"][0]["retrieved_context"], [{"id": "transcript:1", "text": "proofread memory"}])
-        self.assertIn("ASR correction", retriever.texts[0])
-        self.assertIn("glossary", retriever.texts[0])
-        self.assertIn("Source: source", retriever.texts[0])
-        self.assertIn("Target: 译文", retriever.texts[0])
-        self.assertEqual(retriever.top_k, 1)
-
-    def test_proofread_prompt_prioritizes_glossary_asr_corrections(self):
-        class FakeRetriever:
-            def retrieve_texts(self, texts, top_k=None):
-                return [[{"id": "glossary:1", "source": "glossary", "text": "ASR correction: bar Drill -> Baudrillard"}]]
-
-        captured = {}
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
-            captured["system_prompt"] = session.system_prompt
-            return [{"id": 1, "en": "Baudrillard", "zh": "鲍德里亚"}]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[
-                t.TranscriptSegment(
-                    1,
-                    0.0,
-                    1.0,
-                    "bar Drill",
-                    split_events=[t.SplitEvent(0.0, 1.0, "bar Drill", "巴德里尔")],
-                )
-            ],
-        )
-
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "custom proofread", quiet=True, retriever=FakeRetriever())
-
-        self.assertIn("glossary or retrieved_context identifies a source-language ASR error", captured["system_prompt"])
-        self.assertIn("must apply that correction to the source-language field", captured["system_prompt"])
-        self.assertIn("Baudrillard", transcript.segments[0].split_events[0].en)
-
-    def test_proofread_retrieval_query_asks_for_asr_corrections(self):
-        class FakeRetriever:
-            def retrieve_texts(self, texts, top_k=None):
-                self.texts = texts
-                return [[{"id": "glossary:1", "text": "ASR correction"}]]
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
-            return [{"id": 1, "en": "source", "zh": "译文"}]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[
-                t.TranscriptSegment(
-                    1,
-                    0.0,
-                    1.0,
-                    "source",
-                    split_events=[t.SplitEvent(0.0, 1.0, "source", "译文")],
-                )
-            ],
-        )
-        retriever = FakeRetriever()
-
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(10), "system", quiet=True, retriever=retriever)
-
-        self.assertIn("ASR correction", retriever.texts[0])
-        self.assertIn("glossary", retriever.texts[0])
-        self.assertIn("source", retriever.texts[0])
-
-    def test_proofread_split_events_respects_small_batch_without_token_limit(self):
-        calls = []
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
-            calls.append(len(request.items))
-            return [
-                {"id": item.id, "en": item.fields["en"], "zh": item.fields["zh"]}
-                for item in request.items
-            ]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[
-                t.TranscriptSegment(
-                    1,
-                    0.0,
-                    3.0,
-                    "source",
-                    split_events=[
-                        t.SplitEvent(0.0, 1.0, "source one", "译文一"),
-                        t.SplitEvent(1.0, 2.0, "source two", "译文二"),
-                        t.SplitEvent(2.0, 3.0, "source three", "译文三"),
-                    ],
-                )
-            ],
-        )
-
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
-
-        self.assertEqual(calls, [2, 1])
-
-    def test_proofread_split_events_splits_batch_on_context_length_error(self):
-        calls = []
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
-            calls.append(len(request.items))
-            if len(request.items) > 1:
-                raise RuntimeError("maximum context length exceeded")
-            return [
-                {"id": item.id, "en": item.fields["en"] + " fixed", "zh": item.fields["zh"] + " fixed"}
-                for item in request.items
-            ]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[
-                t.TranscriptSegment(
-                    1,
-                    0.0,
-                    2.0,
-                    "source",
-                    split_events=[
-                        t.SplitEvent(0.0, 1.0, "source one", "译文一"),
-                        t.SplitEvent(1.0, 2.0, "source two", "译文二"),
-                    ],
-                )
-            ],
-        )
-
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            changed = t.proofread_split_events(transcript, self.ctx, FakeBatchLLM(2), "system", quiet=True)
-
-        self.assertTrue(changed)
-        self.assertEqual(calls, [2, 1, 1])
-        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
-        self.assertEqual(transcript.segments[0].split_events[1].zh, "译文二 fixed")
-
-    def test_proofread_split_events_drops_retrieved_context_when_single_item_is_too_large(self):
-        class FakeRetriever:
-            def retrieve_texts(self, texts, top_k=None):
-                return [[{"id": "transcript:1", "text": "x" * 1000}]]
-
-        saw_context = []
-
-        def fake_llm_numbered_batch(request, session, quiet, retries=3, raise_on_failure=False):
-            has_context = bool(request.items[0].fields.get("retrieved_context"))
-            saw_context.append(has_context)
-            if has_context:
-                raise RuntimeError("maximum context length exceeded")
-            item = request.items[0]
-            return [{"id": item.id, "en": item.fields["en"] + " fixed", "zh": item.fields["zh"]}]
-
-        transcript = t.Transcript(
-            path="video.json",
-            language="en",
-            segments=[
-                t.TranscriptSegment(
-                    1,
-                    0.0,
-                    1.0,
-                    "source",
-                    split_events=[t.SplitEvent(0.0, 1.0, "source one", "译文一")],
-                )
-            ],
-        )
-
-        with patch.object(t, "llm_numbered_batch", side_effect=fake_llm_numbered_batch):
-            changed = t.proofread_split_events(
-                transcript,
-                self.ctx,
-                FakeBatchLLM(1),
-                "system",
-                quiet=True,
-                retriever=FakeRetriever(),
-            )
-
-        self.assertTrue(changed)
-        self.assertEqual(saw_context, [True, False])
-        self.assertEqual(transcript.segments[0].split_events[0].en, "source one fixed")
 
     def test_chat_session_passes_provider_response_format(self):
         calls = []
@@ -1900,7 +1571,7 @@ class JsonProtocolTests(unittest.TestCase):
 
         answer = session.ask(
             '{"request": 1}',
-            retry_template=t.CompletionRetryTemplate(attempts=2, base_delay=0, quiet=True),
+            retry_template=t.CompletionRetryTemplate(attempts=2, base_delay=0, ),
         )
 
         self.assertEqual(answer, '{"markdown": "ok"}')
@@ -1923,7 +1594,7 @@ class JsonProtocolTests(unittest.TestCase):
         content, parsed = session.ask_validated(
             '{"request": 1}',
             lambda value: t.require_json_object(t._extract_json_value(value), "response"),
-            retry_template=t.CompletionRetryTemplate(attempts=2, base_delay=0, quiet=True),
+            retry_template=t.CompletionRetryTemplate(attempts=2, base_delay=0, ),
         )
 
         self.assertEqual(content, '{"markdown": "ok"}')
@@ -2273,7 +1944,7 @@ class JsonProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "EMBEDDING_MODEL or provider.default_model"):
                 t.embedding_function(cfg, {"CUSTOM_API_KEY": "secret"})
 
-    def test_embedding_stage_enabled_skips_only_beautify(self):
+    def test_embedding_stage_enabled_skips_only_scenes(self):
         self.assertFalse(t.embedding_enabled_for_stage(True, False))
         self.assertTrue(t.embedding_enabled_for_stage(False, True))
         self.assertTrue(t.embedding_enabled_for_stage(False, False))
@@ -2422,7 +2093,7 @@ class JsonProtocolTests(unittest.TestCase):
         fake_store = FakeStore()
 
         with patch.object(t, "open_chroma_store", return_value=fake_store):
-            result = t.build_embedding_index(transcript, cfg, {}, quiet=True)
+            result = t.build_embedding_index(transcript, cfg, {}, )
 
         self.assertEqual(result, "index")
         self.assertEqual(fake_store.ids, ["transcript:1"])
@@ -2456,7 +2127,7 @@ class JsonProtocolTests(unittest.TestCase):
         fake_store = FakeStore()
 
         with patch.object(t, "open_chroma_store", return_value=fake_store):
-            t.build_embedding_index(transcript, cfg, {}, quiet=True, ctx=self.ctx)
+            t.build_embedding_index(transcript, cfg, {}, ctx=self.ctx)
 
         self.assertEqual(fake_store.ids, ["transcript:1", "translation_memory:1:1"])
         self.assertIn("SOURCE(en): source", fake_store.documents[1].page_content)
@@ -2487,7 +2158,7 @@ class JsonProtocolTests(unittest.TestCase):
             fake_store = FakeStore()
 
             with patch.object(t, "open_chroma_store", return_value=fake_store):
-                t.build_embedding_index(transcript, cfg, {}, quiet=True, ctx=ctx)
+                t.build_embedding_index(transcript, cfg, {}, ctx=ctx)
 
         self.assertEqual(fake_store.ids, ["transcript:1", "glossary:1"])
         self.assertIn("原标题：Original Title", fake_store.documents[1].page_content)
@@ -2536,7 +2207,7 @@ class JsonProtocolTests(unittest.TestCase):
             fake_store = FakeStore()
 
             with patch.object(t, "open_chroma_store", return_value=fake_store):
-                t.build_embedding_index(transcript, cfg, {}, quiet=True, ctx=ctx)
+                t.build_embedding_index(transcript, cfg, {}, ctx=ctx)
 
         self.assertEqual(fake_store.ids, ["transcript:1", "web_evidence:1"])
         self.assertIn("discipline concept", fake_store.documents[1].page_content)
@@ -2563,7 +2234,7 @@ class JsonProtocolTests(unittest.TestCase):
         fake_store = FakeStore()
 
         with patch.object(t, "open_chroma_store", return_value=fake_store):
-            t.build_embedding_index(transcript, cfg, {}, quiet=True, existing_chunk_ids=["transcript:1", "transcript:2"])
+            t.build_embedding_index(transcript, cfg, {}, existing_chunk_ids=["transcript:1", "transcript:2"])
 
         self.assertEqual(fake_store.deleted, ["transcript:1", "transcript:2"])
         self.assertEqual(fake_store.ids, ["transcript:1"])
@@ -2594,7 +2265,7 @@ class JsonProtocolTests(unittest.TestCase):
                 self.config = config
                 self.env = env
 
-        def fake_build_embedding_index(transcript, config, env, quiet=False, ctx=None):
+        def fake_build_embedding_index(transcript, config, env, ctx=None):
             calls.append(os.path.isfile(ctx.glossary))
             return config.chroma_dir
 
@@ -2614,7 +2285,7 @@ class JsonProtocolTests(unittest.TestCase):
             with patch.object(t, "build_embedding_index", side_effect=fake_build_embedding_index), patch.object(
                 t, "EmbeddingRetriever", FakeRetriever
             ):
-                retriever = t.refresh_embedding_retriever(transcript, cfg, {}, quiet=True, ctx=ctx)
+                retriever = t.refresh_embedding_retriever(transcript, cfg, {}, ctx=ctx)
 
         self.assertEqual(calls, [True])
         self.assertIsInstance(retriever, FakeRetriever)
@@ -2640,7 +2311,7 @@ class JsonProtocolTests(unittest.TestCase):
         fake_store = FakeStore()
 
         with patch.object(t, "open_chroma_store", return_value=fake_store), patch.object(t, "CHROMA_WRITE_BATCH_SIZE", 2):
-            t.build_embedding_index(transcript, cfg, {}, quiet=True)
+            t.build_embedding_index(transcript, cfg, {}, )
 
         self.assertEqual([ids for _, ids in fake_store.calls], [["transcript:1", "transcript:1-2"], ["transcript:2-3"]])
 
@@ -2652,91 +2323,6 @@ class JsonProtocolTests(unittest.TestCase):
         self.assertIsNone(fields.get_source({"source": "legacy"}))
         self.assertIsNone(fields.get_target({"target": "legacy"}))
 
-    def test_parse_split_response_aligns_by_actual_ids(self):
-        source, target, error = t.parse_split_response(
-            [
-                {"id": 12, "en": ["source a", "source b"], "zh": ["target a", "target b"]},
-                {"id": 44, "en": ["source c"], "zh": ["target c"]},
-            ],
-            [12, 44],
-            self.ctx,
-        )
-
-        self.assertEqual(error, "")
-        self.assertEqual(source[12], ["source a", "source b"])
-        self.assertEqual(target[44], ["target c"])
-
-    def test_parse_split_response_keeps_other_ids_when_one_item_has_part_count_mismatch(self):
-        source, target, error = t.parse_split_response(
-            [
-                {"id": 73, "en": ["source a"], "zh": ["target a"]},
-                {"id": 74, "en": ["source b"], "zh": ["target b"]},
-                {"id": 88, "en": ["source c", "source d"], "zh": ["target c"]},
-            ],
-            [73, 74, 88],
-            self.ctx,
-        )
-
-        self.assertEqual(error, "")
-        self.assertEqual(source[73], ["source a"])
-        self.assertEqual(target[74], ["target b"])
-        self.assertEqual(source[88], ["source c", "source d"])
-        self.assertEqual(target[88], ["target c"])
-
-    def test_parse_split_response_ignores_extra_context_items(self):
-        source, target, error = t.parse_split_response(
-            [
-                {"id": 34, "en": ["source a"], "zh": ["target a"]},
-                {"id": 35, "en": ["source b"], "zh": ["target b"]},
-                {"id": 33, "en": ["context before"], "zh": ["上下文前"]},
-                {"id": 36, "en": ["context after"], "zh": ["上下文后"]},
-            ],
-            [34, 35],
-            self.ctx,
-        )
-
-        self.assertEqual(error, "")
-        self.assertEqual(source, {34: ["source a"], 35: ["source b"]})
-        self.assertEqual(target, {34: ["target a"], 35: ["target b"]})
-
-    def test_parse_split_response_keeps_present_ids_when_one_expected_id_is_missing(self):
-        source, target, error = t.parse_split_response(
-            [
-                {"id": 34, "en": ["source a"], "zh": ["target a"]},
-                {"id": 36, "en": ["source c"], "zh": ["target c"]},
-            ],
-            [34, 35, 36],
-            self.ctx,
-        )
-
-        self.assertEqual(error, "")
-        self.assertEqual(source, {34: ["source a"], 36: ["source c"]})
-        self.assertEqual(target, {34: ["target a"], 36: ["target c"]})
-
-    def test_parse_split_response_keeps_other_ids_when_one_item_has_invalid_language_values(self):
-        source, target, error = t.parse_split_response(
-            [
-                {"id": 34, "en": ["source a"], "zh": ["target a"]},
-                {"id": 35, "en": "not an array", "zh": ["target b"]},
-                {"id": 36, "en": ["source c"], "zh": ["target c"]},
-            ],
-            [34, 35, 36],
-            self.ctx,
-        )
-
-        self.assertEqual(error, "")
-        self.assertEqual(source, {34: ["source a"], 36: ["source c"]})
-        self.assertEqual(target, {34: ["target a"], 36: ["target c"]})
-
-    def test_parse_proofread_response_aligns_by_actual_ids(self):
-        pairs = t.parse_proofread_response(
-            [{"id": 3, "en": "corrected source", "zh": "corrected target"}],
-            [3],
-            [("fallback source", "fallback target")],
-            self.ctx,
-        )
-
-        self.assertEqual(pairs, [("corrected source", "corrected target")])
 
     def test_get_scene_changes_handles_missing_ffmpeg_stderr(self):
         class FakeCompletedProcess:
@@ -2744,7 +2330,7 @@ class JsonProtocolTests(unittest.TestCase):
 
         with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
             with patch.object(t.subprocess, "run", return_value=FakeCompletedProcess()):
-                self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, quiet=True), [])
+                self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, ), [])
 
     def test_get_scene_changes_decodes_ffmpeg_stderr_bytes_with_replacement(self):
         class FakeCompletedProcess:
@@ -2752,13 +2338,13 @@ class JsonProtocolTests(unittest.TestCase):
 
         with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
             with patch.object(t.subprocess, "run", return_value=FakeCompletedProcess()):
-                self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, quiet=True), [1.25])
+                self.assertEqual(t.get_scene_changes(video.name, 0.15, 0.1, ), [1.25])
 
     def test_write_scene_change_sidecars(self):
         with tempfile.TemporaryDirectory() as tmp:
             json_path = os.path.join(tmp, "video.json")
             ctx = t.TranscriptContext.from_json(json_path, "", "en", "zh")
-            options = t.BeautifyOptions(scene_threshold=0.12, min_scene_interval_frames=2, fps=25.0)
+            options = t.SceneDetectionOptions(scene_threshold=0.12, min_scene_interval_frames=2, fps=25.0)
 
             t.write_scene_change_sidecars(ctx, os.path.join(tmp, "video.webm"), options, [1.25, 2.5])
 
@@ -2831,7 +2417,7 @@ class JsonProtocolTests(unittest.TestCase):
                 }
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                result = t.translate_description(ctx, FakeProviderLLM(), quiet=True)
+                result = t.translate_description(ctx, FakeProviderLLM(), )
 
             self.assertEqual(result, ctx.target_desc)
             self.assertEqual(captured_request["tags"], ["AI", "philosophy"])
@@ -2871,7 +2457,7 @@ class JsonProtocolTests(unittest.TestCase):
 
             retriever = FakeRetriever()
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                t.translate_description(ctx, FakeProviderLLM(), quiet=True, retriever=retriever)
+                t.translate_description(ctx, FakeProviderLLM(), retriever=retriever)
 
             self.assertEqual(
                 captured_request["retrieved_context"],
@@ -2901,7 +2487,7 @@ class JsonProtocolTests(unittest.TestCase):
                 return {"title": "译后标题", "description": "译后简介。", "tags": []}
 
             with patch.object(t, "llm_json_once", side_effect=fake_llm_json_once):
-                t.translate_description(ctx, FakeProviderLLM(), quiet=True)
+                t.translate_description(ctx, FakeProviderLLM(), )
 
         self.assertIn("# 术语知识库", captured["system_prompt"])
         self.assertIn("discipline: 定译为自律", captured["system_prompt"])

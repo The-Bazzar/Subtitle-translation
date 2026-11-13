@@ -1,4 +1,5 @@
 import pathlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -23,10 +24,11 @@ class PythonCliSmokeTests(unittest.TestCase):
         )
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         dry_run = subprocess.run(
-            [sys.executable, "-m", "subtitle_translation", "batch", "--dry-run", "url"],
+            [sys.executable, "-m", "subtitle_translation", "batch", "url"],
             cwd=ROOT,
             capture_output=True,
             text=True,
+            env={**os.environ, "DRY_RUN": "1"},
         )
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
         self.assertNotIn("\a", dry_run.stdout + dry_run.stderr)
@@ -59,9 +61,10 @@ class PythonCliSmokeTests(unittest.TestCase):
         self.addCleanup(temporary_directory.cleanup)
         calls = []
 
-        def fake_main(arguments):
+        def fake_main(arguments, **kwargs):
             calls.append(list(arguments))
-            if "--only-beautify" in arguments:
+            pathlib.Path(arguments[arguments.index("--beautified-json") + 1]).write_text("{}", encoding="utf-8")
+            if "--only-scenes" in arguments:
                 pathlib.Path(arguments[arguments.index("--beautified-json") + 1]).write_text(
                     "{}", encoding="utf-8"
                 )
@@ -79,7 +82,7 @@ class PythonCliSmokeTests(unittest.TestCase):
             asyncio_run(runner(task))
 
         self.assertEqual(len(calls), 3)
-        self.assertIn("--reuse-glossary", calls[1])
+        self.assertIn("--only-glossary", calls[1])
         self.assertEqual(task.ass_path, root / "video.en-zh.ass")
 
     def test_batch_postprocess_honors_beautify_and_knowledge_skips(self):
@@ -87,9 +90,9 @@ class PythonCliSmokeTests(unittest.TestCase):
         self.addCleanup(temporary_directory.cleanup)
         calls = []
 
-        def fake_main(arguments):
+        def fake_main(arguments, **kwargs):
             calls.append(list(arguments))
-            if "--only-beautify" in arguments:
+            if "--only-scenes" in arguments:
                 pathlib.Path(arguments[arguments.index("--beautified-json") + 1]).write_text(
                     "{}", encoding="utf-8"
                 )
@@ -100,7 +103,7 @@ class PythonCliSmokeTests(unittest.TestCase):
         env = {
             "SOURCE_LANG": "en",
             "TARGET_LANG": "zh",
-            "PIPELINE_SKIP_BEAUTIFY": "1",
+            "PIPELINE_SKIP_SCENE_DETECTION": "1",
             "PIPELINE_SKIP_KNOWLEDGE": "1",
         }
         with mock.patch.dict("os.environ", {}, clear=False), mock.patch.object(
@@ -109,9 +112,36 @@ class PythonCliSmokeTests(unittest.TestCase):
             runner = batch_runtime.create_platform_postprocess_runner(root, env)
             asyncio_run(runner(task))
 
-        self.assertEqual(len(calls), 2)
-        self.assertIn("--skip-beautify", calls[0])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--skip-scene-detection", calls[0])
         self.assertFalse(any("--only-glossary" in call for call in calls))
+
+    def test_mfa_postprocess_uses_one_coordinated_call_and_preserves_skips(self):
+        task, root, temporary_directory = self._postprocess_task()
+        self.addCleanup(temporary_directory.cleanup)
+        calls = []
+        settings = []
+        def fake_main(arguments, **kwargs):
+            calls.append(arguments)
+            settings.append(kwargs["stage_overrides"])
+            pathlib.Path(arguments[arguments.index("--beautified-json") + 1]).write_text("{}", encoding="utf-8")
+            (root / "video.en-zh.ass").write_text("ass", encoding="utf-8")
+            return 0
+        with mock.patch.dict("os.environ", {}, clear=False), \
+             mock.patch.object(batch_runtime.translate_srt, "main", side_effect=fake_main):
+            runner = batch_runtime.create_platform_postprocess_runner(root, {
+                "SOURCE_LANG": "en", "TARGET_LANG": "zh", "PIPELINE_SKIP_SCENE_DETECTION": "1",
+                "PIPELINE_SKIP_KNOWLEDGE": "1",
+            }, use_mfa=True)
+            asyncio_run(runner(task))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--mfa", calls[0])
+        self.assertNotIn("--skip-scene-detection", calls[0])
+        self.assertNotIn("--skip-knowledge", calls[0])
+        self.assertNotIn("--only-scenes", calls[0])
+        self.assertEqual(settings[0]["MFA_ENABLED"], "1")
+        self.assertEqual(settings[0]["PIPELINE_SKIP_SCENE_DETECTION"], "1")
+        self.assertEqual(settings[0]["PIPELINE_SKIP_KNOWLEDGE"], "1")
 
     def test_batch_skip_translate_requires_existing_bilingual_ass(self):
         task, root, temporary_directory = self._postprocess_task()

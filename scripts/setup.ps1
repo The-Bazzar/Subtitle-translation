@@ -2,6 +2,12 @@
 # setup.ps1 — 安装字幕流水线全部依赖 (Windows PowerShell)
 # =============================================================================
 
+[CmdletBinding()]
+param(
+    [switch]$InstallMfa,
+    [string]$MfaDistribution = ""
+)
+
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ScriptDir = Split-Path $PSCommandPath -Parent
@@ -213,6 +219,14 @@ if ($TorchBackend -eq 'cuda128') {
 
 Write-Host ">>> 安装 subtitle-translation 命令..." -ForegroundColor Yellow
 $CliShim = Install-CliShim -PythonPath $PythonExe -ProjectPath $ProjectRoot
+
+if ($InstallMfa) {
+    Write-Host ">>> 安装独立 MFA 工具环境（默认 Windows 原生，指定发行版时使用 WSL）..." -ForegroundColor Yellow
+    $MfaArguments = @()
+    if ($MfaDistribution) { $MfaArguments += @("--distribution", $MfaDistribution) }
+    & $PythonExe -m subtitle_translation --project-dir $ProjectRoot setup-mfa @MfaArguments
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 # ── 验证 ────────────────────────────────────────────────────────────────────
 Write-Host ""

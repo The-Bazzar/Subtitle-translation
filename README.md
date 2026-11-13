@@ -1,274 +1,169 @@
-<h1 align="center">🎬 Subtitle Translation</h1>
+# Subtitle Translation
 
-<p align="center">
-  以 WhisperX JSON 为核心的视频字幕下载、识别、翻译、校对与硬压流水线
-</p>
+以 WhisperX JSON 为主输入的字幕下载、翻译、对轴和 ASS 输出工具。
+2.1.0 优先单 WhisperX、英文源文验证；多 ASR 接入延期，不属于本版功能。
 
-<p align="center">
-  <img alt="Python 3.10-3.13" src="https://img.shields.io/badge/Python-3.10--3.13-3776AB?logo=python&logoColor=white">
-  <img alt="PowerShell 7" src="https://img.shields.io/badge/PowerShell-7-5391FE?logo=powershell&logoColor=white">
-  <img alt="Windows Linux WSL" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL-555555">
-  <img alt="Version 2.0.2" src="https://img.shields.io/badge/Version-2.0.2-blue">
-  <a href="LICENSE"><img alt="GPL-3.0 license" src="https://img.shields.io/badge/License-GPL--3.0-2ea44f"></a>
-</p>
+## 开始使用
 
----
-
-## ✨ 核心特性
-
-- 🎯 **JSON-first**：WhisperX `.json` 是唯一字幕主输入，保留 word 级时间轴。
-- 🧠 **上下文翻译**：glossary、网页证据和 Chroma 检索共同维护术语一致性。
-- 🎞️ **可靠对轴**：场景吸附与源语言 word 首尾匹配失败时整句回退，不做本地强切。
-- ⚙️ **资源调度**：batch 分离 CPU/IO、NVENC 与 WhisperX 阶段，避免 GPU 任务互相争抢。
-- 🌍 **多语言输出**：源语言和目标语言使用 ISO 639 代码生成统一文件名。
-- 🖥️ **跨平台入口**：Python CLI 同时服务 Windows、Linux 和 WSL。
-
-<details>
-<summary><strong>📚 目录</strong></summary>
-
-- [快速开始](#quick-start)
-- [常用命令](#commands)
-- [项目结构](#layout)
-- [Batch 资源模型](#batch-resources)
-- [输出与缓存](#outputs)
-- [配置提醒](#configuration)
-- [测试与文档](#testing)
-
-</details>
-
-## 🔄 工作流
-
-```text
-下载原片 -> 准备编辑版 -> WhisperX JSON -> 时间轴美化 -> glossary
--> 整句翻译 -> AI 分割对轴 -> split 校对 -> ASS -> 硬压
-```
-
-> [!IMPORTANT]
-> ⚠️ Windows 必须使用 **PowerShell 7**。旧版 Windows PowerShell 5.x 会导致 `.ps1` 脚本报错。
->
-> ```powershell
-> winget install Microsoft.PowerShell
-> ```
-
-<a id="quick-start"></a>
-
-## 🚀 快速开始
-
-### 🪟 Windows
+Windows 需要 PowerShell 7；Linux/WSL 使用 bash。
 
 ```powershell
-.\scripts\setup.ps1
-subtitle-translation pipeline "https://www.youtube.com/watch?v=*"
+.\scripts\setup.ps1 -InstallMfa
+subtitle-translation help
 ```
-
-### 🐧 Linux / WSL
 
 ```bash
-./scripts/setup.sh
-subtitle-translation pipeline "https://www.youtube.com/watch?v=*"
+./scripts/setup.sh --mfa
+subtitle-translation help
 ```
 
-setup 会完成以下工作：
+setup 创建项目 .venv、安装 CLI/所选 ASR 依赖并生成缺失配置和命令 shim，
+不要求手动 PATH，不复制第二套 CLI。已有配置值不覆盖。
+示例的 PROOFREAD=0、MFA_ENABLED=1、PIPELINE_SKIP_BURN=1。新配置默认常开 MFA，需先完成 setup-mfa。
+当前 MFA 只支持英文源文；其他源语言请设置 MFA_ENABLED=0，使用兼容 ASR 词轴路径。
 
-- 创建项目 `.venv`。
-- 从 example 创建缺失的本地配置。
-- 安装项目、WhisperX 和所选 CPU/CUDA PyTorch 后端。
-- 安装并验证全局 `subtitle-translation` 命令 shim。
-
-shim 始终转发到当前项目 `.venv`，不创建第二套 Python 环境。用户不需要手动配置 PATH。
-
-<a id="commands"></a>
-
-## 🧰 常用命令
-
-激活项目 `.venv` 后，可以使用下面的简写命令：
+## 命令与配置
 
 ```text
-# 处理一个视频
 subtitle-translation pipeline "URL"
-
-# 批量处理多个视频
-subtitle-translation batch "URL1" "URL2"
-
-# 翻译已有 WhisperX JSON
-subtitle-translation translate "G:/project/video.json"
-
-# 合并两条已校对 ASS
+subtitle-translation batch "URL1" "URL2" --report "batch-result.json"
+subtitle-translation translate "video.json" --video "video.mkv" --lang en --target-lang zh
+subtitle-translation translate "video.json" --only-glossary
+subtitle-translation translate "video.json" --video "video.mkv" --only-scenes
 subtitle-translation merge-ass "video.zh.ass" "video.en.ass"
 ```
 
-未激活虚拟环境时，也可以直接使用项目 Python：
+CLI 仅保留 URL、路径、语言、输出位置及 --only-*。
+help 打印所有子命令的完整帮助；--help / --version 仍可用。
+MFA、校对、分段、阶段跳过、模型/设备、批量大小、场景阈值、编码、调试和强制重建均在 .env 配置。
+未知参数和已删除的开关直接报错，不静默忽略。
+旧 ffmpeg-burn/mpv-burn 脚本均为 burn 别名，后端只由 BURN_BACKEND 配置选择。
+完整参数/变量表见 [CLI 与环境配置](docs/cli-and-env.md)。
 
-```powershell
-& "<repo>\.venv\Scripts\python.exe" -m subtitle_translation pipeline "URL" --skip-burn
-```
+从其他位置运行时，可在子命令前加 --project-dir 选择配置根。
+它不改变输出根；cookies.txt 始终只从命令执行目录读取。
+每次 yt-dlp 业务调用前先清理其缓存，清理失败则下载阶段失败。
 
-```bash
-"<repo>/.venv/bin/python" -m subtitle_translation pipeline "URL" --skip-burn
-```
+## 当前流程
 
-运行以下命令查看某个子命令的完整参数：
-
-```text
-subtitle-translation <command> --help
-```
-
-`pipeline` 常用选项：
-
-| 选项 | 用途 |
-|---|---|
-| `--skip-burn` | 生成字幕后跳过硬压 |
-| `--skip-download --video PATH` | 使用已有原片 |
-| `--skip-whisper --json PATH` | 使用已有 WhisperX JSON |
-| `--source-lang CODE` | 指定源语言 |
-| `--target-lang CODE` | 指定目标语言 |
-| `--model` / `--device` | 覆盖 WhisperX 模型或设备 |
-| `--ovc` / `--ovcopts` / `--oac` / `--res` | 调整硬压参数 |
-
-<a id="layout"></a>
-
-## 🗂️ 项目结构
+MFA_ENABLED=0 时保留兼容路径：
 
 ```text
-core/          Python package 与核心运行模块
-scripts/       setup 和平台兼容启动脚本
-tests/         自动化测试
-docs/          架构与设计文档
+download original -> prepare edit video -> WhisperX JSON
+  -> scene detection -> glossary -> joint bilingual translation
+  -> ASR word-time projection -> optional target proofread -> ASS -> optional burn
 ```
 
-正式功能由 `subtitle-translation` CLI 统一提供。`scripts/` 中除 setup 外的文件仅用于旧入口迁移，不承载业务逻辑。
-
-<a id="batch-resources"></a>
-
-## ⚙️ Batch 资源模型
-
-batch 使用 Python scheduler 按阶段调度任务，不会并行启动多条完整 pipeline，也不接受手工 jobs 参数。
-
-| 资源或事件 | 调度规则 |
-|---|---|
-| CPU / IO | 自动使用 `max(1, (os.cpu_count() or 1) // 4)` 路并发 |
-| NVENC | prepare 与 burn 共用固定 4 路容量 |
-| WhisperX | 全局串行，在一个 worker 内复用 ASR/alignment 模型 |
-| GPU 隔离 | NVENC 与 WhisperX 不同时运行 |
-| 单任务失败 | 只停止该任务的后续阶段，其他任务继续 |
-| worker crash | 阻止后续 worker-stage 任务并记录失败报告 |
-| 第一次 `Ctrl+C` | 停止接纳和推进新阶段，等待当前阶段 |
-| 第二次 `Ctrl+C` | 终止活动进程树，以退出码 `130` 结束 |
-
-batch 会同时输出文本报告和同基名 JSON machine report。
-
-batch 与 pipeline 都只提供 `--skip-burn`。未传入时读取 `.env` 的 `PIPELINE_SKIP_BURN`；未配置则默认启用硬压。
-
-batch 同样读取 `PIPELINE_SKIP_BEAUTIFY`、`PIPELINE_SKIP_KNOWLEDGE` 和 `PIPELINE_SKIP_TRANSLATE`。跳过 translate 时，每个项目目录必须已有约定命名的双语 ASS。URL batch 无法表达已有下载/JSON 映射，因此 `PIPELINE_SKIP_DOWNLOAD=1` 或 `PIPELINE_SKIP_WHISPER=1` 会在启动前明确报错。
-
-通知音效使用终端 BEL：
-
-- 成功：一组短响。
-- 错误：一组错误响铃。
-- help 和 dry-run：静默。
-
-<a id="outputs"></a>
-
-## 📦 输出与缓存
-
-SRT 不作为输入缓存。典型文件链如下：
+模板默认 MFA_ENABLED=1：
 
 ```text
-原片与编辑版
-  <base>.original.<ext>
-  <base>.mkv
-
-识别与时间轴
-  <base>.json
-  <base>.beautified.json
-  <base>.scenes.json
-  <base>.scenechange.txt
-
-知识与证据
-  glossary.md
-  <base>.web_evidence.json
-
-字幕成果
-  <base>.split.<source>.srt
-  <base>.split.<target>.srt
-  <base>.<source>.proofread.ass
-  <base>.<target>.ass
-  <base>.<source>-<target>.ass
-  <base>.<target>.description
+WhisperX JSON -> glossary/source_review -> joint bilingual translation
+  -> source-window corpus MFA -> scene detection -> optional target proofread
+  -> ASS -> optional burn
 ```
 
-glossary 位于翻译之前：
+- glossary 是唯一自动源文编辑阶段，保留语义、否定、数量、实体和玩梗；不确定则保留实际候选。
+- translate 同一次响应返回整句译文和成对源/目标字幕片段，按完整上下文语义断句。
+  不独立调用 split，不要求 LLM 计算字符位置、事件 ID、时间或严格拼接等式。
+- 本地只读定位源片段，生成稳定事件 ID/范围。没有有效片段但整句译文有效时保留整句双语内容；
+  完全缺少实际译文时有界重试，不能导出空字幕。
+- PROOFREAD 控制纯译文校对，不修改源文、事件 ID/数量或时间；失败保留已有译文。
+- 场景检测只写 sidecar，不吸附或改时间，不补时长/间隔，不缩放词轴。
+  调整场景设置不失效有效译文或字幕时间缓存。
+- PIPELINE_SKIP_BURN=0 才让模板配置下的 pipeline/batch 执行后续硬压。
+  prepare-video 保留 CPU decode，优先 NVENC，按既定策略回退 CPU。
 
-- 普通 pipeline 会复用已有的非空 `glossary.md`。
-- `--only-glossary` 会重新生成并覆盖它。
-- 网页证据单独写入 `.web_evidence.json`。
-- 启用 Chroma embedding 后，网页证据可作为动态检索记忆。
+SRT 是检查输出，不是输入缓存。原始识别 JSON 不被修订稿覆盖。
+ASS/SRT 序列化按各自精度取整并正确进位，不改变内部词轴。
 
-<a id="configuration"></a>
-
-## 🔧 配置提醒
-
-示例 `.env` 的 `PROOFREAD=0`，新建配置默认关闭校对；需要时改为 `PROOFREAD=1`。已有本地 `.env` 不会被安装或初始化覆盖，保留原有设置。此默认值来自配置模板，不改变变量缺失时的 CLI 兼容行为。
-
-### 🧠 Provider 与模型
-
-模型解析遵循固定优先级：非空的 `TRANSLATE_MODEL`、`GLOSSARY_MODEL`、`PROOFREAD_MODEL` 或 `EMBEDDING_MODEL` 是显式覆盖；对应变量留空时，使用所选 provider 在 `providers.json` 中的 `default_model`。glossary / proofread 的 provider 也留空时，才整体复用翻译配置。
-
-因此，修改 provider 的默认模型后，需要同时清空 `.env` 中该角色已有的 `*_MODEL`，否则显式值仍会优先。
-
-所有 embedding 模型均逐条请求，每次 API 调用的 `input` 为一个文本字符串，兼容只接受单输入的通道。建索引和查询采用相同规则，Chroma 写入批次由程序内部处理。逐条请求可能增加索引耗时和请求频率限制的影响。
-
-### 🌐 语言
-
-`SOURCE_LANG` / `TARGET_LANG` 支持 ISO 639、BCP-47 或语言名。输出文件后缀会通过 `langcodes` 规范为 ISO 639 代码。
-
-### 📁 项目目录
-
-`--project-dir` 只指定 `.env`、provider 和 template 的配置根，不改变输出位置。pipeline 下载项目默认创建在执行命令时的当前目录。
-
-download、pipeline 和 batch 都只读取执行命令时的当前目录下的 `cookies.txt`，包括获取标题时；不存在时不传 cookies，也不回退到安装目录或 `--project-dir`。每次获取标题、下载或刷新元数据前，先使用同一个 yt-dlp 执行 `--rm-cache-dir`；清理失败则停止该任务的下载阶段并报告错误。
-
-从其他目录运行时，仍可显式指定其余配置的根目录，但 cookies 保持从当前执行目录读取：
+## MFA 安装与边界
 
 ```text
-subtitle-translation --project-dir "<repo>" pipeline "URL"
+subtitle-translation setup-mfa
+subtitle-translation setup-mfa --distribution Debian
 ```
 
-### 🤖 LLM 数据约束
+模板已设置 MFA_ENABLED=1；安装后运行普通 translate/pipeline/batch。已有配置仍保留原值，需要关闭时设为 0。
+开关不自动安装或下载模型；缺失资源时在语义请求前报错，不暗中退回另一种词轴。
+当前受管理 profile 为 MFA 3.4.3，与项目 .venv 隔离。
+Windows x86_64 默认原生安装，不依赖 WSL；完整安装使用 `scripts/setup.ps1 -InstallMfa`。
+显式 --distribution 才使用已有 WSL；Linux x86_64 本机，macOS 尚未接入。
+VAD 优先复用完整本地快照，直接加载固定模型的 YAML/权重，不要求不存在的 custom.py；支持缓存/输出目录带空格。
+MFA 工具进程隔离用户 Python 包与继承的 PYTHONPATH/PYTHONHOME，避免加载工具环境之外的依赖。
 
-- glossary、翻译、分割和校对使用 JSON 请求/响应协议。
-- `glossary.md` 是完整常驻的全局硬规则。
-- retrieved context 只提供动态补充，不替代 glossary。
-- split 只按源语言首尾 word 对轴；匹配失败时整句回退，不做本地强切。
+MFA 按来源 ASR 句段粗时间定位窗口，跨段/共享来源时合并相邻范围。
+Windows 原生 MFA 的执行文件使用独立短目录，避免 SQLite CLI 的长路径限制；缓存仍保留完整身份哈希，不影响译文检查点。
+当前每块上限 60 秒/12 源单元、零额外 padding。
+全部有效窗口作为独立音频/文稿加入同一 corpus，仅一次 align 和一次批量导出，固定 num_jobs=1。
+不把整片全文作为无锚点 utterance，不给每个窗口重复启动模型。
 
-目标语言 `.description` 还会读取同名 `<base>.original.mkv` 的内嵌章节，沿用术语库翻译章节标题，并以 `HH:MM:SS 标题` 追加到“章节”区块。时间来自原片，不由 LLM 改写；无原简介文件也可生成章节简介。原片缺失、没有章节或提取失败时保持原有简介翻译，缺失/无效的章节译名逐项保留原标题。
+必要词、时间范围、异常空洞和不可分离映射仍由本地验收，不等于听录真实性证明。
+失败保留完整双语粗时间输出；相邻粗时间重叠时协调合并，不制造词时间或重发翻译。
+完整跨语料质量、边界余量和平台矩阵仍需验收，不能仅凭结构校验宣称准确。
+版本、目录和资源见 [MFA 安装配置](docs/mfa-installation-preferences.md)。
 
-### 🔒 不应提交的文件
+## 数据与缓存
 
-请勿提交 `.env`、真实 provider、cookies、本地 prompt、`template.ass`、glossary、视频、字幕、sidecar、`chroma_db` 或 batch reports。
+- .json：原始识别；.beautified.json：沿用兼容名称的派生工作 JSON，不代表时间美化。
+- segments[].words[] 是派生词轴；旧根级 word_segments 不复制到工作文件。
+- glossary.md / .source_review.json / .web_evidence.json：术语、采用稿及网页证据。
+- .asr_work/text_events/：无精确时间的双语检查点；pending 事件不能导出。
+- .scenes.json / .scenechange.txt：独立场景检测缓存。
+- .split.<lang>.srt、.<source>.proofread.ass、.<target>.ass、.<source>-<target>.ass：字幕成果。
+- .<target>.description：标题、简介、标签及同名原片内嵌章节的目标语言内容。
 
-`*_prompt.example.md` 的文案由 `The-Bazzar/prompt` 仓库维护。
+语义、原生 MFA corpus、定时投影和场景缓存分别绑定实际输入。
+旧协议首次切换可能重译；不需删除原始识别、视频或整个项目缓存。
+FORCE_REBUILD 会重建工作规划/译文，使用后应恢复 0。
+原生模型/profile/解析器变化可能要求重对轴，但不应因此重发输入不变的语义请求。
 
-<a id="testing"></a>
+完整 glossary 常驻提示词，retrieved_context 只补充。
+embedding 对所有模型统一逐文本串行请求，不提供 EMBEDDING_BATCH_SIZE。
+每轮实际 translate 请求在 stderr 记录项目/句段 ID、耗时、响应与校验/回退摘要；
+每个有效句段/event 还打印编号、稳定 ID、split/unsplit/whole_fallback 状态及当前时间（MFA 前为 pending）。
+每条采用的 event 均记录完整原文/译文、ID、状态和当前时间，仅按 LOG_LEVEL 过滤。
+正常 split/unsplit 使用 INFO；回退、重试、失败等异常状态使用 WARNING。任务级错误仍为 ERROR。
+缓存命中也逐 event 打印并注明 cache=hit，不伪造 LLM 请求轮次；不打印 prompt、glossary、检索上下文、原始回复或密钥。
 
-## ✅ 测试与文档
+## 运行日志
+
+应用日志统一使用 Loguru，包含当前时间/时区、级别、项目和阶段。
+控制台始终使用 ANSI 配色，按日志级别着色；文件始终为纯文本，不增加颜色配置项。
+单项目固定写视频文件夹内的 `subtitle-translation.log`：优先 --video 所在目录，否则使用输入 JSON 目录，绝不使用配置根。
+batch 全部集中写执行目录的 `batch-result.log`，不在各视频目录另建日志；行内项目名区分并发任务。
+每次重新 run 覆盖旧文件，同一轮内部阶段共用文件，不轮转、不备份。
+`.env` 的 LOG_LEVEL 默认 INFO，可选 TRACE/DEBUG/INFO/WARNING/ERROR/CRITICAL；控制台与文件统一使用这个阈值，不再提供 QUIET。
+日志不改变 stdout 路径 marker。详细规则见 [运行日志](docs/logging.md)。
+
+## Batch 资源与恢复
+
+CPU/IO 为 max(1, (os.cpu_count() or 1) // 4)，prepare/burn 共用最多 4 路 NVENC，
+NVENC 与 WhisperX 不同时运行，WhisperX worker 全局串行复用模型。
+MFA 使用既有 postprocess admission，不另建并行池。
+任务顺序、.prepare.json/.asr.json/.asr.lock、generation、candidate 和原子发布规则不变。
+
+第一次 Ctrl+C 停止新阶段并等待活动任务；第二次终止进程树，返回 130。
+worker 意外退出沿用 fail-fast；已完成对齐的任务仍可后处理。
+batch 输出文本和 JSON 报告，不接受手动 jobs 参数。
+URL batch 无法表达已有输入映射，配置 skip download/whisper 会在启动前报错。
+
+## 验证与资料
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-```bash
-./.venv/bin/python -m unittest discover -s tests
-```
+自动测试 mock 网络、LLM、yt-dlp、ffmpeg、WhisperX/MFA。
+真实媒体、安装/平台、模型质量和 CUDA 验收单独进行。
 
-测试必须 mock 网络、LLM、yt-dlp、ffmpeg 和 WhisperX。真实媒体、CUDA 与远程 API 仍需在实际环境中验证。
-
-### 📖 更多资料
-
-- [技术与协作约束](AGENTS.md)
 - [迁移说明](MIGRATION.md)
-- [Python CLI 重构设计](docs/superpowers/specs/2026-08-21-python-cli-rewrite-design.md)
-- [ASR 兼容层、glossary 原文校对与 MFA 对齐研发路线图](docs/superpowers/specs/2026-08-25-v2.1.0-asr-provider-design.md)
-- [ASR 兼容层、glossary 原文校对与 MFA 对齐完整设计](docs/superpowers/specs/2026-11-07-en-zh-multi-asr-design.md)
-- [ASR Provider 输出考据与适配契约](docs/superpowers/specs/2026-11-07-asr-provider-output-contracts.md)
-- [GPL-3.0 许可证](LICENSE)
+- [技术与协作约束](AGENTS.md)
+- [2.1 架构与发布范围](docs/v2.1-architecture.md)
+- [CLI 与环境配置](docs/cli-and-env.md)
+- [MFA 安装配置](docs/mfa-installation-preferences.md)
+- [Python CLI 设计不变量](docs/superpowers/specs/2026-08-21-python-cli-rewrite-design.md)
+- [后续 ASR 路线图](docs/superpowers/specs/2026-08-25-v2.1.0-asr-provider-design.md)
+- [许可证 GPL-3.0](LICENSE)
+
+本地 .env、provider、cookies、prompt、模板、媒体、字幕、术语、sidecar、模型/runtime、
+Chroma 和 batch 报告都不能提交。外部维护的 *_prompt.example.md 文案不在本项目修改。

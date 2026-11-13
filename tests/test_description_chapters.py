@@ -88,7 +88,7 @@ class DescriptionChapterTests(unittest.TestCase):
                                 {"id": 1, "title": "\u5f00\u573a", "start_time": 888}])
         with patch.object(t, "read_original_chapters", return_value=self.source_chapters), \
              patch.object(t, "llm_json_once", return_value=output) as request:
-            t.translate_description(self.ctx, self.llm, quiet=True)
+            t.translate_description(self.ctx, self.llm, )
         payload = request.call_args.args[2].to_json_value()
         self.assertEqual(payload["chapters"], [value.to_request() for value in self.source_chapters])
         self.assertEqual(request.call_count, 1)
@@ -113,7 +113,7 @@ class DescriptionChapterTests(unittest.TestCase):
         response.pop("chapters")
         with patch.object(t, "read_original_chapters", return_value=self.source_chapters), \
              patch.object(t, "llm_json_once", return_value=response):
-            t.translate_description(self.ctx, self.llm, quiet=True)
+            t.translate_description(self.ctx, self.llm, )
         text = Path(self.ctx.target_desc).read_text(encoding="utf-8")
         self.assertIn("00:00:00 Opening", text)
         self.assertIn("01:02:03 A new lens", text)
@@ -121,14 +121,14 @@ class DescriptionChapterTests(unittest.TestCase):
     def test_no_chapters_preserves_old_description_without_empty_heading(self):
         with patch.object(t, "read_original_chapters", return_value=[]), \
              patch.object(t, "llm_json_once", return_value=self.response()) as request:
-            t.translate_description(self.ctx, self.llm, quiet=True)
+            t.translate_description(self.ctx, self.llm, )
         self.assertNotIn("chapters", request.call_args.args[2].to_json_value())
         self.assertNotIn("\u7ae0\u8282\uff1a", Path(self.ctx.target_desc).read_text(encoding="utf-8"))
 
     def test_probe_failure_does_not_block_other_description_translation(self):
         with patch.object(t, "read_original_chapters", side_effect=ValueError("probe unavailable")), \
              patch.object(t, "llm_json_once", return_value=self.response()):
-            t.translate_description(self.ctx, self.llm, quiet=True)
+            t.translate_description(self.ctx, self.llm, )
         text = Path(self.ctx.target_desc).read_text(encoding="utf-8")
         self.assertIn("Translated description.", text)
         self.assertNotIn("\u7ae0\u8282\uff1a", text)
@@ -137,7 +137,7 @@ class DescriptionChapterTests(unittest.TestCase):
         Path(self.ctx.target_desc).write_text("existing translated description", encoding="utf-8")
         with patch.object(t, "read_original_chapters", return_value=self.source_chapters), \
              patch.object(t, "llm_json_once", side_effect=RuntimeError("offline")):
-            t.translate_description(self.ctx, self.llm, quiet=True)
+            t.translate_description(self.ctx, self.llm, )
         self.assertEqual(Path(self.ctx.target_desc).read_text(encoding="utf-8"), "existing translated description")
 
     def test_main_translates_container_chapters_without_source_description_file(self):
@@ -149,12 +149,11 @@ class DescriptionChapterTests(unittest.TestCase):
         with patch.object(t, "load_env", return_value={"TRANSLATE_PROVIDER": "fake"}), \
              patch.object(t, "translate_llm_from_env", return_value=self.llm), \
              patch.object(t, "load_prompt", return_value="style"), \
-             patch.object(t, "translate_segments", return_value=False), \
-             patch.object(t, "split_segments", return_value=False), \
+             patch("subtitle_translation.bilingual_translation.translate_events", return_value=False), \
              patch.object(t, "write_ass"), \
              patch.object(t, "read_original_chapters", return_value=self.source_chapters), \
              patch.object(t, "llm_json_once", return_value=self.response()) as translate:
-            t.main([str(source), "--template", str(template), "--skip-beautify", "--skip-knowledge", "--no-proofread", "--quiet"])
+            t.main([str(source), "--template", str(template)], stage_overrides={"PIPELINE_SKIP_SCENE_DETECTION": "1", "PIPELINE_SKIP_KNOWLEDGE": "1", "PROOFREAD": "0", })
         self.assertEqual(translate.call_count, 1)
         self.assertTrue(Path(self.ctx.target_desc).exists())
         self.assertFalse(Path(self.ctx.desc).exists())

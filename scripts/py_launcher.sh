@@ -16,31 +16,22 @@ shift
 case "$TARGET" in
     pipeline|batch|translate|download|prepare-video|whisper|burn|init)
         COMMAND="$TARGET"
-        EXTRA=()
         ;;
     translate_srt|translate-srt)
         COMMAND=translate
-        EXTRA=()
         ;;
     merge_ass|merge-ass)
         COMMAND=merge-ass
-        EXTRA=()
         ;;
     prepare_video)
         COMMAND=prepare-video
-        EXTRA=()
         ;;
-    ffmpeg-burn)
+    ffmpeg-burn|mpv-burn)
         COMMAND=burn
-        EXTRA=(--backend ffmpeg)
-        ;;
-    mpv-burn)
-        COMMAND=burn
-        EXTRA=(--backend mpv)
         ;;
     *)
         echo "Error: unsupported Python target: $TARGET" >&2
         exit 2
         ;;
 esac
-exec "$PYTHON_BIN" -m subtitle_translation --project-dir "$PROJECT_ROOT" "$COMMAND" "${EXTRA[@]}" "$@"
+exec "$PYTHON_BIN" -m subtitle_translation --project-dir "$PROJECT_ROOT" "$COMMAND" "$@"

@@ -1,133 +1,107 @@
-# Python CLI Migration
+# Migration
 
-## 配置模板默认关闭校对
+## 2.1.0
 
-包内唯一 `.env.example` 将 `PROOFREAD` 默认值改为 `0`，新建配置默认不执行校对；显式设置 `PROOFREAD=1` 可恢复。既有 `.env` 不覆盖，已设置为 `1` 的项目仍会校对；需要关闭时自行修改该值或使用 `--no-proofread`。本次只改配置模板，不修改变量缺失时的 CLI 回退行为，不变更版本号或标签。
+多 ASR/多语言 MFA profile 不在本版发布范围，
+2.1 重点是窗口 corpus MFA、联合双语翻译/断句、只读场景检测及配置入口收敛。
 
-## v2.0.2 原片章节简介
+### CLI 与配置
 
-无需新增配置。翻译元数据时从项目内同名 `<base>.original.mkv` 使用 ffprobe JSON 读取内嵌章节，优先查找已配置 ffmpeg 同目录的 ffprobe。只读取原片，不回退到编辑版或其他项目影片；探测最多等待 30 秒。
+subtitle-translation help 打印全部真实子命令帮助。
+CLI 只保留输入/输出路径、URL、语言、配置根和 --only-*；--help/--version 元信息保留。
+功能开关与调优参数全部从 .env 读取，旧参数会直接报错。
+--print-output-path 改为 --only-output-path。
+完整字段见 [配置对照表](docs/cli-and-env.md)。
 
-章节标题与原有标题、简介、标签在同一次元数据请求中翻译，沿用完整 glossary 和当前项目检索上下文。输出至已有目标语言 description 路径（如 `.zh.description`），追加“章节”及 `HH:MM:SS 标题`。开始时间在本地保留，展示向下取整到秒；模型只返回章节 ID 和译名，不能重排或改写时间。
+| 旧参数 | .env 配置 |
+|---|---|
+| --mfa / --no-mfa | MFA_ENABLED=1 / 0 |
+| --proofread / --no-proofread | PROOFREAD=1 / 0 |
+| --no-split | SPLIT_ENABLED=0 |
+| --skip-* | PIPELINE_SKIP_* |
+| --batch-size | TRANSLATE_BATCH_SIZE |
+| --split-context-window | TRANSLATE_CONTEXT_WINDOW |
+| --quiet | 已删除；通过 LOG_LEVEL 控制日志 |
+| --dry-run / --force | DRY_RUN / FORCE_REBUILD |
+| --model / --align-model / --device | WHISPER_MODEL / WHISPER_ALIGN_MODEL / WHISPER_DEVICE |
+| --translate-provider / --translate-model | TRANSLATE_PROVIDER / TRANSLATE_MODEL |
+| 场景检测调优 | SCENE_THRESHOLD / SCENE_MIN_INTERVAL_FRAMES |
+| 编码设置 / 额外 argv | BURN_* / BURN_EXTRA_ARGS_JSON |
 
-无 `.description` 源文件但有同名原片时也会尝试输出章节简介。无章节/原片或探测失败时，其他元数据仍正常翻译；章节译名缺失、为空、ID 重复或非法时，对受影响章节保留原标题。整次元数据翻译失败时沿用已有行为，不覆盖现有目标简介。
+旧 --split-max-chars/duration 及吸附、帧偏移、补时长/间隔等参数已删除，不提供新等价约束。
+--only-scenes / --only-glossary 保留，显式选择阶段时不受对应 pipeline skip 设置屏蔽。
+GLOSSARY_REUSE=1 可让 only-glossary 复用已有术语；默认 0 强制重建。
+内部 batch/pipeline 传递配置快照，不再拼接旧开关 argv。
+translate 日志新增逐句段/event 明细，包含轮次、编号、稳定 ID、状态和当前时间；MFA 前显示 pending。
+每条采用的 event（含缓存）完整记录原文/译文。QUIET 及其内部参数/输出分支已删除；正常 split/unsplit 为 INFO，异常状态为 WARNING，任务级错误为 ERROR。
+缓存注明 cache=hit，不伪造 LLM 轮次；不记录未采用回复或提示词，不改变缓存身份。
+应用日志改用 Loguru，带时间/时区、级别、项目和阶段；LOG_LEVEL 默认 INFO，统一控制终端及文件过滤。
+控制台固定开启 ANSI 配色（包括重定向输出），日志文件不含 ANSI，不提供颜色开关或环境变量。
+单项目的 subtitle-translation.log 位于视频目录（无 --video 时为 JSON 目录）；batch 全部集中在执行目录 batch-result.log。
+每次外部 run 覆盖，不在内部阶段重复清空，不轮转；batch worker 故障诊断也汇入中央文件，报告及 generation 协议不变。
+旧 ffmpeg-burn/mpv-burn wrapper 和 launcher 别名均转发到 burn，不再注入 --backend；
+后端统一由 BURN_BACKEND 选择，脚本名称不覆盖配置。
 
-本版本不改变字幕主输入、ASR、时间轴、batch 调度和恢复 generation；不需要重新识别或删除已有字幕缓存。重新运行现有 translate/pipeline 命令即可刷新目标简介。完整边界见[设计说明](docs/superpowers/specs/2026-11-10-original-chapter-description-design.md)。
+setup/init 不覆盖已有配置值，setup 只追加缺失键。
+模板 PROOFREAD=0、MFA_ENABLED=1、PIPELINE_SKIP_BURN=1，默认常开 MFA。
+setup/init 不覆盖其他用户已有的 MFA_ENABLED；彻底缺失该键时仍沿用兼容关闭回退，setup 会补齐缺失键。
+旧 .env 中已有的 PROOFREAD=1 不会自动变成 0；需要关闭时自行修改。
+变量缺失时的既有兼容回退不变。
+PIPELINE_SKIP_BEAUTIFY 改为 PIPELINE_SKIP_SCENE_DETECTION，其他新增键从模板补齐。
 
-## Embedding 单输入请求
+### 翻译与对轴
 
-所有 embedding provider 的建索引和查询都改为每次发送一个文本字符串，避免单输入通道拒绝多文本数组。无需修改模型或 provider 配置。`EMBEDDING_BATCH_SIZE` 已删除，旧 `.env` 中残留的同名设置不再生效，可以移除。Chroma 写入批次由程序内部处理，文本按顺序逐条调用 API。请求失败仍通过原有索引错误处理报告，单次响应必须恰好包含一个向量。
+独立 split 阶段移除，translate 一次返回整句译文及成对源/目标片段。
+所有句段参与，不按 72 字符跳过，不让模型计算 ID/坐标/时间或严格拼接等式。
+本地定位源文，源文不可定位或片段无效但整句译文有效时保留整句；完全无译文才重试/失败。
+校对只改译文，不改源文、ID、数量或时间，也不要求目标字符串严格拼接相等。
 
-相比远程批量输入，请求数增加，索引可能更慢。此调整不改变文本分块、向量顺序或索引 ID；使用相同模型和向量维度的现有数据库无需为请求形式单独迁移。
+MFA_ENABLED=1 使用 glossary/source_review -> 联合 translate -> 窗口 corpus MFA -> 场景检测 -> 可选校对。
+显式 MFA_ENABLED=0 继续使用 ASR 词轴。当前 MFA 仅验证英文源文，启用前需准备 runtime 和媒体。
+Windows x86_64 的 setup-mfa 默认原生安装；setup.ps1 -InstallMfa 使用同一入口。
+显式 --distribution NAME 时才使用已有 WSL，Linux x86_64 本机；开关不自动安装环境。
+原生资源位于 LOCALAPPDATA/subtitle-translation，不迁移或删除已有 WSL 环境。
+Windows 原生的 corpus/SQLite/特征/TextGrid 改在独立短执行目录运行，避免深层缓存目录触发 SQLite CLI 路径限制；完整项目/窗口/corpus 哈希和缓存身份不截短、不改写，Linux/WSL 布局不变。
+缓存命中仅探测环境，不创建新的执行目录；失败不发布成功缓存，旧缓存/诊断保留。本次修复不要求重译正文。
+修复 VAD 本地快照加载时误取可选 custom.py 的失败；固定模型仅加载 YAML/权重，COPY 方式不要求符号链接权限。
+完整本地快照优先复用，缺项才下载。setup 与对齐工具设置 PYTHONNOUSERSITE=1，清除继承的 PYTHONPATH/PYTHONHOME，不修改父进程或用户全局环境。
+旧前置全文 segment、逐窗口独立 MFA 和 partial 重读入口已移除。
 
-## 下载 cookies 与 yt-dlp 缓存
+场景检测只生成 sidecar，不改变词/句段/事件时间；不再美化或缩放。
+.beautified.json 仅保留命名兼容。派生输出只使用 segments[].words[]，
+根级旧 word_segments 会清理；原始 JSON 不改。粗时间失败重叠输出协调成完整双语字幕。
+ASS/SRT 时间序列化修复小数进位，避免 ASS 出现 .100，不改变内部对齐时间。
 
-- download、pipeline 和 batch 的 `cookies.txt` 改为从命令启动时的执行目录读取，不再从 `.code` / `--project-dir` 配置根读取，也不在缺失时回退。升级后应在实际执行目录提供 cookies；`.env`、provider 和 template 的配置位置不变。
-- 获取标题与下载/元数据刷新都携带同一 cookies。每个 yt-dlp 业务调用前，先用同一 executable 运行 `--rm-cache-dir`；清理失败则停止该任务的下载阶段，并保留失败退出码及诊断。
-- yt-dlp 缓存通常跨项目共享；清理影响其所选缓存目录，不删除项目媒体、ASR sidecar、glossary 或字幕。batch 并发容量和调度策略不变。
-- 设计说明见 [下载 cookies 与缓存清理](docs/superpowers/specs/2026-09-18-download-cookies-cache-design.md)。
+### 缓存和恢复
 
-v2.0.0 将项目从“脚本之间互相调用”迁移为“Python package 统一编排”。这是一项 breaking change，但保留了 PowerShell/bash 薄包装器，已有快捷方式可以逐步迁移。
+- 旧固定事件/独立断句译文不能冒充联合协议完成，首次切换可能重译。
+- 实际文本、窗口和声学依赖不变时可复用原生 corpus，重新投影事件。
+- 场景设置变化只刷新 sidecar，不失效有效译文或字幕时间。
+- 旧被吸附/补显示留白的定时缓存使用新策略从原始 ASR 或 MFA 结果重建。
+- 删除旧未使用的 Python helper 不保留其导入接口；正式 CLI 和原始数据格式继续支持。
+- 安装资源/profile/解析器变化可能令旧声学缓存 miss，不删除旧文件，不伪造成功。
+- 原 batch sidecar、锁、generation、candidate、取消与原子 publish 协议不变。
 
-## 新入口
+不要为迁移批量删除媒体、识别 JSON 或术语库。
+旧 proofread_text 仅兼容读取，不能作为源文覆盖项。
+本地配置、runtime、模型、真实媒体和项目产物禁止提交。
 
-```text
-subtitle-translation pipeline URL
-subtitle-translation batch URL1 URL2
-subtitle-translation translate input.json
-```
+## 2.0.2 保留行为
 
-安装后也可以直接调用项目解释器：
+同名 <base>.original.mkv 的章节通过 ffprobe JSON 提取，章节标题与元数据同回合翻译，
+以原片时间写入目标 description。原标题逐项兜底，无章节或探测失败不阻断其他简介翻译，
+不从编辑版或其他项目回退，不修改媒体/ASR/batch generation。
 
-```powershell
-.\.venv\Scripts\python.exe -m subtitle_translation pipeline URL
-```
+embedding 建索引/查询统一逐文本字符串输入，EMBEDDING_BATCH_SIZE 不再生效。
+完整 glossary 不能由检索片段替代，证据及向量按项目/generation 隔离。
 
-```bash
-./.venv/bin/python -m subtitle_translation pipeline URL
-```
+download/pipeline/batch 只从执行目录读取 cookies.txt；配置根不改变输出根。
+每个 yt-dlp 业务操作前清理其缓存，失败则停止该下载阶段。
+安装 CLI 使用项目 .venv 与转发 shim，不要求手工 PATH 或全局 Python；
+Windows 需要 PowerShell 7。
 
-console entry point 和 `python -m subtitle_translation` 使用同一份实现，退出码约定为：`0` 成功，`1` 任务失败，`2` 参数/配置错误，`130` 用户中断。
+## 文档入口
 
-新版 `scripts/setup.ps1` / `scripts/setup.sh` 会安装全局 `subtitle-translation` shim。shim 只转发到当前仓库 `.venv` 并自动附带 `--project-dir`，不会复制第二套 Python/WhisperX 环境，也不要求用户手动设置 PATH。切换仓库位置后重新运行 setup 即可刷新 shim。
-
-`--project-dir` 从输出目录语义中拆出：它只用于读取 `.env`、provider 和 template。download/pipeline 的新项目默认写入执行命令时的当前目录，batch 默认报告也写入当前目录。cookies 也从执行目录读取，详见上方下载迁移说明。
-
-batch 与 pipeline 现在共享 postprocess skip 语义：`PIPELINE_SKIP_BEAUTIFY`、`PIPELINE_SKIP_KNOWLEDGE`、`PIPELINE_SKIP_TRANSLATE` 和 `PIPELINE_SKIP_BURN` 均生效。batch 复用已有 glossary；skip translate 时从每个项目目录读取约定命名的双语 ASS。URL batch 无法映射 per-task 现有视频/JSON，因此配置 `PIPELINE_SKIP_DOWNLOAD=1` 或 `PIPELINE_SKIP_WHISPER=1` 会明确返回配置错误。
-
-两个入口都只接受 `--skip-burn`，已移除 `--burn`。示例配置为 `PIPELINE_SKIP_BURN=1`，留出人工校对时间；需要硬压时将其改为 `0`。setup 保留已有 `.env` 值，升级时请核对本地设置。
-
-非空 `*_MODEL` 覆盖所选 provider 的 `default_model`；embedding 模型留空时也遵循此规则。glossary / proofread 的 provider 和 model 都留空时复用翻译配置。更换 embedding 模型后应使用独立的向量库目录，避免复用旧模型的向量空间。
-
-## 旧入口
-
-兼容 wrapper 已统一移入 `scripts/`。其中的 pipeline、batch、download、prepare-video、whisper、translate、merge-ass 和 burn 脚本都只定位项目 `.venv` 后执行 `python -m subtitle_translation ...`，不再解析 `OUTPUT_*` marker，也不再互相调用。
-
-`py_launcher.ps1/.sh` 的旧 target 仍可用：
-
-```powershell
-.\scripts\py_launcher.ps1 translate_srt video.json
-.\scripts\py_launcher.ps1 merge_ass video.zh.ass video.en.ass
-.\scripts\py_launcher.ps1 batch URL1 URL2
-```
-
-推荐新代码直接使用 `subtitle-translation translate`、`subtitle-translation merge-ass` 和 `subtitle-translation batch`。
-
-## 代码迁移
-
-旧的 PowerShell/bash stage 调用：
-
-```powershell
-$download = & .\download.ps1 URL
-$render = ($download | Select-String '^OUTPUT_RENDER_VIDEO=').ToString().Substring(21)
-$prepare = & .\prepare-video.ps1 $render
-```
-
-迁移后可直接让 Python 返回结构化结果；CLI 仅在兼容脚本中打印 `OUTPUT_*`：
-
-```python
-from pathlib import Path
-from subtitle_translation.config import ProjectConfig
-from subtitle_translation.stages import download_video, prepare_video
-
-config = ProjectConfig.load(Path.cwd())
-download_result = download_video(url, config)
-render_path = Path(download_result.outputs["render_video"])
-prepare_result = prepare_video(render_path, config)
-edit_path = Path(prepare_result.outputs["edit_video"])
-```
-
-batch runner 使用相同 stage functions，不再依赖平台 shell、PowerShell、marker 或共享 launcher。`core/batch_runtime.py` 只负责把 `StageResult` 转为 scheduler 的阶段结果；`core/subtitle_translation/process.py` 统一管理 argv、工具环境和活动子进程。
-
-## 仓库布局迁移
-
-源码布局已集中整理：
-
-```text
-core/          Python package 与核心模块
-scripts/       PowerShell/bash 安装和兼容脚本
-```
-
-旧自动化若直接引用根目录脚本，需要为路径加上 `scripts/`。Python import 和 `subtitle-translation` CLI 名称保持不变。
-
-batch 的 CPU/IO capacity 为 `max(1, (os.cpu_count() or 1) // 4)`，prepare 与 burn 共用固定 4 路 NVENC。
-
-batch 的第一次 `Ctrl+C` 停止接纳新任务并停止推进新的阶段，正在运行的外部命令允许自然结束；第二次 `Ctrl+C` 终止活动进程树并以 `130` 退出。
-
-## 行为保持
-
-- WhisperX `.json` 仍是唯一字幕输入，阶段顺序与 `.beautified.json` 缓存语义不变。
-- glossary 仍是翻译、校对的全局硬规则，网页证据仍使用独立 sidecar。
-- 整句翻译、源语言 split、word 首尾对齐、split event 校对的顺序不变。
-- batch 的 worker、generation、lock、ASR cache、CPU/IO 与 NVENC 限制不变。
-- `cookies.txt` 的读取位置已改为执行目录，不受 `--project-dir` 影响；详见上方下载迁移说明。
-
-## 迁移检查
-
-1. 运行 `scripts/setup.ps1` 或 `scripts/setup.sh`，让 uv 重建项目 `.venv` 并安装 package。
-2. 把自动化中的全局 `python` / `python3` 替换为项目 CLI 或 `.venv` 解释器。
-3. 删除自定义的 `OUTPUT_*` 解析和 stage 间 shell 串联；Python API 返回 `StageResult.outputs`。
-4. 不再传递 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，并发由 scheduler 自动检测。
-5. 用 `python -m unittest discover -s tests` 验证安装、CLI 和 scheduler。
-
-真实视频、ffmpeg、WhisperX、LLM、网络和 CUDA 仍需人工验证；测试 smoke 不代替这些环境测试。
+当前说明见 [README](README.md)、[架构与发布范围](docs/v2.1-architecture.md)、
+[CLI/环境配置](docs/cli-and-env.md)、[MFA 安装](docs/mfa-installation-preferences.md)。
+被替代的阶段方案见 [历史设计归档](docs/archive/v2.1-design-history/README.md)，不作为当前功能保证。

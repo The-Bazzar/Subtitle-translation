@@ -1,0 +1,4 @@
+include .gitignore AGENTS.md MIGRATION.md
+recursive-include docs *.md
+recursive-include scripts *.ps1 *.sh
+recursive-include tests *.py

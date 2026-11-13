@@ -1049,6 +1049,10 @@ class AcquisitionScheduler:
         cancel_event: threading.Event | None = None,
         commit_state: _AlignmentCommitState | None = None,
     ):
+        from subtitle_translation.project_logging import log
+
+        operation_name = getattr(operation, "__name__", type(operation).__name__)
+        log("INFO", f"ASR worker: {operation_name}", stage="whisper")
         call_task = asyncio.create_task(asyncio.to_thread(operation, *args))
         self._worker_calls.add(call_task)
         call_task.add_done_callback(self._worker_calls.discard)
@@ -1346,6 +1350,14 @@ class AcquisitionScheduler:
         )
         temporary_path: Path | None = None
         try:
+            from subtitle_translation.project_logging import active_batch_log_path, log
+
+            batch_log = active_batch_log_path()
+            if batch_log is not None:
+                log("ERROR", f"Worker failed: task={task_index} stage={stage}", stage=stage)
+                log("ERROR", content, stage=stage)
+                self.failure_log_path = batch_log
+                return
             self.failure_log_dir.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 mode="w",

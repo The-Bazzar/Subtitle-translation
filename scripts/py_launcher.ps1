@@ -33,7 +33,5 @@ if (-not $Targets.ContainsKey($Target)) {
     exit 2
 }
 $Command = $Targets[$Target]
-$Extra = @()
-if ($Target -eq "mpv-burn") { $Extra = @("--backend", "mpv") }
-& $PythonExe -m subtitle_translation --project-dir $ProjectRoot $Command @Extra @Arguments
+& $PythonExe -m subtitle_translation --project-dir $ProjectRoot $Command @Arguments
 exit $LASTEXITCODE

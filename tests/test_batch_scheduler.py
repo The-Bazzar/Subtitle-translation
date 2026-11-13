@@ -8,11 +8,9 @@ import multiprocessing
 import os
 import pathlib
 import runpy
-import subprocess
 import sys
 import tempfile
 import threading
-import time
 import types
 import unittest
 import uuid
@@ -25,8 +23,6 @@ from batch_runtime import (
     batch_stage_plan,
     build_parser,
     build_stage_environment,
-    create_platform_postprocess_runner,
-    create_platform_runners,
     resolve_batch_burn,
     run_acquisition,
     validate_batch_stage_environment,
@@ -95,82 +91,6 @@ def worker_output_crash_target(
     print("unique-worker-stdout", flush=True)
     os.write(2, b"unique-worker-stderr\n")
     os._exit(37)
-
-
-@unittest.skip("legacy subprocess runner removed by the Python CLI rewrite")
-class StageCommandCancellationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cancellation_kills_process_tree_before_releasing_scheduler_slot(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            work_dir = pathlib.Path(temp_dir)
-            ready_path = work_dir / "ready"
-            finished_path = work_dir / "finished"
-            child_code = (
-                "import pathlib,time;"
-                "time.sleep(0.25);"
-                f"pathlib.Path({str(finished_path)!r}).write_text('finished')"
-            )
-            parent_code = (
-                "import pathlib,subprocess,sys,time;"
-                f"subprocess.Popen([sys.executable, '-c', {child_code!r}]);"
-                f"pathlib.Path({str(ready_path)!r}).write_text('ready');"
-                "time.sleep(0.6)"
-            )
-
-            async def download(_url):
-                return await _run_stage_command(
-                    [sys.executable, "-c", parent_code],
-                    cwd=work_dir,
-                    env=os.environ.copy(),
-                    stage="download",
-                )
-
-            async def unused_runner(value):
-                return value
-
-            scheduler = AcquisitionScheduler(
-                urls=["cancel-me"],
-                limits=ResourceLimits(cpu_io=1),
-                runners=AcquisitionRunners(download, unused_runner, unused_runner),
-            )
-            run_task = asyncio.create_task(scheduler.run())
-            for _ in range(100):
-                if ready_path.exists():
-                    break
-                await asyncio.sleep(0.01)
-            self.assertTrue(ready_path.exists(), "child process did not start")
-
-            run_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await run_task
-            await asyncio.sleep(0.8)
-
-            self.assertFalse(finished_path.exists())
-            self.assertIs(scheduler.tasks[0].state, TaskState.CANCELED)
-            self.assertEqual(scheduler._cpu_io_slots._value, 1)
-
-    def test_process_group_options_cover_windows_and_posix(self):
-        from batch_runtime import _process_group_kwargs
-
-        self.assertEqual(_process_group_kwargs("posix"), {"start_new_session": True})
-        self.assertEqual(
-            _process_group_kwargs("nt"),
-            {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)},
-        )
-
-    async def test_windows_tree_termination_falls_back_when_taskkill_fails(self):
-        from batch_runtime import _terminate_process_tree
-
-        process = mock.Mock(pid=1234, returncode=None)
-        process.wait = mock.AsyncMock(return_value=1)
-        terminator = mock.Mock(returncode=1)
-        terminator.wait = mock.AsyncMock(return_value=1)
-        with mock.patch(
-            "batch_runtime.asyncio.create_subprocess_exec",
-            new=mock.AsyncMock(return_value=terminator),
-        ):
-            await _terminate_process_tree(process, platform="nt")
-
-        process.kill.assert_called_once_with()
 
 
 class ResourceLimitsTests(unittest.TestCase):
@@ -766,7 +686,8 @@ class BatchAsrExecutionTests(unittest.TestCase):
                 seen_configs.append(config)
                 return FakeAsrController(config, worker_calls)
 
-            args = build_parser().parse_args(["--skip-burn", "url"])
+            args = build_parser().parse_args(["url"])
+            args.burn = False
             with mock.patch.dict(
                 os.environ,
                 {
@@ -3035,23 +2956,20 @@ class BatchCliTests(unittest.TestCase):
 
     def test_existing_batch_options_remain_representable(self):
         args = build_parser().parse_args([
-            "--skip-burn",
             "--report", "report.txt",
-            "--dry-run",
-            "--translate-provider", "deepseek",
-            "--translate-model", "deepseek-chat",
             "url-1",
             "url-2",
         ])
 
-        self.assertFalse(args.burn)
+        self.assertIsNone(args.burn)
         self.assertEqual(args.report, "report.txt")
-        self.assertTrue(args.dry_run)
-        self.assertEqual(args.translate_provider, "deepseek")
-        self.assertEqual(args.translate_model, "deepseek-chat")
+        self.assertFalse(args.dry_run)
+        self.assertIsNone(args.translate_provider)
+        self.assertIsNone(args.translate_model)
         self.assertEqual(args.urls, ["url-1", "url-2"])
 
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch("batch_runtime.load_project_environment", return_value={
+            "PIPELINE_SKIP_BURN": "1", "TRANSLATE_PROVIDER": "deepseek", "TRANSLATE_MODEL": "deepseek-chat"}):
             stage_environment = build_stage_environment(args)
         self.assertEqual(stage_environment["BURN"], "0")
         self.assertEqual(stage_environment["PIPELINE_SKIP_BURN"], "1")
@@ -3095,7 +3013,6 @@ class BatchCliTests(unittest.TestCase):
                     build_parser().parse_args([option, "url"])
 
 
-@unittest.skip("legacy batch.py module alias replaced by the package CLI")
 class BatchWrapperTests(unittest.TestCase):
     def test_import_batch_returns_runtime_module_identity(self):
         with mock.patch.dict(sys.modules, {}, clear=False):
@@ -3104,40 +3021,11 @@ class BatchWrapperTests(unittest.TestCase):
 
             self.assertIs(compatibility_module, batch)
 
-    def test_from_batch_import_keeps_legacy_runtime_symbols(self):
-        with mock.patch.dict(sys.modules, {}, clear=False):
-            sys.modules.pop("batch", None)
-            compatibility_module = importlib.import_module("batch")
-            namespace = {}
-            try:
-                exec(
-                    "from batch import _run_stage_command, build_parser",
-                    namespace,
-                )
-            except ImportError as exc:
-                self.fail(f"legacy batch import failed: {exc}")
 
-            self.assertIs(compatibility_module, batch)
-            self.assertIs(namespace["_run_stage_command"], batch._run_stage_command)
-            self.assertIs(namespace["build_parser"], batch.build_parser)
-
-    def test_patch_batch_symbol_updates_runtime_module_object(self):
-        replacement = mock.AsyncMock()
-        with mock.patch.dict(sys.modules, {}, clear=False):
-            sys.modules.pop("batch", None)
-            compatibility_module = importlib.import_module("batch")
-            with mock.patch(
-                "batch._run_stage_command",
-                replacement,
-                create=True,
-            ):
-                self.assertIs(compatibility_module, batch)
-                self.assertIs(batch._run_stage_command, replacement)
-
-    def test_wrapper_only_imports_runtime_main_and_keeps_entrypoint_guard(self):
+    def test_wrapper_only_aliases_runtime_and_keeps_entrypoint_guard(self):
         wrapper_path = ROOT / "core" / "batch.py"
         tree = ast.parse(wrapper_path.read_text(encoding="utf-8"), filename="batch.py")
-        imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)]
+        imports = [node for node in tree.body if isinstance(node, ast.Import)]
         definitions = [
             node
             for node in tree.body
@@ -3146,8 +3034,7 @@ class BatchWrapperTests(unittest.TestCase):
 
         self.assertEqual(definitions, [])
         self.assertEqual(len(imports), 1)
-        self.assertEqual(imports[0].module, "batch_runtime")
-        self.assertEqual([alias.name for alias in imports[0].names], ["main"])
+        self.assertEqual([alias.name for alias in imports[0].names], ["batch_runtime"])
         self.assertTrue(any(isinstance(node, ast.If) for node in tree.body))
 
     def test_wrapper_delegates_runtime_return_code_to_system_exit(self):
@@ -3204,7 +3091,6 @@ class BatchWrapperTests(unittest.TestCase):
         fake_runtime.main.assert_not_called()
 
 
-@unittest.skip("legacy script/marker runner tests replaced by direct Python stages")
 class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
     def test_project_env_uses_process_values_before_dotenv(self):
         from batch_runtime import load_project_environment
@@ -3223,224 +3109,6 @@ class BatchEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(env["FFMPEG_PATH_WIN"], "C:\\Dot Env\\ffmpeg.exe")
         self.assertEqual(env["FFMPEG_PATH_LINUX"], "/process env/ffmpeg")
-
-    def test_explicit_cli_values_override_process_and_dotenv(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_dir = pathlib.Path(temp_dir)
-            (script_dir / ".env").write_text(
-                "TRANSLATE_PROVIDER=dotenv\nTRANSLATE_MODEL=dotenv-model\n",
-                encoding="utf-8",
-            )
-            args = build_parser().parse_args([
-                "--translate-provider", "cli",
-                "--translate-model", "cli-model",
-                "url",
-            ])
-            env = build_stage_environment(
-                args,
-                script_dir=script_dir,
-                environ={
-                    "TRANSLATE_PROVIDER": "process",
-                    "TRANSLATE_MODEL": "process-model",
-                },
-            )
-
-        self.assertEqual(env["TRANSLATE_PROVIDER"], "cli")
-        self.assertEqual(env["TRANSLATE_MODEL"], "cli-model")
-
-    async def test_dotenv_ffmpeg_paths_with_spaces_are_exact_argv_zero(self):
-        from batch_runtime import load_project_environment
-
-        configured_paths = {
-            "nt": ("FFMPEG_PATH_WIN", r"C:\Program Files\FFmpeg Build\ffmpeg.exe"),
-            "posix": ("FFMPEG_PATH_LINUX", "/opt/FFmpeg Build/bin/ffmpeg"),
-        }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_dir = pathlib.Path(temp_dir)
-            (script_dir / ".env").write_text(
-                "\n".join(f"{key}={value}" for key, value in configured_paths.values()) + "\n",
-                encoding="utf-8",
-            )
-            env = load_project_environment(script_dir, environ={})
-            for platform, (_key, expected_path) in configured_paths.items():
-                process = mock.Mock(returncode=0)
-                process.stdout = asyncio.StreamReader()
-                process.stderr = asyncio.StreamReader()
-                process.stdout.feed_eof()
-                process.stderr.feed_eof()
-                process.wait = mock.AsyncMock(return_value=0)
-
-                with self.subTest(platform=platform):
-                    with mock.patch(
-                        "batch_runtime.asyncio.create_subprocess_exec",
-                        new=mock.AsyncMock(return_value=process),
-                    ) as create_process:
-                        runners = create_platform_runners(
-                            script_dir,
-                            env,
-                            platform=platform,
-                        )
-                        await runners.extract_audio(str(script_dir / "video.mkv"))
-                    self.assertEqual(create_process.await_args.args[0], expected_path)
-
-    async def test_ffmpeg_defaults_when_project_env_has_no_override(self):
-        commands = []
-
-        async def fake_stage_command(command, **_kwargs):
-            commands.append(command)
-            pathlib.Path(command[10]).write_bytes(b"wav")
-            return ""
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_dir = pathlib.Path(temp_dir)
-            with mock.patch("batch_runtime._run_stage_command", side_effect=fake_stage_command):
-                runners = create_platform_runners(
-                    script_dir,
-                    {},
-                    platform="posix",
-                )
-                await runners.extract_audio(str(script_dir / "video.mkv"))
-
-        self.assertEqual(commands[0][0], "ffmpeg")
-
-    async def test_empty_dotenv_ffmpeg_value_uses_default(self):
-        from batch_runtime import load_project_environment
-
-        commands = []
-
-        async def fake_stage_command(command, **_kwargs):
-            commands.append(command)
-            pathlib.Path(command[10]).write_bytes(b"wav")
-            return ""
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_dir = pathlib.Path(temp_dir)
-            (script_dir / ".env").write_text(
-                "FFMPEG_PATH_LINUX=\n",
-                encoding="utf-8",
-            )
-            env = load_project_environment(script_dir, environ={})
-            with mock.patch("batch_runtime._run_stage_command", side_effect=fake_stage_command):
-                runners = create_platform_runners(
-                    script_dir,
-                    env,
-                    platform="posix",
-                )
-                await runners.extract_audio(str(script_dir / "video.mkv"))
-
-        self.assertEqual(commands[0][0], "ffmpeg")
-
-    async def test_postprocess_runner_uses_shared_launcher_for_all_three_stages(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_dir = pathlib.Path(temp_dir)
-            edit_video = script_dir / "video.mkv"
-            json_path = script_dir / "video.json"
-            edit_video.write_bytes(b"edit")
-            json_path.write_text('{"language":"en","segments":[]}', encoding="utf-8")
-            task = BatchTask(
-                index=1,
-                url="url",
-                edit_video_path=edit_video,
-                json_path=json_path,
-                beautified_candidate_path=(
-                    script_dir / ".video.beautified.json.generation.candidate.json"
-                ),
-                detected_language="ja",
-            )
-
-            for platform, expected_prefix, launcher_name in (
-                (
-                    "nt",
-                    ["pwsh", "-NoProfile", "-File"],
-                    "py_launcher.ps1",
-                ),
-                ("posix", ["bash"], "py_launcher.sh"),
-            ):
-                commands = []
-
-                async def fake_stage_command(command, **kwargs):
-                    commands.append((command, kwargs))
-                    if kwargs["stage"] == "beautify":
-                        task.beautified_candidate_path.write_text(
-                            "{}",
-                            encoding="utf-8",
-                        )
-                    if kwargs["stage"] == "translate":
-                        script_dir.joinpath("video.en-zh.ass").write_text(
-                            "ass",
-                            encoding="utf-8",
-                        )
-                    return ""
-
-                with self.subTest(platform=platform):
-                    with mock.patch(
-                        "batch_runtime._run_stage_command",
-                        side_effect=fake_stage_command,
-                    ):
-                        with mock.patch("batch_runtime.shutil.which", return_value="pwsh"):
-                            runner = create_platform_postprocess_runner(
-                                script_dir,
-                                {
-                                    "TRANSLATE_PROVIDER": "test",
-                                    "SOURCE_LANG": "English",
-                                },
-                                platform=platform,
-                            )
-                            await runner(task)
-
-                launcher = str(script_dir / launcher_name)
-                beautified = str(task.beautified_candidate_path)
-                self.assertEqual(
-                    [entry[1]["stage"] for entry in commands],
-                    ["beautify", "glossary", "translate"],
-                )
-                self.assertEqual(
-                    commands[0][0],
-                    expected_prefix
-                    + [
-                        launcher,
-                        "translate_srt",
-                        str(json_path),
-                        "--video",
-                        str(edit_video),
-                        "--only-beautify",
-                        "--beautified-json",
-                        beautified,
-                    ],
-                )
-                self.assertEqual(
-                    commands[1][0],
-                    expected_prefix
-                    + [
-                        launcher,
-                        "translate_srt",
-                        str(json_path),
-                        "--video",
-                        str(edit_video),
-                        "--only-glossary",
-                        "--skip-beautify",
-                        "--beautified-json",
-                        beautified,
-                    ],
-                )
-                self.assertEqual(
-                    commands[2][0],
-                    expected_prefix
-                    + [
-                        launcher,
-                        "translate_srt",
-                        str(json_path),
-                        "--video",
-                        str(edit_video),
-                        "--skip-beautify",
-                        "--skip-knowledge",
-                        "--beautified-json",
-                        beautified,
-                    ],
-                )
-                self.assertTrue(
-                    all(entry[1]["env"]["TRANSLATE_PROVIDER"] == "test" for entry in commands)
-                )
 
 
 class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -3668,72 +3336,6 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(tasks[0].state, TaskState.CANCELED)
         self.assertEqual(control.interrupt_count, 1)
 
-    @unittest.skip("legacy subprocess runner removed by the Python CLI rewrite")
-    async def test_second_interrupt_terminates_active_process_tree(self):
-        control = batch_scheduler.BatchControl()
-        process = mock.Mock(pid=4321, returncode=None)
-        process.stdout = asyncio.StreamReader()
-        process.stderr = asyncio.StreamReader()
-        process.stdout.feed_eof()
-        process.stderr.feed_eof()
-        process_finished = asyncio.Event()
-
-        async def wait():
-            await process_finished.wait()
-            return process.returncode
-
-        process.wait = wait
-
-        async def terminate(active_process, platform=None):
-            self.assertIs(active_process, process)
-            active_process.returncode = -9
-            process_finished.set()
-
-        with mock.patch(
-            "batch_runtime.asyncio.create_subprocess_exec",
-            new=mock.AsyncMock(return_value=process),
-        ), mock.patch("batch_runtime._terminate_process_tree", side_effect=terminate) as killer:
-            command_task = asyncio.create_task(
-                batch._run_stage_command(
-                    ["fake-command"],
-                    cwd=self.root,
-                    env={},
-                    stage="download",
-                    task_index=1,
-                    control=control,
-                )
-            )
-            await asyncio.sleep(0)
-            control.request_interrupt()
-            await asyncio.sleep(0)
-            killer.assert_not_awaited()
-
-            control.request_interrupt()
-            with self.assertRaises(batch_scheduler.StageAdvancementStopped):
-                await command_task
-
-        killer.assert_awaited_once()
-
-    @unittest.skip("legacy subprocess runner removed by the Python CLI rewrite")
-    async def test_interrupt_before_command_reservation_never_spawns(self):
-        control = batch_scheduler.BatchControl()
-        control.request_interrupt()
-        with mock.patch(
-            "batch_runtime.asyncio.create_subprocess_exec",
-            new=mock.AsyncMock(),
-        ) as spawn:
-            with self.assertRaises(batch_scheduler.StageAdvancementStopped):
-                await batch._run_stage_command(
-                    ["fake-command"],
-                    cwd=self.root,
-                    env={},
-                    stage="prepare",
-                    task_index=1,
-                    control=control,
-                )
-
-        spawn.assert_not_awaited()
-        self.assertEqual(control.active_command_count, 0)
 
     async def test_reentrant_interrupt_before_reservation_insert_wins_gate(self):
         control = batch_scheduler.BatchControl()
@@ -3750,82 +3352,6 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(control.active_command_count, 0)
 
-    @unittest.skip("legacy subprocess runner removed by the Python CLI rewrite")
-    async def test_interrupt_after_command_reservation_drains_one_active_spawn(self):
-        control = batch_scheduler.BatchControl()
-        reservation_made = asyncio.Event()
-        allow_spawn = asyncio.Event()
-        finish_process = asyncio.Event()
-        process = mock.Mock(pid=8765, returncode=None)
-        process.stdout = asyncio.StreamReader()
-        process.stderr = asyncio.StreamReader()
-        process.stdout.feed_eof()
-        process.stderr.feed_eof()
-
-        async def wait():
-            await finish_process.wait()
-            process.returncode = 0
-            return 0
-
-        async def spawn(*_args, **_kwargs):
-            await allow_spawn.wait()
-            return process
-
-        process.wait = wait
-        real_reserve = control.reserve_command
-
-        def observe_reservation(stage):
-            reservation = real_reserve(stage)
-            reservation_made.set()
-            return reservation
-
-        with mock.patch.object(
-            control,
-            "reserve_command",
-            side_effect=observe_reservation,
-        ), mock.patch(
-            "batch_runtime.asyncio.create_subprocess_exec",
-            side_effect=spawn,
-        ) as spawn_call:
-            command_task = asyncio.create_task(
-                batch._run_stage_command(
-                    ["fake-command"],
-                    cwd=self.root,
-                    env={},
-                    stage="prepare",
-                    task_index=1,
-                    control=control,
-                )
-            )
-            await reservation_made.wait()
-            self.assertEqual(control.active_command_count, 1)
-            control.request_interrupt()
-            allow_spawn.set()
-            await asyncio.sleep(0)
-            finish_process.set()
-            await command_task
-
-        spawn_call.assert_awaited_once()
-        self.assertEqual(control.active_command_count, 0)
-
-    @unittest.skip("legacy subprocess runner removed by the Python CLI rewrite")
-    async def test_command_reservation_is_released_when_spawn_fails(self):
-        control = batch_scheduler.BatchControl()
-        with mock.patch(
-            "batch_runtime.asyncio.create_subprocess_exec",
-            new=mock.AsyncMock(side_effect=OSError("fake spawn failure")),
-        ):
-            with self.assertRaisesRegex(OSError, "fake spawn failure"):
-                await batch._run_stage_command(
-                    ["fake-command"],
-                    cwd=self.root,
-                    env={},
-                    stage="prepare",
-                    task_index=1,
-                    control=control,
-                )
-
-        self.assertEqual(control.active_command_count, 0)
 
     async def test_worker_native_stdout_stderr_are_in_failure_log(self):
         media = {"crash": self.create_media("native-output-crash")}
@@ -3912,191 +3438,6 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(scheduler.worker_released.is_set())
         self.assertFalse(controllers[0].is_alive)
 
-    @unittest.skip("legacy terminal queue removed; Python stages inherit live stdout/stderr")
-    async def test_terminal_queue_preserves_event_order_and_partial_eof_line(self):
-        output = io.StringIO()
-        terminal = batch.TerminalEventQueue(stdout=output, stderr=output)
-        printer = asyncio.create_task(terminal.run_printer())
-        await terminal.publish(batch.LogEvent(2, "prepare", "stdout", "first"))
-        await terminal.publish(batch.LogEvent(1, "download", "stderr", "second"))
-
-        reader = asyncio.StreamReader()
-        reader.feed_data(b"tail without newline")
-        reader.feed_eof()
-        await batch._read_process_stream(
-            reader,
-            terminal=terminal,
-            task_index=3,
-            stage="translate",
-            stream_name="stdout",
-        )
-        await terminal.close()
-        await printer
-
-        self.assertEqual(
-            output.getvalue().splitlines(),
-            [
-                "[02][prepare] first",
-                "[01][download] second",
-                "[03][translate] tail without newline",
-            ],
-        )
-
-    @unittest.skip("legacy terminal queue removed; Python stages inherit live stdout/stderr")
-    async def test_stream_reader_handles_crlf_progress_and_long_continuations(self):
-        output = io.StringIO()
-        terminal = batch.TerminalEventQueue(stdout=output, stderr=output)
-        printer = asyncio.create_task(terminal.run_printer())
-        long_line = b"x" * (70 * 1024)
-        reader = asyncio.StreamReader()
-        reader.feed_data(b"progress one\rprogress two\r\n" + long_line)
-        reader.feed_eof()
-
-        await batch._read_process_stream(
-            reader,
-            terminal=terminal,
-            task_index=4,
-            stage="download",
-            stream_name="stdout",
-        )
-        await terminal.close()
-        await printer
-
-        self.assertEqual(
-            terminal.stage_output(4, "download", "stdout"),
-            "progress one\nprogress two\n" + long_line.decode("ascii"),
-        )
-        prefixed_lines = output.getvalue().splitlines()
-        self.assertEqual(prefixed_lines[:2], [
-            "[04][download] progress one",
-            "[04][download] progress two",
-        ])
-        self.assertGreaterEqual(len(prefixed_lines), 4)
-        self.assertTrue(
-            all(line.startswith("[04][download] ") for line in prefixed_lines)
-        )
-
-    @unittest.skip("legacy terminal queue removed; Python stages inherit live stdout/stderr")
-    async def test_one_megabyte_no_newline_child_drains_without_transport_error(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            terminal = batch.TerminalEventQueue(
-                stdout=io.StringIO(),
-                stderr=io.StringIO(),
-            )
-            printer = asyncio.create_task(terminal.run_printer())
-            await asyncio.wait_for(
-                batch._run_stage_command(
-                    [
-                        sys.executable,
-                        "-c",
-                        "import sys;sys.stdout.write('z'*(1024*1024));sys.stdout.flush()",
-                    ],
-                    cwd=pathlib.Path(temp_dir),
-                    env=os.environ.copy(),
-                    stage="download",
-                    task_index=1,
-                    terminal=terminal,
-                ),
-                10.0,
-            )
-            await terminal.close()
-            await printer
-
-        captured = terminal.stage_output(1, "download", "stdout")
-        self.assertIn("output truncated", captured)
-        self.assertTrue(captured.endswith("z" * 1024))
-
-    @unittest.skip("legacy terminal queue removed; Python stages inherit live stdout/stderr")
-    async def test_terminal_queue_backpressure_is_bounded_and_close_has_sentinel_slot(self):
-        asyncio.get_running_loop().slow_callback_duration = 1.0
-        output = io.StringIO()
-        terminal = batch.TerminalEventQueue(stdout=output, stderr=output)
-        self.assertGreater(terminal._queue.maxsize, 0)
-        event_capacity = terminal._queue.maxsize - 1
-        publishers = [
-            asyncio.create_task(
-                terminal.publish(batch.LogEvent(1, "prepare", "stdout", str(index)))
-            )
-            for index in range(event_capacity * 2)
-        ]
-        await asyncio.sleep(0)
-
-        self.assertLessEqual(terminal._queue.qsize(), event_capacity)
-        self.assertTrue(any(not publisher.done() for publisher in publishers))
-        await asyncio.wait_for(terminal.close(), 1.0)
-        printer = asyncio.create_task(terminal.run_printer())
-        await asyncio.gather(*publishers)
-        await printer
-
-        self.assertLessEqual(terminal._queue.qsize(), terminal._queue.maxsize)
-
-    @unittest.skip("legacy terminal queue removed; Python stages inherit live stdout/stderr")
-    async def test_terminal_raw_tail_is_bounded_and_marks_truncation(self):
-        terminal = batch.TerminalEventQueue(stdout=io.StringIO(), stderr=io.StringIO())
-        printer = asyncio.create_task(terminal.run_printer())
-        for index in range(512):
-            await terminal.publish(
-                batch.LogEvent(7, "translate", "stderr", f"{index:04d}:" + "e" * 1024)
-            )
-        await terminal.close()
-        await printer
-
-        captured = terminal.task_output(7)[1]
-        self.assertIn("output truncated", captured)
-        self.assertLess(len(captured.encode("utf-8")), 300 * 1024)
-        self.assertIn("0511:", captured)
-
-    @unittest.skip("legacy terminal queue removed; Python stages inherit live stdout/stderr")
-    async def test_slow_printer_backpressure_still_drains_child_and_bounds_tail(self):
-        class SlowOutput(io.StringIO):
-            def write(self, value):
-                time.sleep(0.0001)
-                return super().write(value)
-
-        terminal = batch.TerminalEventQueue(
-            stdout=SlowOutput(),
-            stderr=io.StringIO(),
-        )
-        printer = asyncio.create_task(terminal.run_printer())
-        with tempfile.TemporaryDirectory() as temp_dir:
-            await asyncio.wait_for(
-                batch._run_stage_command(
-                    [
-                        sys.executable,
-                        "-c",
-                        "for i in range(2048): print(f'{i:04d}:' + 'q'*256)",
-                    ],
-                    cwd=pathlib.Path(temp_dir),
-                    env=os.environ.copy(),
-                    stage="translate",
-                    task_index=8,
-                    terminal=terminal,
-                ),
-                10.0,
-            )
-        await terminal.close()
-        await printer
-
-        captured = terminal.task_output(8)[0]
-        self.assertIn("output truncated", captured)
-        self.assertIn("2047:", captured)
-        self.assertLess(len(captured.encode("utf-8")), 300 * 1024)
-
-    @unittest.skip("legacy terminal queue removed; Python stages inherit live stdout/stderr")
-    async def test_printer_cancellation_closes_publish_admission(self):
-        terminal = batch.TerminalEventQueue(stdout=io.StringIO(), stderr=io.StringIO())
-        printer = asyncio.create_task(terminal.run_printer())
-        await asyncio.sleep(0)
-        printer.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await printer
-
-        await asyncio.wait_for(
-            terminal.publish(batch.LogEvent(9, "burn", "stdout", "dropped")),
-            1.0,
-        )
-        await asyncio.wait_for(terminal.close(), 1.0)
-        self.assertEqual(terminal.task_output(9), ("", ""))
 
     async def test_worker_crash_log_is_written_to_invocation_cwd_without_ansi(self):
         media = {"crash": self.create_media("crash")}
@@ -4137,68 +3478,6 @@ class TaskSixSchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(field, log_text)
         self.assertNotIn("\x1b[", log_text)
         self.assertEqual(list(self.root.glob(".batch-worker-failure-*.tmp")), [])
-
-
-@unittest.skip("legacy ffmpeg wrapper runner replaced by direct Python stage")
-class BurnRunnerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_platform_burn_runner_uses_existing_wrapper_marker_and_file(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_dir = pathlib.Path(temp_dir)
-            render_video = script_dir / "video.original.mkv"
-            edit_video = script_dir / "video.mkv"
-            ass_path = script_dir / "video.en-zh.ass"
-            output_path = script_dir / "burned.mkv"
-            render_video.write_bytes(b"original")
-            edit_video.write_bytes(b"edit")
-            ass_path.write_text("ass", encoding="utf-8")
-            task = BatchTask(
-                index=1,
-                url="url",
-                render_video_path=render_video,
-                edit_video_path=edit_video,
-                detected_language="en",
-                ass_path=ass_path,
-            )
-
-            for platform, expected_prefix, wrapper_name, sub_file_flag in (
-                ("nt", ["pwsh", "-NoProfile", "-File"], "ffmpeg-burn.ps1", "-SubFile"),
-                ("posix", ["bash"], "ffmpeg-burn.sh", "--sub-file"),
-            ):
-                commands = []
-
-                async def fake_stage_command(command, **kwargs):
-                    commands.append((command, kwargs))
-                    output_path.write_bytes(b"burned")
-                    return str(output_path)
-
-                with self.subTest(platform=platform):
-                    with mock.patch(
-                        "batch_runtime._run_stage_command",
-                        side_effect=fake_stage_command,
-                    ), mock.patch("batch_runtime.shutil.which", return_value="pwsh"):
-                        runner = batch.create_platform_burn_runner(
-                            script_dir,
-                            {"TARGET_LANG": "Chinese"},
-                            platform=platform,
-                        )
-                        await runner(task)
-
-                self.assertEqual(
-                    commands[0][0],
-                    expected_prefix
-                    + [
-                        str(script_dir / wrapper_name),
-                        str(render_video),
-                        sub_file_flag,
-                        str(ass_path),
-                    ],
-                )
-                self.assertEqual(commands[0][1]["stage"], "burn")
-                self.assertEqual(
-                    commands[0][1]["output_marker"],
-                    "OUTPUT_BURNED_VIDEO=",
-                )
-                self.assertEqual(task.burned_video_path, output_path)
 
 
 if __name__ == "__main__":

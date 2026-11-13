@@ -49,11 +49,13 @@ class ProjectLauncherTests(unittest.TestCase):
                     self.assertIn("--project-dir", content)
                     self.assertRegex(content, rf"\b{re.escape(command)}\b")
 
-    def test_mpv_wrappers_select_mpv_backend(self):
-        self.assertIn("--backend mpv", read("mpv-burn.ps1"))
-        self.assertIn("--backend mpv", read("mpv-burn.sh"))
+    def test_legacy_burn_aliases_do_not_override_env_backend(self):
+        for name in ("mpv-burn.ps1", "mpv-burn.sh", "ffmpeg-burn.ps1", "ffmpeg-burn.sh",
+                     "py_launcher.ps1", "py_launcher.sh"):
+            with self.subTest(name=name):
+                self.assertNotIn("--backend", read(name))
         self.assertIn('"mpv-burn" = "burn"', read("py_launcher.ps1"))
-        self.assertIn("mpv-burn)", read("py_launcher.sh"))
+        self.assertIn("ffmpeg-burn|mpv-burn)", read("py_launcher.sh"))
 
     def test_launcher_maps_legacy_names_without_script_paths(self):
         powershell = read("py_launcher.ps1")

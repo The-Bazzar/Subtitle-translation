@@ -209,6 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Merge a .zh.ass and .en.ass pair into a bilingual .en-zh.ass file."
     )
+    parser.prog = "subtitle-translation merge-ass"
     parser.add_argument("zh_ass", help="Path to the target-language .zh.ass file.")
     parser.add_argument("en_ass", help="Path to the source-language .en.ass file.")
     parser.add_argument("-o", "--output", help="Optional output path for the merged .en-zh.ass file.")

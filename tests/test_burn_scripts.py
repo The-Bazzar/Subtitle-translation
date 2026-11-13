@@ -13,9 +13,13 @@ SCRIPTS = ROOT / "scripts"
 
 
 class BurnStageTests(unittest.TestCase):
-    def test_wrappers_select_the_expected_backend(self):
-        self.assertIn("burn --backend ffmpeg", (SCRIPTS / "ffmpeg-burn.ps1").read_text())
-        self.assertIn("burn --backend mpv", (SCRIPTS / "mpv-burn.ps1").read_text())
+    def test_wrappers_forward_only_project_arguments(self):
+        for name in ("ffmpeg-burn", "mpv-burn"):
+            for suffix in ("ps1", "sh"):
+                content = (SCRIPTS / f"{name}.{suffix}").read_text(encoding="utf-8")
+                with self.subTest(wrapper=f"{name}.{suffix}"):
+                    self.assertIn("burn", content)
+                    self.assertNotIn("--backend", content)
 
     def test_mpv_stage_builds_an_argument_vector(self):
         with tempfile.TemporaryDirectory() as directory:

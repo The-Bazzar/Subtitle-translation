@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -14,6 +13,7 @@ from typing import Mapping, Sequence
 
 from .config import ProjectConfig
 from .process import CommandResult, capture_command, child_environment, run_command
+from .project_logging import log, logged_stage
 
 
 @dataclass(frozen=True)
@@ -178,6 +178,7 @@ def _prepare_args(input_path: Path, output_path: Path, video_args: Sequence[str]
     ]
 
 
+@logged_stage("prepare_video")
 def prepare_video(original_video: str | Path, config: ProjectConfig) -> StageResult:
     original = _absolute(original_video)
     if not original.is_file():
@@ -199,7 +200,7 @@ def prepare_video(original_video: str | Path, config: ProjectConfig) -> StageRes
         for encoder, command in attempts:
             if temporary.exists():
                 temporary.unlink()
-            print(f"prepare-video: {encoder}")
+            log("INFO", f'prepare-video: {encoder}')
             result = run_command([ffmpeg, *command], cwd=original.parent, label="ffmpeg")
             last_code = result.returncode
             if (last_code == 0 and temporary.is_file()) or (
@@ -213,6 +214,7 @@ def prepare_video(original_video: str | Path, config: ProjectConfig) -> StageRes
             temporary.unlink()
 
 
+@logged_stage("extract_audio")
 def extract_audio(video: str | Path, config: ProjectConfig) -> StageResult:
     video_path = _absolute(video)
     if not video_path.is_file():
@@ -260,6 +262,7 @@ def _whisperx_path(config: ProjectConfig) -> str | None:
     return shutil.which("whisperx")
 
 
+@logged_stage("whisper")
 def transcribe_video(video: str | Path, config: ProjectConfig, *, model: str = "", align_model: str = "", device: str = "") -> StageResult:
     video_path = _absolute(video)
     if not video_path.is_file():
@@ -289,6 +292,7 @@ def transcribe_video(video: str | Path, config: ProjectConfig, *, model: str = "
             ).split("-")[0].lower()
         except (OSError, json.JSONDecodeError):
             language = "en"
+    language = config.get("SOURCE_LANG", "").strip() or language
     ffmpeg_result = run_command(
         [ffmpeg, "-i", str(video_path), "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(wav_path), "-y", "-loglevel", "error"],
         cwd=video_path.parent,
@@ -338,73 +342,75 @@ def transcribe_video(video: str | Path, config: ProjectConfig, *, model: str = "
     return StageResult.ok(json=str(json_path.resolve()))
 
 
-def _parser_with_project(description: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=description)
+def _parser_with_project(description: str, command: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"subtitle-translation {command}", description=description)
     parser.add_argument("--project-dir", default=None)
     return parser
 
 
 def main_download(argv: Sequence[str]) -> int:
-    parser = _parser_with_project("Download a YouTube video and metadata")
+    parser = _parser_with_project("Download a YouTube video and metadata", "download")
     parser.add_argument("url")
     args = parser.parse_args(argv)
     result = download_video(args.url, _config_from_args(args))
     if result.success:
         print(f"OUTPUT_RENDER_VIDEO={result.outputs['render_video']}")
     else:
-        print(f"Error: {result.diagnostics[0]}", file=sys.stderr)
+        log("ERROR", f'Error: {result.diagnostics[0]}')
     return result.exit_code
 
 
 def main_prepare_video(argv: Sequence[str]) -> int:
-    parser = _parser_with_project("Prepare an edit video")
+    parser = _parser_with_project("Prepare an edit video", "prepare-video")
     parser.add_argument("original_video")
     args = parser.parse_args(argv)
     result = prepare_video(args.original_video, _config_from_args(args))
     if result.success:
         print(f"OUTPUT_VIDEO={result.outputs['edit_video']}")
     else:
-        print(f"Error: {result.diagnostics[0]}", file=sys.stderr)
+        log("ERROR", f'Error: {result.diagnostics[0]}')
     return result.exit_code
 
 
 def main_whisper(argv: Sequence[str]) -> int:
-    parser = _parser_with_project("Run WhisperX")
+    parser = _parser_with_project("Run WhisperX", "whisper")
     parser.add_argument("video")
-    parser.add_argument("--model", default="")
-    parser.add_argument("--align-model", default="")
-    parser.add_argument("--device", default="")
+    parser.add_argument("--lang", "--source-lang", default="")
     args = parser.parse_args(argv)
-    result = transcribe_video(args.video, _config_from_args(args), model=args.model, align_model=args.align_model, device=args.device)
+    config = _config_from_args(args)
+    if args.lang:
+        config = ProjectConfig(config.project_dir, {**config.values, "SOURCE_LANG": args.lang}, config.invocation_dir)
+    result = transcribe_video(args.video, config)
     if result.success:
         print(f"OUTPUT_JSON={result.outputs['json']}")
     else:
-        print(f"Error: {result.diagnostics[0]}", file=sys.stderr)
+        log("ERROR", f'Error: {result.diagnostics[0]}')
     return result.exit_code
 
 
 def main_burn(argv: Sequence[str]) -> int:
-    parser = _parser_with_project("Burn an ASS subtitle into a video")
+    parser = _parser_with_project("Burn an ASS subtitle into a video", "burn")
     parser.add_argument("video")
     parser.add_argument("subtitle", nargs="?")
     parser.add_argument("-s", "--sub-file", "-SubFile", dest="subtitle_option", default="")
     parser.add_argument("-o", "--output", "-Output", default="")
-    parser.add_argument("--ovc", "-Ovc", default="")
-    parser.add_argument("--ovcopts", "-Ovcopts", default="")
-    parser.add_argument("--oac", "-Oac", default="")
-    parser.add_argument("--res", "-Res", default="")
-    parser.add_argument("--backend", choices=("ffmpeg", "mpv"), default="ffmpeg")
-    parser.add_argument("--dry-run", "-DryRun", action="store_true")
-    parser.add_argument("extra_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     subtitle = args.subtitle or args.subtitle_option
     if not subtitle:
         parser.error("a subtitle path is required")
-    result = burn_video(args.video, subtitle, _config_from_args(args), output=args.output, ovc=args.ovc, ovcopts=args.ovcopts, oac=args.oac, resolution=args.res, backend=args.backend, extra_args=args.extra_args, dry_run=args.dry_run)
+    config = _config_from_args(args)
+    try:
+        extra = json.loads(config.get("BURN_EXTRA_ARGS_JSON", "[]") or "[]")
+        if not isinstance(extra, list) or any(not isinstance(arg, str) for arg in extra):
+            raise ValueError("BURN_EXTRA_ARGS_JSON must be a JSON array of strings")
+    except (ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    result = burn_video(args.video, subtitle, config, output=args.output,
+                        backend=config.get("BURN_BACKEND", "ffmpeg"), extra_args=extra, dry_run=config.flag("DRY_RUN"))
     if result.success and result.outputs.get("burned_video"):
         print(f"OUTPUT_BURNED_VIDEO={result.outputs['burned_video']}")
     elif not result.success:
-        print(f"Error: {result.diagnostics[0]}", file=sys.stderr)
+        log("ERROR", f'Error: {result.diagnostics[0]}')
     return result.exit_code
 
 
@@ -462,6 +468,7 @@ def _encode_options(value: str) -> list[str]:
     return result
 
 
+@logged_stage("burn")
 def burn_video(
     video: str | Path,
     subtitle: str | Path,
@@ -472,7 +479,7 @@ def burn_video(
     ovcopts: str = "",
     oac: str = "",
     resolution: str = "",
-    backend: str = "ffmpeg",
+    backend: str = "",
     extra_args: Sequence[str] = (),
     dry_run: bool = False,
 ) -> StageResult:
@@ -482,7 +489,14 @@ def burn_video(
         return StageResult.fail(1, f"video file not found: {video_path}")
     if not subtitle_path.is_file():
         return StageResult.fail(1, f"subtitle file not found: {subtitle_path}")
-    normalized_backend = backend.strip().lower() or "ffmpeg"
+    normalized_backend = (backend or config.get("BURN_BACKEND", "ffmpeg")).strip().lower() or "ffmpeg"
+    if not extra_args:
+        try:
+            extra_args = json.loads(config.get("BURN_EXTRA_ARGS_JSON", "[]") or "[]")
+            if not isinstance(extra_args, list) or any(not isinstance(arg, str) for arg in extra_args):
+                raise ValueError("BURN_EXTRA_ARGS_JSON must be a JSON array of strings")
+        except ValueError as error:
+            return StageResult.fail(2, str(error))
     if normalized_backend not in {"ffmpeg", "mpv"}:
         return StageResult.fail(2, f"unsupported burn backend: {backend}")
     tool_key = (
@@ -559,7 +573,7 @@ def burn_video(
         ]
     command.extend(str(arg) for arg in extra_args)
     if dry_run:
-        print("[DRY RUN] " + " ".join(command))
+        log("INFO", '[DRY RUN] ' + ' '.join(command))
         return StageResult.ok()
     result = run_command(command, cwd=video_path.parent, label=f"{normalized_backend} burn")
     if result.returncode != 0:
