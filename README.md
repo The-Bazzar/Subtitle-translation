@@ -208,6 +208,8 @@ glossary 位于翻译之前：
 
 ## 🔧 配置提醒
 
+示例 `.env` 的 `PROOFREAD=0`，新建配置默认关闭校对；需要时改为 `PROOFREAD=1`。已有本地 `.env` 不会被安装或初始化覆盖，保留原有设置。此默认值来自配置模板，不改变变量缺失时的 CLI 兼容行为。
+
 ### 🧠 Provider 与模型
 
 模型解析遵循固定优先级：非空的 `TRANSLATE_MODEL`、`GLOSSARY_MODEL`、`PROOFREAD_MODEL` 或 `EMBEDDING_MODEL` 是显式覆盖；对应变量留空时，使用所选 provider 在 `providers.json` 中的 `default_model`。glossary / proofread 的 provider 也留空时，才整体复用翻译配置。
