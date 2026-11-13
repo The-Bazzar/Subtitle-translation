@@ -16,6 +16,7 @@ class PythonCliTests(unittest.TestCase):
         self.assertEqual(
             command_names,
             {
+                "help",
                 "pipeline",
                 "batch",
                 "translate",
@@ -25,6 +26,7 @@ class PythonCliTests(unittest.TestCase):
                 "whisper",
                 "burn",
                 "init",
+                "setup-mfa",
             },
         )
 
@@ -102,24 +104,16 @@ class PythonCliTests(unittest.TestCase):
             args = Namespace(
                 source_lang="fr",
                 target_lang="de",
-                skip_beautify=False,
+                skip_scene_detection=False,
                 skip_knowledge=False,
                 no_proofread=False,
                 no_split=False,
-                quiet=True,
-                aggressive=False,
-                no_scene_snap=False,
                 batch_size=None,
                 split_max_chars=None,
                 split_max_duration=None,
                 split_context_window=None,
                 scene_threshold=None,
-                snap_frames=None,
-                end_offset_frames=None,
                 min_scene_interval_frames=None,
-                min_duration=None,
-                min_gap=None,
-                max_gap_merge=None,
             )
             config = ProjectConfig(root, {})
             with mock.patch.object(pipeline.translate_srt, "main", return_value=0):

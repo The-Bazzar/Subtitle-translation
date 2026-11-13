@@ -2,16 +2,16 @@
 translate_srt.py - JSON-first subtitle pipeline.
 
 Flow:
-  WhisperX JSON -> beautified JSON -> glossary -> translation/split/proofread -> ASS
+  WhisperX JSON -> glossary -> joint bilingual translation -> timing -> ASS
 
-SRT is intentionally not part of the main pipeline anymore. WhisperX JSON is the
-single source of truth; word timestamps are used only to project split whole
-sentences back onto the timeline.
+SRT is an inspection output, not a primary input. Source text stays read-only
+after glossary; ASR or optional post-translation MFA word times locate events.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -23,6 +23,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlparse
 
@@ -35,6 +36,9 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 from subtitle_translation.chapters import original_chapter_media, read_original_chapters, translated_chapters
+from subtitle_translation.artifacts import atomic_write_json, file_sha256, json_sha256, read_json_object
+from subtitle_translation import source_review
+from subtitle_translation.project_logging import log, logged_stage, project_run, validate_log_level
 
 
 # --- Data model ---------------------------------------------------------------
@@ -45,6 +49,7 @@ class SplitStatus(str, Enum):
     OK = "ok"
     FALLBACK = "fallback"
     UNSPLIT = "unsplit"
+    SKIPPED = "skipped"
 
     @staticmethod
     def normalize(value: str) -> str:
@@ -63,6 +68,7 @@ class SplitReason(str, Enum):
     PARSE_FAILED = "parse_failed"
     EXCEPTION = "exception"
     AI_SPLIT_INVALID = "ai_split_invalid"
+    WORD_TIMING_UNAVAILABLE = "word_timing_unavailable"
 
     @staticmethod
     def normalize(value: str) -> str:
@@ -93,6 +99,7 @@ class TranscriptWord:
     start: Optional[float] = None
     end: Optional[float] = None
     score: Optional[float] = None
+    source_range: Optional[tuple[int, int]] = None
 
     @staticmethod
     def from_json(data: dict) -> "TranscriptWord":
@@ -101,6 +108,7 @@ class TranscriptWord:
             start=_float_or_none(data.get("start")),
             end=_float_or_none(data.get("end")),
             score=_float_or_none(data.get("score")),
+            source_range=tuple(data["source_range"]) if data.get("source_range") else None,
         )
 
     def to_json(self) -> dict:
@@ -111,32 +119,45 @@ class TranscriptWord:
             result["end"] = round(self.end, 3)
         if self.score is not None:
             result["score"] = self.score
+        if self.source_range is not None:
+            result["source_range"] = list(self.source_range)
         return result
 
 
 @dataclass
 class SplitEvent:
-    start: float
-    end: float
+    start: Optional[float]
+    end: Optional[float]
     en: str
     zh: str
+    id: str = ""
+    source_range: Optional[tuple[int, int]] = None
 
     @staticmethod
     def from_json(data: dict) -> "SplitEvent":
         return SplitEvent(
-            start=float(data.get("start", 0.0)),
-            end=float(data.get("end", 0.0)),
+            start=None if data.get("timing_status") == "pending" else float(data.get("start", 0.0)),
+            end=None if data.get("timing_status") == "pending" else float(data.get("end", 0.0)),
             en=str(data.get("en", "")),
             zh=str(data.get("zh", "")),
+            id=str(data.get("id", "")),
+            source_range=tuple(data["source_range"]) if data.get("source_range") else None,
         )
 
     def to_json(self) -> dict:
-        return {
-            "start": round(self.start, 3),
-            "end": round(self.end, 3),
+        data = {
             "en": self.en,
             "zh": self.zh,
         }
+        if self.start is None and self.end is None:
+            data["timing_status"] = "pending"
+        else:
+            data.update(start=round(self.start, 3), end=round(self.end, 3))
+        if self.id:
+            data["id"] = self.id
+        if self.source_range is not None:
+            data["source_range"] = list(self.source_range)
+        return data
 
 
 @dataclass
@@ -154,6 +175,15 @@ class TranscriptSegment:
     split_reason_detail: str = ""
     original_start: Optional[float] = None
     original_end: Optional[float] = None
+    event_plan_key: str = ""
+    translation_key: str = ""
+    proofread_key: str = ""
+    word_timing: dict = field(default_factory=dict)
+    source_range: Optional[tuple[int, int]] = None
+    source_refs: list[str] = field(default_factory=list)
+    text_origin: str = ""
+    segment_timing: dict = field(default_factory=dict)
+    manual_review: dict = field(default_factory=dict)
 
     @staticmethod
     def from_json(index: int, data: dict) -> "TranscriptSegment":
@@ -181,6 +211,15 @@ class TranscriptSegment:
             split_reason_detail=str(data.get("split_reason_detail", "")).strip(),
             original_start=_float_or_none(data.get("original_start")),
             original_end=_float_or_none(data.get("original_end")),
+            event_plan_key=str(data.get("event_plan_key", "")),
+            translation_key=str(data.get("translation_key", "")),
+            proofread_key=str(data.get("proofread_key", "")),
+            word_timing=dict(data.get("word_timing") or {}),
+            source_range=tuple(data["source_range"]) if data.get("source_range") else None,
+            source_refs=list(data.get("source_refs") or []),
+            text_origin=str(data.get("text_origin") or ""),
+            segment_timing=dict(data.get("segment_timing") or {}),
+            manual_review=dict(data.get("manual_review") or {}),
         )
 
     def en_text(self) -> str:
@@ -213,6 +252,16 @@ class TranscriptSegment:
             data["split_reason"] = self.split_reason
         if self.split_reason_detail:
             data["split_reason_detail"] = self.split_reason_detail
+        for name in ("event_plan_key", "translation_key", "proofread_key"):
+            if getattr(self, name):
+                data[name] = getattr(self, name)
+        if self.word_timing:
+            data["word_timing"] = self.word_timing
+        if self.source_range is not None:
+            data["source_range"] = list(self.source_range)
+        for name in ("source_refs", "text_origin", "segment_timing", "manual_review"):
+            if getattr(self, name):
+                data[name] = getattr(self, name)
         return data
 
 
@@ -470,6 +519,8 @@ class LLMConfig:
     model: str = ""
     api_key: Optional[str] = None
     batch_size: int = 50
+    request_timeout: Optional[float] = None
+    api_max_retries: Optional[int] = None
 
     def resolve_key(self) -> str:
         if self.api_key is None:
@@ -479,8 +530,8 @@ class LLMConfig:
     def cfg(self) -> dict:
         providers = load_providers()
         if self.provider not in providers:
-            print(f"Error: unknown provider: {self.provider}", file=sys.stderr)
-            print(f"Available: {', '.join(providers)}", file=sys.stderr)
+            log("ERROR", f'Error: unknown provider: {self.provider}')
+            log("INFO", f"Available: {', '.join(providers)}")
             sys.exit(1)
         return providers[self.provider]
 
@@ -490,10 +541,16 @@ class LLMConfig:
 
     def _client(self):
         provider_cfg = self.cfg()
+        options = {}
+        if self.request_timeout is not None:
+            options["timeout"] = self.request_timeout
+        if self.api_max_retries is not None:
+            options["max_retries"] = self.api_max_retries
         return OpenAI(
             base_url=provider_cfg["url"],
             api_key=self.resolve_key(),
             default_headers=provider_cfg.get("extra_headers", {}),
+            **options,
         )
 
 
@@ -1041,7 +1098,6 @@ def build_embedding_index(
     transcript: Transcript,
     config: EmbeddingConfig,
     env: dict[str, str],
-    quiet: bool = False,
     ctx: Optional[TranscriptContext] = None,
     existing_chunk_ids: Optional[list[str]] = None,
 ) -> str:
@@ -1060,28 +1116,27 @@ def build_embedding_index(
             [chunk.to_document() for chunk in batch],
             ids=[chunk.chunk_id for chunk in batch],
         )
-    if not quiet:
-        print(f"Embedding index: {config.chroma_dir} ({len(chunks)} chunks)", file=sys.stderr)
+    log("INFO", f'Embedding index: {config.chroma_dir} ({len(chunks)} chunks)')
     return config.chroma_dir
 
 
+@logged_stage("embedding")
 def refresh_embedding_retriever(
     transcript: Transcript,
     config: EmbeddingConfig,
     env: dict[str, str],
-    quiet: bool,
     ctx: TranscriptContext,
     fatal: bool = False,
     warning_label: str = "embedding index failed",
 ) -> EmbeddingRetriever | None:
     try:
-        build_embedding_index(transcript, config, env, quiet, ctx)
+        build_embedding_index(transcript, config, env, ctx)
         return EmbeddingRetriever(config, env)
     except Exception as e:
         if fatal:
-            print(f"Error: {warning_label}: {e}", file=sys.stderr)
+            log("ERROR", f'Error: {warning_label}: {e}')
             sys.exit(1)
-        print(f"Warning: {warning_label}: {e}", file=sys.stderr)
+        log("WARNING", f'Warning: {warning_label}: {e}')
         return None
 
 
@@ -1097,34 +1152,15 @@ def env_int(value: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def embedding_enabled_for_stage(only_beautify: bool, only_glossary: bool) -> bool:
-    return not only_beautify
-
-
-DEFAULT_SPLIT_MAX_CHARS = 72
-DEFAULT_SPLIT_MAX_DURATION = 3.8
+def embedding_enabled_for_stage(only_scenes: bool, only_glossary: bool) -> bool:
+    return not only_scenes
 
 
 @dataclass
-class BeautifyOptions:
+class SceneDetectionOptions:
     scene_threshold: float = 0.15
-    snap_frames: int = 7
-    end_offset_frames: int = 2
     min_scene_interval_frames: int = 2
-    min_duration: float = 1.0
-    min_gap: float = 0.083
-    max_gap_merge: float = 0.5
-    no_scene_snap: bool = False
-    aggressive: bool = False
     fps: float = 24.0
-
-
-@dataclass
-class SplitConfig:
-    enabled: bool = True
-    max_chars: int = DEFAULT_SPLIT_MAX_CHARS
-    max_duration: float = DEFAULT_SPLIT_MAX_DURATION
-    context_window: int = 1
 
 
 # --- Providers/env/prompts ----------------------------------------------------
@@ -1386,29 +1422,13 @@ Rules:
 - Keep proper nouns, brand names, and technical terms in original form unless a standard ${TARGET_LANG} translation exists.
 - Follow natural subtitle formatting for ${TARGET_LANG}."""
 
-_PROOFREAD_PROMPT_FALLBACK = """You are a bilingual subtitle proofreader. Review each already-split ${SOURCE_LANG}/${TARGET_LANG} subtitle event and fix both languages.
+_PROOFREAD_PROMPT_FALLBACK = """Review only the ${TARGET_LANG} subtitle translation against the frozen ${SOURCE_LANG} source.
+Fix clear mistranslations, omissions, unsupported additions and terminology errors.
+Keep already-correct natural wording. Avoid cosmetic rewrites, unnecessary filler
+or expansions that make short subtitles harder to read. Preserve jokes and tone.
+Do not edit source text, event IDs, event count or timing. If uncertain, retain
+the existing translation. Follow the full glossary and target subtitle style."""
 
-Step 1 - Check the source-language text for ASR errors:
-- Homophone confusion, garbled terms, missing negation, obvious grammar breaks.
-- If the glossary or retrieved_context explicitly identifies a source-language ASR error, apply that correction to the source-language text.
-- Treat glossary corrections for proper names, titles, quotes, and terminology as stronger evidence than the WhisperX ASR text.
-- Fix only errors that affect correctness or readability.
-- Keep the original source-language sentence structure and word order. Do not rewrite, paraphrase, merge, split, or reorder source text.
-- Source-language edits should normally be single-word or short-phrase ASR corrections so word-level timing remains traceable.
-
-Step 2 - Check the ${TARGET_LANG} translation against the corrected source:
-- Fix mistranslations, omissions, added content, awkward phrasing, and tone mismatches.
-- Follow the glossary if provided.
-- Follow natural subtitle formatting for ${TARGET_LANG}.
-
-Do not merge, split, reorder, add, or remove events. Timing has already been aligned and must not be changed."""
-
-_SPLIT_PROMPT_FALLBACK = r"""Style preference:
-- Split only at natural pause points such as commas, clause boundaries, conjunctions, and breath groups.
-- Use as many split parts as the sentence naturally needs. There is no two-part limit; long multi-clause segments may become 3, 4, 5, or more subtitle events.
-- Prefer coherent subtitle events over tiny fragments, but do not keep a long multi-clause segment under-split just to avoid more than two parts.
-- Keep each split event readable as a complete thought.
-- For the source-language array, split by copying exact contiguous spans from the input source text. Do not correct, remove, add, or paraphrase source-language words."""
 
 _JSON_FORMAT = """MANDATORY JSON PROTOCOL:
 The user message is JSON. Your response must be machine-parseable JSON only.
@@ -1425,12 +1445,6 @@ ABSOLUTE JSON RULES:
 
 Never imitate Python dict syntax. Single-quoted pseudo-JSON will be rejected."""
 
-_JSON_BATCH_FORMAT = """Return a JSON object.
-The first response character must be `{` and the last response character must be `}`.
-The object must have exactly one top-level key: "items".
-"items" must be a JSON array with one object per input item.
-Preserve each input item's exact `id`. Do not renumber."""
-
 _JSON_OBJECT_FORMAT = """Return a JSON object.
 The first response character must be `{` and the last response character must be `}`."""
 
@@ -1439,57 +1453,6 @@ Some input items may include a "retrieved_context" array from the same project m
 Use it only for terminology, names, recurring concepts, tone, and local consistency.
 Do not output, translate, proofread, split, merge, or return retrieved_context items themselves."""
 
-_PROOFREAD_ASR_CONTEXT_RULES = """PROOFREAD ASR CORRECTION PRIORITY:
-If the glossary or retrieved_context identifies a source-language ASR error, you must apply that correction to the source-language field.
-This applies especially to proper names, work titles, technical terms, quotes, and domain-specific terminology.
-Treat explicit glossary ASR corrections as stronger evidence than the WhisperX text.
-Keep the source sentence structure and timing-aligned event count unchanged; correct only the misheard word or short phrase."""
-
-_TRANSLATE_FORMAT = """
-TRANSLATION RESPONSE FORMAT:
-Return exactly these keys in each "items" object: "id", "${TARGET_LANG_CODE}".
-"${TARGET_LANG_CODE}" is the ${TARGET_LANG} translation string.
-
-GOOD:
-{"items": [
-  {"id": 1, "${TARGET_LANG_CODE}": "<target translation>"},
-  {"id": 2, "${TARGET_LANG_CODE}": "<target translation>"}
-]}
-
-The placeholder values above are format markers only. In your actual response, replace them with translated text."""
-
-_SPLIT_FORMAT = """SPLIT RESPONSE FORMAT:
-Return exactly these keys in each "items" object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}".
-"${SOURCE_LANG_CODE}" is the ${SOURCE_LANG} split text array. "${TARGET_LANG_CODE}" is the ${TARGET_LANG} split text array.
-Split by adding multiple strings inside "${SOURCE_LANG_CODE}" and "${TARGET_LANG_CODE}".
-The arrays may contain 1, 2, 3, 4, 5, or more strings. Choose the count from natural sentence boundaries; do not cap splits at two parts.
-
-CONTEXT RULES:
-- Input items may include "context_before" and "context_after" arrays.
-- Use context only to understand rhythm, references, and surrounding meaning.
-- Split only the item's own "${SOURCE_LANG_CODE}" and "${TARGET_LANG_CODE}" fields.
-- Do not return context items. Return exactly one output item for each input item id.
-
-SOURCE-LANGUAGE HARD RULES:
-- "${SOURCE_LANG_CODE}" must be made only by inserting split boundaries into the exact input "${SOURCE_LANG_CODE}" string.
-- Preserve every source-language word, repeated word, filler, typo, and ASR artifact in order.
-- Do not correct grammar, deduplicate repeated words, remove fillers, normalize wording, paraphrase, or improve readability in "${SOURCE_LANG_CODE}".
-- If the input says "to to", output "to to"; if it says "how you how you", output "how you how you".
-- When all "${SOURCE_LANG_CODE}" strings are joined with one space, the result must match the input source text token-for-token.
-
-TARGET-LANGUAGE RULES:
-- "${TARGET_LANG_CODE}" must have the same number of strings as "${SOURCE_LANG_CODE}".
-- Each "${TARGET_LANG_CODE}" string translates the matching source split at the same array index.
-- You may make the target-language text natural, but do not merge, omit, or move content across split indexes.
-
-GOOD:
-{"items": [
-  {"id": 1, "${SOURCE_LANG_CODE}": ["you don't know if you can get to it", "you're learning something about discipline and how you how you push yourself", "and what does motivate you", "and what do you really want out of this life"], "${TARGET_LANG_CODE}": ["<target part 1>", "<target part 2>", "<target part 3>", "<target part 4>"]},
-  {"id": 2, "${SOURCE_LANG_CODE}": ["you're actually being honest and earnest", "in your attempt to to pull something from who you are", "and what you understand"], "${TARGET_LANG_CODE}": ["<target part 1>", "<target part 2>", "<target part 3>"]},
-  {"id": 3, "${SOURCE_LANG_CODE}": ["<source full sentence>"], "${TARGET_LANG_CODE}": ["<target full sentence>"]}
-]}
-
-The placeholder values above are format markers only. In your actual response, replace them with split text from the provided segment."""
 
 _GLOSSARY_PROMPT_FALLBACK = """You are a terminology expert. Build a rigorous glossary for ${TARGET_LANG} subtitle translation from the ${SOURCE_LANG} transcript, metadata, and any provided search evidence.
 
@@ -1669,18 +1632,6 @@ def glossary_finalizer_system_prompt(ctx: TranscriptContext, retriever: Embeddin
     return glossary_base_prompt(ctx, retriever) + "\n\n" + render_prompt_template(_GLOSSARY_FINALIZER_FORMAT, ctx)
 
 
-_PROOFREAD_FORMAT = """PROOFREAD RESPONSE FORMAT:
-Return exactly these keys in each "items" object: "id", "${SOURCE_LANG_CODE}", "${TARGET_LANG_CODE}".
-{"items": [
-  {"id": 1, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>"},
-  {"id": 2, "${SOURCE_LANG_CODE}": "<corrected source text>", "${TARGET_LANG_CODE}": "<corrected target translation>"}
-]}
-
-The placeholder values above are format markers only. In your actual response, replace them with corrected text from the provided subtitle events.
-Do not output Source: or Target: labels inside values. Do not use separators like |||.
-Do not merge, split, or reorder items."""
-
-
 def _config_root() -> str:
     configured = os.environ.get("SUBTITLE_TRANSLATION_PROJECT_DIR", "").strip()
     if configured:
@@ -1731,8 +1682,8 @@ def get_api_key(provider: str, env: dict[str, str]) -> str:
     key_name = load_providers()[provider]["env_key"]
     key = env.get(key_name, "")
     if not key:
-        print(f"Error: {key_name} not found in environment or .env file.", file=sys.stderr)
-        print(f"Set it in .env: {key_name}=your_key_here", file=sys.stderr)
+        log("ERROR", f'Error: {key_name} not found in environment or .env file.')
+        log("INFO", f'Set it in .env: {key_name}=your_key_here')
         sys.exit(1)
     return key
 
@@ -1793,7 +1744,7 @@ def load_transcript(json_path: str) -> Transcript:
         for i, seg in enumerate(data.get("segments", []))
     ]
     if not segments:
-        print(f"Error: no segments found in JSON: {json_path}", file=sys.stderr)
+        log("ERROR", f'Error: no segments found in JSON: {json_path}')
         sys.exit(1)
     return Transcript(
         path=os.path.abspath(json_path),
@@ -1804,45 +1755,49 @@ def load_transcript(json_path: str) -> Transcript:
 
 
 def save_transcript(transcript: Transcript, output_path: str) -> None:
-    transcript.path = os.path.abspath(output_path)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(transcript.to_json(), f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    destination = os.path.abspath(output_path)
+    payload = transcript.to_json()
+    payload.pop("word_segments", None)
+    atomic_write_json(destination, payload)
+    transcript.path = destination
 
 
 def load_or_create_beautified(
     ctx: TranscriptContext,
     source: Transcript,
     video_path: str,
-    options: BeautifyOptions,
-    skip_beautify: bool,
+    options: SceneDetectionOptions,
+    skip_scene_detection: bool,
     force: bool,
-    quiet: bool,
+    source_identity: str = "",
 ) -> Transcript:
+    if not skip_scene_detection:
+        detect_project_scenes(ctx, video_path, options, )
     if (
         os.path.abspath(source.path) != os.path.abspath(ctx.beautified_json)
         and os.path.isfile(ctx.beautified_json)
         and not force
     ):
-        if not quiet:
-            print(f"Beautified JSON cache: {ctx.beautified_json}")
-        return load_transcript(ctx.beautified_json)
+        try:
+            cached = load_transcript(ctx.beautified_json)
+        except (OSError, ValueError, TypeError, KeyError, SystemExit):
+            cached = None
+        if cached is not None and (not source_identity or cached.raw.get("_source_first_input") == source_identity):
+            if "word_segments" in cached.raw:
+                cached.raw.pop("word_segments")
+                save_transcript(cached, ctx.beautified_json)
+            log("INFO", f'Beautified JSON cache: {ctx.beautified_json}')
+            return cached
 
     transcript = source
-    if skip_beautify:
-        if not quiet:
-            print("Beautify: skipped")
-    else:
-        scene_changes = beautify_transcript_timeline(transcript, video_path, options, quiet)
-        write_scene_change_sidecars(ctx, video_path, options, scene_changes)
-
+    if source_identity:
+        transcript.raw["_source_first_input"] = source_identity
     save_transcript(transcript, ctx.beautified_json)
-    if not quiet:
-        print(f"Beautified JSON: {ctx.beautified_json}")
+    log("INFO", f'Beautified JSON: {ctx.beautified_json}')
     return transcript
 
 
-# --- Beautify timeline --------------------------------------------------------
+# --- Read-only scene detection -----------------------------------------------
 
 
 def get_frame_rate(video_path: str) -> float:
@@ -1875,12 +1830,10 @@ def get_scene_changes(
     video_path: str,
     threshold: float,
     min_interval_sec: float,
-    quiet: bool,
-) -> list[float]:
+    ) -> list[float]:
     if not video_path or not os.path.isfile(video_path):
         return []
-    if not quiet:
-        print(f"Scene detection: threshold={threshold:.2f}", file=sys.stderr)
+    log("INFO", f'Scene detection: threshold={threshold:.2f}')
     cmd = [
         "ffmpeg",
         "-i",
@@ -1917,10 +1870,12 @@ def scene_timecode(seconds: float) -> str:
 def write_scene_change_sidecars(
     ctx: TranscriptContext,
     video_path: str,
-    options: BeautifyOptions,
+    options: SceneDetectionOptions,
     scene_changes: list[float],
+    *, scene_input_key: str = "",
 ) -> None:
     payload = {
+        "scene_input_key": scene_input_key,
         "video": os.path.abspath(video_path) if video_path else "",
         "fps": options.fps,
         "threshold": options.scene_threshold,
@@ -1943,171 +1898,26 @@ def write_scene_change_sidecars(
             f.write(f"{float(time):.6f}\n")
 
 
-def snap_to_previous(value: float, targets: list[float], max_distance: float) -> float:
-    for target in reversed(targets):
-        if target <= value and value - target <= max_distance:
-            return target
-        if target < value - max_distance:
-            break
-    return value
-
-
-def snap_end_to_scene_before(
-    value: float,
-    targets: list[float],
-    max_distance: float,
-    offset: float,
-) -> float:
-    for target in targets:
-        snapped = target - offset
-        if snapped >= value and snapped - value <= max_distance:
-            return max(0.0, snapped)
-        if target > value + max_distance + offset:
-            break
-    return value
-
-
-def beautify_transcript_timeline(
-    transcript: Transcript,
-    video_path: str,
-    options: BeautifyOptions,
-    quiet: bool = False,
-) -> list[float]:
-    if options.aggressive:
-        options.scene_threshold = 0.08
-        options.snap_frames = 12
-        options.end_offset_frames = 0
-        options.min_scene_interval_frames = 1
-
-    if video_path and os.path.isfile(video_path):
-        options.fps = get_frame_rate(video_path)
-    frame = 1.0 / options.fps
-    snap_window = options.snap_frames * frame
-    end_offset = options.end_offset_frames * frame
-    min_scene_interval = options.min_scene_interval_frames * frame
-
-    scene_changes = []
-    if not options.no_scene_snap and video_path:
-        scene_changes = get_scene_changes(
-            video_path, options.scene_threshold, min_scene_interval, quiet
-        )
-    if not quiet:
-        print(
-            f"Beautify: {len(transcript.segments)} segments, fps={options.fps:.3f}, scenes={len(scene_changes)}",
-            file=sys.stderr,
-        )
-
-    for seg in transcript.segments:
-        if seg.original_start is None:
-            seg.original_start = seg.start
-        if seg.original_end is None:
-            seg.original_end = seg.end
-
-        beautify_segment_words(seg, scene_changes, snap_window, end_offset)
-
-    for prev, cur in zip(transcript.segments, transcript.segments[1:]):
-        gap = cur.start - prev.end
-        if gap < 0:
-            midpoint = (prev.end + cur.start) / 2.0
-            prev.end = max(prev.start + frame, midpoint - frame / 2)
-            cur.start = max(prev.end + frame, midpoint + frame / 2)
-        elif 0 < gap < options.max_gap_merge:
-            prev.end = cur.start
-        elif gap < options.min_gap:
-            cur.start = prev.end + options.min_gap
-            if cur.end <= cur.start:
-                cur.end = cur.start + options.min_duration
-        shift_words_to_segment_bounds(prev)
-        shift_words_to_segment_bounds(cur)
-
-    for seg in transcript.segments:
-        segment_bounds_from_words(seg)
-        seg.split_events = []
-
-    return scene_changes
-
-
-def beautify_segment_words(
-    seg: TranscriptSegment,
-    scene_changes: list[float],
-    snap_window: float,
-    end_offset: float,
-) -> None:
-    timed_words = [w for w in seg.words if w.start is not None and w.end is not None]
-    if not timed_words:
-        return
-
-    min_word_duration = 0.01
-    for word in timed_words:
-        word.start = float(word.start)
-        word.end = max(float(word.end), word.start + min_word_duration)
-
-    old_start = float(timed_words[0].start)
-    old_end = float(timed_words[-1].end)
-    new_start = old_start
-    new_end = old_end
-    if scene_changes:
-        new_start = snap_to_previous(old_start, scene_changes, snap_window)
-        new_end = snap_end_to_scene_before(old_end, scene_changes, snap_window, end_offset)
-
-    start_delta = new_start - old_start
-    if start_delta:
-        for word in timed_words:
-            distance = float(word.start) - old_start
-            if distance < 0 or distance > snap_window:
-                continue
-            weight = 1.0 - (distance / snap_window if snap_window > 0 else 1.0)
-            word.start += start_delta * weight
-            if word.end <= word.start:
-                word.end = word.start + min_word_duration
-
-    end_window = snap_window + end_offset
-    end_delta = new_end - old_end
-    if end_delta:
-        for word in timed_words:
-            distance = old_end - float(word.end)
-            if distance < 0 or distance > end_window:
-                continue
-            weight = 1.0 - (distance / end_window if end_window > 0 else 1.0)
-            word.end += end_delta * weight
-            if word.end <= word.start:
-                word.start = max(new_start, word.end - min_word_duration)
-
-    for prev, cur in zip(timed_words, timed_words[1:]):
-        if cur.start < prev.end:
-            midpoint = (prev.end + cur.start) / 2.0
-            prev.end = max(prev.start + min_word_duration, midpoint)
-            cur.start = max(prev.end, min(midpoint, cur.end - min_word_duration))
-        if cur.end <= cur.start:
-            cur.end = cur.start + min_word_duration
-
-    segment_bounds_from_words(seg)
-
-
-def segment_bounds_from_words(seg: TranscriptSegment) -> None:
-    timed_words = [w for w in seg.words if w.start is not None and w.end is not None]
-    if not timed_words:
-        return
-    seg.start = float(timed_words[0].start)
-    seg.end = float(timed_words[-1].end)
-
-
-def shift_words_to_segment_bounds(seg: TranscriptSegment) -> None:
-    timed_words = [w for w in seg.words if w.start is not None and w.end is not None]
-    if not timed_words:
-        return
-    original_start = float(timed_words[0].start)
-    original_end = float(timed_words[-1].end)
-    original_duration = max(0.01, original_end - original_start)
-    target_duration = max(0.01, seg.end - seg.start)
-    scale = target_duration / original_duration
-    for word in timed_words:
-        word.start = seg.start + (float(word.start) - original_start) * scale
-        word.end = seg.start + (float(word.end) - original_start) * scale
-        if word.end <= word.start:
-            word.end = word.start + 0.01
-    timed_words[0].start = seg.start
-    timed_words[-1].end = seg.end
+@logged_stage("scene_detection")
+def detect_project_scenes(ctx, video_path, options, ):
+    """Detect and cache scene changes without reading or modifying subtitles."""
+    if not video_path or not os.path.isfile(video_path):
+        return []
+    stat = os.stat(video_path)
+    identity = json_sha256({"video": os.path.abspath(video_path), "size": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns, "threshold": options.scene_threshold,
+                            "min_interval_frames": options.min_scene_interval_frames})
+    try:
+        cached = read_json_object(ctx.scenes_json)
+        if cached.get("scene_input_key") == identity and os.path.isfile(ctx.scenechange_txt):
+            return [float(row["time"]) for row in cached["scene_changes"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    options.fps = get_frame_rate(video_path)
+    changes = get_scene_changes(video_path, options.scene_threshold,
+                                options.min_scene_interval_frames / options.fps, )
+    write_scene_change_sidecars(ctx, video_path, options, changes, scene_input_key=identity)
+    return changes
 
 
 # --- Glossary -----------------------------------------------------------------
@@ -2432,7 +2242,7 @@ def load_tavily_domain_preferences(base_dir: str = "") -> TavilyDomainPreference
             with open(path, "r", encoding="utf-8") as f:
                 preferences = preferences.merge(TavilyDomainPreferences.from_json_value(json.load(f)))
         except (json.JSONDecodeError, OSError) as e:
-            print(f"  Warning: failed to load {filename}: {e}", file=sys.stderr)
+            log("WARNING", f'  Warning: failed to load {filename}: {e}')
     return preferences
 
 
@@ -2599,7 +2409,7 @@ def tavily_search(
     try:
         client = TavilyClient(api_key=api_key)
     except Exception as e:
-        print(f"  Warning: Tavily client init failed: {e}", file=sys.stderr)
+        log("WARNING", f'  Warning: Tavily client init failed: {e}')
         return []
 
     preferred_results: list[dict] = []
@@ -2607,7 +2417,7 @@ def tavily_search(
         try:
             preferred_results = _tavily_client_search(client, query, max_results, include_domains=domains)
         except Exception as e:
-            print(f"  Warning: Tavily preferred-domain search failed: {e}", file=sys.stderr)
+            log("WARNING", f'  Warning: Tavily preferred-domain search failed: {e}')
 
     preferred_unique = merge_tavily_results(preferred_results, preferred_domains=domains, max_results=max_results)
     if domains and len(preferred_unique) >= max_results:
@@ -2617,7 +2427,7 @@ def tavily_search(
     try:
         general_results = _tavily_client_search(client, query, max_results)
     except Exception as e:
-        print(f"  Warning: Tavily search failed: {e}", file=sys.stderr)
+        log("WARNING", f'  Warning: Tavily search failed: {e}')
 
     return merge_tavily_results(preferred_results, general_results, preferred_domains=domains, max_results=max_results)
 
@@ -2735,7 +2545,6 @@ def translate_tavily_query_output(
     source_queries: list[str],
     ctx: TranscriptContext,
     llm: LLMConfig,
-    quiet: bool = False,
     topic_hints: Optional[list[str]] = None,
 ) -> TavilyQueryOutput:
     if not source_queries or ctx.source_lang_code == ctx.target_lang_code:
@@ -2754,12 +2563,11 @@ def translate_tavily_query_output(
             tavily_query_translate_system_prompt(ctx),
             request,
             temperature=0.1,
-            raw_label=None if quiet else "translate_tavily_query_output",
+            raw_label="translate_tavily_query_output",
         )
         return TavilyQueryOutput.from_json_value(response_obj, max_queries=len(source_queries))
     except Exception as e:
-        if not quiet:
-            print(f"  Warning: Tavily query translation failed: {e}", file=sys.stderr)
+        log("WARNING", f'  Warning: Tavily query translation failed: {e}')
         return TavilyQueryOutput([])
 
 
@@ -2767,7 +2575,6 @@ def build_tavily_search_plan(
     transcript: Transcript,
     ctx: TranscriptContext,
     llm: LLMConfig,
-    quiet: bool = False,
     max_queries: int = 8,
     retriever: EmbeddingRetriever | None = None,
 ) -> TavilySearchPlan:
@@ -2812,7 +2619,7 @@ def build_tavily_search_plan(
             tavily_query_system_prompt(ctx),
             request,
             temperature=0.2,
-            raw_label=None if quiet else "build_tavily_search_plan",
+            raw_label="build_tavily_search_plan",
         )
         agent_output = TavilyQueryOutput.from_json_value(response_obj, max_queries=max_queries)
         source_queries = merge_tavily_queries_with_fallbacks(agent_output.queries, fields, max_queries=max_queries)
@@ -2820,7 +2627,6 @@ def build_tavily_search_plan(
             source_queries,
             ctx,
             llm,
-            quiet=quiet,
             topic_hints=agent_output.topic_hints,
         )
         queries = merge_source_and_target_tavily_queries(
@@ -2831,10 +2637,9 @@ def build_tavily_search_plan(
         topic_hints = unique_non_empty_strings([*agent_output.topic_hints, *target_output.topic_hints], 32)
         return TavilySearchPlan(queries=queries, topic_hints=topic_hints)
     except Exception as e:
-        if not quiet:
-            print(f"  Warning: Tavily query agent failed: {e}", file=sys.stderr)
+        log("WARNING", f'  Warning: Tavily query agent failed: {e}')
         source_queries = merge_tavily_queries_with_fallbacks([], fields, max_queries=max_queries)
-        target_output = translate_tavily_query_output(source_queries, ctx, llm, quiet=quiet)
+        target_output = translate_tavily_query_output(source_queries, ctx, llm)
         queries = merge_source_and_target_tavily_queries(
             source_queries,
             target_output.queries,
@@ -2862,17 +2667,15 @@ class GlossaryBuildOptions:
     tavily_key: str = ""
     tavily_max_results: int = 20
     tavily_max_queries: int = 15
-    quiet: bool = False
     retriever: EmbeddingRetriever = None
     force: bool = False
 
     @staticmethod
-    def from_env(env: dict[str, str], quiet: bool = False, retriever=None, force: bool = False) -> "GlossaryBuildOptions":
+    def from_env(env: dict[str, str], retriever=None, force: bool = False) -> "GlossaryBuildOptions":
         return GlossaryBuildOptions(
             tavily_key=env.get("TAVILY_API_KEY", ""),
             tavily_max_results=env_int(env.get("TAVILY_MAX_RESULTS", ""), 20),
             tavily_max_queries=env_int(env.get("TAVILY_MAX_QUERIES", ""), 15),
-            quiet=quiet,
             retriever=retriever,
             force=force,
         )
@@ -3132,7 +2935,6 @@ def finalize_glossary_from_evidence(
             lambda value: GlossaryOutput.from_model_content(value),
             retry_template=CompletionRetryTemplate(
                 attempts=3,
-                quiet=options.quiet,
                 label="Glossary finalizer",
             ),
             retry_feedback=lambda _answer, error, _attempt: (
@@ -3146,15 +2948,12 @@ def finalize_glossary_from_evidence(
             ),
         )
     except Exception as e:
-        if not options.quiet:
-            print(f"Warning: glossary finalizer failed; using local web-evidence draft: {e}", file=sys.stderr)
+        log("WARNING", f'Warning: glossary finalizer failed; using local web-evidence draft: {e}')
         return GlossaryBuildArtifact(
             markdown=local_glossary_markdown_from_evidence(request_fields, sidecar),
             web_evidence=sidecar,
         )
-    if not options.quiet:
-        print("build_glossary finalizer raw response:", file=sys.stderr)
-        print(content, file=sys.stderr)
+    log("DEBUG", f"Glossary finalizer response received: chars={len(content)}")
     return GlossaryBuildArtifact(markdown=glossary_output.markdown, web_evidence=sidecar)
 
 
@@ -3210,7 +3009,6 @@ def build_glossary_with_tools(
         response = session.create(
             retry_template=CompletionRetryTemplate(
                 attempts=3,
-                quiet=options.quiet,
                 label="Glossary tool completion",
             ),
             **kwargs,
@@ -3222,12 +3020,7 @@ def build_glossary_with_tools(
             format_retries += 1
             if format_retries > max_format_retries:
                 raise RuntimeError("glossary tool call format retry limit reached")
-            if not options.quiet:
-                print(
-                    f"Glossary: malformed tool-call response, retrying "
-                    f"({format_retries}/{max_format_retries})",
-                    file=sys.stderr,
-                )
+            log("INFO", f'Glossary: malformed tool-call response, retrying ({format_retries}/{max_format_retries})')
             continue
         if tool_calls and allow_tools:
             format_retries = 0
@@ -3251,12 +3044,7 @@ def build_glossary_with_tools(
                     )
                     if record.query and record.results:
                         evidence_records.append(record)
-                if not options.quiet:
-                    print(
-                        f"Glossary tool result ({tool_name}, {used_tool_queries}/{max_tool_queries}): "
-                        f"{tool_result.get('query', '')}",
-                        file=sys.stderr,
-                    )
+                log("INFO", f"Glossary tool result ({tool_name}, {used_tool_queries}/{max_tool_queries}): {tool_result.get('query', '')}")
                 session.messages.append(
                     {
                         "role": "tool",
@@ -3268,9 +3056,7 @@ def build_glossary_with_tools(
         if tool_calls:
             raise RuntimeError("glossary Tavily query budget reached before final answer")
         content = str(get_message_value(message, "content", "") or "")
-        if not options.quiet:
-            print("build_glossary raw response:", file=sys.stderr)
-            print(content, file=sys.stderr)
+        log("DEBUG", f"Glossary response received: chars={len(content)}")
         sidecar = WebEvidenceSidecar(records=evidence_records)
         if sidecar.has_records():
             return finalize_glossary_from_evidence(request_fields, sidecar, ctx, llm, options)
@@ -3280,8 +3066,7 @@ def build_glossary_with_tools(
                 web_evidence=sidecar,
             )
         except Exception as e:
-            if not options.quiet:
-                print(f"Glossary: final response was not parseable; using finalizer retry: {e}", file=sys.stderr)
+            log("INFO", f'Glossary: final response was not parseable; using finalizer retry: {e}')
             return finalize_glossary_from_evidence(request_fields, sidecar, ctx, llm, options)
 
     raise RuntimeError("glossary tool session ended without final answer")
@@ -3289,8 +3074,8 @@ def build_glossary_with_tools(
 
 def write_glossary_generation_fallback(ctx: TranscriptContext, options: GlossaryBuildOptions) -> str:
     glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary("", ctx))
-    if glossary and not options.quiet:
-        print(f"Glossary fallback: {ctx.glossary}", file=sys.stderr)
+    if glossary:
+        log("INFO", f'Glossary fallback: {ctx.glossary}')
     return glossary
 
 
@@ -3310,7 +3095,6 @@ def build_tavily_search_evidence(
         transcript,
         ctx,
         llm,
-        quiet=options.quiet,
         max_queries=max(1, options.tavily_max_queries),
         retriever=options.retriever,
     )
@@ -3322,9 +3106,8 @@ def build_tavily_search_evidence(
             domain_preferences,
             topic_hints=search_plan.topic_hints,
         )
-        if not options.quiet:
-            domain_hint = f" ({len(preferred_domains)} preferred domains)" if preferred_domains else ""
-            print(f"  Searching: {q[:60]}{domain_hint}", file=sys.stderr)
+        domain_hint = f" ({len(preferred_domains)} preferred domains)" if preferred_domains else ""
+        log("INFO", f'  Searching: {q[:60]}{domain_hint}')
         results = tavily_search(q, options.tavily_key, per_query_results, preferred_domains=preferred_domains)
         record = build_web_evidence_record(
             q,
@@ -3339,6 +3122,7 @@ def build_tavily_search_evidence(
     return WebEvidenceSidecar(records=records)
 
 
+@logged_stage("glossary")
 def build_glossary(
     transcript: Transcript,
     ctx: TranscriptContext,
@@ -3352,10 +3136,9 @@ def build_glossary(
         if options.tavily_key and int(options.tavily_max_queries or 0) > 0 and not load_web_evidence_sidecar(ctx.web_evidence_json).has_records():
             sidecar = build_tavily_search_evidence(transcript, ctx, llm, metadata_fields, options)
             write_web_evidence_sidecar(ctx, sidecar)
-            if sidecar.has_records() and not options.quiet:
-                print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
-        if not options.quiet:
-            print(f"Glossary cache: {ctx.glossary}", file=sys.stderr)
+            if sidecar.has_records():
+                log("INFO", f'Web evidence: {ctx.web_evidence_json}')
+        log("INFO", f'Glossary cache: {ctx.glossary}')
         return glossary
 
     title = metadata_fields["title"]
@@ -3364,12 +3147,7 @@ def build_glossary(
     transcript_text = "\n".join(transcript.text_lines())
 
     if options.use_tool_session():
-        if not options.quiet:
-            print(
-                f"Glossary: generating with {llm.provider} / {llm.model_name()} "
-                f"(Tavily queries={options.tavily_max_queries})",
-                file=sys.stderr,
-            )
+        log("INFO", f'Glossary: generating with {llm.provider} / {llm.model_name()} (Tavily queries={options.tavily_max_queries})')
         try:
             artifact = build_glossary_with_tools(
                 transcript,
@@ -3379,15 +3157,13 @@ def build_glossary(
             )
             write_web_evidence_sidecar(ctx, artifact.web_evidence)
             glossary = write_glossary_file(ctx, ensure_local_metadata_in_glossary(artifact.markdown, ctx))
-            if not options.quiet:
-                print(f"Glossary: {ctx.glossary}", file=sys.stderr)
-                if artifact.web_evidence.has_records():
-                    print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
+            log("INFO", f'Glossary: {ctx.glossary}')
+            if artifact.web_evidence.has_records():
+                log("INFO", f'Web evidence: {ctx.web_evidence_json}')
             return glossary
         except Exception as e:
-            print(f"Warning: glossary tool session failed: {e}", file=sys.stderr)
-            if not options.quiet:
-                print("Glossary: falling back to query-agent Tavily search", file=sys.stderr)
+            log("WARNING", f'Warning: glossary tool session failed: {e}')
+            log("INFO", 'Glossary: falling back to query-agent Tavily search')
 
     sidecar = build_tavily_search_evidence(transcript, ctx, llm, metadata_fields, options)
     write_web_evidence_sidecar(ctx, sidecar)
@@ -3407,29 +3183,26 @@ def build_glossary(
             request_fields["retrieved_context"] = retrieved[0]
 
     request = LLMObjectRequest(request_fields)
-
-    if not options.quiet:
-        print(f"Glossary: generating with {llm.provider} / {llm.model_name()}", file=sys.stderr)
+    log("INFO", f'Glossary: generating with {llm.provider} / {llm.model_name()}')
     try:
         response_obj = llm_json_once(
             llm,
             glossary_system_prompt(ctx, options.retriever),
             request,
             temperature=0.3,
-            raw_label=None if options.quiet else "build_glossary",
+            raw_label="build_glossary",
             disable_response_format=True,
         )
         glossary_output = GlossaryOutput.from_json_value(response_obj)
         glossary = ensure_local_metadata_in_glossary(glossary_output.markdown, ctx)
     except Exception as e:
-        print(f"Warning: glossary generation failed: {e}", file=sys.stderr)
+        log("WARNING", f'Warning: glossary generation failed: {e}')
         return write_glossary_generation_fallback(ctx, options)
 
     glossary = write_glossary_file(ctx, glossary)
-    if not options.quiet:
-        print(f"Glossary: {ctx.glossary}", file=sys.stderr)
-        if sidecar.has_records():
-            print(f"Web evidence: {ctx.web_evidence_json}", file=sys.stderr)
+    log("INFO", f'Glossary: {ctx.glossary}')
+    if sidecar.has_records():
+        log("INFO", f'Web evidence: {ctx.web_evidence_json}')
     return glossary
 
 
@@ -3524,75 +3297,6 @@ def make_source_item(
     )
 
 
-def make_pair_item(
-    item_id: int,
-    ctx: TranscriptContext,
-    source_text: str,
-    target_text: str,
-    retrieved_context: Optional[list[dict]] = None,
-    context_before: Optional[list[dict]] = None,
-    context_after: Optional[list[dict]] = None,
-) -> LLMBatchItem:
-    return make_language_item(
-        item_id,
-        ctx,
-        source=source_text,
-        target=target_text,
-        extra={
-            "retrieved_context": retrieved_context or [],
-            "context_before": context_before or [],
-            "context_after": context_after or [],
-        },
-    )
-
-
-def make_pair_json(
-    item_id: int,
-    ctx: TranscriptContext,
-    source_text: str,
-    target_text: str,
-) -> dict:
-    return make_pair_item(item_id, ctx, source_text, target_text).to_json_value()
-
-
-@dataclass
-class LanguageTextResult:
-    id: int
-    source_text: str
-    target_text: str
-
-    @staticmethod
-    def from_json_value(data: dict, ctx: TranscriptContext, require_source: bool = True) -> "LanguageTextResult":
-        fields = LanguageFields.from_ctx(ctx)
-        source_value = fields.get_source(data) if require_source else ""
-        target_value = fields.get_target(data)
-        return LanguageTextResult(
-            int(data.get("id")),
-            _strip_speaker_labels(str(source_value or "")),
-            _strip_speaker_labels(str(target_value or "")),
-        )
-
-
-@dataclass
-class SplitOutputItem:
-    id: int
-    source_parts: list[str]
-    target_parts: list[str]
-
-    @staticmethod
-    def from_json_value(data: dict, ctx: TranscriptContext) -> "SplitOutputItem":
-        fields = LanguageFields.from_ctx(ctx)
-        source_items = fields.get_source(data)
-        target_items = fields.get_target(data)
-        if not isinstance(source_items, list) or not isinstance(target_items, list):
-            raise ValueError("language-code values must both be arrays")
-        return SplitOutputItem(
-            int(data.get("id")),
-            [str(p).replace("\\N", " ").strip() for p in source_items if str(p).strip()],
-            [str(p).replace("\\N", " ").strip() for p in target_items if str(p).strip()],
-        )
-
-
 @dataclass
 class LLMBatchRequest:
     items: list[LLMBatchItem]
@@ -3602,56 +3306,6 @@ class LLMBatchRequest:
 
     def to_json_text(self) -> str:
         return json.dumps(self.to_json_value(), ensure_ascii=False, indent=2)
-
-
-@dataclass
-class LLMBatchResponse:
-    items: list[dict]
-
-    @staticmethod
-    def from_json_value(data) -> "LLMBatchResponse":
-        if isinstance(data, dict):
-            items = data.get("items")
-        elif isinstance(data, list):
-            items = data
-        else:
-            items = None
-        if not isinstance(items, list):
-            raise ValueError('response is not a JSON object with an "items" array')
-        clean_items = [item for item in items if isinstance(item, dict)]
-        if len(clean_items) != len(items):
-            raise ValueError('response "items" must contain only objects')
-        return LLMBatchResponse(clean_items)
-
-    def to_items(self) -> list[dict]:
-        return self.items
-
-    def to_translate_outputs(self, ctx: TranscriptContext) -> list[LanguageTextResult]:
-        result: list[LanguageTextResult] = []
-        for item in self.items:
-            try:
-                result.append(LanguageTextResult.from_json_value(item, ctx, require_source=False))
-            except (TypeError, ValueError):
-                continue
-        return result
-
-    def to_proofread_outputs(self, ctx: TranscriptContext) -> list[LanguageTextResult]:
-        result: list[LanguageTextResult] = []
-        for item in self.items:
-            try:
-                result.append(LanguageTextResult.from_json_value(item, ctx, require_source=True))
-            except (TypeError, ValueError):
-                continue
-        return result
-
-    def to_split_outputs(self, ctx: TranscriptContext) -> list[SplitOutputItem]:
-        result: list[SplitOutputItem] = []
-        for item in self.items:
-            try:
-                result.append(SplitOutputItem.from_json_value(item, ctx))
-            except (TypeError, ValueError):
-                continue
-        return result
 
 
 @dataclass
@@ -3725,7 +3379,6 @@ class GlossaryOutput:
 class CompletionRetryTemplate:
     attempts: int = 3
     base_delay: float = 0.0
-    quiet: bool = False
     label: str = "LLM completion"
 
     def normalized_attempts(self) -> int:
@@ -3775,6 +3428,8 @@ class ChatSession:
         if response_format and "response_format" not in kwargs:
             kwargs["response_format"] = response_format
         kwargs.update(extra_kwargs)
+        if getattr(self.llm, "request_timeout", None) is not None:
+            kwargs["timeout"] = self.llm.request_timeout
         if self.disable_response_format:
             kwargs.pop("response_format", None)
         return self.llm._client().chat.completions.create(**kwargs)
@@ -3848,12 +3503,7 @@ class ChatSession:
 
     def _wait_before_retry(self, template: CompletionRetryTemplate, attempt_index: int, error: Exception) -> None:
         wait = template.wait_seconds(attempt_index)
-        if not template.quiet:
-            print(
-                f"  {template.label} retry {attempt_index + 1}/{template.normalized_attempts()} "
-                f"in {wait:g}s: {error}",
-                file=sys.stderr,
-            )
+        log("WARNING", f'  {template.label} retry {attempt_index + 1}/{template.normalized_attempts()} in {wait:g}s: {error}')
         if wait > 0:
             time.sleep(wait)
 
@@ -3872,13 +3522,10 @@ def llm_json_once(
         lambda value: require_json_object(_extract_json_value(value), "response"),
         retry_template=CompletionRetryTemplate(
             attempts=3,
-            quiet=raw_label is None,
             label=raw_label or "LLM JSON",
         ),
     )
-    if raw_label:
-        print(f"{raw_label} raw response:", file=sys.stderr)
-        print(content, file=sys.stderr)
+    log("DEBUG", f"{raw_label or 'LLM JSON'} response received: chars={len(content)}")
     return response_obj
 
 
@@ -3912,86 +3559,6 @@ def _extract_json_value(content: str):
         return None
 
 
-def _extract_json_batch(content: str) -> Optional[LLMBatchResponse]:
-    data = _extract_json_value(content)
-    try:
-        return LLMBatchResponse.from_json_value(data)
-    except ValueError:
-        return None
-
-
-def require_json_batch_response(content: str) -> LLMBatchResponse:
-    data = _extract_json_batch(content)
-    if data is None:
-        raise ValueError('response is not a JSON object with an "items" array')
-    return data
-
-
-def _strip_speaker_labels(text: str) -> str:
-    value = text.strip()
-    for _ in range(3):
-        new_value = re.sub(r"^(?:EN|ZH|SRC|TGT)\s*:\s*", "", value, flags=re.IGNORECASE).strip()
-        if new_value == value:
-            break
-        value = new_value
-    return value
-
-
-def parse_proofread_response(
-    data: list,
-    expected_ids: list[int],
-    fallback_pairs: list[tuple[str, str]],
-    ctx: TranscriptContext,
-) -> list[tuple[str, str]]:
-    if data is not None:
-        by_id: dict[int, tuple[str, str]] = {}
-        for parsed in LLMBatchResponse([item for item in data if isinstance(item, dict)]).to_proofread_outputs(ctx):
-            if parsed.source_text or parsed.target_text:
-                by_id[parsed.id] = (parsed.source_text, parsed.target_text)
-        return [by_id.get(item_id, fallback_pairs[idx]) for idx, item_id in enumerate(expected_ids)]
-    return fallback_pairs
-
-
-def proofread_retrieval_query(event: SplitEvent) -> str:
-    return "\n".join(
-        [
-            "ASR correction glossary proofread source-language proper names terminology",
-            f"Source: {event.en}",
-            f"Target: {event.zh}",
-        ]
-    )
-
-
-def llm_numbered_batch(
-    request: LLMBatchRequest,
-    session: ChatSession,
-    quiet: bool,
-    retries: int = 3,
-    raise_on_failure: bool = False,
-) -> list:
-    prompt = request.to_json_text()
-    try:
-        _content, data = session.ask_validated(
-            prompt,
-            require_json_batch_response,
-            retry_template=CompletionRetryTemplate(
-                attempts=retries,
-                base_delay=3.0,
-                quiet=quiet,
-                label="LLM batch",
-            ),
-        )
-        return data.to_items()
-    except Exception as e:
-        if raise_on_failure and is_context_length_error(e):
-            raise
-        message = f"LLM batch failed after {retries} attempts: {e}"
-        if raise_on_failure:
-            raise RuntimeError(message)
-        print(f"Error: {message}", file=sys.stderr)
-        return []
-
-
 def is_context_length_error(error: Exception | str) -> bool:
     message = str(error).lower()
     return any(
@@ -4003,199 +3570,6 @@ def is_context_length_error(error: Exception | str) -> bool:
             "reduce the length",
         )
     )
-
-
-def translate_segments(
-    transcript: Transcript,
-    ctx: TranscriptContext,
-    llm: LLMConfig,
-    system_prompt: str,
-    quiet: bool,
-    retriever: EmbeddingRetriever | None = None,
-) -> bool:
-    pending = [s for s in transcript.segments if not s.translation]
-    if not pending:
-        if not quiet:
-            print("Translate: cached", file=sys.stderr)
-        return False
-
-    if not quiet:
-        print(f"Translator: {llm.provider} / {llm.model_name()}", file=sys.stderr)
-        print(f"Total segments: {len(pending)}", file=sys.stderr)
-
-    session = ChatSession(
-        llm,
-        system_prompt
-        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
-        + "\n\n"
-        + _JSON_FORMAT
-        + "\n\n"
-        + _JSON_BATCH_FORMAT
-        + "\n\n"
-        + render_prompt_template(_TRANSLATE_FORMAT, ctx),
-        temperature=0.3,
-    )
-    for start in range(0, len(pending), llm.batch_size):
-        batch = pending[start : start + llm.batch_size]
-        if not quiet:
-            print(
-                f"  Batch {start // llm.batch_size + 1}/{math.ceil(len(pending) / llm.batch_size)}: "
-                f"translating {start + 1}-{start + len(batch)}",
-                file=sys.stderr,
-            )
-        contexts = retriever.retrieve_texts([seg.en_text() for seg in batch]) if retriever is not None else [[] for _ in batch]
-        request = LLMBatchRequest(
-            [
-                make_source_item(s.index, ctx, s.en_text(), retrieved_context=contexts[idx])
-                for idx, s in enumerate(batch)
-            ]
-        )
-        response_items = llm_numbered_batch(
-            request,
-            session,
-            quiet,
-        )
-        by_id = {
-            parsed.id: parsed.target_text
-            for parsed in LLMBatchResponse(response_items).to_translate_outputs(ctx)
-        }
-        translations = [
-            by_id.get(seg.index, "")
-            for seg in batch
-        ]
-        for seg, zh in zip(batch, translations):
-            seg.translation = zh.strip()
-            seg.split_events = []
-    return True
-
-
-def proofread_split_events(
-    transcript: Transcript,
-    ctx: TranscriptContext,
-    llm: LLMConfig,
-    system_prompt: str,
-    quiet: bool,
-    retriever: EmbeddingRetriever | None = None,
-    proofread_retrieval_top_k: int = 1,
-) -> bool:
-    events: list[SplitEvent] = []
-    for seg in transcript.segments:
-        events.extend(seg.split_events or [whole_segment_split_event(seg)])
-    if not events:
-        return False
-
-    pr_llm = llm
-    retrieval_top_k = max(1, int(proofread_retrieval_top_k or 1))
-    if not quiet:
-        print(f"Proofreader: {pr_llm.provider} / {pr_llm.model_name()}", file=sys.stderr)
-        print(f"Total split events: {len(events)}", file=sys.stderr)
-
-    proofread_format = render_prompt_template(_PROOFREAD_FORMAT, ctx)
-    session = ChatSession(
-        pr_llm,
-        system_prompt
-        + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
-        + "\n\n"
-        + _PROOFREAD_ASR_CONTEXT_RULES
-        + "\n\n"
-        + _JSON_FORMAT
-        + "\n\n"
-        + _JSON_BATCH_FORMAT
-        + "\n\n"
-        + proofread_format,
-        temperature=0.2,
-    )
-    changed = False
-
-    def apply_proofread_batch(
-        batch_events: list[SplitEvent],
-        item_offset: int,
-        batch_contexts: list[list[dict]],
-    ) -> bool:
-        request = LLMBatchRequest(
-            [
-                make_pair_item(
-                    item_offset + idx + 1,
-                    ctx,
-                    event.en,
-                    event.zh,
-                    retrieved_context=batch_contexts[idx],
-                )
-                for idx, event in enumerate(batch_events)
-            ]
-        )
-        try:
-            response_items = llm_numbered_batch(
-                request,
-                session,
-                quiet,
-                raise_on_failure=True,
-            )
-        except Exception as e:
-            if len(batch_events) > 1 and is_context_length_error(e):
-                mid = len(batch_events) // 2
-                if not quiet:
-                    print(
-                        f"  Proofread batch too large; splitting {item_offset + 1}-"
-                        f"{item_offset + len(batch_events)}",
-                        file=sys.stderr,
-                    )
-                left_changed = apply_proofread_batch(
-                    batch_events[:mid],
-                    item_offset,
-                    batch_contexts[:mid],
-                )
-                right_changed = apply_proofread_batch(
-                    batch_events[mid:],
-                    item_offset + mid,
-                    batch_contexts[mid:],
-                )
-                return left_changed or right_changed
-            if is_context_length_error(e) and any(batch_contexts):
-                if not quiet:
-                    print(
-                        f"  Proofread item {item_offset + 1} too large with retrieved context; retrying without RAG context",
-                        file=sys.stderr,
-                    )
-                return apply_proofread_batch(batch_events, item_offset, [[] for _ in batch_events])
-            print(f"Warning: proofread batch failed: {e}", file=sys.stderr)
-            response_items = []
-
-        fallback_pairs = [(event.en, event.zh) for event in batch_events]
-        parsed_pairs = parse_proofread_response(
-            response_items,
-            [item.id for item in request.items],
-            fallback_pairs,
-            ctx,
-        )
-        batch_changed = False
-        for event, (en, zh) in zip(batch_events, parsed_pairs):
-            new_en = en.strip() or event.en
-            new_zh = zh.strip() or event.zh
-            if new_en != event.en or new_zh != event.zh:
-                batch_changed = True
-            event.en = new_en
-            event.zh = new_zh
-        return batch_changed
-
-    for start in range(0, len(events), pr_llm.batch_size):
-        batch = events[start : start + pr_llm.batch_size]
-        contexts = (
-            retriever.retrieve_texts(
-                [proofread_retrieval_query(event) for event in batch],
-                top_k=retrieval_top_k,
-            )
-            if retriever is not None
-            else [[] for _ in batch]
-        )
-        if not quiet:
-            print(
-                f"  Batch {start // pr_llm.batch_size + 1}/{math.ceil(len(events) / pr_llm.batch_size)}: "
-                f"proofreading split events {start + 1}-{start + len(batch)}",
-                file=sys.stderr,
-            )
-        changed = apply_proofread_batch(batch, start, contexts) or changed
-    return changed
 
 
 # --- Split and word alignment -------------------------------------------------
@@ -4252,403 +3626,409 @@ def text_tokens(text: str) -> list[str]:
     return tokens
 
 
-def find_word_span(
-    words: list[TranscriptWord],
-    phrase: str,
-    offset: int,
-) -> Optional[tuple[int, int, float, float]]:
-    phrase_tokens = text_tokens(phrase)
-    if not phrase_tokens:
-        return None
-    flat: list[tuple[str, int]] = []
-    for word_idx, word in enumerate(words):
-        for token in text_tokens(word.text):
-            flat.append((token, word_idx))
-    n = len(phrase_tokens)
-    start_token_offset = 0
-    while start_token_offset < len(flat) and flat[start_token_offset][1] < offset:
-        start_token_offset += 1
-    for i in range(start_token_offset, max(start_token_offset, len(flat) - n + 1)):
-        if [token for token, _ in flat[i : i + n]] != phrase_tokens:
-            continue
-        start_word_idx = flat[i][1]
-        end_word_idx = flat[i + n - 1][1]
-        timed = [w for w in words[start_word_idx : end_word_idx + 1] if w.start is not None and w.end is not None]
-        if timed:
-            return start_word_idx, end_word_idx + 1, float(timed[0].start), float(timed[-1].end)
-    return None
-
-
-def find_word_index(
-    words: list[TranscriptWord],
-    token: str,
-    start_offset: int,
-) -> Optional[int]:
-    for i in range(start_offset, len(words)):
-        if token in text_tokens(words[i].text):
-            return i
-    return None
-
-
-def timed_token_words(segment: TranscriptSegment) -> list[TranscriptWord]:
-    return [
-        w
-        for w in segment.words
-        if w.start is not None and w.end is not None and text_tokens(w.text)
-    ]
-
-
-def align_split_events_by_edge_tokens(
-    segment: TranscriptSegment,
-    en_parts: list[str],
-    zh_parts: list[str],
-) -> Optional[list[SplitEvent]]:
-    words = timed_token_words(segment)
-    if not words:
-        return None
-
-    events: list[SplitEvent] = []
-    offset = 0
-    for idx, en in enumerate(en_parts):
-        tokens = text_tokens(en)
-        if not tokens:
-            return None
-        first_idx = find_word_index(words, tokens[0], offset)
-        if first_idx is None:
-            return None
-        last_idx = find_word_index(words, tokens[-1], first_idx)
-        if last_idx is None:
-            return None
-        zh = zh_parts[idx] if idx < len(zh_parts) else ""
-        events.append(
-            SplitEvent(
-                start=float(words[first_idx].start),
-                end=float(words[last_idx].end),
-                en=en,
-                zh=zh,
-            )
-        )
-        offset = last_idx + 1
-
-    return events
-
-
-def clamp_split_events(
-    segment: TranscriptSegment,
-    events: list[SplitEvent],
-) -> list[SplitEvent]:
-    events[0].start = segment.start
-    events[-1].end = segment.end
-    for i, event in enumerate(events):
-        event.start = max(segment.start, min(event.start, segment.end))
-        event.end = max(event.start + 0.01, min(event.end, segment.end))
-        if i > 0 and event.start < events[i - 1].end:
-            event.start = events[i - 1].end
-            event.end = max(event.start + 0.01, event.end)
-    return events
-
-
-def align_split_events(
-    segment: TranscriptSegment,
-    source_parts: list[str],
-    target_parts: list[str],
-) -> Optional[list[SplitEvent]]:
-    if text_tokens(" ".join(source_parts)) != text_tokens(segment.source_text()):
-        return None
-
-    edged = align_split_events_by_edge_tokens(segment, source_parts, target_parts)
-    if edged:
-        return clamp_split_events(segment, edged)
-
-    events: list[SplitEvent] = []
-    timed_words = timed_token_words(segment)
-    offset = 0
-
-    for idx, source_text in enumerate(source_parts):
-        target_text = target_parts[idx] if idx < len(target_parts) else ""
-        span = find_word_span(timed_words, source_text, offset) if timed_words else None
-        if not span:
-            return None
-        offset = span[1]
-        start, end = span[2], span[3]
-        events.append(SplitEvent(start=start, end=end, en=source_text, zh=target_text))
-
-    if not events:
-        return None
-
-    return clamp_split_events(segment, events)
-
-
-def parse_split_response(
-    data: list,
-    expected_ids: list[int],
-    ctx: TranscriptContext,
-) -> tuple[dict[int, list[str]], dict[int, list[str]], str]:
-    source: dict[int, list[str]] = {}
-    target: dict[int, list[str]] = {}
-    expected_set = set(expected_ids)
-    if data is None:
-        return source, target, 'response is not a JSON object with an "items" array'
-
-    seen_ids: set[int] = set()
-    for pos, item in enumerate(data, 1):
-        if not isinstance(item, dict):
-            continue
-        item_id = item.get("id")
-        try:
-            item_id_int = int(item_id)
-        except (TypeError, ValueError):
-            continue
-        if item_id_int not in expected_set:
-            continue
-        if item_id_int in seen_ids:
-            continue
-        seen_ids.add(item_id_int)
-        try:
-            parsed = SplitOutputItem.from_json_value(item, ctx)
-        except (TypeError, ValueError):
-            continue
-        if parsed.source_parts:
-            source[item_id_int] = parsed.source_parts
-            target[item_id_int] = parsed.target_parts
-    return source, target, ""
-
-
-def whole_segment_split_event(segment: TranscriptSegment) -> SplitEvent:
-    return SplitEvent(segment.start, segment.end, segment.source_text(), segment.translation)
-
-
-def is_whole_segment_split(segment: TranscriptSegment) -> bool:
-    return (
-        len(segment.split_events) == 1
-        and segment.split_events[0].en == segment.source_text()
-    )
-
-
-def infer_split_status(segment: TranscriptSegment, split: SplitConfig) -> str:
-    if segment.split_status:
-        return segment.split_status
-    if not segment.split_events:
-        return ""
-    is_long = len(segment.source_text()) > split.max_chars or segment.end - segment.start > split.max_duration
-    if is_whole_segment_split(segment):
-        return SplitStatus.FALLBACK.value if is_long else SplitStatus.UNSPLIT.value
-    return SplitStatus.OK.value
-
-
-def split_reason_message(reason: str, detail: str = "") -> str:
-    messages = {
-        SplitReason.BELOW_THRESHOLDS.value: "below split thresholds",
-        SplitReason.NO_USABLE_PARTS.value: "no usable split parts for this id",
-        SplitReason.PART_COUNT_MISMATCH.value: "source/target part count mismatch",
-        SplitReason.TOKEN_RECONSTRUCT_FAILED.value: "source tokens do not reconstruct original",
-        SplitReason.WORD_ALIGNMENT_FAILED.value: "split edge words could not align to WhisperX words",
-        SplitReason.PARSE_FAILED.value: "AI split response parse failed",
-        SplitReason.EXCEPTION.value: "split request failed",
-        SplitReason.AI_SPLIT_INVALID.value: "invalid or unaligned AI split",
-    }
-    base = messages.get(reason, reason or SplitReason.AI_SPLIT_INVALID.value)
-    return f"{base}: {detail}" if detail else base
-
-
-def split_context_items(
-    transcript: Transcript,
-    segment: TranscriptSegment,
-    ctx: TranscriptContext,
-    window: int,
-    before: bool,
-) -> list[dict]:
-    if window <= 0:
-        return []
-    try:
-        pos = transcript.segments.index(segment)
-    except ValueError:
-        return []
-    if before:
-        candidates = transcript.segments[max(0, pos - window) : pos]
-    else:
-        candidates = transcript.segments[pos + 1 : pos + 1 + window]
-    return [make_pair_json(seg.index, ctx, seg.source_text(), seg.translation) for seg in candidates]
-
-
-def validated_split_events(
-    segment: TranscriptSegment,
-    source_parts: Optional[list[str]],
-    target_parts: Optional[list[str]],
-) -> tuple[Optional[list[SplitEvent]], str, str]:
-    if not source_parts or not target_parts:
-        return None, SplitReason.NO_USABLE_PARTS.value, ""
-    if len(source_parts) != len(target_parts):
-        return (
-            None,
-            SplitReason.PART_COUNT_MISMATCH.value,
-            f"source parts {len(source_parts)} != target parts {len(target_parts)}",
-        )
-    expected_tokens = text_tokens(segment.source_text())
-    actual_tokens = text_tokens(" ".join(source_parts))
-    if actual_tokens != expected_tokens:
-        return (
-            None,
-            SplitReason.TOKEN_RECONSTRUCT_FAILED.value,
-            f"{len(actual_tokens)} != {len(expected_tokens)}",
-        )
-    if len(source_parts) == 1:
-        return [SplitEvent(segment.start, segment.end, source_parts[0], target_parts[0])], "", ""
-    events = align_split_events(segment, source_parts, target_parts)
-    if not events or len(events) != len(source_parts):
-        return None, SplitReason.WORD_ALIGNMENT_FAILED.value, ""
-    return events, "", ""
-
-
-def split_segments(
-    transcript: Transcript,
-    ctx: TranscriptContext,
-    llm: LLMConfig,
-    split: SplitConfig,
-    quiet: bool,
-) -> bool:
-    changed = False
-    for seg in transcript.segments:
-        if not seg.split_events:
-            should_split = (
-                split.enabled
-                and (len(seg.source_text()) > split.max_chars or seg.end - seg.start > split.max_duration)
-            )
-            if not should_split:
-                seg.split_events = [whole_segment_split_event(seg)]
-                seg.split_status = SplitStatus.UNSPLIT.value
-                seg.split_reason = SplitReason.BELOW_THRESHOLDS.value
-                seg.split_reason_detail = ""
-                changed = True
-
-    if not split.enabled:
-        return changed
-
-    pending = [
-        s
-        for s in transcript.segments
-        if infer_split_status(s, split) in ("", SplitStatus.FALLBACK.value)
-    ]
-    pending = [s for s in pending if len(s.source_text()) > split.max_chars or s.end - s.start > split.max_duration]
-    if not pending:
-        if not quiet:
-            print("Split: cached/no long segments", file=sys.stderr)
-        return changed
-
-    if not quiet:
-        print(f"Split: {len(pending)} long segment(s), context_window={split.context_window}", file=sys.stderr)
-        print(
-            "Split pending ids: " + ", ".join(str(seg.index) for seg in pending),
-            file=sys.stderr,
-        )
-        for seg in pending:
-            status = infer_split_status(seg, split) or SplitStatus.PENDING.value
-            print(
-                f"  #{seg.index}: chars={len(seg.source_text())} "
-                f"duration={seg.end - seg.start:.2f}s split_status={status}",
-                file=sys.stderr,
-            )
-
-    style_prompt = render_language_template(
-        load_prompt("split_prompt", _SPLIT_PROMPT_FALLBACK),
-        ctx.source_lang,
-        ctx.target_lang,
-        ctx.source_lang_code,
-        ctx.target_lang_code,
-    )
-    split_format = render_prompt_template(_SPLIT_FORMAT, ctx)
-    session = ChatSession(
-        llm,
-        f"{style_prompt}\n\n{_JSON_FORMAT}\n\n{_JSON_BATCH_FORMAT}\n\n{split_format}",
-        temperature=0.1,
-    )
-    for start in range(0, len(pending), max(1, llm.batch_size // 2)):
-        batch = pending[start : start + max(1, llm.batch_size // 2)]
-        expected_ids = [seg.index for seg in batch]
-        request = LLMBatchRequest(
-            [
-                make_pair_item(
-                    seg.index,
-                    ctx,
-                    seg.source_text(),
-                    seg.translation,
-                    context_before=split_context_items(transcript, seg, ctx, split.context_window, before=True),
-                    context_after=split_context_items(transcript, seg, ctx, split.context_window, before=False),
-                )
-                for seg in batch
-            ]
-        )
-        try:
-            if not quiet:
-                print("Split AI user prompt:", file=sys.stderr)
-                print(request.to_json_text(), file=sys.stderr)
-            response_items = llm_numbered_batch(
-                request,
-                session,
-                quiet,
-            )
-            if not quiet:
-                print("Split AI raw response:", file=sys.stderr)
-                print(json.dumps(response_items, ensure_ascii=False, indent=2), file=sys.stderr)
-            source_splits, target_splits, parse_error = parse_split_response(
-                response_items,
-                expected_ids,
-                ctx,
-            )
-            if parse_error and not quiet:
-                print(f"Split parse warning: {parse_error}", file=sys.stderr)
-        except Exception as e:
-            print(f"Warning: split failed: {e}", file=sys.stderr)
-            source_splits, target_splits, parse_error = {}, {}, str(e)
-
-        for seg in batch:
-            events, reason, reason_detail = validated_split_events(
-                seg,
-                source_splits.get(seg.index),
-                target_splits.get(seg.index),
-            )
-            if events is None:
-                fallback_reason = reason or (SplitReason.PARSE_FAILED.value if parse_error else SplitReason.AI_SPLIT_INVALID.value)
-                fallback_detail = reason_detail or parse_error
-                if not quiet:
-                    print(
-                        f"Split: fallback to whole segment #{seg.index} "
-                        f"({split_reason_message(fallback_reason, fallback_detail)})",
-                        file=sys.stderr,
-                    )
-                    print(f"  Source text: {seg.source_text()}", file=sys.stderr)
-                    print(f"  AI source parts: {source_splits.get(seg.index)}", file=sys.stderr)
-                    print(f"  AI target parts: {target_splits.get(seg.index)}", file=sys.stderr)
-                events = [whole_segment_split_event(seg)]
-                seg.split_status = SplitStatus.FALLBACK.value
-                seg.split_reason = fallback_reason
-                seg.split_reason_detail = fallback_detail
-            else:
-                seg.split_status = (
-                    SplitStatus.UNSPLIT.value
-                    if len(events) == 1 and events[0].en == seg.source_text()
-                    else SplitStatus.OK.value
-                )
-                seg.split_reason = ""
-                seg.split_reason_detail = ""
-            seg.split_events = events
-            changed = True
-
-    return changed
-
-
 # --- Subtitle output ----------------------------------------------------------
 
 
+SOURCE_FIRST_VERSION = "whisperx-source-first-v1"
+
+
+_EVENT_PROOFREAD_PROTOCOL = """TARGET-ONLY PROOFREADING (overrides all earlier correction instructions):
+Only improve the target translation. The source is READ ONLY, even if a glossary or
+retrieved context suggests an ASR error. Do not correct source grammar or terminology.
+Do not change event IDs, count, order or times. Preserve the whole sentence meaning.
+Return {"items":[{"id":<sentence id>,"${TARGET_LANG_CODE}":<whole revised translation>,
+"split_events":[{"id":<existing event id>,"${TARGET_LANG_CODE}":<revised target part>}]}]}.
+Return all existing event IDs and nonempty target parts. Preserve their semantic
+correspondence; there is no exact concatenation, spacing or punctuation equation
+between the whole translation and its subtitle parts. Do not count characters.
+Keep unresolved source doubts outside subtitle text. If uncertain, keep the translation.
+"""
+
+
+def source_first_hash(value) -> str:
+    return json_sha256(value)
+
+
+def source_first_model_identity(llm: LLMConfig) -> dict:
+    return {"provider": llm.provider, "model": llm.model_name(), "config": llm.cfg()}
+
+
+def source_first_context(transcript: Transcript, segment: TranscriptSegment, window: int = 1) -> dict:
+    position = next(i for i, item in enumerate(transcript.segments) if item is segment)
+    return {
+        "context_before": [s.source_text() for s in transcript.segments[max(0, position - window):position]],
+        "context_after": [s.source_text() for s in transcript.segments[position + 1:position + 1 + window]],
+    }
+
+
+def source_word_boundaries(segment: TranscriptSegment) -> list[dict]:
+    """Expose only boundaries backed by a complete, ordered word-to-text mapping."""
+    if segment.word_timing.get("status") == "unavailable":
+        raise ValueError("word timing explicitly unavailable")
+    words = [word for word in segment.words if text_tokens(word.text)]
+    expected = text_tokens(segment.text)
+    actual: list[str] = []
+    word_ends: dict[int, int] = {}
+    previous_end = segment.start
+    for index, word in enumerate(words):
+        if (
+            word.start is None or word.end is None
+            or not math.isfinite(word.start) or not math.isfinite(word.end)
+            or word.start < previous_end - 0.001 or word.end <= word.start
+            or word.end > segment.end + 0.001
+        ):
+            raise ValueError("incomplete, overlapping or invalid word timing")
+        actual.extend(text_tokens(word.text))
+        word_ends[len(actual)] = index + 1
+        previous_end = word.end
+    if not expected or expected != actual:
+        raise ValueError("words do not cover the complete source text")
+    boundaries = [{"id": "b0", "offset": 0, "word_index": 0}]
+    for match in re.finditer(r"\s+", segment.text):
+        offset = match.end()
+        count = len(text_tokens(segment.text[:offset]))
+        if (
+            0 < count < len(expected) and count in word_ends
+            and text_tokens(segment.text[:offset]) + text_tokens(segment.text[offset:]) == expected
+            and word_ends[count] != boundaries[-1]["word_index"]
+        ):
+            boundaries.append({"id": f"b{len(boundaries)}", "offset": offset, "word_index": word_ends[count]})
+    boundaries.append({"id": f"b{len(boundaries)}", "offset": len(segment.text), "word_index": len(words)})
+    return boundaries
+
+
+def source_events_from_boundaries(
+    segment: TranscriptSegment, boundaries: list[dict], selected: list[str], plan_key: str,
+) -> list[SplitEvent]:
+    if not isinstance(selected, list) or any(not isinstance(value, str) for value in selected):
+        raise ValueError("source split must return boundary IDs")
+    by_id = {item["id"]: item for item in boundaries}
+    if (
+        len(selected) < 2 or len(set(selected)) != len(selected)
+        or selected[0] != boundaries[0]["id"] or selected[-1] != boundaries[-1]["id"]
+        or any(value not in by_id for value in selected)
+    ):
+        raise ValueError("missing, duplicate or unknown boundary ID")
+    cuts = [by_id[value] for value in selected]
+    if any(left["offset"] >= right["offset"] for left, right in zip(cuts, cuts[1:])):
+        raise ValueError("boundary IDs are out of order")
+    words = [word for word in segment.words if text_tokens(word.text)]
+    events = []
+    for left, right in zip(cuts, cuts[1:]):
+        start, end = left["offset"], right["offset"]
+        text = segment.text[start:end].strip()
+        if not text or left["word_index"] >= right["word_index"]:
+            raise ValueError("empty source event")
+        events.append(SplitEvent(
+            float(words[left["word_index"]].start), float(words[right["word_index"] - 1].end),
+            text, "", source_first_hash([plan_key, start, end])[:24], (start, end),
+        ))
+    events[0].start = segment.start
+    events[-1].end = segment.end
+    return events
+
+
+def source_first_rows(answer: str, expected_ids: list[int]) -> dict[int, dict]:
+    payload = require_json_object(_extract_json_value(answer))
+    if set(payload) != {"items"} or not isinstance(payload["items"], list):
+        raise ValueError('response must contain only an "items" array')
+    rows = {}
+    for item in payload["items"]:
+        if not isinstance(item, dict) or type(item.get("id")) is not int:
+            raise ValueError("invalid sentence ID")
+        if item["id"] not in expected_ids or item["id"] in rows:
+            raise ValueError("unknown or duplicate sentence ID")
+        rows[item["id"]] = item
+    return rows
+
+
+def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, admission_guard=None, *, round_log=None) -> tuple[dict, dict]:
+    accepted, errors = {}, {}
+    pending = list(items)
+    for attempt in range(2):
+        if not pending:
+            break
+        if admission_guard:
+            admission_guard()
+        def parse_response(answer):
+            if round_log:
+                round_log("response", chars=len(answer))
+            return source_first_rows(answer, [item.id for item in pending])
+
+        request_started = False
+        try:
+            request = LLMBatchRequest(pending).to_json_text()
+            session = ChatSession(llm, prompt, temperature=0.2)
+            if round_log:
+                round_log("request", attempt=attempt + 1, ids=[item.id for item in pending], chars=len(request))
+            request_started = True
+            _, rows = session.ask_validated(
+                request,
+                parse_response,
+                retry_template=CompletionRetryTemplate(attempts=1, ),
+            )
+        except Exception as error:
+            rows = {}
+            errors.update({item.id: str(error) for item in pending})
+            if round_log and request_started:
+                round_log("error", kind=type(error).__name__)
+        except BaseException as error:
+            if round_log and request_started:
+                round_log("aborted", kind=type(error).__name__)
+            raise
+        remaining, valid_ids = [], []
+        for item in pending:
+            try:
+                if item.id not in rows:
+                    raise ValueError(errors.get(item.id, "missing sentence ID"))
+                accepted[item.id] = validate(item.id, rows[item.id])
+                valid_ids.append(item.id)
+                errors.pop(item.id, None)
+            except (TypeError, ValueError, KeyError) as error:
+                errors[item.id] = str(error)
+                remaining.append(item)
+        if round_log and request_started:
+            round_log("validated", accepted=valid_ids, failed=[item.id for item in remaining], retry=bool(remaining) and attempt == 0)
+        pending = remaining
+    if admission_guard:
+        admission_guard()
+    return accepted, errors
+
+
+@logged_stage("source_review")
+def build_source_review(transcript, ctx, llm, *, force: bool = False, admission_guard=None) -> dict:
+    """Publish a text-only adopted draft without changing ASR text or its word axis."""
+    glossary_path = os.path.abspath(ctx.glossary)
+    glossary = _read_text_file(glossary_path)
+    units = [source_review.SourceUnit(
+        segment.index, segment.source_text(), segment.start, segment.end, f"whisperx:{segment.index}",
+    ) for segment in transcript.segments]
+    input_hash = file_sha256(ctx.input_json)
+    disk_source = load_transcript(ctx.input_json)
+    if [(segment.index, segment.source_text()) for segment in disk_source.segments] != [(unit.id, unit.text) for unit in units]:
+        raise ValueError("source input changed before review")
+    if file_sha256(ctx.input_json) != input_hash:
+        raise ValueError("source input changed while taking review snapshot")
+    metadata = read_video_metadata_fields(ctx)
+    evidence = load_web_evidence_sidecar(ctx.web_evidence_json).prompt_text(max_chars=4000)
+    prompt = (
+        _JSON_FORMAT + "\n\n" + source_review.REVIEW_PROTOCOL
+        + f"\nSource language key: {ctx.source_lang_code}\n\nFULL GLOSSARY:\n" + glossary
+        + "\n\nPROJECT CONTEXT (not acoustic verification):\n"
+        + json.dumps({"metadata": metadata, "web_evidence": evidence}, ensure_ascii=False)
+    )
+    context = {
+        "project": ctx.dir, "input": input_hash,
+        "generation": transcript.raw.get("_batch_artifact", {}),
+        "model": source_first_model_identity(llm), "prompt": prompt,
+    }
+    identity = source_review.review_input_identity(units, ctx.source_lang_code, glossary, context)
+    from pathlib import Path
+
+    pointer = Path(ctx.dir) / f"{ctx.base}.source_review.json"
+    if not force:
+        cached = source_review.load_review(pointer, identity, glossary, units)
+        if cached is not None:
+            log("INFO", f'Source review cache: {pointer}')
+            return cached
+    bounded_llm = copy.copy(llm)
+    bounded_llm.request_timeout = 120.0
+    bounded_llm.api_max_retries = 0
+    accepted = {}
+    errors = {}
+    by_id = {unit.id: unit for unit in units}
+    source_review.validate_units(units)
+    batch_size = max(1, min(8, llm.batch_size))
+    for start in range(0, len(units), batch_size):
+        batch = units[start:start + batch_size]
+        request = [make_source_item(unit.id, ctx, unit.text) for unit in batch]
+        for item in request:
+            segment = next(segment for segment in transcript.segments if segment.index == item.id)
+            item.fields.update(source_first_context(transcript, segment))
+        valid, failed = source_first_batch(
+            bounded_llm, prompt, request,
+            lambda item_id, row: source_review.validate_review(row, by_id[item_id], ctx.source_lang_code), admission_guard,
+        )
+        accepted.update(valid)
+        errors.update(failed)
+    items = [accepted.get(unit.id) or source_review.fallback_review(
+        unit, "source_review_request_failed",
+    ) for unit in units]
+    if file_sha256(ctx.input_json) != context["input"]:
+        raise ValueError("source input changed during review; generation not published")
+    if admission_guard:
+        admission_guard()
+    result = source_review.publish_review(
+        pointer, identity, Path(glossary_path), glossary, units, items, ctx.source_lang_code,
+        provenance={"provider": llm.provider, "model": llm.model_name(), "prompt_sha256": json_sha256(prompt),
+                    "input_file_sha256": input_hash},
+    )
+    log("INFO", f'Source review: {pointer} (fallback={len(errors)})')
+    return result
+
+
+@logged_stage("source_prepare")
+def prepare_mfa_review(source, ctx, env, video_path: str, args, admission_guard=None):
+    from pathlib import Path
+
+    from subtitle_translation.mfa import MfaRuntime
+    from subtitle_translation.artifacts import text_sha256
+
+    if ctx.source_lang_code != "en":
+        raise ValueError("the managed MFA profile currently supports English source text only")
+    runtime = MfaRuntime.for_project(Path(_config_root()))
+    media = Path(video_path) if video_path else Path(ctx.dir) / f"{ctx.base}.wav"
+    if not media.is_file():
+        raise ValueError("MFA_ENABLED=1 requires --video or a same-name WAV alongside the input JSON")
+    if not env.get("TRANSLATE_PROVIDER", "").strip():
+        raise ValueError("TRANSLATE_PROVIDER is required for MFA translation")
+    original = copy.deepcopy(source)
+    for segment in original.segments:
+        segment.proofread_text = ""
+    if args.skip_knowledge:
+        units = [source_review.SourceUnit(segment.index, segment.text, segment.start, segment.end,
+                                         f"whisperx:{segment.index}") for segment in original.segments]
+        source_review.validate_units(units)
+        items = [source_review.fallback_review(unit, "knowledge_skipped") for unit in units]
+        text, ranges = source_review.compose_adopted_text(items, ctx.source_lang_code)
+        review = {"language": ctx.source_lang_code, "text": text, "text_sha256": text_sha256(text),
+                  "items": items, "source_map": ranges, "generation": "knowledge_skipped", "skipped": True}
+    else:
+        if admission_guard:
+            admission_guard()
+        llm = glossary_llm_from_env(env, translate_llm_from_env(env, args.batch_size), batch_size=args.batch_size)
+        build_glossary(original, ctx, llm, GlossaryBuildOptions.from_env(env, ))
+        if admission_guard:
+            admission_guard()
+        review_ctx = copy.copy(ctx)
+        review_ctx.glossary = os.path.abspath(args.glossary or ctx.glossary)
+        review = build_source_review(original, review_ctx, llm, force=args.force, admission_guard=admission_guard)
+    if admission_guard:
+        admission_guard()
+    return review, media, runtime
+
+
+def source_events_are_valid(segment: TranscriptSegment) -> bool:
+    offset = 0
+    ids = set()
+    previous_end = segment.start
+    for event in segment.split_events:
+        if not event.id or event.id in ids or event.source_range is None:
+            return False
+        ids.add(event.id)
+        if not isinstance(event.source_range, (list, tuple)) or len(event.source_range) != 2:
+            return False
+        start, end = event.source_range
+        if type(start) is not int or type(end) is not int or start != offset or not start < end <= len(segment.text):
+            return False
+        if event.en != segment.text[start:end].strip():
+            return False
+        if segment.segment_timing.get("quality") == "pending":
+            if event.start is not None or event.end is not None:
+                return False
+            offset = end
+            continue
+        if event.start is None or event.end is None:
+            return False
+        if (
+            not math.isfinite(event.start) or not math.isfinite(event.end)
+            or event.start < previous_end - 0.001 or event.end <= event.start
+            or event.end > segment.end + 0.001
+        ):
+            return False
+        previous_end, offset = event.end, end
+    return bool(segment.split_events) and offset == len(segment.text)
+
+
+def validate_target_events(row: dict, segment: TranscriptSegment, ctx: TranscriptContext) -> tuple[str, list[str]]:
+    if set(row) != {"id", ctx.target_lang_code, "split_events"}:
+        raise ValueError("proofreading must return only sentence ID, whole target and target events")
+
+    def target_text(item):
+        value = item.get(ctx.target_lang_code)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("proofreading must provide a nonempty target string")
+        return value.strip()
+
+    whole = target_text(row)
+    events = row["split_events"]
+    expected = [event.id for event in segment.split_events]
+    if not isinstance(events, list) or len(events) != len(expected):
+        raise ValueError("proofreading event count mismatch")
+    by_id = {}
+    for event in events:
+        if not isinstance(event, dict) or set(event) != {"id", ctx.target_lang_code}:
+            raise ValueError("proofreading cannot edit source text or time")
+        event_id = event["id"]
+        if not isinstance(event_id, str) or event_id not in expected or event_id in by_id:
+            raise ValueError("unknown or duplicate event ID")
+        by_id[event_id] = target_text(event)
+    return whole, [by_id[item_id] for item_id in expected]
+
+
+def _proofread_source_events(segment, ctx):
+    if segment.segment_timing.get("text_planned"):
+        return [{"id": e.id, ctx.source_lang_code: e.en, "source_range": list(e.source_range)}
+                for e in segment.split_events]
+    return [{"id": e.id, ctx.source_lang_code: e.en, "start": round(e.start, 3), "end": round(e.end, 3)}
+            for e in segment.split_events]
+
+
+@logged_stage("proofread")
+def proofread_target_events(transcript, ctx, llm, system_prompt, retriever=None, *,
+                            retrieval_top_k=1, admission_guard=None):
+    prompt = system_prompt + "\n\n" + _JSON_FORMAT + "\n\n" + render_prompt_template(_EVENT_PROOFREAD_PROTOCOL, ctx)
+    if retriever is not None:
+        prompt += "\n\n" + _RETRIEVED_CONTEXT_RULES
+    plans, pending, changed = {}, [], False
+    for segment in transcript.segments:
+        if not source_events_are_valid(segment):
+            raise ValueError(f"invalid source event plan #{segment.index}")
+        current = {"id": segment.index, ctx.target_lang_code: segment.translation, "split_events": [
+            {"id": e.id, ctx.target_lang_code: e.zh} for e in segment.split_events]}
+        validate_target_events(current, segment, ctx)
+        fields = {"split_events": _proofread_source_events(segment, ctx), **source_first_context(transcript, segment)}
+        if retriever is not None:
+            query = f"Target translation terminology\n{segment.text}\n{segment.translation}"
+            fields["retrieved_context"] = retriever.retrieve_texts([query], top_k=retrieval_top_k)[0]
+        base_key = source_first_hash({"version": SOURCE_FIRST_VERSION, "plan": segment.event_plan_key,
+            "source": segment.text, "input": copy.deepcopy(fields), "prompt": prompt,
+            "model": source_first_model_identity(llm), "languages": [ctx.source_lang_code, ctx.target_lang_code]})
+        if segment.proofread_key == source_first_hash([base_key, current]):
+            continue
+        fields[ctx.target_lang_code] = segment.translation
+        for event, item in zip(segment.split_events, fields["split_events"]):
+            item[ctx.target_lang_code] = event.zh
+        plans[segment.index] = (segment, base_key)
+        pending.append(make_language_item(segment.index, ctx, source=segment.text, extra=fields))
+    log("INFO", f'Target proofread: {len(pending)} pending sentence(s)')
+    for start in range(0, len(pending), max(1, llm.batch_size)):
+        accepted, errors = source_first_batch(llm, prompt, pending[start:start + max(1, llm.batch_size)],
+            lambda item_id, row: validate_target_events(row, plans[item_id][0], ctx), admission_guard)
+        for item_id, (whole, parts) in accepted.items():
+            segment, base_key = plans[item_id]
+            segment.translation = whole
+            for event, part in zip(segment.split_events, parts):
+                event.zh = part
+            current = {"id": segment.index, ctx.target_lang_code: whole, "split_events": [
+                {"id": e.id, ctx.target_lang_code: e.zh} for e in segment.split_events]}
+            segment.proofread_key = source_first_hash([base_key, current])
+            changed = True
+        if errors:
+            ids = ", ".join(f"#{i}" for i in errors)
+            log("WARNING", f'Warning: target proofreading kept existing translation for {ids}')
+    return changed
+
+
 def srt_time(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = min(999, int(round((seconds - int(seconds)) * 1000)))
+    milliseconds = int(round(max(0.0, seconds) * 1000))
+    h, remainder = divmod(milliseconds, 3600000)
+    m, remainder = divmod(remainder, 60000)
+    s, ms = divmod(remainder, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+@logged_stage("export")
 def write_srt_events(output_path: str, events: list[SplitEvent], field_name: str) -> None:
     with open(output_path, "w", encoding="utf-8") as f:
         for i, event in enumerate(events, 1):
@@ -4659,11 +4039,10 @@ def write_srt_events(output_path: str, events: list[SplitEvent], field_name: str
 
 
 def ass_time(seconds: float) -> str:
-    seconds = max(0.0, seconds)
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    cs = int(round((seconds - int(seconds)) * 100))
+    centiseconds = int(round(max(0.0, seconds) * 100))
+    h, remainder = divmod(centiseconds, 360000)
+    m, remainder = divmod(remainder, 6000)
+    s, cs = divmod(remainder, 100)
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
@@ -4672,13 +4051,13 @@ def load_template(template_path: str) -> tuple[str, str]:
         content = f.read()
     events_pos = content.find("\n[Events]\n")
     if events_pos == -1:
-        print("Error: template.ass missing [Events] section.", file=sys.stderr)
+        log("ERROR", 'Error: template.ass missing [Events] section.')
         sys.exit(1)
     header = content[: events_pos + 1]
     events_section = content[events_pos + 1 :]
     match = re.search(r"Format:.*", events_section)
     if not match:
-        print("Error: template.ass [Events] section missing Format line.", file=sys.stderr)
+        log("ERROR", 'Error: template.ass [Events] section missing Format line.')
         sys.exit(1)
     return header, "\n[Events]\n" + match.group(0) + "\n"
 
@@ -4702,6 +4081,8 @@ def all_events(transcript: Transcript) -> list[SplitEvent]:
             events.extend(seg.split_events)
         else:
             events.append(SplitEvent(seg.start, seg.end, seg.source_text(), seg.translation))
+    if any(event.start is None or event.end is None for event in events):
+        raise ValueError("cannot export text events before timing is complete")
     return events
 
 
@@ -4721,6 +4102,7 @@ ASS_OUTPUT_TRACKS: dict[AssOutputMode, tuple[AssTrack, ...]] = {
 }
 
 
+@logged_stage("export")
 def write_ass(
     output_path: str,
     template_path: str,
@@ -4767,10 +4149,10 @@ Rules:
 - Do not add explanations."""
 
 
+@logged_stage("metadata")
 def translate_description(
     ctx: TranscriptContext,
     llm: LLMConfig,
-    quiet: bool,
     retriever: EmbeddingRetriever | None = None,
     glossary_path: str = "",
 ) -> str:
@@ -4780,7 +4162,7 @@ def translate_description(
     try:
         chapters = read_original_chapters(ctx.dir, ctx.base)
     except (OSError, ValueError) as error:
-        print(f"Warning: original chapter extraction failed: {error}", file=sys.stderr)
+        log("WARNING", f'Warning: original chapter extraction failed: {error}')
         chapters = []
     if not desc_text.strip() and not title and not chapters:
         if metadata_header:
@@ -4826,7 +4208,7 @@ def translate_description(
             system_prompt + "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_OBJECT_FORMAT,
             request,
             temperature=0.3,
-            raw_label=None if quiet else "translate_description",
+            raw_label="translate_description",
         )
         translated_title = str(response_obj.get("title", "")).strip()
         translated_desc = str(response_obj.get("description", "")).strip()
@@ -4839,7 +4221,7 @@ def translate_description(
             translated_tags = []
         chapter_output = translated_chapters(chapters, response_obj.get("chapters"))
     except Exception as e:
-        print(f"Warning: description translation failed: {e}", file=sys.stderr)
+        log("WARNING", f'Warning: description translation failed: {e}')
         return ctx.target_desc
 
     with open(ctx.target_desc, "w", encoding="utf-8") as f:
@@ -4859,8 +4241,7 @@ def translate_description(
             if translated_desc or chapter_output:
                 f.write("\n")
             f.write(f"标签：{', '.join(translated_tags)}\n")
-    if not quiet:
-        print(f"Description: {ctx.target_desc}", file=sys.stderr)
+    log("INFO", f'Description: {ctx.target_desc}')
     return ctx.target_desc
 
 
@@ -4875,56 +4256,80 @@ def infer_video_path(ctx: TranscriptContext) -> str:
     return ""
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, admission_guard=None, stage_overrides=None) -> int:
     script_dir = _config_root()
     env = load_env(script_dir)
+    if stage_overrides:
+        env = {**env, **stage_overrides}
 
     parser = argparse.ArgumentParser(
+        prog="subtitle-translation translate",
         description="Translate WhisperX JSON to proofread/target-language/bilingual ASS.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   subtitle-translation translate video.json --video video.webm
   subtitle-translation translate video.json --source-lang en --target-lang zh
   subtitle-translation translate video.json -o video.en-zh.ass
-  subtitle-translation translate video.json --only-beautify --video video.webm
+  subtitle-translation translate video.json --only-scenes --video video.webm
 """,
     )
     parser.add_argument("json", help="WhisperX .json transcript path")
-    parser.add_argument("--video", help="Video path for scene-aware timeline beautify")
+    parser.add_argument("--video", help="Media path for scene detection and optional MFA audio extraction")
     parser.add_argument("-t", "--template", help="template.ass path")
     parser.add_argument("-o", "--output", help="Output bilingual .ass path")
-    parser.add_argument("--source-lang", help="Source language name/tag for prompts and ISO 639 output suffix")
+    parser.add_argument("--source-lang", "--lang", help="Source language name/tag for this project")
     parser.add_argument("--target-lang", help="Target language name/tag for prompts and ISO 639 output suffix (default: zh)")
-    parser.add_argument("--print-output-path", action="store_true", help="Print computed bilingual ASS path and exit")
-    parser.add_argument("--batch-size", type=int, default=50)
-    parser.add_argument("--only-beautify", action="store_true")
+    parser.add_argument("--only-output-path", dest="print_output_path", action="store_true", help="Print computed bilingual ASS path and exit")
+    parser.add_argument("--only-scenes", action="store_true")
     parser.add_argument("--only-glossary", action="store_true")
-    parser.add_argument("--reuse-glossary", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--beautified-json", help=argparse.SUPPRESS)
-    parser.add_argument("--skip-beautify", action="store_true")
-    parser.add_argument("--skip-knowledge", action="store_true")
-    parser.add_argument("--force", action="store_true", help="Rebuild beautified JSON")
-    parser.add_argument("--no-split", action="store_true")
-    parser.add_argument("--split-max-chars", type=int, default=DEFAULT_SPLIT_MAX_CHARS)
-    parser.add_argument("--split-max-duration", type=float, default=DEFAULT_SPLIT_MAX_DURATION)
-    parser.add_argument("--split-context-window", type=int, default=1, help="Neighbor segment count included as split-only context")
-    parser.add_argument("--proofread", action="store_true", default=True)
-    parser.add_argument("--no-proofread", action="store_true")
     parser.add_argument("--glossary", metavar="PATH")
-    parser.add_argument("--scene-threshold", type=float, default=0.15)
-    parser.add_argument("--snap-frames", type=int, default=7)
-    parser.add_argument("--end-offset-frames", type=int, default=2)
-    parser.add_argument("--min-scene-interval-frames", type=int, default=2)
-    parser.add_argument("--min-duration", type=float, default=1.0)
-    parser.add_argument("--min-gap", type=float, default=0.083)
-    parser.add_argument("--max-gap-merge", type=float, default=0.5)
-    parser.add_argument("--aggressive", action="store_true")
-    parser.add_argument("--no-scene-snap", action="store_true")
-    parser.add_argument("-q", "--quiet", action="store_true")
     args = parser.parse_args(argv)
+    from subtitle_translation.config import ProjectConfig, resolve_mfa_enabled
+    try:
+        settings = ProjectConfig(Path(script_dir), env)
+        validate_log_level(env.get("LOG_LEVEL", "INFO"))
+        args.mfa = resolve_mfa_enabled(None, env)
+        args.batch_size = int(env.get("TRANSLATE_BATCH_SIZE", "50") or "50")
+        args.split_context_window = int(env.get("TRANSLATE_CONTEXT_WINDOW", "1") or "1")
+        args.scene_threshold = float(env.get("SCENE_THRESHOLD", "0.15") or "0.15")
+        args.min_scene_interval_frames = int(env.get("SCENE_MIN_INTERVAL_FRAMES", "2") or "2")
+        if args.batch_size < 1:
+            raise ValueError("TRANSLATE_BATCH_SIZE must be positive")
+        if args.split_context_window < 0:
+            raise ValueError("TRANSLATE_CONTEXT_WINDOW must be nonnegative")
+        if not math.isfinite(args.scene_threshold) or not 0 <= args.scene_threshold <= 1:
+            raise ValueError("SCENE_THRESHOLD must be finite and between 0 and 1")
+        if args.min_scene_interval_frames < 0:
+            raise ValueError("SCENE_MIN_INTERVAL_FRAMES must be nonnegative")
+        args.skip_scene_detection = settings.flag("PIPELINE_SKIP_SCENE_DETECTION") and not args.only_scenes
+        args.skip_knowledge = settings.flag("PIPELINE_SKIP_KNOWLEDGE") and not args.only_glossary
+        args.no_split = not settings.flag("SPLIT_ENABLED", True)
+        args.proofread = settings.flag("PROOFREAD", True)
+        args.no_proofread = False
+        args.reuse_glossary = settings.flag("GLOSSARY_REUSE")
+        args.force = settings.flag("FORCE_REBUILD")
+    except ValueError as error:
+        parser.error(str(error))
+    if args.print_output_path or not os.path.isfile(args.json):
+        return _run_translate_command(args, env, script_dir, admission_guard)
+    log_directory = Path(args.video or args.json).resolve().parent
+    try:
+        with project_run(log_directory, env.get("LOG_LEVEL", "INFO")):
+            code = _run_translate_command(args, env, script_dir, admission_guard)
+            if code:
+                log("ERROR", f"Translation failed with exit code {code}")
+            return code
+    except OSError as error:
+        log("ERROR", f"Project log or file operation failed: {type(error).__name__}")
+        return 1
+
+
+def _run_translate_command(args, env, script_dir, admission_guard):
+    admission_kwargs = {"admission_guard": admission_guard} if admission_guard else {}
 
     if not os.path.isfile(args.json):
-        print(f"Error: JSON file not found: {args.json}", file=sys.stderr)
+        log("ERROR", f'Error: JSON file not found: {args.json}')
         sys.exit(1)
 
     source = load_transcript(args.json)
@@ -4938,77 +4343,91 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.beautified_json or "",
     )
     embedding_config = EmbeddingConfig.from_env(env, ctx)
-    embedding_active = embedding_config.enabled and embedding_enabled_for_stage(args.only_beautify, args.only_glossary)
+    embedding_active = embedding_config.enabled and embedding_enabled_for_stage(args.only_scenes, args.only_glossary)
     if args.print_output_path:
         print(os.path.abspath(ctx.bilingual_ass))
         print(f"OUTPUT_ASS={os.path.abspath(ctx.bilingual_ass)}")
         return
     video_path = args.video or infer_video_path(ctx)
+    if args.only_scenes and (not video_path or not os.path.isfile(video_path)):
+        log("ERROR", 'Error: --only-scenes requires an existing video')
+        return 2
     template_path = args.template or os.path.join(script_dir, "template.ass")
-
-    if not args.quiet:
-        print(f"JSON:     {os.path.abspath(args.json)}")
-        print(f"Source:   {ctx.source_lang}")
-        print(f"Target:   {ctx.target_lang}")
-        if video_path:
-            print(f"Video:    {video_path}")
-        if embedding_active:
-            print(f"Embedding: {embedding_config.provider} / {embedding_config.model}")
-            print(f"Embedding DB: {embedding_config.chroma_dir}")
+    log("INFO", f'JSON:     {os.path.abspath(args.json)}')
+    log("INFO", f'Source:   {ctx.source_lang}')
+    log("INFO", f'Target:   {ctx.target_lang}')
+    if video_path:
+        log("INFO", f'Video:    {video_path}')
+    if embedding_active:
+        log("INFO", f'Embedding: {embedding_config.provider} / {embedding_config.model}')
+        log("INFO", f'Embedding DB: {embedding_config.chroma_dir}')
 
     if embedding_active:
         if embedding_config.store != "chroma":
-            print(f"Error: unsupported EMBEDDING_STORE={embedding_config.store}; only chroma is available.", file=sys.stderr)
+            log("ERROR", f'Error: unsupported EMBEDDING_STORE={embedding_config.store}; only chroma is available.')
             sys.exit(1)
 
-    beautify_options = BeautifyOptions(
+    scene_options = SceneDetectionOptions(
         scene_threshold=args.scene_threshold,
-        snap_frames=args.snap_frames,
-        end_offset_frames=args.end_offset_frames,
         min_scene_interval_frames=args.min_scene_interval_frames,
-        min_duration=args.min_duration,
-        min_gap=args.min_gap,
-        max_gap_merge=args.max_gap_merge,
-        no_scene_snap=args.no_scene_snap,
-        aggressive=args.aggressive,
     )
-    transcript = load_or_create_beautified(
-        ctx, source, video_path, beautify_options, args.skip_beautify, args.force, args.quiet
-    )
+    knowledge_done = args.mfa and not args.only_scenes and not args.only_glossary
+    text_checkpoint = ctx.beautified_json
+    timing_marker = timing_key = None
+    if knowledge_done:
+        try:
+            mfa_input_sha256 = file_sha256(args.json)
+            if admission_guard:
+                admission_guard()
+            from subtitle_translation import windowed_mfa
+            review, mfa_media, mfa_runtime = prepare_mfa_review(source, ctx, env, video_path, args, admission_guard)
+            transcript, text_checkpoint = windowed_mfa.load_text_checkpoint(source, review, ctx, args.force)
+        except (OSError, ValueError) as error:
+            log("ERROR", f'Error: MFA source preparation failed: {error}')
+            return 1
+    source_identity = source_first_hash({
+        "version": SOURCE_FIRST_VERSION, "source": source.to_json(),
+        "timeline_policy": "asr-direct-no-beautify-v2",
+    })
+    if admission_guard:
+        admission_guard()
+    if not knowledge_done:
+        transcript = load_or_create_beautified(
+            ctx, source, video_path, scene_options, args.skip_scene_detection, args.force, source_identity=source_identity,
+        )
+    for segment in transcript.segments:
+        segment.proofread_text = ""
+        if args.force:
+            segment.event_plan_key = ""
+            segment.translation_key = segment.proofread_key = ""
     retriever = None
     if embedding_active:
         retriever = refresh_embedding_retriever(
             transcript,
             embedding_config,
             env,
-            args.quiet,
             ctx,
             fatal=True,
         )
 
-    if args.only_beautify:
-        print(f"OUTPUT_JSON={os.path.abspath(ctx.beautified_json)}")
+    if args.only_scenes:
+        print(f"OUTPUT_SCENES={os.path.abspath(ctx.scenes_json)}")
+        print(f"OUTPUT_SCENECHANGE={os.path.abspath(ctx.scenechange_txt)}")
         return
 
     llm = None
     if needs_translate_llm(args):
         provider = env.get("TRANSLATE_PROVIDER", "").strip()
         if not provider:
-            print(
-                f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
-                file=sys.stderr,
-            )
+            log("ERROR", f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}")
             sys.exit(1)
         llm = translate_llm_from_env(env, args.batch_size)
 
-    if not args.skip_knowledge and not required_glossary_provider(env):
-        print(
-            f"Error: GLOSSARY_PROVIDER or TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
-            file=sys.stderr,
-        )
+    if not knowledge_done and not args.skip_knowledge and not required_glossary_provider(env):
+        log("ERROR", f"Error: GLOSSARY_PROVIDER or TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}")
         sys.exit(1)
 
-    if not args.skip_knowledge:
+    if not knowledge_done and not args.skip_knowledge:
         glossary_llm = glossary_llm_from_env(env, llm, batch_size=args.batch_size)
         build_glossary(
             transcript,
@@ -5016,7 +4435,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             glossary_llm,
             GlossaryBuildOptions.from_env(
                 env,
-                quiet=args.quiet,
                 retriever=retriever,
                 force=args.only_glossary and not args.reuse_glossary,
             ),
@@ -5026,21 +4444,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 transcript,
                 embedding_config,
                 env,
-                args.quiet,
                 ctx,
                 warning_label="glossary index update failed",
             )
             retriever = updated_retriever or retriever
 
     if args.only_glossary:
+        if not args.skip_knowledge and not args.reuse_glossary:
+            try:
+                build_source_review(
+                    source, ctx, glossary_llm, force=args.only_glossary and not args.reuse_glossary,
+                    )
+            except (OSError, ValueError) as error:
+                log("ERROR", f'Error: source review publication failed: {error}')
+                return 1
+            print(f"OUTPUT_SOURCE_REVIEW={os.path.join(ctx.dir, ctx.base + '.source_review.json')}")
         print(f"OUTPUT_GLOSSARY={os.path.abspath(ctx.glossary)}")
         return
 
     if llm is None:
-        print(
-            f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}",
-            file=sys.stderr,
-        )
+        log("ERROR", f"Error: TRANSLATE_PROVIDER not set in .env. Available: {', '.join(load_providers())}")
         sys.exit(1)
 
     system_prompt = render_prompt_template(
@@ -5061,45 +4484,68 @@ def main(argv: Sequence[str] | None = None) -> int:
         system_prompt += glossary_text
         proofread_prompt += glossary_text
 
-    changed = translate_segments(transcript, ctx, llm, system_prompt, args.quiet, retriever)
-    changed = split_segments(
-        transcript,
-        ctx,
-        llm,
-        SplitConfig(
-            enabled=not args.no_split,
-            max_chars=args.split_max_chars,
-            max_duration=args.split_max_duration,
-            context_window=max(0, args.split_context_window),
-        ),
-        args.quiet,
-    ) or changed
+    try:
+        if admission_guard:
+            admission_guard()
+        from subtitle_translation.bilingual_translation import translate_events
+        changed = translate_events(
+            transcript, ctx, llm, system_prompt, retriever,
+            split_enabled=not args.no_split, context_window=max(0, args.split_context_window),
+            checkpoint=lambda: save_transcript(transcript, str(text_checkpoint)),
+            **admission_kwargs,
+        )
+    except ValueError as error:
+        log("ERROR", f'Error: {error}')
+        return 1
+    if knowledge_done:
+        try:
+            from subtitle_translation.config import ProjectConfig
+            if admission_guard:
+                admission_guard()
+            save_transcript(transcript, str(text_checkpoint))
+            transcript, timing_marker, timing_key = windowed_mfa.finish_timing(
+                transcript, review, mfa_media, mfa_runtime, ProjectConfig.load(), ctx,
+                video_path, scene_options, args.skip_scene_detection, args.force, admission_guard,
+            )
+            changed = True
+        except (OSError, ValueError) as error:
+            log("ERROR", f'Error: windowed MFA failed: {error}')
+            return 1
     if embedding_active:
         updated_retriever = refresh_embedding_retriever(
             transcript,
             embedding_config,
             env,
-            args.quiet,
             ctx,
             warning_label="translation memory index update failed",
         )
         retriever = updated_retriever or retriever
     if args.proofread and not args.no_proofread and env.get("PROOFREAD", "1") != "0":
         proofread_llm = proofread_llm_from_env(env, llm, args.batch_size)
-        changed = proofread_split_events(
+        changed = proofread_target_events(
             transcript,
             ctx,
             proofread_llm,
             proofread_prompt,
-            args.quiet,
             retriever,
-            proofread_retrieval_top_k=proofread_retrieval_top_k_from_env(env),
+            retrieval_top_k=proofread_retrieval_top_k_from_env(env),
+            **admission_kwargs,
         ) or changed
     if changed:
+        if knowledge_done and file_sha256(args.json) != mfa_input_sha256:
+            raise ValueError("source JSON changed during windowed translation")
+        if admission_guard:
+            admission_guard()
         save_transcript(transcript, ctx.beautified_json)
+        if timing_marker is not None:
+            if admission_guard:
+                admission_guard()
+            atomic_write_json(timing_marker, {"key": timing_key, "sha256": file_sha256(ctx.beautified_json)})
 
+    if admission_guard:
+        admission_guard()
     if not os.path.isfile(template_path):
-        print(f"Error: template.ass not found: {template_path}", file=sys.stderr)
+        log("ERROR", f'Error: template.ass not found: {template_path}')
         sys.exit(1)
 
     events = all_events(transcript)
@@ -5110,17 +4556,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_ass(ctx.bilingual_ass, template_path, ctx.base, events, AssOutputMode.BILINGUAL)
 
     if os.path.isfile(ctx.desc) or original_chapter_media(ctx.dir, ctx.base) is not None:
-        translate_description(ctx, llm, args.quiet, retriever=retriever, glossary_path=glossary_path)
-
-    if not args.quiet:
-        print(f"SRT:      {ctx.split_source_srt}")
-        print(f"          {ctx.split_target_srt}")
-        print(f"ASS:      {ctx.proofread_ass}")
-        print(f"          {ctx.target_ass}")
-        print(f"          {ctx.bilingual_ass}")
-        print(f"Events:   {len(events)}")
-    else:
-        print(ctx.bilingual_ass)
+        if admission_guard:
+            admission_guard()
+        translate_description(ctx, llm, retriever=retriever, glossary_path=glossary_path)
+    log("INFO", f'SRT:      {ctx.split_source_srt}')
+    log("INFO", f'          {ctx.split_target_srt}')
+    log("INFO", f'ASS:      {ctx.proofread_ass}')
+    log("INFO", f'          {ctx.target_ass}')
+    log("INFO", f'          {ctx.bilingual_ass}')
+    log("INFO", f'Events:   {len(events)}')
     print(f"OUTPUT_ASS={os.path.abspath(ctx.bilingual_ass)}")
 
 

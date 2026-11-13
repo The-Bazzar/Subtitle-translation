@@ -19,7 +19,7 @@ import langcodes
 
 import translate_srt
 
-from subtitle_translation.config import ProjectConfig
+from subtitle_translation.config import ProjectConfig, resolve_mfa_enabled
 from subtitle_translation.stages import (
     burn_video,
     download_video,
@@ -27,6 +27,7 @@ from subtitle_translation.stages import (
     prepare_video,
 )
 from subtitle_translation.process import terminate_active_processes
+from subtitle_translation.project_logging import log, logged_stage, project_run, validate_log_level
 
 from batch_scheduler import (
     AcquisitionRunners,
@@ -63,54 +64,12 @@ def emit_task_bell(kind: str, stream=None) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="批量字幕流水线 - 自动按阶段调度资源",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s "url1" "url2" "url3"
-  %(prog)s --skip-burn --translate-provider deepseek "url1" "url2"
-  %(prog)s --dry-run --report batch-result.txt "url1"
-        """,
-    )
-    parser.add_argument("urls", nargs="+", help="YouTube 链接列表")
-    parser.add_argument(
-        "--skip-burn",
-        "-SkipBurn",
-        dest="burn",
-        action="store_false",
-        default=None,
-        help="跳过后续硬压阶段",
-    )
-    parser.add_argument(
-        "-r",
-        "--report",
-        "-Report",
-        default=None,
-        help="结果报告路径 (默认: 脚本同目录 batch-result.txt)",
-    )
-    parser.add_argument(
-        "-n",
-        "--dry-run",
-        "-DryRun",
-        action="store_true",
-        help="仅打印阶段计划, 不执行",
-    )
-    parser.add_argument(
-        "-p",
-        "--translate-provider",
-        "-TranslateProvider",
-        default=None,
-        help="翻译 provider 覆盖值",
-    )
-    parser.add_argument(
-        "-tm",
-        "--translate-model",
-        "-TranslateModel",
-        default=None,
-        help="翻译 model 覆盖值",
-    )
-    parser.add_argument("-Help", action="help", help=argparse.SUPPRESS)
+    parser = argparse.ArgumentParser(prog="subtitle-translation batch", description="Batch subtitle pipeline; switches and model settings are read from .env")
+    parser.add_argument("urls", nargs="+", help="YouTube URLs")
+    parser.add_argument("-r", "--report", "-Report", default=None, help="Report output path")
+    parser.add_argument("--source-lang", "--lang", default="")
+    parser.add_argument("--target-lang", default="")
+    parser.set_defaults(mfa=None, burn=None, dry_run=False, translate_provider=None, translate_model=None)
     return parser
 
 
@@ -210,13 +169,20 @@ def validate_batch_stage_environment(values: Mapping[str, str]) -> None:
         )
 
 
-def batch_stage_plan(burn: bool, values: Mapping[str, str]) -> list[str]:
+def batch_stage_plan(burn: bool, values: Mapping[str, str], *, use_mfa: bool | None = None) -> list[str]:
+    use_mfa = resolve_mfa_enabled(use_mfa, values)
     stages = ["download", "prepare", "extract_audio", "asr", "align"]
     if batch_stage_skipped(values, "TRANSLATE"):
         stages.append("existing_ass")
+    elif use_mfa:
+        if not batch_stage_skipped(values, "KNOWLEDGE"):
+            stages.append("glossary/source_review")
+        stages.extend(["translate", "mfa"])
+        if not batch_stage_skipped(values, "SCENE_DETECTION"):
+            stages.append("scene_detection")
     else:
-        if not batch_stage_skipped(values, "BEAUTIFY"):
-            stages.append("beautify")
+        if not batch_stage_skipped(values, "SCENE_DETECTION"):
+            stages.append("scene_detection")
         if not batch_stage_skipped(values, "KNOWLEDGE"):
             stages.append("glossary")
         stages.append("translate")
@@ -243,6 +209,10 @@ def build_stage_environment(
         env["TRANSLATE_PROVIDER"] = args.translate_provider
     if args.translate_model:
         env["TRANSLATE_MODEL"] = args.translate_model
+    if getattr(args, "source_lang", ""):
+        env["SOURCE_LANG"] = args.source_lang
+    if getattr(args, "target_lang", ""):
+        env["TARGET_LANG"] = args.target_lang
     return env
 
 
@@ -327,9 +297,11 @@ def create_platform_postprocess_runner(
     platform: str | None = None,
     terminal: object | None = None,
     control: BatchControl | None = None,
+    use_mfa: bool | None = None,
 ) -> PostprocessRunner:
     del platform, terminal
-    skip_beautify = batch_stage_skipped(env, "BEAUTIFY")
+    use_mfa = resolve_mfa_enabled(use_mfa, env)
+    skip_scene_detection = batch_stage_skipped(env, "SCENE_DETECTION")
     skip_knowledge = batch_stage_skipped(env, "KNOWLEDGE")
     skip_translate = batch_stage_skipped(env, "TRANSLATE")
     os.environ["SUBTITLE_TRANSLATION_PROJECT_DIR"] = str(script_dir)
@@ -344,7 +316,7 @@ def create_platform_postprocess_runner(
         if env.get(key):
             os.environ[key] = env[key]
 
-    async def invoke_translate(arguments: list[str], stage: str) -> None:
+    async def invoke_translate(arguments: list[str], stage: str, overrides=None) -> None:
         reservation = control.reserve_command(stage) if control is not None else None
         force_token = (
             control.register_force_callback(terminate_active_processes)
@@ -354,7 +326,14 @@ def create_platform_postprocess_runner(
         try:
             if control is not None and control.force_requested:
                 raise StageAdvancementStopped(f"batch force-interrupted before {stage}")
-            code = await asyncio.to_thread(translate_srt.main, arguments)
+            if use_mfa and control is not None:
+                def admission_guard():
+                    token = control.reserve_command("mfa_continuation")
+                    control.release_command(token)
+                code = await asyncio.to_thread(translate_srt.main, arguments, admission_guard=admission_guard,
+                                              stage_overrides={**env, **(overrides or {})})
+            else:
+                code = await asyncio.to_thread(translate_srt.main, arguments, stage_overrides={**env, **(overrides or {})})
         finally:
             if control is not None and force_token is not None:
                 control.unregister_force_callback(force_token)
@@ -365,7 +344,7 @@ def create_platform_postprocess_runner(
         if code:
             raise StageCommandError(f"{stage} failed with exit code {code}")
 
-    async def postprocess(task: BatchTask) -> None:
+    async def postprocess_project(task: BatchTask) -> None:
         if task.json_path is None or task.edit_video_path is None or task.beautified_candidate_path is None:
             raise StageCommandError("postprocess task is missing aligned JSON, edit-video path, or beautified candidate")
         aligned_json = str(task.json_path)
@@ -387,21 +366,34 @@ def create_platform_postprocess_runner(
             task.ass_path = ass_path
             return
         common = [aligned_json, "--video", edit_video, "--beautified-json", beautified_json]
-        beautify_arguments = common + ["--only-beautify"]
-        if skip_beautify:
-            beautify_arguments.append("--skip-beautify")
-        await invoke_translate(beautify_arguments, "beautify")
-        if not task.beautified_candidate_path.is_file():
-            raise StageCommandError(f"beautify did not write expected output: {beautified_json}")
+        if use_mfa:
+            await invoke_translate(common, "mfa_postprocess", {"MFA_ENABLED": "1"})
+            if not task.beautified_candidate_path.is_file() or not ass_path.is_file() or ass_path.stat().st_size <= 0:
+                raise StageCommandError("MFA postprocess did not write expected subtitles and candidate JSON")
+            task.ass_path = ass_path
+            return
+        if not skip_scene_detection:
+            await invoke_translate(common + ["--only-scenes"], "scene_detection", {"MFA_ENABLED": "0"})
+            if not task.beautified_candidate_path.is_file():
+                raise StageCommandError(f"scene stage did not write expected working JSON: {beautified_json}")
         if not skip_knowledge:
             await invoke_translate(
-                common + ["--only-glossary", "--reuse-glossary", "--skip-beautify"],
+                common + ["--only-glossary"],
                 "glossary",
+                {"MFA_ENABLED": "0", "GLOSSARY_REUSE": "1", "PIPELINE_SKIP_SCENE_DETECTION": "1"},
             )
-        await invoke_translate(common + ["--skip-beautify", "--skip-knowledge"], "translate")
+        await invoke_translate(common, "translate", {"MFA_ENABLED": "0", "PIPELINE_SKIP_SCENE_DETECTION": "1", "PIPELINE_SKIP_KNOWLEDGE": "1"})
         if not ass_path.is_file() or ass_path.stat().st_size <= 0:
             raise StageCommandError(f"translate did not write expected bilingual ASS: {ass_path}")
         task.ass_path = ass_path
+
+    async def postprocess(task: BatchTask) -> None:
+        from subtitle_translation.project_logging import project_run
+
+        if task.json_path is None:
+            raise StageCommandError("postprocess task is missing aligned JSON")
+        with project_run((task.edit_video_path or task.json_path).parent, env.get("LOG_LEVEL", "INFO")):
+            await postprocess_project(task)
 
     return postprocess
 
@@ -462,6 +454,7 @@ def run_acquisition(
             script_dir,
             stage_environment,
             control=control,
+            use_mfa=getattr(args, "mfa", False),
         )
     stage_burn_runner = burn_runner
     if args.burn and stage_burn_runner is None:
@@ -654,28 +647,44 @@ def _main(argv: Sequence[str] | None = None) -> int:
     project_environment = load_project_environment(script_dir)
     try:
         validate_batch_stage_environment(project_environment)
+        args.mfa = resolve_mfa_enabled(None, project_environment)
+        validate_log_level(project_environment.get("LOG_LEVEL", "INFO"))
     except ValueError as error:
-        print(f"Error: {error}", file=sys.stderr)
+        log("ERROR", f'Error: {error}')
         return 2
     args.burn = resolve_batch_burn(args.burn, project_environment)
-    plan = batch_stage_plan(args.burn, project_environment)
+    args.dry_run = ProjectConfig(script_dir, project_environment).flag("DRY_RUN")
+    if args.source_lang:
+        project_environment["SOURCE_LANG"] = args.source_lang
+    if args.target_lang:
+        project_environment["TARGET_LANG"] = args.target_lang
+    plan = batch_stage_plan(args.burn, project_environment, use_mfa=args.mfa)
     report_path = Path(args.report) if args.report else Path.cwd() / "batch-result.txt"
     limits = ResourceLimits.detect()
     started_at = datetime.now()
+    if args.dry_run:
+        return _run_batch(args, project_environment, plan, report_path, limits, started_at, script_dir)
+    with project_run(Path.cwd(), project_environment.get("LOG_LEVEL", "INFO"),
+                     filename="batch-result.log", capture_children=True):
+        return _run_batch(args, project_environment, plan, report_path, limits, started_at, script_dir)
 
-    print("=" * 60)
-    print(f"batch - {len(args.urls)} videos, automatic stage capacities")
-    print("=" * 60)
-    print(f"Start:    {started_at.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"CPU/IO:   {limits.cpu_io}")
-    print(f"NVENC:    {limits.nvenc}")
-    print(f"Burn:     {'yes' if args.burn else 'no'}")
+
+@logged_stage("batch")
+def _run_batch(args, project_environment, plan, report_path, limits, started_at, script_dir):
+
+    log("INFO", '=' * 60)
+    log("INFO", f'batch - {len(args.urls)} videos, automatic stage capacities')
+    log("INFO", '=' * 60)
+    log("INFO", f"Start:    {started_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    log("INFO", f'CPU/IO:   {limits.cpu_io}')
+    log("INFO", f'NVENC:    {limits.nvenc}')
+    log("INFO", f"Burn:     {('yes' if args.burn else 'no')}")
     if args.translate_provider:
-        print(f"Provider: {args.translate_provider}")
+        log("INFO", f'Provider: {args.translate_provider}')
     if args.translate_model:
-        print(f"Model:    {args.translate_model}")
-    print(f"Current:  {' -> '.join(plan)}")
-    print("=" * 60)
+        log("INFO", f'Model:    {args.translate_model}')
+    log("INFO", f"Current:  {' -> '.join(plan)}")
+    log("INFO", '=' * 60)
 
     if args.dry_run:
         for index, url in enumerate(args.urls, start=1):
@@ -684,6 +693,15 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 f"{' -> '.join(plan)} <- {url}"
             )
         return 0
+
+    if args.mfa and not batch_stage_skipped(project_environment, "TRANSLATE"):
+        from subtitle_translation.mfa import MfaRuntime
+
+        try:
+            MfaRuntime.for_project(script_dir)
+        except (OSError, ValueError) as error:
+            log("ERROR", f'Error: MFA preflight failed: {error}')
+            return 2
 
     interrupted = False
     report_metadata: Mapping[str, object] = {}
@@ -695,13 +713,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
         report_metadata = exc.report_metadata
         interrupted = True
     for task in tasks:
-        print(
-            f"[{task.index}/{len(tasks)}] {_task_status(task)} "
-            f"stage={task.stage} ({task.elapsed_seconds / 60:.1f}min) <- {task.url}"
-        )
+        log("INFO", f'[{task.index}/{len(tasks)}] {_task_status(task)} stage={task.stage} ({task.elapsed_seconds / 60:.1f}min) <- {task.url}')
         if task.state is not TaskState.SUCCEEDED:
             if task.error_detail:
-                print(f"  {task.error_detail}")
+                log("ERROR", f'  {task.error_detail}')
             emit_task_bell("error")
 
     write_report(

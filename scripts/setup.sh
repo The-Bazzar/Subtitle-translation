@@ -4,6 +4,14 @@
 # =============================================================================
 set -euo pipefail
 
+INSTALL_MFA=0
+for argument in "$@"; do
+    case "$argument" in
+        --mfa) INSTALL_MFA=1 ;;
+        *) echo "Error: unsupported setup argument: $argument" >&2; exit 2 ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXAMPLES_DIR="$PROJECT_ROOT/core/subtitle_translation/examples"
@@ -198,6 +206,10 @@ fi
 
 echo ">>> 安装 subtitle-translation 命令..."
 install_cli_shim
+
+if [ "$INSTALL_MFA" = "1" ]; then
+    "$PROJECT_ROOT/.venv/bin/python" -m subtitle_translation --project-dir "$PROJECT_ROOT" setup-mfa
+fi
 
 # ── 验证 ────────────────────────────────────────────────────────────────────
 echo ""

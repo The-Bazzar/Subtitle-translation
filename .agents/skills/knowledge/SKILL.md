@@ -1,6 +1,6 @@
 ---
 name: knowledge
-description: 在 JSON 时间轴美化后、翻译前建立 glossary.md
+description: 从 WhisperX JSON 建立翻译前术语库及可选采用稿
 platform: Agent + Script
 ---
 
@@ -10,20 +10,22 @@ platform: Agent + Script
 
 ## 推荐时机
 
-`json beautify -> glossary -> translate`
+默认：`WhisperX JSON -> scene detection -> glossary -> translate`。
+MFA_ENABLED=1：`WhisperX JSON -> glossary/source_review -> translate -> MFA -> scene detection`。
+场景检测仅写 sidecar，不修改时间。
 
 ## 自动脚本行为
 
 当前自动 glossary 已集成到 `core/translate_srt.py`，通过统一 CLI 调用：
 
 ```bash
-subtitle-translation translate video.beautified.json --video video.webm --only-glossary --skip-beautify
+subtitle-translation translate video.json --video video.webm --only-glossary
 ```
 
 输入：
 
-- 优先 `.beautified.json`
-- 回退 `.json`
+- 原始 WhisperX `.json`，派生工作文件名仍为 `.beautified.json`
+- 显式 --only-glossary 还保存 .source_review.json 及不可变采用稿快照；MFA 模式在翻译前采用修订稿
 
 附加上下文：
 
@@ -34,7 +36,7 @@ subtitle-translation translate video.beautified.json --video video.webm --only-g
 模型配置：
 
 - `GLOSSARY_PROVIDER` / `GLOSSARY_MODEL` 专用于 glossary agent、Tavily tool calling 和最终术语定稿
-- 留空则回退到 `TRANSLATE_PROVIDER` / `TRANSLATE_MODEL`
+- 专用 Provider 也留空时才复用翻译 Provider/model；模型统一遵循非空 *_MODEL 优先，否则使用所选 Provider.default_model
 - 术语知识库会影响后续翻译和校对记忆，用户应使用可用范围内最顶级模型，不要用弱模型省成本
 
 联网搜索：
@@ -78,7 +80,7 @@ Prompt：
 ## 重要约束
 
 - 普通 pipeline 中已存在且非空的 `glossary.md` 不需要重新总结
-- 手动运行 `--only-glossary` 时忽略已有缓存，重新生成并覆盖 `glossary.md`
+- 手动运行 `--only-glossary` 默认重建；.env 中 GLOSSARY_REUSE=1 时可复用
 - 不要把“离线生成”“联网生成”之类元信息写进 glossary
 - glossary 是后续翻译、校对和视频简介翻译的常驻 system prompt 硬规则，不会因为启用 embedding 而省略
 - embedding / Chroma 召回的 `retrieved_context` 只是逐条动态补充记忆，不能替代完整 glossary

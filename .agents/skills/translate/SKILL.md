@@ -1,66 +1,30 @@
 ---
 name: translate
-description: LLM 翻译 WhisperX JSON，输出 .<source>.proofread.ass / .<target>.ass / .<source>-<target>.ass
+description: 联合双语语义翻译、可选 MFA 对轴与 ASS 输出
 platform: Win + Linux
 ---
 
-# 翻译与校对
+# 翻译与对轴
 
-目标：以 WhisperX `.json` 为唯一字幕输入，完成 JSON 时间轴美化、glossary、整句翻译、同步分割、词级对轴、split event 校对和 ASS 导出。
+使用原始 WhisperX JSON 为主输入，原片/编辑视频通过 --video 指定，源/目标语言通过 --lang / --target-lang 指定。subtitle-translation help 查看所有命令帮助。
 
-## 输入
+```bash
+subtitle-translation translate video.json --video video.mkv --lang en --target-lang zh
+subtitle-translation translate video.json --only-glossary
+```
 
-- 优先：`.beautified.json`
-- 回退：原始 `.json`
-- 可选上下文：
-  - `.description`
-  - `.tags.txt`
-  - `.info.json`
-  - `glossary.md`
-
-## 输出
-
-- `.beautified.json`
-- `.split.<source>.srt`
-- `.split.<target>.srt`
-- `.<source>.proofread.ass`
-- `.<target>.ass`
-- `.<source>-<target>.ass`
-- `.<target>.description`
-
-## 当前实现
-
-- 核心实现：`core/translate_srt.py`
-- 正式入口：`subtitle-translation translate`
+功能开关和调优仅在 .env 设置：MFA_ENABLED、PROOFREAD、SPLIT_ENABLED、TRANSLATE_BATCH_SIZE、TRANSLATE_CONTEXT_WINDOW、SCENE_THRESHOLD、SCENE_MIN_INTERVAL_FRAMES、PIPELINE_SKIP_*、LOG_LEVEL、FORCE_REBUILD。旧开关 argv 不再接受。
 
 ## 流程
 
-1. 读取 WhisperX JSON 到 dataclass transcript
-2. 词源级时间轴美化，输出 `.beautified.json`
-3. 若 `glossary.md` 不存在，读取整句 transcript 和元数据生成 glossary
-4. 使用 JSON 整句 segment 翻译
-5. 对未校对整句源/目标语言文本同步分割；显式 `--no-split` 时跳过分割但继续导出 ASS
-6. 用每个源语言分割片段的首尾 word 顺序匹配美化后的 `words[]`，回填 split event 起止时间
-7. 对已分割、已对轴的 split events 做最终双语校对，不改变时间轴或事件数量
-8. 输出 split 级 `.split.<source>.srt`、`.split.<target>.srt` 和最终 `.<source>.proofread.ass`、`.<target>.ass`、`.<source>-<target>.ass`
-9. 若存在 `.description`，同时生成 `.<target>.description`
+- glossary/source_review 是唯一自动源文修订阶段，完整术语常驻上下文。
+- translate 同一响应生成整句译文与成对源/目标字幕片段；以语义为主，不要求边界 ID、字符数、时间或严格目标拼接等式。不再读取 split_prompt 或单独请求 split。
+- 模板默认 MFA_ENABLED=1，在翻译后按来源粗时间窗口批量对齐；0 才使用兼容 ASR 词轴。场景检测只输出 sidecar，不改变时间。
+- 纯译文校对由 PROOFREAD 控制，不改源文、ID、数量或时间。默认模板关闭。
+- 源文无法定位或对轴失败时保留整句双语内容，不强切或伪造词时间；失败粗时间重叠输出协调合并。
 
-## Prompt 来源
+## 产物与恢复
 
-- `translate_prompt.md` 或 `core/subtitle_translation/examples/translate_prompt.example.md`
-- `proofread_prompt.md` 或 `core/subtitle_translation/examples/proofread_prompt.example.md`
-- `split_prompt.md` 或 `core/subtitle_translation/examples/split_prompt.example.md` 仅用于微调分割风格；`core/translate_srt.py` 会在其后追加内置 `_SPLIT_FORMAT`
-- prompt 文件可使用 `${SOURCE_LANG}`、`${TARGET_LANG}`、`${SOURCE_LANG_CODE}`、`${TARGET_LANG_CODE}` 模板变量
+.beautified.json 是兼容命名的工作 JSON，不表示改动了时间；原始 ASR JSON 不覆盖。另输出 .split.<lang>.srt、源/目标/双语 ASS 与目标 description，按当前项目 generation 复用缓存。MFA 文本检查点独立于定时缓存。
 
-## 关键点
-
-- 不再读取或生成 SRT 缓存
-- `.beautified.json` 是主缓存，保存 `translation` / `proofread_text` / `split_events`
-- `SOURCE_LANG` / `TARGET_LANG` 可写 ISO 代码、BCP-47 标签或语言名；输出文件语种后缀通过 `langcodes` 规范为 ISO 639 代码
-- `.<source>-<target>.ass` 使用校对后的源语言文本
-- AI 分割结果必须保留 `id` 和源/目标 ISO 639 语言代码 key，例如 `id/en/zh`。源/目标段数必须一致，并且源语言片段能还原未校对整句、首尾 word 能对齐 `words[]`；否则整句回退到 beautified 时间轴
-- token normalize 仅用于匹配，不改显示文本；词内 dash/hyphen 会被忽略，带空格 dash 仍作为分隔
-- 源语言校对发生在 split event 上，只做 ASR 纠错和轻量可读性修正，不改变事件数量或时间轴；目标语言翻译可以按目标语言表达自然调整
-- 禁止本地强切 fallback，宁可不分割也不把源/目标文本硬切错位
-- glossary 推荐在翻译前建立；一旦存在，会完整常驻注入翻译、校对和视频简介翻译的 system prompt
-- embedding / Chroma 的 `retrieved_context` 只做逐条补充记忆，不替代完整 glossary
+translate_prompt / proofread_prompt 风格文件仍按既有配置加载，阶段协议由代码追加；外部维护的 prompt example 不修改。检索证据不替代完整 glossary。

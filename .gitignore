@@ -20,3 +20,11 @@ split_prompt.md
 chroma_db/
 uv.lock
 template.ass
+asr_runtime.json
+.asr_runtime.*.candidate.json
+asr_providers.json
+.asr_work/
+*.source_review.json
+glossary.md
+subtitle-translation.log
+batch-result.log

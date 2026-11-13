@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from .project_logging import log
+
 
 _active_processes: set[subprocess.Popen] = set()
 _active_processes_lock = threading.RLock()
@@ -32,10 +34,12 @@ def run_command(
     cwd: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     label: str = "",
+    timeout: float | None = None,
 ) -> CommandResult:
     command = tuple(str(arg) for arg in args)
     if label:
-        print(f"{label}: {_display_command(command)}", file=sys.stderr)
+        log("INFO", f"{label}: starting {Path(command[0]).name}")
+    log("DEBUG", f"Managed process argc={len(command)} timeout={timeout}")
     process: subprocess.Popen | None = None
     try:
         process_kwargs: dict[str, object] = {}
@@ -53,7 +57,17 @@ def run_command(
         )
         with _active_processes_lock:
             _active_processes.add(process)
-        returncode = int(process.wait())
+        returncode = int(process.wait() if timeout is None else process.wait(timeout=timeout))
+    except subprocess.TimeoutExpired as error:
+        if process is not None:
+            terminate_process_tree(process)
+            process.wait()
+        return CommandResult(command, 124, "", str(error))
+    except KeyboardInterrupt:
+        if process is not None:
+            terminate_process_tree(process)
+            process.wait()
+        raise
     except FileNotFoundError as error:
         print(f"Error: command not found: {command[0]}", file=sys.stderr)
         return CommandResult(command, 127, "", str(error))
@@ -64,7 +78,28 @@ def run_command(
         if process is not None:
             with _active_processes_lock:
                 _active_processes.discard(process)
+    log("ERROR" if returncode else "DEBUG", f"Managed process finished: exit={returncode}")
     return CommandResult(command, returncode)
+
+
+def terminate_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            if result.returncode:
+                process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (FileNotFoundError, ProcessLookupError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
 
 
 def terminate_active_processes() -> None:
@@ -72,24 +107,7 @@ def terminate_active_processes() -> None:
     with _active_processes_lock:
         processes = tuple(_active_processes)
     for process in processes:
-        if process.poll() is not None:
-            continue
-        try:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
-        except (FileNotFoundError, ProcessLookupError, OSError):
-            try:
-                process.kill()
-            except OSError:
-                # A process may exit between the poll and either kill attempt.
-                pass
+        terminate_process_tree(process)
 
 
 def capture_command(

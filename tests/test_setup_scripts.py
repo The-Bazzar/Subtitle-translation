@@ -50,17 +50,18 @@ class SetupAndDocumentationTests(unittest.TestCase):
         self.assertTrue((package_examples / "template.ass.example").is_file())
 
     def test_docs_describe_the_python_cli_and_resource_invariants(self):
-        documents = [
-            (ROOT / "AGENTS.md").read_text(encoding="utf-8"),
-            (ROOT / "README.md").read_text(encoding="utf-8"),
-            (ROOT / "MIGRATION.md").read_text(encoding="utf-8"),
-        ]
-        for content in documents:
-            self.assertIn("subtitle-translation pipeline", content)
-            self.assertIn("max(1, (os.cpu_count() or 1) // 4)", content)
-            self.assertIn("WhisperX `.json`", content)
-            self.assertIn("glossary", content)
-            self.assertIn("Ctrl+C", content)
+        for name in ("AGENTS.md", "README.md"):
+            content = (ROOT / name).read_text(encoding="utf-8")
+            with self.subTest(document=name):
+                self.assertIn("subtitle-translation pipeline", content)
+                self.assertIn("max(1, (os.cpu_count() or 1) // 4)", content)
+                self.assertIn("WhisperX", content)
+                self.assertIn(".json", content)
+                self.assertIn("glossary", content)
+                self.assertIn("Ctrl+C", content)
+        migration = (ROOT / "MIGRATION.md").read_text(encoding="utf-8")
+        self.assertIn("[README](README.md)", migration)
+        self.assertIn("[CLI/环境配置](docs/cli-and-env.md)", migration)
 
     def test_local_configuration_files_are_explicitly_excluded(self):
         agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")

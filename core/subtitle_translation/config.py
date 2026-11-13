@@ -2,8 +2,20 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def resolve_mfa_enabled(cli_value: bool | None, values: Mapping[str, str]) -> bool:
+    if cli_value is not None:
+        return bool(cli_value)
+    value = str(values.get("MFA_ENABLED", "0")).strip().lower()
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    raise ValueError("MFA_ENABLED must be 0/1 or a boolean value")
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
