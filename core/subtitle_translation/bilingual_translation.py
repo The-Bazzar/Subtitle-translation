@@ -10,7 +10,7 @@ from .artifacts import json_sha256
 from .project_logging import log, logged_stage
 
 
-PROTOCOL_VERSION = "semantic-bilingual-events-v1"
+PROTOCOL_VERSION = "semantic-bilingual-events-v2-shared-session"
 PROTOCOL = """SEMANTIC BILINGUAL SUBTITLE TRANSLATION (overrides earlier splitting and response instructions):
 Read the complete source sentence, its context and the full glossary. Translate
 the whole meaning naturally, then choose readable semantic subtitle units and
@@ -73,10 +73,13 @@ def whole_event(segment, whole, plan_key):
 def response_events(row, segment, ctx, plan_key, split_enabled):
     import translate_srt as t
 
-    whole = row.get(ctx.target_lang_code)
+    fields = t.LanguageFields.from_ctx(ctx)
+    whole = fields.get_target(row)
     if not isinstance(whole, str) or not whole.strip():
         raise ValueError("whole translation must be a nonempty string")
-    whole = whole.strip()
+    whole = t._strip_speaker_labels(whole)
+    if not whole:
+        raise ValueError("whole translation must be a nonempty string")
     if not split_enabled:
         return whole, [whole_event(segment, whole, plan_key)], None
     try:
@@ -87,11 +90,14 @@ def response_events(row, segment, ctx, plan_key, split_enabled):
         for item in rows:
             if not isinstance(item, dict):
                 raise ValueError("invalid bilingual subtitle part")
-            en, zh = item.get(ctx.source_lang_code), item.get(ctx.target_lang_code)
+            en, zh = fields.get_source(item), fields.get_target(item)
             if not isinstance(en, str) or not en.strip() or not isinstance(zh, str) or not zh.strip():
                 raise ValueError("bilingual subtitle parts must have actual source and target text")
+            cleaned = t._strip_speaker_labels(zh)
+            if not cleaned:
+                raise ValueError("bilingual subtitle parts must have actual target text")
             source.append(en)
-            target.append(zh.strip())
+            target.append(cleaned)
         ranges = source_ranges(segment.text, source, ctx.source_lang_code)
         if segment.segment_timing.get("quality") == "pending":
             events = [t.SplitEvent(None, None, segment.text[a:b].strip(), zh,
@@ -133,35 +139,42 @@ def log_events(segment, ctx, whole, events, status, prefix, *, cached=False, war
 
 @logged_stage("translate")
 def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, split_enabled=True,
-                     context_window=1, checkpoint=None, admission_guard=None):
+                     checkpoint=None, admission_guard=None):
     import translate_srt as t
 
-    prompt = system_prompt + "\n\n" + t._JSON_FORMAT + "\n\n" + t.render_prompt_template(PROTOCOL, ctx)
+    prompt = system_prompt + ("\n\n" + t._RETRIEVED_CONTEXT_RULES if retriever is not None else "")
+    prompt += "\n\n" + t._JSON_FORMAT + "\n\n" + t._JSON_BATCH_FORMAT + "\n\n" + t.render_prompt_template(PROTOCOL, ctx)
     if not split_enabled:
         prompt += "\nSEGMENTATION DISABLED: Return one bilingual event for the complete source sentence."
-    if retriever is not None:
-        prompt += "\n\n" + t._RETRIEVED_CONTEXT_RULES
-    pending, plans, changed = [], {}, False
-    for segment in transcript.segments:
-        context = t.source_first_context(transcript, segment, max(0, context_window))
-        if retriever is not None:
-            context["retrieved_context"] = retriever.retrieve_texts([segment.text], top_k=1)[0]
-        plan_key = json_sha256({"version": PROTOCOL_VERSION, "source": segment.text, "id": segment.index,
-                               "project": ctx.dir, "generation": transcript.raw.get("_batch_artifact", {}),
-                               "source_input": transcript.raw.get("_source_first_input", ""), "context": context,
-                               "split_enabled": split_enabled, "prompt": prompt, "model": t.source_first_model_identity(llm),
-                               "languages": [ctx.source_lang_code, ctx.target_lang_code]})
-        if (segment.translation_key == plan_key and segment.event_plan_key == plan_key
-                and isinstance(segment.translation, str) and segment.translation.strip()
-                and t.source_events_are_valid(segment) and all(isinstance(e.zh, str) and e.zh.strip() for e in segment.split_events)):
-            log("TRACE", f"Translation cache hit: sentence #{segment.index}")
-            status = "split" if len(segment.split_events) > 1 else "unsplit"
-            if segment.split_status not in {"ok", "unsplit"}:
-                status = segment.split_status or "unknown"
-            log_events(segment, ctx, segment.translation, segment.split_events, status, "Translate cache:", cached=True)
-            continue
-        plans[segment.index] = (segment, plan_key)
-        pending.append(t.make_language_item(segment.index, ctx, source=segment.text, extra=context))
+    plans, changed = {}, False
+    budget = max(1, llm.batch_size)
+
+    def prepare_batch(batch):
+        if admission_guard:
+            admission_guard()
+        retrieved = retriever.retrieve_texts([segment.text for segment in batch]) if retriever is not None else [[] for _ in batch]
+        if len(retrieved) != len(batch):
+            raise ValueError("translation retrieval lost source items")
+        pending = []
+        for segment, retrieved_context in zip(batch, retrieved):
+            context = {"retrieved_context": retrieved_context}
+            plan_key = json_sha256({"version": PROTOCOL_VERSION, "source": segment.text, "id": segment.index,
+                                   "project": ctx.dir, "generation": transcript.raw.get("_batch_artifact", {}),
+                                   "source_input": transcript.raw.get("_source_first_input", ""), "context": context,
+                                   "split_enabled": split_enabled, "prompt": prompt, "model": t.source_first_model_identity(llm),
+                                   "languages": [ctx.source_lang_code, ctx.target_lang_code]})
+            if (segment.translation_key == plan_key and segment.event_plan_key == plan_key
+                    and isinstance(segment.translation, str) and segment.translation.strip()
+                    and t.source_events_are_valid(segment) and all(isinstance(e.zh, str) and e.zh.strip() for e in segment.split_events)):
+                log("TRACE", f"Translation cache hit: sentence #{segment.index}")
+                status = "split" if len(segment.split_events) > 1 else "unsplit"
+                if segment.split_status not in {"ok", "unsplit"}:
+                    status = segment.split_status or "unknown"
+                log_events(segment, ctx, segment.translation, segment.split_events, status, "Translate cache:", cached=True)
+                continue
+            plans[segment.index] = (segment, plan_key)
+            pending.append(t.make_source_item(segment.index, ctx, segment.text, retrieved_context=retrieved_context))
+        return pending
 
     validated_results = {}
     round_number, round_start = 0, 0.0
@@ -178,7 +191,7 @@ def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, spl
             round_number += 1
             round_start = time.monotonic()
             ids = ",".join(str(i) for i in data["ids"])
-            message = f"request attempt={data['attempt']}/2 items={len(data['ids'])} ids=[{ids}] chars={data['chars']}"
+            message = f"request attempt={data['attempt']}/{data['attempts']} items={len(data['ids'])} ids=[{ids}] chars={data['chars']}"
         elif event == "response":
             message = f"response chars={data['chars']} elapsed={time.monotonic() - round_start:.2f}s"
         elif event == "validated":
@@ -205,10 +218,16 @@ def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, spl
             for item_id in data["failed"]:
                 status = "retry" if data["retry"] else "failed"
                 log("WARNING", f'{prefix} sentence #{item_id} status={status} project={ctx.base!r}')
-    log("INFO", f'Translate bilingual events: {len(pending)} pending sentence(s)')
-    for start in range(0, len(pending), max(1, llm.batch_size)):
-        accepted, errors = t.source_first_batch(llm, prompt, pending[start:start + max(1, llm.batch_size)], validate, admission_guard,
-                                              round_log=round_log)
+    session = None
+    for start in range(0, len(transcript.segments), budget):
+        pending = prepare_batch(transcript.segments[start:start + budget])
+        log("INFO", f'Translate bilingual events: {len(pending)} pending sentence(s) in batch {start // budget + 1}')
+        if not pending:
+            continue
+        if session is None:
+            session = t.ChatSession(llm, prompt, temperature=0.3)
+        accepted, errors = t.source_first_batch(llm, prompt, pending, validate, admission_guard,
+                                              round_log=round_log, session=session, attempts=3, retry_delay=3.0)
         for item_id, (whole, events, warning) in accepted.items():
             segment, key = plans[item_id]
             segment.translation, segment.split_events = whole, events

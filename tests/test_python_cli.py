@@ -20,6 +20,7 @@ class PythonCliTests(unittest.TestCase):
                 "pipeline",
                 "batch",
                 "translate",
+                "proofread",
                 "merge-ass",
                 "download",
                 "prepare-video",
@@ -37,7 +38,16 @@ class PythonCliTests(unittest.TestCase):
             result = cli.main(["translate", "input.json", "--no-split"])
 
         self.assertEqual(result, 7)
-        translate.assert_called_once_with(["input.json", "--no-split"])
+        translate.assert_called_once_with(["input.json", "--no-split"], rerun_translation=True)
+
+    def test_proofread_dispatches_only_to_the_standalone_stage(self):
+        from subtitle_translation import cli, proofread
+
+        with mock.patch.object(proofread, "main", return_value=3) as stage, \
+             mock.patch.object(cli.translate_srt, "main") as translate:
+            self.assertEqual(cli.main(["proofread", "input.beautified.json"]), 3)
+        stage.assert_called_once_with(["input.beautified.json"])
+        translate.assert_not_called()
 
     def test_command_detection_does_not_consume_a_url_named_like_a_command(self):
         from subtitle_translation import cli

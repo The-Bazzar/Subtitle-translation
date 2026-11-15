@@ -20,6 +20,7 @@ COMMANDS = (
     "pipeline",
     "batch",
     "translate",
+    "proofread",
     "merge-ass",
     "download",
     "prepare-video",
@@ -47,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     _forwarding_command(subparsers, "pipeline", "Run the complete subtitle pipeline")
     _forwarding_command(subparsers, "batch", "Process multiple YouTube URLs with stage scheduling")
     _forwarding_command(subparsers, "translate", "Translate a WhisperX JSON transcript")
+    _forwarding_command(subparsers, "proofread", "Proofread target text in an already timed translation JSON")
     _forwarding_command(subparsers, "merge-ass", "Merge source and target ASS files")
     _forwarding_command(subparsers, "download", "Download a video and its metadata")
     _forwarding_command(subparsers, "prepare-video", "Create the timestamp-stabilized edit video")
@@ -135,7 +137,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return int(error.code)
         return 0
     if command == "translate":
-        return _normalize_result(translate_srt.main(command_args))
+        return _normalize_result(translate_srt.main(command_args, rerun_translation=True))
+    if command == "proofread":
+        from . import proofread
+
+        return _normalize_result(proofread.main(command_args))
     if command == "merge-ass":
         return _normalize_result(merge_ass.main(command_args))
     if command == "batch":

@@ -1,5 +1,31 @@
 # Migration
 
+## 2.1.1
+
+### 独立校对与源文 ASS 命名
+
+新增 subtitle-translation proofread <base>.beautified.json，只重新校对已有目标文本，不调用上游或元数据翻译；显式命令不受 PROOFREAD 开关影响。
+输入必须是完整的新结构翻译工作 JSON，含整句/事件译文、稳定 ID、源文范围和有效定时；原始 ASR、ASS/SRT 和 pending 检查点不自动转换。
+默认原位更新输入工作 JSON；--output-json 用于另存，--output 仍是双语 ASS 路径。原位更新会覆盖已有译文，需保留先前结果时使用另存。
+新生成工作文件保存 subtitle_languages，旧文件缺失时有警告并使用 CLI/.env/ASR 语言默认值；已保存语言不允许被 proofread 参数更换。
+源文 ASS 从 .<source>.proofread.ass 改为 .<source>.ass，与是否启用校对无关。依赖旧路径的播放器/脚本需改用新路径；旧文件不自动迁移或删除。
+校对只更新目标文本和成功项 proofread_key，保留未知字段/原有时间精度；沿用派生 JSON 清理旧根 word_segments 的规则。有效原位 MFA 定时投影仅刷新结果 digest，不重跑声学阶段，不改文本检查点或 batch generation 协议。
+
+### 翻译与校对调用兼容修复
+
+主翻译恢复 2.0.2 的项目内共享会话、温度 0.3、最多三次尝试及 3/6 秒退避，RAG 按批查询并遵循 EMBEDDING_TOP_K。
+完整 glossary/简介/风格 prompt 的加载不变，user 项恢复 id、源文、retrieved_context，响应保留 2.1 的整句译文与双语 split_events。
+移除 TRANSLATE_CONTEXT_WINDOW；不再给每项附加独立邻句字段。语境来自当前批次、项目内对话历史和检索。
+纯译文校对恢复项目内共享会话、温度 0.2、逐 event 检索、三次尝试/3、6 秒退避和超限缩批/去 RAG；保留只改目标文本及整句/事件一起保存的 2.1 数据结构。
+PROOFREAD_BATCH_SIZE 恢复为 event 预算，完整句不可拆开；单句可超过预算，单句去除动态 RAG 后仍超限则保留原译文。
+显式 subtitle-translation translate 每次重新翻译/联合断句，启用校对时重新校对；旧 .beautified.json 和文本/定时投影不用于跳过语义请求，--only-* 不触发全流程。
+无需设置 FORCE_REBUILD 或删除项目文件；glossary/采用稿、ASR、场景、原生 MFA 声学缓存和检索库仍可复用。
+pipeline/batch 的内部续跑规则不变；新调用身份首次会重译，仍核对实际检索输入，命中不请求模型或伪造对话历史。
+源文审阅、元数据和其他工具的调用策略不变。
+MFA 路径在 glossary 之前恢复原始听录索引与检索器；不会因启用 MFA 而丢失旧 glossary/Tavily 的 RAG 输入。
+翻译和校对恢复逐批检索后立即请求，不再提前检索全项目；后续批次检索失败不会阻止已完成翻译批次保存检查点。
+恢复响应 ISO 语言键大小写规范化和目标文本的 EN/ZH/SRC/TGT 标签清理；标签清理后为空仍不作为实际译文接受。
+
 ## 2.1.0
 
 多 ASR/多语言 MFA profile 不在本版发布范围，
@@ -20,7 +46,7 @@ CLI 只保留输入/输出路径、URL、语言、配置根和 --only-*；--help
 | --no-split | SPLIT_ENABLED=0 |
 | --skip-* | PIPELINE_SKIP_* |
 | --batch-size | TRANSLATE_BATCH_SIZE |
-| --split-context-window | TRANSLATE_CONTEXT_WINDOW |
+| --split-context-window | 已删除；使用项目内对话历史和 RAG |
 | --quiet | 已删除；通过 LOG_LEVEL 控制日志 |
 | --dry-run / --force | DRY_RUN / FORCE_REBUILD |
 | --model / --align-model / --device | WHISPER_MODEL / WHISPER_ALIGN_MODEL / WHISPER_DEVICE |

@@ -15,7 +15,7 @@ from subtitle_translation.config import ProjectConfig
 class CliConfigurationTests(unittest.TestCase):
     def test_invalid_numeric_settings_fail_before_model_or_media_work(self):
         for values in ({"SCENE_THRESHOLD": "nan"}, {"SCENE_THRESHOLD": "2"},
-                       {"TRANSLATE_BATCH_SIZE": "0"}, {"TRANSLATE_CONTEXT_WINDOW": "-1"},
+                       {"TRANSLATE_BATCH_SIZE": "0"},
                        {"SCENE_MIN_INTERVAL_FRAMES": "-1"}):
             with self.subTest(values=values), patch.object(t, "load_env", return_value={}), \
                  patch("sys.stderr", io.StringIO()), patch.object(t, "load_transcript") as read, self.assertRaises(SystemExit) as error:

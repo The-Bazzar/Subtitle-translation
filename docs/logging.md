@@ -3,6 +3,7 @@
 ## 位置与生命周期
 
 - 单项目：视频文件夹的 subtitle-translation.log；显式 --video 优先决定目录，否则取输入 JSON 所在目录。不是 .code 或 --project-dir 配置根。
+- 独立 proofread 始终使用输入工作 JSON 所在目录；--output-json 另存或 --output 指定 ASS 不改变日志所属项目。发布后逐 event 完整记录采用文字、ID 和原时间，reviewed 为 INFO，保留原译文为 WARNING。
 - batch：命令执行目录的 batch-result.log，所有视频、阶段和 worker 故障诊断集中在此；不会额外创建各视频的应用日志。--report 只改变结果报告位置，不改变日志位置。
 - 每次外部运行以 w 模式覆盖旧文件。内部 glossary/translate/MFA/proofread 等阶段共享本轮 sink，不再次清空。无轮转、追加或时间戳备份。
 - help、only-output-path、batch dry-run 不创建日志。无法定位有效项目的早期参数错误只打印控制台。
@@ -21,7 +22,7 @@ LOG_LEVEL 仅在 .env 设置，默认 INFO，接受 TRACE、DEBUG、INFO、WARNI
 控制台和 UTF-8 文件统一按此阈值过滤；文件实时刷新并在结束时关闭。
 TRACE 用于缓存诊断，DEBUG 用于工具调用/响应体积。正常 split/unsplit 句段和每条 event 均为 INFO；whole_fallback、retry、failed 和未知缓存状态等异常记录为 WARNING。任务级异常仍为 ERROR。
 每条采用的 event 都完整记录原文、译文、稳定 ID、status 和当前时间，不截断正文。MFA 前的 time=pending 是正常状态，不因此升级警告。
-缓存命中也逐条打印并标注 cache=hit，不伪造 LLM 轮次。每轮中已通过的句段不因其他句段重试而重复打印。
+内部续跑缓存命中也逐条打印并标注 cache=hit，不伪造 LLM 轮次。显式 translate 每次重新翻译，开头记录不加载旧文本结果；可复用的 MFA 声学缓存不代表跳过翻译。每轮中已通过的句段不因其他句段重试而重复打印。
 QUIET 配置及内部参数/输出分支已删除，LOG_LEVEL 是控制台和文件唯一的级别入口；查看全部 event 应设为 INFO 或更低，WARNING 及以上会过滤正常事件。不修改路径 marker 或 help 等命令结果输出。
 
 ## 数据边界
