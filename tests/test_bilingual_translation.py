@@ -431,7 +431,7 @@ class BilingualTranslationTests(unittest.TestCase):
             self.assertEqual(item["retrieved_context"], context)
         prompt = self.calls[0][1]
         self.assertTrue(prompt.startswith(full_prompt))
-        self.assertIn(bt.BATCH_PROTOCOL, prompt)
+        self.assertIn(t._JSON_BATCH_FORMAT, prompt)
         self.assertLess(prompt.index(t._RETRIEVED_CONTEXT_RULES), prompt.index(t._JSON_FORMAT))
 
     def test_shared_session_retries_bad_json_without_duplicating_users_or_losing_history(self):

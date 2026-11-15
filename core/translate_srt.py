@@ -1445,6 +1445,12 @@ ABSOLUTE JSON RULES:
 
 Never imitate Python dict syntax. Single-quoted pseudo-JSON will be rejected."""
 
+_JSON_BATCH_FORMAT = """Return a JSON object.
+The first response character must be `{` and the last response character must be `}`.
+The object must have exactly one top-level key: "items".
+"items" must be a JSON array with one object per input item.
+Preserve each input item's exact `id`. Do not renumber."""
+
 _JSON_OBJECT_FORMAT = """Return a JSON object.
 The first response character must be `{` and the last response character must be `}`."""
 
@@ -4036,10 +4042,8 @@ def proofread_batches(segments, event_budget):
 @logged_stage("proofread")
 def proofread_target_events(transcript, ctx, llm, system_prompt, retriever=None, *,
                             retrieval_top_k=1, admission_guard=None):
-    from subtitle_translation.bilingual_translation import BATCH_PROTOCOL
-
     prompt = system_prompt + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
-    prompt += "\n\n" + _JSON_FORMAT + "\n\n" + BATCH_PROTOCOL + "\n\n" + render_prompt_template(_EVENT_PROOFREAD_PROTOCOL, ctx)
+    prompt += "\n\n" + _JSON_FORMAT + "\n\n" + _JSON_BATCH_FORMAT + "\n\n" + render_prompt_template(_EVENT_PROOFREAD_PROTOCOL, ctx)
     plans, changed = {}, False
     budget = max(1, llm.batch_size)
 

@@ -109,6 +109,7 @@ def publish_results(transcript, payload, input_path, input_hash, destination, de
             if candidate.get("sha256") == input_hash and isinstance(candidate.get("key"), str) and candidate["key"]:
                 timed_manifest = candidate
         except (OSError, ValueError):
+            # Missing or invalid timing manifests remain cache misses.
             pass
     with ExitStack() as stack:
         directories, staged, exports = {}, copy.copy(ctx), []

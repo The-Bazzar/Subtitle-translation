@@ -11,11 +11,6 @@ from .project_logging import log, logged_stage
 
 
 PROTOCOL_VERSION = "semantic-bilingual-events-v2-shared-session"
-BATCH_PROTOCOL = """Return a JSON object.
-The first response character must be `{` and the last response character must be `}`.
-The object must have exactly one top-level key: "items".
-"items" must be a JSON array with one object per input item.
-Preserve each input item's exact `id`. Do not renumber."""
 PROTOCOL = """SEMANTIC BILINGUAL SUBTITLE TRANSLATION (overrides earlier splitting and response instructions):
 Read the complete source sentence, its context and the full glossary. Translate
 the whole meaning naturally, then choose readable semantic subtitle units and
@@ -148,7 +143,7 @@ def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, spl
     import translate_srt as t
 
     prompt = system_prompt + ("\n\n" + t._RETRIEVED_CONTEXT_RULES if retriever is not None else "")
-    prompt += "\n\n" + t._JSON_FORMAT + "\n\n" + BATCH_PROTOCOL + "\n\n" + t.render_prompt_template(PROTOCOL, ctx)
+    prompt += "\n\n" + t._JSON_FORMAT + "\n\n" + t._JSON_BATCH_FORMAT + "\n\n" + t.render_prompt_template(PROTOCOL, ctx)
     if not split_enabled:
         prompt += "\nSEGMENTATION DISABLED: Return one bilingual event for the complete source sentence."
     plans, changed = {}, False
