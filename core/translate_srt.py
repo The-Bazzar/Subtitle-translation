@@ -305,7 +305,7 @@ class TranscriptContext:
     beautified_json: str
     split_source_srt: str
     split_target_srt: str
-    proofread_ass: str
+    source_ass: str
     target_ass: str
     bilingual_ass: str
     desc: str
@@ -346,7 +346,7 @@ class TranscriptContext:
             ),
             split_source_srt=os.path.join(directory, f"{base}.split.{source_suffix}.srt"),
             split_target_srt=os.path.join(directory, f"{base}.split.{target_suffix}.srt"),
-            proofread_ass=os.path.join(directory, f"{base}.{source_suffix}.proofread.ass"),
+            source_ass=os.path.join(directory, f"{base}.{source_suffix}.ass"),
             target_ass=os.path.join(directory, f"{base}.{target_suffix}.ass"),
             bilingual_ass=output_ass or os.path.join(directory, f"{base}.{source_suffix}-{target_suffix}.ass"),
             desc=os.path.join(directory, f"{base}.description"),
@@ -3572,6 +3572,16 @@ def is_context_length_error(error: Exception | str) -> bool:
     )
 
 
+def _strip_speaker_labels(text: str) -> str:
+    value = text.strip()
+    for _ in range(3):
+        new_value = re.sub(r"^(?:EN|ZH|SRC|TGT)\s*:\s*", "", value, flags=re.IGNORECASE).strip()
+        if new_value == value:
+            break
+        value = new_value
+    return value
+
+
 # --- Split and word alignment -------------------------------------------------
 
 
@@ -3742,10 +3752,11 @@ def source_first_rows(answer: str, expected_ids: list[int]) -> dict[int, dict]:
     return rows
 
 
-def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, admission_guard=None, *, round_log=None) -> tuple[dict, dict]:
+def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, admission_guard=None, *,
+                       round_log=None, session=None, attempts=2, retry_delay=0.0) -> tuple[dict, dict]:
     accepted, errors = {}, {}
     pending = list(items)
-    for attempt in range(2):
+    for attempt in range(attempts):
         if not pending:
             break
         if admission_guard:
@@ -3756,23 +3767,31 @@ def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, ad
             return source_first_rows(answer, [item.id for item in pending])
 
         request_started = False
+        retry_blocked = False
+        history_size = len(session.messages) if session is not None else 0
         try:
             request = LLMBatchRequest(pending).to_json_text()
-            session = ChatSession(llm, prompt, temperature=0.2)
+            conversation = session if session is not None else ChatSession(llm, prompt, temperature=0.2)
             if round_log:
-                round_log("request", attempt=attempt + 1, ids=[item.id for item in pending], chars=len(request))
+                round_log("request", attempt=attempt + 1, attempts=attempts,
+                          ids=[item.id for item in pending], chars=len(request))
             request_started = True
-            _, rows = session.ask_validated(
+            _, rows = conversation.ask_validated(
                 request,
                 parse_response,
                 retry_template=CompletionRetryTemplate(attempts=1, ),
             )
         except Exception as error:
+            if session is not None:
+                del session.messages[history_size:]
+                retry_blocked = is_context_length_error(error)
             rows = {}
             errors.update({item.id: str(error) for item in pending})
             if round_log and request_started:
                 round_log("error", kind=type(error).__name__)
         except BaseException as error:
+            if session is not None:
+                del session.messages[history_size:]
             if round_log and request_started:
                 round_log("aborted", kind=type(error).__name__)
             raise
@@ -3788,8 +3807,15 @@ def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, ad
                 errors[item.id] = str(error)
                 remaining.append(item)
         if round_log and request_started:
-            round_log("validated", accepted=valid_ids, failed=[item.id for item in remaining], retry=bool(remaining) and attempt == 0)
+            round_log("validated", accepted=valid_ids, failed=[item.id for item in remaining],
+                      retry=bool(remaining) and not retry_blocked and attempt + 1 < attempts)
         pending = remaining
+        if retry_blocked:
+            break
+        if pending and attempt + 1 < attempts and retry_delay:
+            if admission_guard:
+                admission_guard()
+            time.sleep(retry_delay * (attempt + 1))
     if admission_guard:
         admission_guard()
     return accepted, errors
@@ -3897,7 +3923,12 @@ def prepare_mfa_review(source, ctx, env, video_path: str, args, admission_guard=
         if admission_guard:
             admission_guard()
         llm = glossary_llm_from_env(env, translate_llm_from_env(env, args.batch_size), batch_size=args.batch_size)
-        build_glossary(original, ctx, llm, GlossaryBuildOptions.from_env(env, ))
+        embedding_config = EmbeddingConfig.from_env(env, ctx)
+        retriever = (refresh_embedding_retriever(original, embedding_config, env, ctx, fatal=True)
+                     if embedding_config.enabled else None)
+        if admission_guard:
+            admission_guard()
+        build_glossary(original, ctx, llm, GlossaryBuildOptions.from_env(env, retriever=retriever))
         if admission_guard:
             admission_guard()
         review_ctx = copy.copy(ctx)
@@ -3941,14 +3972,22 @@ def source_events_are_valid(segment: TranscriptSegment) -> bool:
 
 
 def validate_target_events(row: dict, segment: TranscriptSegment, ctx: TranscriptContext) -> tuple[str, list[str]]:
-    if set(row) != {"id", ctx.target_lang_code, "split_events"}:
+    fields = LanguageFields.from_ctx(ctx)
+
+    def canonical_keys(item):
+        return {ctx.target_lang_code if normalized_response_key(key) in fields.target_candidates() else key for key in item}
+
+    if len(row) != 3 or canonical_keys(row) != {"id", ctx.target_lang_code, "split_events"}:
         raise ValueError("proofreading must return only sentence ID, whole target and target events")
 
     def target_text(item):
-        value = item.get(ctx.target_lang_code)
+        value = fields.get_target(item)
         if not isinstance(value, str) or not value.strip():
             raise ValueError("proofreading must provide a nonempty target string")
-        return value.strip()
+        value = _strip_speaker_labels(value)
+        if not value:
+            raise ValueError("proofreading must provide a nonempty target string")
+        return value
 
     whole = target_text(row)
     events = row["split_events"]
@@ -3957,7 +3996,7 @@ def validate_target_events(row: dict, segment: TranscriptSegment, ctx: Transcrip
         raise ValueError("proofreading event count mismatch")
     by_id = {}
     for event in events:
-        if not isinstance(event, dict) or set(event) != {"id", ctx.target_lang_code}:
+        if not isinstance(event, dict) or len(event) != 2 or canonical_keys(event) != {"id", ctx.target_lang_code}:
             raise ValueError("proofreading cannot edit source text or time")
         event_id = event["id"]
         if not isinstance(event_id, str) or event_id not in expected or event_id in by_id:
@@ -3974,49 +4013,122 @@ def _proofread_source_events(segment, ctx):
             for e in segment.split_events]
 
 
+def proofread_retrieval_query(event: SplitEvent) -> str:
+    return "\n".join([
+        "ASR correction glossary proofread source-language proper names terminology",
+        f"Source: {event.en}", f"Target: {event.zh}",
+    ])
+
+
+def proofread_batches(segments, event_budget):
+    batch, count = [], 0
+    for segment in segments:
+        size = len(segment.split_events)
+        if batch and count + size > event_budget:
+            yield batch
+            batch, count = [], 0
+        batch.append(segment)
+        count += size
+    if batch:
+        yield batch
+
+
 @logged_stage("proofread")
 def proofread_target_events(transcript, ctx, llm, system_prompt, retriever=None, *,
                             retrieval_top_k=1, admission_guard=None):
-    prompt = system_prompt + "\n\n" + _JSON_FORMAT + "\n\n" + render_prompt_template(_EVENT_PROOFREAD_PROTOCOL, ctx)
-    if retriever is not None:
-        prompt += "\n\n" + _RETRIEVED_CONTEXT_RULES
-    plans, pending, changed = {}, [], False
+    from subtitle_translation.bilingual_translation import BATCH_PROTOCOL
+
+    prompt = system_prompt + ("\n\n" + _RETRIEVED_CONTEXT_RULES if retriever is not None else "")
+    prompt += "\n\n" + _JSON_FORMAT + "\n\n" + BATCH_PROTOCOL + "\n\n" + render_prompt_template(_EVENT_PROOFREAD_PROTOCOL, ctx)
+    plans, changed = {}, False
+    budget = max(1, llm.batch_size)
+
+    def current_target(segment):
+        return {"id": segment.index, ctx.target_lang_code: segment.translation, "split_events": [
+            {"id": e.id, ctx.target_lang_code: e.zh} for e in segment.split_events]}
+
+    def base_identity(segment, fields):
+        return source_first_hash({"version": SOURCE_FIRST_VERSION, "plan": segment.event_plan_key,
+            "source": segment.text, "input": fields, "prompt": prompt,
+            "model": source_first_model_identity(llm), "languages": [ctx.source_lang_code, ctx.target_lang_code]})
+
     for segment in transcript.segments:
         if not source_events_are_valid(segment):
             raise ValueError(f"invalid source event plan #{segment.index}")
-        current = {"id": segment.index, ctx.target_lang_code: segment.translation, "split_events": [
-            {"id": e.id, ctx.target_lang_code: e.zh} for e in segment.split_events]}
-        validate_target_events(current, segment, ctx)
-        fields = {"split_events": _proofread_source_events(segment, ctx), **source_first_context(transcript, segment)}
-        if retriever is not None:
-            query = f"Target translation terminology\n{segment.text}\n{segment.translation}"
-            fields["retrieved_context"] = retriever.retrieve_texts([query], top_k=retrieval_top_k)[0]
-        base_key = source_first_hash({"version": SOURCE_FIRST_VERSION, "plan": segment.event_plan_key,
-            "source": segment.text, "input": copy.deepcopy(fields), "prompt": prompt,
-            "model": source_first_model_identity(llm), "languages": [ctx.source_lang_code, ctx.target_lang_code]})
-        if segment.proofread_key == source_first_hash([base_key, current]):
-            continue
-        fields[ctx.target_lang_code] = segment.translation
-        for event, item in zip(segment.split_events, fields["split_events"]):
-            item[ctx.target_lang_code] = event.zh
-        plans[segment.index] = (segment, base_key)
-        pending.append(make_language_item(segment.index, ctx, source=segment.text, extra=fields))
-    log("INFO", f'Target proofread: {len(pending)} pending sentence(s)')
-    for start in range(0, len(pending), max(1, llm.batch_size)):
-        accepted, errors = source_first_batch(llm, prompt, pending[start:start + max(1, llm.batch_size)],
-            lambda item_id, row: validate_target_events(row, plans[item_id][0], ctx), admission_guard)
+        validate_target_events(current_target(segment), segment, ctx)
+    def prepare_batch(batch):
+        if admission_guard:
+            admission_guard()
+        events = [event for segment in batch for event in segment.split_events]
+        contexts = (retriever.retrieve_texts([proofread_retrieval_query(e) for e in events], top_k=max(1, retrieval_top_k))
+                    if retriever is not None else [[] for _ in events])
+        if len(contexts) != len(events):
+            raise ValueError("proofreading retrieval lost events")
+        pending, offset = [], 0
+        for segment in batch:
+            fields = {"split_events": _proofread_source_events(segment, ctx)}
+            for item, context in zip(fields["split_events"], contexts[offset:offset + len(segment.split_events)]):
+                if context:
+                    item["retrieved_context"] = context
+            offset += len(segment.split_events)
+            base_key = base_identity(segment, fields)
+            if segment.proofread_key == source_first_hash([base_key, current_target(segment)]):
+                continue
+            plans[segment.index] = fields
+            pending.append(segment)
+        return pending
+
+    session = None
+
+    def apply_batch(batch, without_rag=False):
+        nonlocal changed
+        requests, keys = [], {}
+        for segment in batch:
+            fields = copy.deepcopy(plans[segment.index])
+            if without_rag:
+                for item in fields["split_events"]:
+                    item.pop("retrieved_context", None)
+            keys[segment.index] = base_identity(segment, fields)
+            fields[ctx.target_lang_code] = segment.translation
+            for event, item in zip(segment.split_events, fields["split_events"]):
+                item[ctx.target_lang_code] = event.zh
+            requests.append(make_language_item(segment.index, ctx, source=segment.text, extra=fields))
+        by_id = {segment.index: segment for segment in batch}
+        accepted, errors = source_first_batch(llm, prompt, requests,
+            lambda item_id, row: validate_target_events(row, by_id[item_id], ctx), admission_guard,
+            session=session, attempts=3, retry_delay=3.0)
         for item_id, (whole, parts) in accepted.items():
-            segment, base_key = plans[item_id]
+            segment = by_id[item_id]
             segment.translation = whole
             for event, part in zip(segment.split_events, parts):
                 event.zh = part
-            current = {"id": segment.index, ctx.target_lang_code: whole, "split_events": [
-                {"id": e.id, ctx.target_lang_code: e.zh} for e in segment.split_events]}
-            segment.proofread_key = source_first_hash([base_key, current])
+            segment.proofread_key = source_first_hash([keys[item_id], current_target(segment)])
             changed = True
-        if errors:
-            ids = ", ".join(f"#{i}" for i in errors)
-            log("WARNING", f'Warning: target proofreading kept existing translation for {ids}')
+        if not errors:
+            return
+        failed = [by_id[item_id] for item_id in errors]
+        if all(is_context_length_error(error) for error in errors.values()):
+            if len(failed) > 1:
+                mid = len(failed) // 2
+                log("WARNING", "Proofread context limit: splitting the sentence batch")
+                apply_batch(failed[:mid], without_rag)
+                apply_batch(failed[mid:], without_rag)
+                return
+            if not without_rag and any(item.get("retrieved_context") for item in plans[failed[0].index]["split_events"]):
+                log("WARNING", f"Proofread context limit: retrying sentence #{failed[0].index} without RAG")
+                apply_batch(failed, True)
+                return
+        ids = ", ".join(f"#{i}" for i in errors)
+        log("WARNING", f"Warning: target proofreading kept existing translation for {ids}")
+
+    for batch in proofread_batches(transcript.segments, budget):
+        pending = prepare_batch(batch)
+        log("INFO", f"Target proofread: {len(pending)} pending sentence(s) in current batch")
+        if not pending:
+            continue
+        if session is None:
+            session = ChatSession(llm, prompt, temperature=0.2)
+        apply_batch(pending)
     return changed
 
 
@@ -4132,6 +4244,16 @@ def write_ass(
                     f"Dialogue: 0,{ass_time(event.start)},{ass_time(event.end)},"
                     f"{track.style},,0,0,0,,{text}\n"
                 )
+
+
+@logged_stage("export")
+def export_subtitles(transcript: Transcript, ctx: TranscriptContext, template_path: str) -> None:
+    events = all_events(transcript)
+    write_srt_events(ctx.split_source_srt, events, "en")
+    write_srt_events(ctx.split_target_srt, events, "zh")
+    write_ass(ctx.source_ass, template_path, ctx.base, events, AssOutputMode.SOURCE)
+    write_ass(ctx.target_ass, template_path, ctx.base, events, AssOutputMode.TARGET)
+    write_ass(ctx.bilingual_ass, template_path, ctx.base, events, AssOutputMode.BILINGUAL)
 
 
 DESCRIPTION_TRANSLATE_PROMPT = """You are a professional translator. Translate the following video title, description, and tags from ${SOURCE_LANG} to ${TARGET_LANG}.
@@ -4256,7 +4378,8 @@ def infer_video_path(ctx: TranscriptContext) -> str:
     return ""
 
 
-def main(argv: Sequence[str] | None = None, *, admission_guard=None, stage_overrides=None) -> int:
+def main(argv: Sequence[str] | None = None, *, admission_guard=None, stage_overrides=None,
+         rerun_translation: bool = False) -> int:
     script_dir = _config_root()
     env = load_env(script_dir)
     if stage_overrides:
@@ -4264,7 +4387,7 @@ def main(argv: Sequence[str] | None = None, *, admission_guard=None, stage_overr
 
     parser = argparse.ArgumentParser(
         prog="subtitle-translation translate",
-        description="Translate WhisperX JSON to proofread/target-language/bilingual ASS.",
+        description="Translate WhisperX JSON to bilingual ASS. Normal translate runs regenerate translation and enabled proofreading.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   subtitle-translation translate video.json --video video.webm
@@ -4291,13 +4414,10 @@ def main(argv: Sequence[str] | None = None, *, admission_guard=None, stage_overr
         validate_log_level(env.get("LOG_LEVEL", "INFO"))
         args.mfa = resolve_mfa_enabled(None, env)
         args.batch_size = int(env.get("TRANSLATE_BATCH_SIZE", "50") or "50")
-        args.split_context_window = int(env.get("TRANSLATE_CONTEXT_WINDOW", "1") or "1")
         args.scene_threshold = float(env.get("SCENE_THRESHOLD", "0.15") or "0.15")
         args.min_scene_interval_frames = int(env.get("SCENE_MIN_INTERVAL_FRAMES", "2") or "2")
         if args.batch_size < 1:
             raise ValueError("TRANSLATE_BATCH_SIZE must be positive")
-        if args.split_context_window < 0:
-            raise ValueError("TRANSLATE_CONTEXT_WINDOW must be nonnegative")
         if not math.isfinite(args.scene_threshold) or not 0 <= args.scene_threshold <= 1:
             raise ValueError("SCENE_THRESHOLD must be finite and between 0 and 1")
         if args.min_scene_interval_frames < 0:
@@ -4311,11 +4431,14 @@ def main(argv: Sequence[str] | None = None, *, admission_guard=None, stage_overr
         args.force = settings.flag("FORCE_REBUILD")
     except ValueError as error:
         parser.error(str(error))
+    args.rerun_translation = rerun_translation and not (args.only_scenes or args.only_glossary or args.print_output_path)
     if args.print_output_path or not os.path.isfile(args.json):
         return _run_translate_command(args, env, script_dir, admission_guard)
     log_directory = Path(args.video or args.json).resolve().parent
     try:
         with project_run(log_directory, env.get("LOG_LEVEL", "INFO")):
+            if args.rerun_translation:
+                log("INFO", "Explicit translate: regenerating translation and enabled proofreading; not loading saved text results")
             code = _run_translate_command(args, env, script_dir, admission_guard)
             if code:
                 log("ERROR", f"Translation failed with exit code {code}")
@@ -4381,7 +4504,7 @@ def _run_translate_command(args, env, script_dir, admission_guard):
                 admission_guard()
             from subtitle_translation import windowed_mfa
             review, mfa_media, mfa_runtime = prepare_mfa_review(source, ctx, env, video_path, args, admission_guard)
-            transcript, text_checkpoint = windowed_mfa.load_text_checkpoint(source, review, ctx, args.force)
+            transcript, text_checkpoint = windowed_mfa.load_text_checkpoint(source, review, ctx, args.force or args.rerun_translation)
         except (OSError, ValueError) as error:
             log("ERROR", f'Error: MFA source preparation failed: {error}')
             return 1
@@ -4393,11 +4516,16 @@ def _run_translate_command(args, env, script_dir, admission_guard):
         admission_guard()
     if not knowledge_done:
         transcript = load_or_create_beautified(
-            ctx, source, video_path, scene_options, args.skip_scene_detection, args.force, source_identity=source_identity,
+            ctx, source, video_path, scene_options, args.skip_scene_detection, args.force or args.rerun_translation,
+            source_identity=source_identity,
         )
     for segment in transcript.segments:
         segment.proofread_text = ""
-        if args.force:
+        if args.rerun_translation:
+            segment.translation = ""
+            segment.split_events = []
+            segment.split_status = segment.split_reason = segment.split_reason_detail = ""
+        if args.force or args.rerun_translation:
             segment.event_plan_key = ""
             segment.translation_key = segment.proofread_key = ""
     retriever = None
@@ -4490,7 +4618,7 @@ def _run_translate_command(args, env, script_dir, admission_guard):
         from subtitle_translation.bilingual_translation import translate_events
         changed = translate_events(
             transcript, ctx, llm, system_prompt, retriever,
-            split_enabled=not args.no_split, context_window=max(0, args.split_context_window),
+            split_enabled=not args.no_split,
             checkpoint=lambda: save_transcript(transcript, str(text_checkpoint)),
             **admission_kwargs,
         )
@@ -4505,7 +4633,7 @@ def _run_translate_command(args, env, script_dir, admission_guard):
             save_transcript(transcript, str(text_checkpoint))
             transcript, timing_marker, timing_key = windowed_mfa.finish_timing(
                 transcript, review, mfa_media, mfa_runtime, ProjectConfig.load(), ctx,
-                video_path, scene_options, args.skip_scene_detection, args.force, admission_guard,
+                video_path, scene_options, args.skip_scene_detection, args.force or args.rerun_translation, admission_guard,
             )
             changed = True
         except (OSError, ValueError) as error:
@@ -4532,6 +4660,7 @@ def _run_translate_command(args, env, script_dir, admission_guard):
             **admission_kwargs,
         ) or changed
     if changed:
+        transcript.raw["subtitle_languages"] = {"source": ctx.source_lang_code, "target": ctx.target_lang_code}
         if knowledge_done and file_sha256(args.json) != mfa_input_sha256:
             raise ValueError("source JSON changed during windowed translation")
         if admission_guard:
@@ -4549,11 +4678,7 @@ def _run_translate_command(args, env, script_dir, admission_guard):
         sys.exit(1)
 
     events = all_events(transcript)
-    write_srt_events(ctx.split_source_srt, events, "en")
-    write_srt_events(ctx.split_target_srt, events, "zh")
-    write_ass(ctx.proofread_ass, template_path, ctx.base, events, AssOutputMode.SOURCE)
-    write_ass(ctx.target_ass, template_path, ctx.base, events, AssOutputMode.TARGET)
-    write_ass(ctx.bilingual_ass, template_path, ctx.base, events, AssOutputMode.BILINGUAL)
+    export_subtitles(transcript, ctx, template_path)
 
     if os.path.isfile(ctx.desc) or original_chapter_media(ctx.dir, ctx.base) is not None:
         if admission_guard:
@@ -4561,7 +4686,7 @@ def _run_translate_command(args, env, script_dir, admission_guard):
         translate_description(ctx, llm, retriever=retriever, glossary_path=glossary_path)
     log("INFO", f'SRT:      {ctx.split_source_srt}')
     log("INFO", f'          {ctx.split_target_srt}')
-    log("INFO", f'ASS:      {ctx.proofread_ass}')
+    log("INFO", f'ASS:      {ctx.source_ass}')
     log("INFO", f'          {ctx.target_ass}')
     log("INFO", f'          {ctx.bilingual_ass}')
     log("INFO", f'Events:   {len(events)}')

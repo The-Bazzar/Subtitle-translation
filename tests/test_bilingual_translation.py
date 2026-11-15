@@ -4,7 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 import translate_srt as t
 from subtitle_translation import bilingual_translation as bt
@@ -19,6 +20,9 @@ class BilingualTranslationTests(unittest.TestCase):
         self.transcript = t.Transcript("video.json", "en", [self.segment], {"_source_first_input": "source"})
         self.llm = FakeLLM()
         self.calls = []
+        sleep = patch.object(t.time, "sleep")
+        self.addCleanup(sleep.stop)
+        self.sleep = sleep.start()
 
     def reply(self, respond):
         def ask(session, content, validator=None, **kwargs):
@@ -111,7 +115,7 @@ class BilingualTranslationTests(unittest.TestCase):
             return result
         with self.reply(respond), self.assertRaisesRegex(ValueError, "bilingual translation failed"):
             self.run_translation()
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
         self.assertEqual(self.segment.to_json(), before)
 
     def test_bad_parts_keep_the_valid_whole_translation(self):
@@ -304,9 +308,9 @@ class BilingualTranslationTests(unittest.TestCase):
         with self.reply(respond), patch("sys.stderr", stderr):
             self.run_translation()
         log = stderr.getvalue()
-        self.assertIn("round 1: request attempt=1/2 items=2 ids=[1,2]", log)
+        self.assertIn("round 1: request attempt=1/3 items=2 ids=[1,2]", log)
         self.assertIn("retry=true failed_ids=[2]", log)
-        self.assertIn("round 2: request attempt=2/2 items=1 ids=[2]", log)
+        self.assertIn("round 2: request attempt=2/3 items=1 ids=[2]", log)
         self.assertIn("round 1: sentence #2 status=retry", log)
         self.assertIn("round 2: sentence #2 status=split", log)
         self.assertEqual(log.count("event #1.1 id="), 1)
@@ -367,7 +371,7 @@ class BilingualTranslationTests(unittest.TestCase):
         with patch.object(t.ChatSession, "ask_validated", autospec=True, side_effect=ask), patch("sys.stderr", stderr):
             self.run_translation()
         self.assertIn("round 1: error type=", stderr.getvalue())
-        self.assertIn("round 2: request attempt=2/2", stderr.getvalue())
+        self.assertIn("round 2: request attempt=2/3", stderr.getvalue())
         self.assertEqual(len(calls), 2)
 
     def test_failed_sentence_status_is_warning_and_still_fails_the_stage(self):
@@ -376,7 +380,7 @@ class BilingualTranslationTests(unittest.TestCase):
         with self.reply(respond), patch.object(bt, "log") as log, self.assertRaises(ValueError):
             self.run_translation()
         statuses = [call for call in log.call_args_list if "status=retry" in call.args[1] or "status=failed" in call.args[1]]
-        self.assertEqual(len(statuses), 2)
+        self.assertEqual(len(statuses), 3)
         self.assertTrue(all(call.args[0] == "WARNING" for call in statuses))
         self.assertFalse(any(" event #" in call.args[1] for call in log.call_args_list))
 
@@ -390,6 +394,132 @@ class BilingualTranslationTests(unittest.TestCase):
         self.assertIn("round 1: aborted type=KeyboardInterrupt", stderr.getvalue())
         self.assertNotIn("round 2", stderr.getvalue())
         self.assertEqual(self.segment.to_json(), before)
+
+    def test_translation_batches_share_prior_requests_and_translations_at_temperature_point_three(self):
+        second = copy.deepcopy(self.segment)
+        second.index = 2
+        self.transcript.segments.append(second)
+        self.llm.batch_size = 1
+        requests, sessions = [], []
+        def create(session, extra_kwargs):
+            sessions.append(session)
+            requests.append(copy.deepcopy(session.messages))
+            payload = json.loads(session.messages[-1]["content"])
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(self.good(payload))))])
+        with patch.object(t.ChatSession, "_create_once", autospec=True, side_effect=create), patch("sys.stderr", io.StringIO()):
+            self.run_translation()
+        self.assertIs(sessions[0], sessions[1])
+        self.assertEqual(sessions[0].temperature, .3)
+        self.assertEqual([message["role"] for message in requests[1]], ["system", "user", "assistant", "user"])
+        self.assertEqual(json.loads(requests[1][1]["content"])["items"][0]["id"], 1)
+        self.assertEqual(json.loads(requests[1][2]["content"])["items"][0]["zh"], "A natural whole translation.")
+        self.assertEqual(json.loads(requests[1][3]["content"])["items"][0]["id"], 2)
+
+    def test_rag_batches_use_configured_default_and_full_glossary_stays_in_system_prompt(self):
+        second = copy.deepcopy(self.segment)
+        second.index = 2
+        self.transcript.segments.append(second)
+        context = [{"id": str(i), "source": "glossary", "text": f"term {i}"} for i in range(6)]
+        retriever = Mock()
+        retriever.retrieve_texts.return_value = [context, context]
+        full_prompt = "style\nFULL GLOSSARY:\n" + "terminology rule\n" * 1000
+        with self.reply(self.good), patch("sys.stderr", io.StringIO()):
+            bt.translate_events(self.transcript, self.ctx, self.llm, full_prompt, retriever)
+        retriever.retrieve_texts.assert_called_once_with([self.segment.text, second.text])
+        for item in self.calls[0][0]["items"]:
+            self.assertEqual(set(item), {"id", "en", "retrieved_context"})
+            self.assertEqual(item["retrieved_context"], context)
+        prompt = self.calls[0][1]
+        self.assertTrue(prompt.startswith(full_prompt))
+        self.assertIn(bt.BATCH_PROTOCOL, prompt)
+        self.assertLess(prompt.index(t._RETRIEVED_CONTEXT_RULES), prompt.index(t._JSON_FORMAT))
+
+    def test_shared_session_retries_bad_json_without_duplicating_users_or_losing_history(self):
+        requests, sessions = [], []
+        def create(session, extra_kwargs):
+            sessions.append(session)
+            requests.append(copy.deepcopy(session.messages))
+            content = "bad json" if len(requests) < 3 else json.dumps(self.good(json.loads(session.messages[-1]["content"])))
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+        with patch.object(t.ChatSession, "_create_once", autospec=True, side_effect=create), patch("sys.stderr", io.StringIO()):
+            self.run_translation()
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(session is sessions[0] for session in sessions))
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(requests[1], requests[2])
+        self.sleep.assert_has_calls([call(3.0), call(6.0)])
+
+    def test_separate_translation_runs_do_not_share_conversation_history(self):
+        fresh = copy.deepcopy(self.transcript)
+        sessions = []
+        def create(session, extra_kwargs):
+            self.assertEqual([message["role"] for message in session.messages], ["system", "user"])
+            sessions.append(session)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(self.good(json.loads(session.messages[-1]["content"])))) )])
+        with patch.object(t.ChatSession, "_create_once", autospec=True, side_effect=create), patch("sys.stderr", io.StringIO()):
+            self.run_translation()
+            bt.translate_events(fresh, self.ctx, self.llm, "style")
+        self.assertIsNot(sessions[0], sessions[1])
+
+    def test_shared_session_does_not_repeat_a_context_length_failure(self):
+        with patch.object(t.ChatSession, "_create_once", side_effect=RuntimeError("maximum context length exceeded")) as request, \
+             patch("sys.stderr", io.StringIO()), self.assertRaises(ValueError):
+            self.run_translation()
+        request.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_rag_and_llm_remain_interleaved_with_each_batch_checkpoint(self):
+        second = copy.deepcopy(self.segment)
+        second.index = 2
+        self.transcript.segments.append(second)
+        self.llm.batch_size = 1
+        order = []
+        retriever = Mock()
+
+        def retrieve(texts):
+            order.append("rag")
+            return [[] for _ in texts]
+
+        def respond(payload):
+            order.append("llm")
+            return self.good(payload)
+
+        retriever.retrieve_texts.side_effect = retrieve
+        with self.reply(respond):
+            self.run_translation(retriever=retriever, checkpoint=lambda: order.append("checkpoint"))
+        self.assertEqual(order, ["rag", "llm", "checkpoint", "rag", "llm", "checkpoint"])
+
+    def test_later_retrieval_failure_does_not_discard_completed_batch_checkpoint(self):
+        second = copy.deepcopy(self.segment)
+        second.index = 2
+        self.transcript.segments.append(second)
+        self.llm.batch_size = 1
+        retriever = Mock()
+        retriever.retrieve_texts.side_effect = [[[]], RuntimeError("retrieval unavailable")]
+        saved = []
+        with self.reply(self.good), self.assertRaisesRegex(RuntimeError, "retrieval unavailable"):
+            self.run_translation(retriever=retriever, checkpoint=lambda: saved.append(copy.deepcopy(self.transcript.to_json())))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["segments"][0]["translation"], "A natural whole translation.")
+        self.assertFalse(second.translation)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_legacy_iso_key_normalization_and_target_label_cleanup_preserve_source(self):
+        def respond(payload):
+            return {"items": [{"id": 1, "ZH": "SRC: TGT: Whole translation.", "split_events": [
+                {"EN": "Hello,", "ZH": "ZH: First part"}, {"EN": "nice day!", "ZH": "TGT: Second part"}]}]}
+
+        with self.reply(respond):
+            self.run_translation()
+        self.assertEqual(self.segment.translation, "Whole translation.")
+        self.assertEqual([e.zh for e in self.segment.split_events], ["First part", "Second part"])
+        self.assertEqual([e.en for e in self.segment.split_events], ["Hello,", "nice day!"])
+
+    def test_label_only_whole_translation_is_still_empty(self):
+        with self.reply(lambda _: {"items": [{"id": 1, "zh": "ZH: TGT: "}]}), self.assertRaises(ValueError):
+            self.run_translation()
+        self.assertFalse(self.segment.translation)
+        self.assertEqual(len(self.calls), 3)
 
 
 if __name__ == "__main__":

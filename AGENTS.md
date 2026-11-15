@@ -28,7 +28,7 @@ winget install Microsoft.PowerShell
 
 ## CLI
 
-最新 CLI 契约见 `docs/cli-and-env.md`：新增 subtitle-translation help 打印全部真实子命令帮助。命令行仅保留输入/输出路径、URL、语言、配置根和 --only-* 模式，--help/--version 元信息保留；开关及调优参数全部移至 .env，旧 --mfa/--no-mfa、proofread/no-proofread、skip/quiet/force/dry-run、batch-size、模型/设备/编码器和场景小参数不再解析。下方早期命令行覆盖规则由此取代。translate 使用 TRANSLATE_BATCH_SIZE、TRANSLATE_CONTEXT_WINDOW、SPLIT_ENABLED、SCENE_THRESHOLD、SCENE_MIN_INTERVAL_FRAMES、LOG_LEVEL、FORCE_REBUILD 等；pipeline/batch/burn 的 DRY_RUN 也从配置读取。内部阶段通过配置快照调用，不拼接隐藏开关。only 模式显式执行所选阶段。
+最新 CLI 契约见 `docs/cli-and-env.md`：新增 subtitle-translation help 打印全部真实子命令帮助。命令行仅保留输入/输出路径、URL、语言、配置根和 --only-* 模式，--help/--version 元信息保留；开关及调优参数全部移至 .env，旧 --mfa/--no-mfa、proofread/no-proofread、skip/quiet/force/dry-run、batch-size、模型/设备/编码器和场景小参数不再解析。下方早期命令行覆盖规则由此取代。translate 使用 TRANSLATE_BATCH_SIZE、SPLIT_ENABLED、SCENE_THRESHOLD、SCENE_MIN_INTERVAL_FRAMES、LOG_LEVEL、FORCE_REBUILD 等；pipeline/batch/burn 的 DRY_RUN 也从配置读取。内部阶段通过配置快照调用，不拼接隐藏开关。only 模式显式执行所选阶段。
 
 安装后推荐使用 console script：
 
@@ -48,7 +48,7 @@ subtitle-translation translate "path/to/video.json"
 "<repo>/.venv/bin/python" -m subtitle_translation pipeline "URL"
 ```
 
-`pipeline`、`batch`、`translate`、`merge-ass`、`download`、`prepare-video`、`whisper`、`burn` 和 `setup-mfa` 都是正式子命令。`subtitle_translation.cli` 只负责参数分派；业务逻辑位于 `core/` 下的 package、`translate_srt.py` 和 batch scheduler。
+`pipeline`、`batch`、`translate`、`proofread`、`merge-ass`、`download`、`prepare-video`、`whisper`、`burn` 和 `setup-mfa` 都是正式子命令。`subtitle_translation.cli` 只负责参数分派；业务逻辑位于 `core/` 下的 package、`translate_srt.py` 和 batch scheduler。
 
 ## Repository Layout
 
@@ -98,7 +98,7 @@ pipeline 固定 download -> prepare-video -> whisper -> translate；默认内部
 - 相邻定时输出重叠且至少一个为 coarse 时，合并为一条完整双语粗时间事件，保留连续定稿、整句译文、来源与包络，不猜词时间，不改文本检查点。所有派生字幕 JSON 去除根级旧 word_segments，仅 segments[].words[] 为正式工作词轴；旧兼容检查点清理该字段不丢有效翻译，原始 ASR 文件不改。
 - 不再提供显示留白/吸附/时长与间隔参数；coarse-output-scene-only-v3 恢复对齐原时间，只失效旧显示投影，语义和原生 MFA 缓存可复用。场景检测设置只更新其独立 sidecar。
 - MFA 桥接只执行窗口 corpus，旧单窗口/全文及 partial 解析入口已删除；CLI 将当前项目全部有效窗口组成一个 corpus，一次 align 和一次批量导出，固定 num_jobs=1，不为窗口启动独立 MFA。身份为 direct-window-corpus-align-v1，绑定完整有序 corpus、窗口 ID/音频/定稿、模型/环境和共享自适应；不能混用旧单窗口或全文缓存。命中只做一次环境探测并验证导出/结果 digest；单个缺失或无效 TextGrid 只使对应窗口降级，命令/全局协议失败按 corpus 失败处理。文本规划/翻译身份不变，不为此重发 LLM。详见 `docs/superpowers/specs/2026-11-13-windowed-mfa-corpus-batching.md`。
-- 输出为 `.split.<lang>.srt`、`.<source>.proofread.ass`、`.<target>.ass`、`.<source>-<target>.ass` 和目标语言 `.description`。
+- 输出为 `.split.<lang>.srt`、`.<source>.ass`、`.<target>.ass`、`.<source>-<target>.ass` 和目标语言 `.description`。源文 ASS 不再含 proofread 后缀，与可选校对阶段无关；不自动删除旧文件。
 - ASS/SRT 序列化先按各自精度取整总时间，再分解时/分/秒，正确处理小数进位；这不是时间美化，不修改内部词轴。
 - 元数据翻译从当前项目同名 `<base>.original.mkv` 的 ffprobe JSON 读取内嵌章节，不回退到编辑版/其他项目。章节标题与标题、简介、标签在同一次请求翻译，使用完整 glossary；按本地章节 ID 恢复时间顺序，时间仅由原片提供，向下取整后以 `HH:MM:SS 标题` 写入目标 description 的“章节”区块。ffprobe 优先使用所配置 ffmpeg 同目录工具，探测超时 30 秒；无原简介但有同名原片也可触发元数据翻译。提取失败不阻塞其他简介内容，缺失/无效/重复 ID 的章节译名逐项使用原标题。该功能不改媒体、词轴或 batch generation。
 
@@ -122,6 +122,12 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 `.prepare.json`、`.asr.json`、`.asr.lock` 和 generation candidate 是恢复协调文件。cache fingerprint、media generation、alignment generation、锁和原子 publish 语义不得改变；损坏、旧版或 fingerprint 不匹配必须视为 cache miss。
 
 ## LLM and Data Contracts
+
+- 主翻译恢复 2.0.2 的共享 ChatSession、温度 0.3、最多三次尝试与 3/6 秒退避，跨批保留实际 user/assistant 历史；不同项目/运行不共享。user 项为 id、源文、retrieved_context，RAG 按批读取并遵循 EMBEDDING_TOP_K，不附加独立邻句字段，TRANSLATE_CONTEXT_WINDOW 已移除。完整 glossary/简介/风格加载不变，追加的响应协议只增加联合双语 split。调用身份为 semantic-bilingual-events-v2-shared-session；内部缓存仍验证实际 RAG 输入，命中不请求模型，部分续跑不伪造历史。详见 [会话兼容契约](docs/superpowers/specs/2026-11-15-translation-session-compatibility.md)。
+- 上述缓存命中只适用于内部续跑。显式 subtitle-translation translate 每次从原始输入/采用稿重建翻译与联合断句，PROOFREAD=1 时重新校对；不从 .beautified.json、文本检查点或定时投影恢复旧译文/校对结果，不需 FORCE_REBUILD。--only-* 保持独立操作；glossary/采用稿、ASR、场景、检索及原生 MFA 声学缓存可复用，pipeline/batch 内部缓存/generation/锁/发布规则不变。
+- 纯译文校对恢复独立于翻译的项目内共享会话，温度 0.2；按 event 数预算组织完整句，逐 event 使用 2.0.2 检索 query 与配置 top_k，保留完整 glossary。最多三次尝试、3/6 秒退避；超限递归缩小句批次，单句再移除动态 RAG，仍失败保留原译文。完整句/事件译文原子接受，源文/ID/数量/时间只读，不恢复旧版源文纠错；source_review 的调用方式不变。
+- proofread.py 提供独立 proofread 子命令：明确读取已翻译/定时且具有稳定 ID/源文范围的工作 JSON，每次重新校对，不受 PROOFREAD 或 MFA_ENABLED 开关控制，不接受原始 ASR/ASS/SRT/pending 检查点。不调用翻译、glossary 生成、场景、MFA 或元数据翻译。默认原位更新工作 JSON，--output-json 另存，--output 指定双语 ASS；导出规范源/目标/双语 ASS 和 SRT，日志在输入 JSON 目录。只更新目标文本/成功项 proofread_key，保留源文、结构、词轴、时间精度和其他字段；旧根 word_segments 仍清除。新工作结果保存 subtitle_languages，独立校对优先采用已保存语言，显式冲突报错；旧文件使用 CLI/.env/ASR 默认值并警告。渲染暂存、输入/目标 JSON hash 检查、JSON 最后发布，I/O 失败尽力回滚；原位有效定时投影只刷新结果 digest，文本/声学/batch generation 不变。详见 [独立校对契约](docs/superpowers/specs/2026-11-16-standalone-proofread.md)。
+- 翻译/校对均逐批执行 RAG -> LLM，不预取全项目；翻译每批完成后立即保存检查点。MFA 路径 glossary 之前同样建立原始听录索引并向旧 glossary/Tavily 流程传递检索器，初次索引错误仍终止语义请求。回复继续规范化 ISO 语言键大小写并清理目标文本的 EN/ZH/SRC/TGT 前缀，冻结源文不清理或改写；非字符串和清理后空译文仍无效，校对继续拒绝重复目标键。
 
 - 所有 user prompt 都是 JSON object，顶层 `items` array；返回必须是 JSON object，item 使用 `id` 与源/目标 ISO 639 语言代码。
 - `glossary.md` 是完整常驻的全局硬规则；`retrieved_context` 只能动态补充，不得截断或替代 glossary。

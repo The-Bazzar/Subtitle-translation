@@ -4,7 +4,7 @@ import unittest
 import wave
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import translate_srt as t
 from subtitle_translation import mfa_pipeline
@@ -96,6 +96,58 @@ class MfaPipelineTests(unittest.TestCase):
             result = t.main([source.path], stage_overrides={"MFA_ENABLED": "1", })
         self.assertEqual(result, 1)
         translate.assert_not_called()
+
+    def test_mfa_glossary_keeps_baseline_embedding_retriever_before_source_review(self):
+        source = t.Transcript(str(self.root / "video.json"), "en", [t.TranscriptSegment(1, 0, 1, "Hello.")])
+        t.save_transcript(source, source.path)
+        ctx = t.TranscriptContext.from_json(source.path, source_lang="en", target_lang="zh")
+        media = self.root / "video.wav"
+        write_wav(media)
+        retriever = Mock()
+        order = []
+        env = {"TRANSLATE_PROVIDER": "fake"}
+        options = SimpleNamespace(skip_knowledge=False, batch_size=50, glossary="", force=False)
+        config = t.EmbeddingConfig(enabled=True, chroma_dir=str(self.root / "chroma_db"))
+
+        def glossary(transcript, context, llm, settings):
+            order.append("glossary")
+            self.assertIs(settings.retriever, retriever)
+            self.assertEqual(transcript.segments[0].text, source.segments[0].text)
+
+        with patch("subtitle_translation.mfa.MfaRuntime.for_project", return_value=object()), \
+             patch.object(t, "translate_llm_from_env", return_value=FakeLLM()), \
+             patch.object(t, "glossary_llm_from_env", return_value=FakeLLM()), \
+             patch.object(t.EmbeddingConfig, "from_env", return_value=config), \
+             patch.object(t, "refresh_embedding_retriever", side_effect=lambda *a, **k: order.append("embedding") or retriever) as refresh, \
+             patch.object(t, "build_glossary", side_effect=glossary), \
+             patch.object(t, "build_source_review", side_effect=lambda *a, **k: order.append("review") or {}):
+            t.prepare_mfa_review(source, ctx, env, str(media), options)
+        self.assertEqual(order, ["embedding", "glossary", "review"])
+        self.assertTrue(refresh.call_args.kwargs["fatal"])
+
+    def test_mfa_glossary_does_not_enable_embeddings_or_hide_initial_index_failure(self):
+        source = t.Transcript(str(self.root / "video.json"), "en", [t.TranscriptSegment(1, 0, 1, "Hello.")])
+        t.save_transcript(source, source.path)
+        ctx = t.TranscriptContext.from_json(source.path, source_lang="en", target_lang="zh")
+        media = self.root / "video.wav"
+        write_wav(media)
+        options = SimpleNamespace(skip_knowledge=False, batch_size=50, glossary="", force=False)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), \
+                 patch("subtitle_translation.mfa.MfaRuntime.for_project", return_value=object()), \
+                 patch.object(t, "translate_llm_from_env", return_value=FakeLLM()), \
+                 patch.object(t, "glossary_llm_from_env", return_value=FakeLLM()), \
+                 patch.object(t.EmbeddingConfig, "from_env", return_value=t.EmbeddingConfig(enabled=enabled)), \
+                 patch.object(t, "refresh_embedding_retriever", side_effect=SystemExit(1)) as refresh, \
+                 patch.object(t, "build_glossary") as glossary, patch.object(t, "build_source_review"):
+                if enabled:
+                    with self.assertRaises(SystemExit):
+                        t.prepare_mfa_review(source, ctx, {"TRANSLATE_PROVIDER": "fake"}, str(media), options)
+                    glossary.assert_not_called()
+                else:
+                    t.prepare_mfa_review(source, ctx, {"TRANSLATE_PROVIDER": "fake"}, str(media), options)
+                    refresh.assert_not_called()
+                    self.assertIsNone(glossary.call_args.args[3].retriever)
 
     def test_pipeline_checks_mfa_before_downloading_or_running_asr(self):
         from subtitle_translation import pipeline

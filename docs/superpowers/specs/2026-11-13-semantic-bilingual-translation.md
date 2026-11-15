@@ -15,7 +15,7 @@ MFA_ENABLED=1：WhisperX -> glossary/source_review -> translate（同时生成 e
 
 ## 一次请求与响应
 
-每项输入完整源句、邻接上下文、完整 glossary 及当前项目检索证据。不预生成英文事件，不提供边界 ID、字符坐标、词时间、目标字符数或事件数量等数学任务。所有有效句段都进入翻译，不按 72 字符跳过分割判断。
+每项输入完整源句和当前项目检索证据，完整 glossary 常驻 system；相邻语境来自同批句段和共享会话，不另附邻句字段。不预生成英文事件，不提供边界 ID、字符坐标、词时间、目标字符数或事件数量等数学任务。所有有效句段都进入翻译，不按 72 字符跳过分割判断。
 
 LLM 在同一次响应中给出整句译文和语义对应的双语片段：
 
@@ -48,14 +48,15 @@ en/zh 使用实际源/目标语言 key。模型不输出事件 ID、source_range
 
 模型成功返回后，本地才生成稳定事件 ID 和 segment-local 字符范围。MFA 路径保持 pending 时间，在后置 MFA 中定位最终双语事件。默认路径只在完整原生词轴可映射时投影多个事件，否则保留整句粗时间和已有整句译文，不为保住分割均分时间。MFA 的有限时间、范围、词序、窗口归属和不可分离词映射检查仍保留；删除的是给 LLM 的数学任务，不是时间轴有效性保护。
 
-SPLIT_ENABLED=0 时仍一次翻译，只保留一个完整双语事件。TRANSLATE_CONTEXT_WINDOW 控制翻译上下文范围。旧 --no-split、--split-max-chars、--split-max-duration、--split-context-window 均不再解析，开关/调优仅在 .env 设置。
+SPLIT_ENABLED=0 时仍一次翻译，只保留一个完整双语事件。项目内各批共享实际对话历史，RAG 使用 EMBEDDING_TOP_K。旧 --no-split、--split-max-chars、--split-max-duration、--split-context-window 均不再解析，开关/调优仅在 .env 设置。
 
 ## 校对、缓存和迁移
 
 纯译文校对只改目标文本，事件 ID/源文/数量/时间只读；也不再要求目标片段严格拼回整句译文。不需要重新计算语义边界或回调上游。
 模板 MFA_ENABLED=1 默认常开。proofread_target_events 接受后置 MFA 的精确时间事件、整句回退和粗时间合并结果；保留词轴及其状态、来源范围与时间元数据，整句/事件译文和 proofread_key 一起保存。PROOFREAD 默认仍为 0，与 MFA 独立控制。
 
-联合协议版本 semantic-bilingual-events-v1 绑定源文/generation、上下文、glossary/检索、语言、模型/prompt 和 no-split 模式，同时生成事件规划与翻译身份。旧独立 split/固定事件结果不冒充新协议完成；首次切换需要一次性重译，失败句段继续按检查点恢复，不删除原始输入或旧文件。
+当前联合协议版本 semantic-bilingual-events-v2-shared-session 绑定源文/generation、glossary/实际检索、语言、模型/prompt 和 no-split 模式，同时生成事件规划与翻译身份。旧调用结果不冒充新协议完成；内部续跑可按有效检查点恢复，不删除原始输入或旧文件。
+显式 subtitle-translation translate 每次重建翻译/断句和启用的校对，不读取文本检查点或旧定时结果跳过语义请求；--only-* 仍只执行所选操作。glossary/采用稿、检索库和原生 MFA 声学缓存保留。调用与缓存边界详见 [会话兼容契约](2026-11-15-translation-session-compatibility.md)。
 
 MFA 原生 corpus 身份仍绑定窗口音频、定稿及声学依赖，不因本次语义协议升级直接失效。实际文字/窗口不变时可复用词轴，仅重新投影新事件。新默认/实验路径都移除独立 split 调用，不在内部偷偷补一个译文分割请求。
 

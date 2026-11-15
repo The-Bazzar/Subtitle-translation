@@ -11,9 +11,10 @@ platform: Win + Linux
 ```bash
 subtitle-translation translate video.json --video video.mkv --lang en --target-lang zh
 subtitle-translation translate video.json --only-glossary
+subtitle-translation proofread video.beautified.json
 ```
 
-功能开关和调优仅在 .env 设置：MFA_ENABLED、PROOFREAD、SPLIT_ENABLED、TRANSLATE_BATCH_SIZE、TRANSLATE_CONTEXT_WINDOW、SCENE_THRESHOLD、SCENE_MIN_INTERVAL_FRAMES、PIPELINE_SKIP_*、LOG_LEVEL、FORCE_REBUILD。旧开关 argv 不再接受。
+功能开关和调优仅在 .env 设置：MFA_ENABLED、PROOFREAD、SPLIT_ENABLED、TRANSLATE_BATCH_SIZE、SCENE_THRESHOLD、SCENE_MIN_INTERVAL_FRAMES、PIPELINE_SKIP_*、LOG_LEVEL、FORCE_REBUILD。旧开关 argv 不再接受。
 
 ## 流程
 
@@ -26,5 +27,7 @@ subtitle-translation translate video.json --only-glossary
 ## 产物与恢复
 
 .beautified.json 是兼容命名的工作 JSON，不表示改动了时间；原始 ASR JSON 不覆盖。另输出 .split.<lang>.srt、源/目标/双语 ASS 与目标 description，按当前项目 generation 复用缓存。MFA 文本检查点独立于定时缓存。
+源文 ASS 为 .<source>.ass（如 .en.ass），不再生成 .<source>.proofread.ass。独立 proofread 接受已翻译且已定时的工作 JSON，默认原位更新并重导字幕；--output-json 另存 JSON，--output 控制双语 ASS。显式命令不受 PROOFREAD 开关控制，不调用上游或元数据翻译，优先读取工作 JSON 保存的 subtitle_languages。
+显式 translate 每次重新翻译和联合断句，启用时重新校对，不从上述工作 JSON/文本或定时检查点恢复译文；--only-* 仍独立执行。glossary/采用稿、ASR、检索及原生 MFA 声学缓存保留，pipeline/batch 内部续跑缓存不变。
 
 translate_prompt / proofread_prompt 风格文件仍按既有配置加载，阶段协议由代码追加；外部维护的 prompt example 不修改。检索证据不替代完整 glossary。
