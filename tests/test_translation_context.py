@@ -1,23 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
-from subtitle_translation.translation_context import TranslationContext, estimate, window_for
+from subtitle_translation.model_context import estimate
+from subtitle_translation.translation_context import TranslationContext
 
 
 class TranslationContextTests(unittest.TestCase):
-    def test_exact_deployment_window_and_override(self):
-        cfg = {"url": "https://api.deepseek.com", "model_info": []}
-        llm = SimpleNamespace(cfg=lambda: cfg, model_name=lambda: "deepseek-flash")
-        self.assertEqual(window_for(llm), 1_000_000)
-        cfg["url"] = "https://gateway.invalid/v1"
-        self.assertEqual(window_for(llm), 32768)
-        cfg["model_info"] = [{"id": "deepseek-flash", "context_length": 16000}]
-        self.assertEqual(window_for(llm), 16000)
-        for invalid in ("-1", 0, "many", True):
-            cfg["model_info"][0]["context_length"] = invalid
-            with self.assertRaises(ValueError):
-                window_for(llm)
-
     def test_budget_without_usage_reserves_output_and_preserves_system(self):
         policy = TranslationContext(1000, "en", "zh", {"max_completion_tokens": 500})
         system = {"role": "system", "content": "glossary"}

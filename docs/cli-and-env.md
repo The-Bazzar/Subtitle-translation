@@ -76,7 +76,7 @@ TRANSLATE_CONTEXT_WINDOW 已删除，翻译按项目共享会话历史，RAG 使
 ```
 
 列表缺省/为空或 context_length 缺省/null 时自动查询；正整数用于覆盖当前部署窗口，按实际请求模型 ID 精确匹配，重复 ID/非法窗口报错。各 provider 相互独立，model_info 不是模型白名单，也不改变 default_model 或模型选择优先级。
-正常使用无需填写列表。程序内部查询部署元数据，缺失时匿名查询 [OpenRouter 公开目录](https://openrouter.ai/api/v1/models)；可直接在该目录查看 id/context_length。仅公开目录查窗口时忽略 vendor 前缀；版本和变体仍精确匹配，候选窗口不一致则回退。实际发送的模型 ID 不改写，不会自动开通模型或提供 API key。用户仍需 BYOK，不新增 models 命令。未知模型首次成功查询后，仅将窗口和来源缓存到配置根 providers.json 的对应 provider/model_info；已有有效项不被覆盖。自动条目换端点失效，可删除该项或其 context_length 后重启刷新。完整格式见包内 providers.example.json。
+正常使用无需填写列表。程序先读 model_info，缺失时仅匿名查询 [OpenRouter 公开目录](https://openrouter.ai/api/v1/models?output_modalities=all)，不调用 provider /models；可直接在该目录查看 id/context_length。仅公开目录查窗口时忽略 vendor 前缀；版本和变体仍精确匹配，候选窗口不一致则回退。实际发送的模型 ID 不改写，不会自动开通模型或提供 API key。用户仍需 BYOK，不新增 models 命令。只为已成功调用的模型缓存窗口和来源，按实际请求 ID 写入配置根 providers.json 对应的 provider/model_info。填写 .env 或 default_model 不会触发扫描；只查窗口或命中阶段缓存不写回。已有有效项不被覆盖。自动条目换端点失效，可删除该项或其 context_length 后重启刷新。完整格式见包内 providers.example.json。
 
 pipeline/batch 不再拼接已删除的开关 argv，而将任务配置快照通过私有 stage_overrides 映射传给 translate。batch 仍按原 admission/取消/原子 publish 规则调度；阶段内 skip/reuse 只是协调器决定，不对用户暴露另一个开关通道，不通过全局临时改环境反复切换任务状态。
 显式 translate 的重新翻译策略由 CLI 分派内部传递，不使用 FORCE_REBUILD 代替，因此不会附带强制重建 glossary/采用稿或清除声学缓存。

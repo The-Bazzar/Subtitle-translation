@@ -82,24 +82,20 @@ class SourceReviewTests(unittest.TestCase):
         self.llm = t.glossary_llm_from_env(env, t.translate_llm_from_env(env, 20))
         self.llm.api_key = "fixture-key"
         client = MagicMock()
-        client.__enter__.return_value = client
-        client.get.return_value = {"data": [{"id": "mirror/review-model"}]}
-        client.with_options.return_value = client
         client.chat.completions.create.side_effect = lambda **kwargs: SimpleNamespace(choices=[
             SimpleNamespace(message=SimpleNamespace(content=json.dumps(self.keep(
                 json.loads(kwargs["messages"][-1]["content"])))))])
-        with patch.object(t.LLMConfig, "cfg", return_value={"url": "https://review.invalid/v1"}), \
-             patch.object(t.LLMConfig, "_client", return_value=client), \
+        providers_path = self.root / "providers.json"
+        atomic_write_json(providers_path, {"knowledge": {"url": "https://review.invalid/v1"}})
+        with patch.object(t.LLMConfig, "_client", return_value=client), \
              patch.object(t, "_config_root", return_value=str(self.root)), \
-             patch.object(model_context, "_cache", {}), \
-             patch.object(model_context, "public_models", return_value=[
-                 {"id": "vendor/review-model", "context_length": 64000}]), \
-             patch("subtitle_translation.translation_context.log") as fallback_log:
+             patch.object(model_context, "_public_limits", return_value={"review-model": 64000}):
             result = self.build()
         self.assertEqual(result["items"][0]["decision"], "keep")
         self.assertEqual(client.chat.completions.create.call_args.kwargs["model"], "mirror/review-model")
-        client.get.assert_called_once_with("models", cast_to=dict)
-        fallback_log.assert_not_called()
+        client.get.assert_not_called()
+        entry, = json.loads(providers_path.read_text(encoding="utf-8"))["knowledge"]["model_info"]
+        self.assertEqual((entry["id"], entry["context_length"]), ("mirror/review-model", 64000))
 
     def test_glossary_change_invalidates_review_without_changing_original_source(self):
         with self.reply(self.keep):

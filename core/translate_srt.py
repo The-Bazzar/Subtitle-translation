@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 from urllib.parse import urlparse
 
 import langcodes
@@ -555,13 +555,14 @@ class LLMConfig:
         )
 
     def context_window(self):
-        from subtitle_translation.translation_context import window_for
+        from subtitle_translation.model_context import window_for
         return window_for(self)
 
-    def persist_context_window(self, config, model, value, source):
-        from subtitle_translation.model_context import persist_limit
-        return persist_limit(Path(_config_root()) / "providers.json", self.provider, config,
-                             _BUILTIN_PROVIDERS.get(self.provider), model, value, source)
+    def record_model_use(self, model: str) -> None:
+        from subtitle_translation.model_context import cache_used_model
+
+        cache_used_model(Path(_config_root()) / "providers.json", self.provider, self.cfg(),
+                         _BUILTIN_PROVIDERS.get(self.provider), model)
 
 
 def translate_llm_from_env(env: dict[str, str], batch_size: int) -> LLMConfig:
@@ -713,9 +714,10 @@ def documents_to_retrieved_context(documents: list[Document]) -> list[dict]:
 
 
 class SingleInputEmbeddings(Embeddings):
-    def __init__(self, client: OpenAI, model: str):
+    def __init__(self, client: OpenAI, model: str, *, on_use: Optional[Callable[[], None]] = None):
         self.client = client
         self.model = model
+        self.on_use = on_use
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [self.embed_query(text) for text in texts]
@@ -728,6 +730,9 @@ class SingleInputEmbeddings(Embeddings):
         )
         if len(response.data) != 1:
             raise ValueError("Embedding response must contain exactly one vector")
+        if self.on_use is not None:
+            self.on_use()
+            self.on_use = None
         return response.data[0].embedding
 
 
@@ -750,7 +755,15 @@ def embedding_function(config: EmbeddingConfig, env: dict[str, str]) -> SingleIn
         api_key=api_key,
         default_headers=provider_cfg.get("extra_headers", {}),
     )
-    return SingleInputEmbeddings(client, config.model)
+    providers_path = Path(_config_root()) / "providers.json"
+
+    def record_use():
+        from subtitle_translation.model_context import cache_used_model
+
+        cache_used_model(providers_path, config.provider, provider_cfg, _BUILTIN_PROVIDERS.get(config.provider),
+                         config.model)
+
+    return SingleInputEmbeddings(client, config.model, on_use=record_use)
 
 
 def open_chroma_store(config: EmbeddingConfig, env: dict[str, str]) -> Chroma:
@@ -3455,6 +3468,9 @@ class ChatSession:
             if not is_context_length_error(error) or not compact(self, kwargs, force=True):
                 raise
             response = self.llm._client().chat.completions.create(**kwargs)
+        record_model_use = getattr(self.llm, "record_model_use", None)
+        if callable(record_model_use):
+            record_model_use(kwargs["model"])
         tokens = getattr(getattr(response, "usage", None), "prompt_tokens", None)
         self.last_prompt_tokens = tokens if type(tokens) is int and tokens > 0 else None
         self.usage_messages = copy.deepcopy(self.messages) if self.last_prompt_tokens else None
