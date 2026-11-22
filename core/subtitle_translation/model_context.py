@@ -40,7 +40,7 @@ def public_models():
             except Exception as error:
                 log("WARNING", f"Public model catalogue unavailable: {type(error).__name__}")
             _public_cache = (now + (3600 if rows else 60), rows)
-        return [dict(row) for row in rows]
+        return [dict(row) for row in _public_cache[1]]
 
 
 def public_model_limit(model):

@@ -1681,16 +1681,8 @@ class JsonProtocolTests(unittest.TestCase):
                     f,
                 )
 
-            old_cache = t._providers_cache
-            old_cache_root = t._providers_cache_root
-            try:
-                t._providers_cache = None
-                t._providers_cache_root = None
-                with patch.dict(t.os.environ, {"SUBTITLE_TRANSLATION_PROJECT_DIR": tmp}):
-                    providers = t.load_providers()
-            finally:
-                t._providers_cache = old_cache
-                t._providers_cache_root = old_cache_root
+            with patch.dict(t.os.environ, {"SUBTITLE_TRANSLATION_PROJECT_DIR": tmp}):
+                providers = t.load_providers()
 
             self.assertIn("openai", providers)
             self.assertIn("llama", providers)

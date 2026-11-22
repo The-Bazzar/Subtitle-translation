@@ -23,6 +23,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlparse
@@ -1418,10 +1419,6 @@ _BUILTIN_PROVIDERS = {
     },
 }
 
-_providers_cache = None
-_providers_cache_root = None
-_providers_cache_signature = None
-
 _TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
 
 Rules:
@@ -1656,17 +1653,17 @@ def _config_root() -> str:
 
 
 def load_providers() -> dict:
-    global _providers_cache, _providers_cache_root, _providers_cache_signature
-    root = _config_root()
-    config_path = os.path.join(root, "providers.json")
+    config_path = os.path.join(_config_root(), "providers.json")
     try:
         info = os.stat(config_path)
         signature = (info.st_ino, info.st_mtime_ns, info.st_size)
     except OSError:
         signature = None
-    if (_providers_cache is not None and _providers_cache_root == root
-            and _providers_cache_signature == signature):
-        return _providers_cache
+    return _load_provider_snapshot(config_path, signature)
+
+
+@lru_cache(maxsize=8)
+def _load_provider_snapshot(config_path, signature):
     providers = dict(_BUILTIN_PROVIDERS)
     if signature is not None:
         try:
@@ -1674,7 +1671,6 @@ def load_providers() -> dict:
         except (ValueError, OSError):
             # An unreadable local configuration leaves the built-in providers available.
             pass
-    _providers_cache, _providers_cache_root, _providers_cache_signature = providers, root, signature
     return providers
 
 
