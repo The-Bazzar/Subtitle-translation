@@ -10,7 +10,6 @@ from openai import InternalServerError, OpenAI
 import translate_srt as t
 from subtitle_translation import model_context
 from subtitle_translation.artifacts import atomic_write_json, read_json_object
-from translate_srt import SingleInputEmbeddings
 
 
 class SingleInputEmbeddingTests(unittest.TestCase):
@@ -45,7 +44,7 @@ class SingleInputEmbeddingTests(unittest.TestCase):
                         "object": "list",
                     })
 
-                embeddings = SingleInputEmbeddings(self.client(handler), model)
+                embeddings = t.SingleInputEmbeddings(self.client(handler), model)
                 self.assertEqual(embeddings.embed_documents([]), [])
                 self.assertEqual(inputs, [])
                 texts = ["first\nline", "second", "first\nline"]
@@ -66,7 +65,7 @@ class SingleInputEmbeddingTests(unittest.TestCase):
                 return httpx.Response(503, json={"error": {"message": "service unavailable"}})
             return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.5]}]})
 
-        embeddings = SingleInputEmbeddings(self.client(handler), "gemini-embedding-2")
+        embeddings = t.SingleInputEmbeddings(self.client(handler), "gemini-embedding-2")
         with self.assertRaises(InternalServerError):
             embeddings.embed_documents(["first", "bad", "last"])
         self.assertEqual(inputs, ["first", "bad"])
@@ -105,7 +104,7 @@ class SingleInputEmbeddingTests(unittest.TestCase):
                         "data": [{"index": index, "embedding": [0.5]} for index in range(count)],
                     })
 
-                embeddings = SingleInputEmbeddings(self.client(handler), "test-model")
+                embeddings = t.SingleInputEmbeddings(self.client(handler), "test-model")
                 with self.assertRaisesRegex(ValueError, "exactly one vector"):
                     embeddings.embed_query("text")
 
