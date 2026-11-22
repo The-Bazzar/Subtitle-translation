@@ -23,6 +23,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlparse
@@ -518,7 +519,7 @@ class LLMConfig:
     provider: str
     model: str = ""
     api_key: Optional[str] = None
-    batch_size: int = 50
+    batch_size: int = 20
     request_timeout: Optional[float] = None
     api_max_retries: Optional[int] = None
 
@@ -553,6 +554,15 @@ class LLMConfig:
             **options,
         )
 
+    def context_window(self):
+        from subtitle_translation.translation_context import window_for
+        return window_for(self)
+
+    def persist_context_window(self, config, model, value, source):
+        from subtitle_translation.model_context import persist_limit
+        return persist_limit(Path(_config_root()) / "providers.json", self.provider, config,
+                             _BUILTIN_PROVIDERS.get(self.provider), model, value, source)
+
 
 def translate_llm_from_env(env: dict[str, str], batch_size: int) -> LLMConfig:
     return LLMConfig(
@@ -583,7 +593,7 @@ def proofread_llm_from_env(env: dict[str, str], translate_llm: LLMConfig, batch_
 def glossary_llm_from_env(
     env: dict[str, str],
     translate_llm: Optional[LLMConfig] = None,
-    batch_size: int = 50,
+    batch_size: int = 20,
 ) -> LLMConfig:
     configured_provider = env.get("GLOSSARY_PROVIDER", "").strip()
     provider = configured_provider or (translate_llm.provider if translate_llm else env.get("TRANSLATE_PROVIDER", "").strip())
@@ -1409,9 +1419,6 @@ _BUILTIN_PROVIDERS = {
     },
 }
 
-_providers_cache = None
-_providers_cache_root = None
-
 _TRANSLATE_PROMPT_FALLBACK = """You are a professional subtitle translator. Translate from ${SOURCE_LANG} to ${TARGET_LANG}.
 
 Rules:
@@ -1646,26 +1653,25 @@ def _config_root() -> str:
 
 
 def load_providers() -> dict:
-    global _providers_cache, _providers_cache_root
-    root = _config_root()
-    if _providers_cache is not None and _providers_cache_root == root:
-        return _providers_cache
-    config_path = os.path.join(root, "providers.json")
-    if os.path.isfile(config_path):
+    config_path = os.path.join(_config_root(), "providers.json")
+    try:
+        info = os.stat(config_path)
+        signature = (info.st_ino, info.st_mtime_ns, info.st_size)
+    except OSError:
+        signature = None
+    return _load_provider_snapshot(config_path, signature)
+
+
+@lru_cache(maxsize=8)
+def _load_provider_snapshot(config_path, signature):
+    providers = dict(_BUILTIN_PROVIDERS)
+    if signature is not None:
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if loaded:
-                providers = dict(_BUILTIN_PROVIDERS)
-                providers.update(loaded)
-                _providers_cache = providers
-                _providers_cache_root = root
-                return _providers_cache
-        except (json.JSONDecodeError, OSError):
+            providers.update(read_json_object(config_path))
+        except (ValueError, OSError):
+            # An unreadable local configuration leaves the built-in providers available.
             pass
-    _providers_cache = dict(_BUILTIN_PROVIDERS)
-    _providers_cache_root = root
-    return _providers_cache
+    return providers
 
 
 def load_env(script_dir: str) -> dict[str, str]:
@@ -3401,6 +3407,9 @@ class ChatSession:
     temperature: float = 0.3
     disable_response_format: bool = False
     messages: list[dict] = field(default_factory=list)
+    last_prompt_tokens: Optional[int] = field(default=None, init=False)
+    usage_messages: Optional[list] = field(default=None, init=False)
+    request_start: Optional[int] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.messages.append({"role": "system", "content": self.system_prompt})
@@ -3438,7 +3447,18 @@ class ChatSession:
             kwargs["timeout"] = self.llm.request_timeout
         if self.disable_response_format:
             kwargs.pop("response_format", None)
-        return self.llm._client().chat.completions.create(**kwargs)
+        from subtitle_translation.model_context import compact
+        compact(self, kwargs)
+        try:
+            response = self.llm._client().chat.completions.create(**kwargs)
+        except Exception as error:
+            if not is_context_length_error(error) or not compact(self, kwargs, force=True):
+                raise
+            response = self.llm._client().chat.completions.create(**kwargs)
+        tokens = getattr(getattr(response, "usage", None), "prompt_tokens", None)
+        self.last_prompt_tokens = tokens if type(tokens) is int and tokens > 0 else None
+        self.usage_messages = copy.deepcopy(self.messages) if self.last_prompt_tokens else None
+        return response
 
     def ask(self, content: str, retry_template: Optional[CompletionRetryTemplate] = None) -> str:
         answer, _ = self.ask_validated(content, retry_template=retry_template)
@@ -3452,6 +3472,7 @@ class ChatSession:
         retry_feedback=None,
     ):
         template = retry_template or CompletionRetryTemplate(attempts=1)
+        self.request_start = len(self.messages)
         self.messages.append({"role": "user", "content": content})
         last_error: Exception | None = None
         for attempt in range(template.normalized_attempts()):
@@ -3461,6 +3482,9 @@ class ChatSession:
                 answer = self._answer_from_response(resp)
                 parsed = validator(answer) if validator is not None else answer
                 self.messages.append({"role": "assistant", "content": answer})
+                tokens = getattr(getattr(resp, "usage", None), "prompt_tokens", None)
+                self.last_prompt_tokens = tokens if type(tokens) is int and tokens > 0 else None
+                self.request_start = None
                 return answer, parsed
             except Exception as e:
                 last_error = e
@@ -3574,6 +3598,8 @@ def is_context_length_error(error: Exception | str) -> bool:
             "context length",
             "too many tokens",
             "reduce the length",
+            "context_length_exceeded",
+            "input token count",
         )
     )
 
@@ -3666,7 +3692,8 @@ def source_first_hash(value) -> str:
 
 
 def source_first_model_identity(llm: LLMConfig) -> dict:
-    return {"provider": llm.provider, "model": llm.model_name(), "config": llm.cfg()}
+    config = {key: value for key, value in llm.cfg().items() if key != "model_info"}
+    return {"provider": llm.provider, "model": llm.model_name(), "config": config}
 
 
 def source_first_context(transcript: Transcript, segment: TranscriptSegment, window: int = 1) -> dict:
@@ -3759,7 +3786,7 @@ def source_first_rows(answer: str, expected_ids: list[int]) -> dict[int, dict]:
 
 
 def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, admission_guard=None, *,
-                       round_log=None, session=None, attempts=2, retry_delay=0.0) -> tuple[dict, dict]:
+                       round_log=None, session=None, attempts=2, retry_delay=0.0, history=None) -> tuple[dict, dict]:
     accepted, errors = {}, {}
     pending = list(items)
     for attempt in range(attempts):
@@ -3774,9 +3801,11 @@ def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, ad
 
         request_started = False
         retry_blocked = False
-        history_size = len(session.messages) if session is not None else 0
+        request = LLMBatchRequest(pending).to_json_text()
+        if history is not None:
+            history.prepare(session, request)
+        history_snapshot = copy.deepcopy(session.messages) if session is not None else None
         try:
-            request = LLMBatchRequest(pending).to_json_text()
             conversation = session if session is not None else ChatSession(llm, prompt, temperature=0.2)
             if round_log:
                 round_log("request", attempt=attempt + 1, attempts=attempts,
@@ -3789,15 +3818,21 @@ def source_first_batch(llm, prompt: str, items: list[LLMBatchItem], validate, ad
             )
         except Exception as error:
             if session is not None:
-                del session.messages[history_size:]
+                session.messages[:] = history_snapshot
+                session.last_prompt_tokens = session.usage_messages = None
+                session.request_start = None
                 retry_blocked = is_context_length_error(error)
+                if retry_blocked and history is not None and attempt + 1 < attempts:
+                    retry_blocked = not history.recover_overflow(session)
             rows = {}
             errors.update({item.id: str(error) for item in pending})
             if round_log and request_started:
                 round_log("error", kind=type(error).__name__)
         except BaseException as error:
             if session is not None:
-                del session.messages[history_size:]
+                session.messages[:] = history_snapshot
+                session.last_prompt_tokens = session.usage_messages = None
+                session.request_start = None
             if round_log and request_started:
                 round_log("aborted", kind=type(error).__name__)
             raise
@@ -4417,7 +4452,7 @@ def main(argv: Sequence[str] | None = None, *, admission_guard=None, stage_overr
         settings = ProjectConfig(Path(script_dir), env)
         validate_log_level(env.get("LOG_LEVEL", "INFO"))
         args.mfa = resolve_mfa_enabled(None, env)
-        args.batch_size = int(env.get("TRANSLATE_BATCH_SIZE", "50") or "50")
+        args.batch_size = int(env.get("TRANSLATE_BATCH_SIZE", "20") or "20")
         args.scene_threshold = float(env.get("SCENE_THRESHOLD", "0.15") or "0.15")
         args.min_scene_interval_frames = int(env.get("SCENE_MIN_INTERVAL_FRAMES", "2") or "2")
         if args.batch_size < 1:

@@ -4,10 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import translate_srt as t
 from subtitle_translation import source_review as review
+from subtitle_translation import model_context
 from subtitle_translation.artifacts import atomic_write_json, json_sha256
 from fakes import FakeLLM
 
@@ -74,6 +75,31 @@ class SourceReviewTests(unittest.TestCase):
             result = self.build()
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(result["items"][0]["decision"], "keep")
+
+    def test_source_review_uses_glossary_model_context_with_gateway_prefix(self):
+        env = {"TRANSLATE_PROVIDER": "translation", "TRANSLATE_MODEL": "translation-model",
+               "GLOSSARY_PROVIDER": "knowledge", "GLOSSARY_MODEL": "mirror/review-model"}
+        self.llm = t.glossary_llm_from_env(env, t.translate_llm_from_env(env, 20))
+        self.llm.api_key = "fixture-key"
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.get.return_value = {"data": [{"id": "mirror/review-model"}]}
+        client.with_options.return_value = client
+        client.chat.completions.create.side_effect = lambda **kwargs: SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(content=json.dumps(self.keep(
+                json.loads(kwargs["messages"][-1]["content"])))))])
+        with patch.object(t.LLMConfig, "cfg", return_value={"url": "https://review.invalid/v1"}), \
+             patch.object(t.LLMConfig, "_client", return_value=client), \
+             patch.object(t, "_config_root", return_value=str(self.root)), \
+             patch.object(model_context, "_cache", {}), \
+             patch.object(model_context, "public_models", return_value=[
+                 {"id": "vendor/review-model", "context_length": 64000}]), \
+             patch("subtitle_translation.translation_context.log") as fallback_log:
+            result = self.build()
+        self.assertEqual(result["items"][0]["decision"], "keep")
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["model"], "mirror/review-model")
+        client.get.assert_called_once_with("models", cast_to=dict)
+        fallback_log.assert_not_called()
 
     def test_glossary_change_invalidates_review_without_changing_original_source(self):
         with self.reply(self.keep):

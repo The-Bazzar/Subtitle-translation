@@ -8,6 +8,7 @@ import time
 
 from .artifacts import json_sha256
 from .project_logging import log, logged_stage
+from .translation_context import TranslationContext, window_for
 
 
 PROTOCOL_VERSION = "semantic-bilingual-events-v2-shared-session"
@@ -148,6 +149,8 @@ def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, spl
         prompt += "\nSEGMENTATION DISABLED: Return one bilingual event for the complete source sentence."
     plans, changed = {}, False
     budget = max(1, llm.batch_size)
+    window = window_for(llm)
+    history = TranslationContext(window, ctx.source_lang_code, ctx.target_lang_code, llm.cfg().get("request_kwargs") or {})
 
     def prepare_batch(batch):
         if admission_guard:
@@ -161,6 +164,7 @@ def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, spl
             plan_key = json_sha256({"version": PROTOCOL_VERSION, "source": segment.text, "id": segment.index,
                                    "project": ctx.dir, "generation": transcript.raw.get("_batch_artifact", {}),
                                    "source_input": transcript.raw.get("_source_first_input", ""), "context": context,
+                                   "history_policy": "recent-pairs-v1", "context_tokens": window,
                                    "split_enabled": split_enabled, "prompt": prompt, "model": t.source_first_model_identity(llm),
                                    "languages": [ctx.source_lang_code, ctx.target_lang_code]})
             if (segment.translation_key == plan_key and segment.event_plan_key == plan_key
@@ -182,6 +186,7 @@ def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, spl
     def validate(item_id, row):
         segment, key = plans[item_id]
         result = response_events(row, segment, ctx, key, split_enabled)
+        history.remember(item_id, segment.text, result[0])
         validated_results[item_id] = result
         return result
 
@@ -227,7 +232,8 @@ def translate_events(transcript, ctx, llm, system_prompt, retriever=None, *, spl
         if session is None:
             session = t.ChatSession(llm, prompt, temperature=0.3)
         accepted, errors = t.source_first_batch(llm, prompt, pending, validate, admission_guard,
-                                              round_log=round_log, session=session, attempts=3, retry_delay=3.0)
+                                              round_log=round_log, session=session, attempts=3, retry_delay=3.0,
+                                              history=history)
         for item_id, (whole, events, warning) in accepted.items():
             segment, key = plans[item_id]
             segment.translation, segment.split_events = whole, events
