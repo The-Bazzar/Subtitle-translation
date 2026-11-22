@@ -98,6 +98,16 @@ class ProofreadCommandTests(unittest.TestCase):
         self.assertEqual(self.run_command(), 0)
         self.assertEqual(len(self.calls), 2)
 
+    def test_standalone_proofread_uses_reduced_default_and_preserves_explicit_batch(self):
+        for value, expected in ((None, 20), ("", 20), ("50", 50)):
+            if value is None:
+                self.env.pop("TRANSLATE_BATCH_SIZE", None)
+            else:
+                self.env["TRANSLATE_BATCH_SIZE"] = value
+            with self.subTest(value=value), patch.object(t, "proofread_llm_from_env", return_value=FakeLLM()) as factory:
+                self.assertEqual(self.run_command(), 0)
+            self.assertEqual(factory.call_args.args[2], expected)
+
     def test_dedicated_proofreader_does_not_require_a_translation_provider(self):
         self.env["PROOFREAD_MODEL"] = "dedicated-model"
         self.assertNotIn("TRANSLATE_PROVIDER", self.env)

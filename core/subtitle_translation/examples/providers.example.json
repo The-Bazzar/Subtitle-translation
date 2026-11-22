@@ -2,6 +2,7 @@
     "openai": {
         "url": "https://api.openai.com/v1",
         "default_model": "gpt-4.1-mini",
+        "model_info": [{"id": "gpt-4.1-mini", "context_length": 1047576}],
         "env_key": "OPENAI_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {}
@@ -9,6 +10,7 @@
     "llama": {
         "url": "http://localhost:11434/v1",
         "default_model": "llama3.1",
+        "model_info": [{"id": "llama3.1"}],
         "env_key": "OLLAMA_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {}
@@ -16,6 +18,7 @@
     "openrouter": {
         "url": "https://openrouter.ai/api/v1",
         "default_model": "anthropic/claude-sonnet-4-6",
+        "model_info": [{"id": "anthropic/claude-sonnet-4-6", "context_length": 1000000}],
         "env_key": "OPENROUTER_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {
@@ -26,6 +29,7 @@
     "deepseek": {
         "url": "https://api.deepseek.com",
         "default_model": "deepseek-v4-pro",
+        "model_info": [{"id": "deepseek-v4-pro", "context_length": 1048576}],
         "env_key": "DEEPSEEK_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},
@@ -38,6 +42,7 @@
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "default_model": "gemini-3.5-flash",
+        "model_info": [{"id": "gemini-3.5-flash", "context_length": 1048576}],
         "env_key": "GEMINI_API_KEY",
         "auth_header": "Bearer {api_key}",
         "extra_headers": {},

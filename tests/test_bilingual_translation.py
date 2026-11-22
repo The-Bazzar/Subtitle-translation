@@ -468,6 +468,48 @@ class BilingualTranslationTests(unittest.TestCase):
         request.assert_called_once()
         self.sleep.assert_not_called()
 
+    def test_usage_triggers_local_compaction_before_next_batch(self):
+        second = copy.deepcopy(self.segment)
+        second.index = 2
+        self.transcript.segments.append(second)
+        self.llm.batch_size = 1
+        requests = []
+        def create(session, extra_kwargs):
+            requests.append(copy.deepcopy(session.messages))
+            payload = json.loads(session.messages[-1]["content"])
+            return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=8100), choices=[
+                SimpleNamespace(message=SimpleNamespace(content=json.dumps(self.good(payload))))])
+        retriever = Mock()
+        retriever.retrieve_texts.side_effect = [[[{"text": "old evidence"}]], [[{"text": "current evidence"}]]]
+        with patch.object(t.ChatSession, "_create_once", autospec=True, side_effect=create), \
+             patch.object(self.llm, "cfg", return_value={"model_info": [
+                 {"id": self.llm.model_name(), "context_length": 10000}]}):
+            self.run_translation(retriever=retriever)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0][0], requests[1][0])
+        self.assertNotIn("retrieved_context", requests[1][1]["content"])
+        self.assertEqual(json.loads(requests[1][2]["content"])["items"],
+                         [{"id": 1, "zh": "A natural whole translation."}])
+        self.assertIn("current evidence", requests[1][-1]["content"])
+        self.assertEqual(len(self.segment.split_events), 2)
+
+    def test_provider_overflow_retries_once_with_same_batch_without_history(self):
+        second = copy.deepcopy(self.segment)
+        second.index = 2
+        self.transcript.segments.append(second)
+        self.llm.batch_size = 1
+        requests = []
+        def create(session, extra_kwargs):
+            requests.append(copy.deepcopy(session.messages))
+            if len(session.messages) > 2:
+                raise RuntimeError("maximum context length exceeded")
+            payload = json.loads(session.messages[-1]["content"])
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(self.good(payload))))])
+        with patch.object(t.ChatSession, "_create_once", autospec=True, side_effect=create):
+            self.run_translation()
+        self.assertEqual([len(r) for r in requests], [2, 4, 2])
+        self.assertEqual(requests[2], [requests[1][0], requests[1][-1]])
+
     def test_rag_and_llm_remain_interleaved_with_each_batch_checkpoint(self):
         second = copy.deepcopy(self.segment)
         second.index = 2

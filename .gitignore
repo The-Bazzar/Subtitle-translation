@@ -6,6 +6,7 @@ __pycache__
 build/
 dist/
 providers.json
+providers.json.lock
 tavily_domains.json
 cookies.txt
 batch-result.txt

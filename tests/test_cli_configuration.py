@@ -13,6 +13,21 @@ from subtitle_translation.config import ProjectConfig
 
 
 class CliConfigurationTests(unittest.TestCase):
+    def test_translation_batch_default_and_explicit_override(self):
+        for env, expected in (({}, 20), ({"TRANSLATE_BATCH_SIZE": ""}, 20),
+                              ({"TRANSLATE_BATCH_SIZE": "50"}, 50), ({"TRANSLATE_BATCH_SIZE": "8"}, 8)):
+            with self.subTest(env=env), patch.object(t, "load_env", return_value=env), \
+                 patch.object(t, "_run_translate_command", return_value=0) as run:
+                self.assertEqual(t.main(["missing.json"]), 0)
+            self.assertEqual(run.call_args.args[0].batch_size, expected)
+
+    def test_model_defaults_and_proofread_half_budget(self):
+        llm = t.LLMConfig("fake")
+        self.assertEqual(llm.batch_size, 20)
+        self.assertEqual(t.glossary_llm_from_env({"GLOSSARY_PROVIDER": "fake"}).batch_size, 20)
+        self.assertEqual(t.proofread_llm_from_env({}, llm, llm.batch_size).batch_size, 10)
+        self.assertEqual(t.proofread_llm_from_env({"PROOFREAD_BATCH_SIZE": "7"}, llm, 20).batch_size, 7)
+
     def test_invalid_numeric_settings_fail_before_model_or_media_work(self):
         for values in ({"SCENE_THRESHOLD": "nan"}, {"SCENE_THRESHOLD": "2"},
                        {"TRANSLATE_BATCH_SIZE": "0"},

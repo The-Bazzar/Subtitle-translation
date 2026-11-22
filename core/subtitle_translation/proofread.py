@@ -176,7 +176,7 @@ def main(argv=None):
     env = t.load_env(root)
     try:
         level = validate_log_level(env.get("LOG_LEVEL", "INFO"))
-        batch_size = int(env.get("TRANSLATE_BATCH_SIZE", "50") or "50")
+        batch_size = int(env.get("TRANSLATE_BATCH_SIZE", "20") or "20")
         if batch_size < 1 or int(env.get("PROOFREAD_BATCH_SIZE", "") or max(1, batch_size // 2)) < 1:
             raise ValueError("translation/proofread batch sizes must be positive")
     except ValueError as error:
