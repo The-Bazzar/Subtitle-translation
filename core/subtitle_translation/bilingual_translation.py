@@ -8,7 +8,8 @@ import time
 
 from .artifacts import json_sha256
 from .project_logging import log, logged_stage
-from .translation_context import TranslationContext, window_for
+from .model_context import window_for
+from .translation_context import TranslationContext
 
 
 PROTOCOL_VERSION = "semantic-bilingual-events-v2-shared-session"

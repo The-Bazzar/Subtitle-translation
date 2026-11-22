@@ -1,9 +1,15 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 from openai import InternalServerError, OpenAI
 
+import translate_srt as t
+from subtitle_translation import model_context
+from subtitle_translation.artifacts import atomic_write_json, read_json_object
 from translate_srt import SingleInputEmbeddings
 
 
@@ -64,6 +70,32 @@ class SingleInputEmbeddingTests(unittest.TestCase):
         with self.assertRaises(InternalServerError):
             embeddings.embed_documents(["first", "bad", "last"])
         self.assertEqual(inputs, ["first", "bad"])
+
+    def test_only_used_embedding_model_is_backfilled_without_changing_request(self):
+        def handler(request):
+            self.assertEqual(json.loads(request.content), {
+                "input": "one query", "model": "relay/embedding", "encoding_format": "float",
+            })
+            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.5]}]})
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "providers.json"
+            atomic_write_json(path, {"relay": {"url": "https://fixture.invalid/v1",
+                                               "default_model": "unused", "env_key": "FIXTURE_KEY"}})
+            client = self.client(handler)
+            with patch.object(t, "_config_root", return_value=root), patch.object(t, "OpenAI", return_value=client), \
+                 patch.object(model_context, "_public_limits", return_value={
+                     "embedding": 8192, "unused": 4096}) as catalogue:
+                config = t.EmbeddingConfig(provider="relay", model="relay/embedding")
+                embeddings = t.embedding_function(config, {"FIXTURE_KEY": "fixture"})
+                self.assertEqual(embeddings.embed_documents([]), [])
+                catalogue.assert_not_called()
+                self.assertEqual(embeddings.embed_query("one query"), [0.5])
+                self.assertEqual(embeddings.embed_query("one query"), [0.5])
+                catalogue.assert_called_once()
+            entry, = read_json_object(path)["relay"]["model_info"]
+        self.assertEqual((entry["id"], entry["context_length"]), ("relay/embedding", 8192))
+        self.assertEqual(entry["context_length_source"], "openrouter")
 
     def test_single_input_requires_exactly_one_response_vector(self):
         for count in (0, 2):

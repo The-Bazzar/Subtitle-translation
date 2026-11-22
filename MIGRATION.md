@@ -2,13 +2,17 @@
 
 ## 2.1.2
 
+### 模型窗口来源收敛（同版本重发）
+
+取消 provider /models、Gemini 原生元数据接口和内置型号窗口表。直接读 providers.json 的 model_info，缺失只查 OpenRouter；未命中仅使用 32768 规划预算。已有缓存仍有效，无需迁移。只给实际请求成功的模型回填，不扫描未使用的配置模型；embedding 请求格式和批量不变。有效预算变化可能使翻译检查点重新规划，不影响声学缓存。
+
 首次成功获取的窗口现在自动缓存到本地 providers.json 的 model_info，保留原有手填窗口和其他配置。端点变化时自动缓存失效；手工修订自动条目时可删除来源和端点字段，或删除自动条目后重启重新查询。公开目录值仍是标称值；失败和估算不落盘。哈希不再把无关的 model_info 纳入共享模型配置身份，旧语义检查点可能首次失配。
 
 新建 provider 配置时，包内模板为云端默认模型预填公开目录的标称窗口；该值作为显式覆盖。切换到不同限制的部署时，修改或删除对应 `context_length`。本机默认模型不预填数值，已有配置不由 setup/init 改写。
 
 ### 公开模型目录回退
 
-当前 provider 的模型元数据未返回窗口时，追加匿名 OpenRouter `/api/v1/models` 查询，成功目录缓存 1 小时，失败缓存 60 秒。仅公开目录忽略 vendor 前缀，精确比对末段 model_id，保留版本/变体；同名条目的窗口若不一致或无效则不采用。部署元数据和 model_info 仍用完整 ID。目录值以标称窗口告警，不覆盖实际端点返回的窗口或人工设置；仍未匹配才使用原有静态/32768 规划回退。
+本地 model_info 未提供窗口时，只匿名查询 OpenRouter `/api/v1/models?output_modalities=all`，成功目录缓存 1 小时，失败缓存 60 秒。仅公开目录忽略 vendor 前缀，精确比对末段 model_id，保留版本和变体；同名条目的窗口若不一致或无效则不采用。model_info 仍用完整 ID。目录值标明是标称窗口，不覆盖已有有效值；未匹配使用 32768 规划预算。
 
 ### 默认批量下调
 
@@ -16,7 +20,7 @@ TRANSLATE_BATCH_SIZE 从 50 调为 20，模板、缺失/空值回退及独立 pr
 
 ### 长视频翻译上下文
 
-上下文预算扩展至所有 ChatSession 文本调用，自动查询 provider 模型元数据并缓存。覆盖配置只在 providers.json 各 provider 的 model_info 列表中声明，缺省/空列表及 context_length=null 都保留自动查询。LLM_CONTEXT_TOKENS、TRANSLATE_CONTEXT_TOKENS 和 model_context_lengths 不再读取，不迁移或覆盖本地配置。公开目录查到模型并不授予调用权限，端点和密钥由用户自备（BYOK）；没有 models 子命令。元数据缺失才使用已知官方窗口或未知端点的 32768 规划值，不假装已获取实际限制。翻译检查点身份包含压缩策略及有效窗口，内部续跑首次可能重译；声学缓存不因配置本身失效。glossary 工具请求保留完整活动调用链，单次请求正文不截断。
+所有 ChatSession 文本调用使用上下文预算。覆盖配置只在 providers.json 各 provider 的 model_info 列表中声明，缺省、空列表及 context_length=null 都保留 OpenRouter 自动查询。LLM_CONTEXT_TOKENS、TRANSLATE_CONTEXT_TOKENS 和 model_context_lengths 不再读取。公开目录查到模型并不授予调用权限，端点和密钥由用户自备（BYOK）；没有 models 子命令。翻译检查点身份包含压缩策略及有效窗口，内部续跑首次可能重译；声学缓存不因配置本身失效。glossary 工具请求保留完整活动调用链，单次请求正文不截断。
 
 ## 2.1.1
 

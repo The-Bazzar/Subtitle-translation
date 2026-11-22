@@ -123,13 +123,15 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 ## LLM and Data Contracts
 
+模型窗口只有两个数据来源：本地 providers.json 的 model_info，以及 OpenRouter 公开目录。不得向实际模型 provider 的 /models 或 Gemini 原生接口请求窗口；未知值只使用 32768-token 规划预算，不写入文件。
+
 包内 providers.example.json 的云端默认模型可预填经公开目录核实的窗口；正整数是显式覆盖。没有可核实部署窗口的本机模型仅列出 ID，省略 context_length 以保留自动查询。
 
-模型窗口查询中，当前部署元数据缺失时可匿名使用固定 OpenRouter /api/v1/models 公开目录；独立 HTTP 请求不得继承 provider 认证/headers 或发送项目内容。目录按进程缓存成功 1 小时/失败 60 秒、5 秒超时、16 MiB 响应上限。公开目录两侧只精确比较最后一个斜杠后的 model_id，忽略 vendor，保留版本及变体；同名目录条目的窗口必须一致且有效。部署元数据和 model_info 保持完整 ID 匹配。公开目录值必须日志标明 nominal/deployment unverified，不覆盖当前部署元数据或人工覆盖；仍无值才进入静态/保守规划回退。
+模型窗口查询中，本地未填有效窗口时只匿名查询固定 OpenRouter /api/v1/models?output_modalities=all 公开目录；独立 HTTP 请求不得继承 provider 认证/headers 或发送项目内容。目录按进程缓存成功 1 小时/失败 60 秒、5 秒超时、16 MiB 响应上限。公开目录两侧只精确比较最后一个斜杠后的 model_id，忽略 vendor，保留版本及变体；同名目录条目的窗口必须一致且有效。model_info 保持完整 ID 匹配。公开目录值必须日志标明 nominal/deployment unverified，不覆盖已有有效配置；仍无值才进入保守规划回退。只在实际模型请求成功后按实际发送的模型 ID 写回，不全量扫描配置。翻译检查点的窗口探测只读，直接复用阶段缓存时不写回。Embedding 在收到有效响应后才查公开窗口，保持单文本请求协议不变。
 
 TRANSLATE_BATCH_SIZE 模板和缺失/空值回退统一为 20；独立 proofread 使用相同基准。PROOFREAD_BATCH_SIZE 未指定时取翻译批量的一半（默认 10），已有显式配置不覆盖。源文审阅 8 项上限及资源调度规则不变。
 
-所有 ChatSession 文本调用在 SDK 请求前检查历史预算，包括 glossary/Tavily、源文审阅、翻译、校对、元数据。自动查询当前模型元数据，按端点/模型/凭据哈希缓存，5 秒超时、无重试，成功 1 小时/缺失 60 秒；不能跨端点套用同名模型信息。窗口人工覆盖和自动缓存均位于配置根 providers.json 的 model_info 列表；缺省、空列表或 null 自动查询，不读取窗口环境变量。只写入部署元数据或公开目录的有效正整数及来源、端点摘要，不持久化失败或静态/保守回退；已有同端点有效值优先，端点变化只使自动条目失效。写回持 providers.json.lock 重新读盘合并并原子替换；读不到/写不了时保留现有失败回退规则。自动元数据不混入请求参数或共享模型身份；翻译仍单独绑定有效窗口。不提供 models 子命令，公开目录不代表可用权限，仍需用户 BYOK。约 80% 时翻译压缩为近期采用的整句原译对，其他阶段移除完整旧轮次；system、当前请求、纠错反馈和活动 tool_calls/results 链不拆分。单次正文超限不截断；实际溢出时可在去除旧历史后额外重试一次。窗口来源、降级及边界见[上下文压缩契约](docs/superpowers/specs/2026-11-19-translation-context.md)。embedding 单文本协议不变。
+所有 ChatSession 文本调用在 SDK 请求前检查历史预算，包括 glossary/Tavily、源文审阅、翻译、校对、元数据。公开目录内存缓存只索引模型 ID 与窗口，不读取或缓存 provider 凭据。窗口人工覆盖和自动缓存均位于配置根 providers.json 的 model_info 列表；缺省、空列表或 null 自动查询，不读取窗口环境变量。只写入公开目录的有效正整数及来源、端点摘要，不持久化失败或保守回退；已有同端点有效值优先，端点变化只使自动条目失效。写回持 providers.json.lock 重新读盘合并并原子替换；读不到/写不了时保留现有失败回退规则。自动元数据不混入请求参数或共享模型身份；翻译仍单独绑定有效窗口。不提供 models 子命令，公开目录不代表可用权限，仍需用户 BYOK。约 80% 时翻译压缩为近期采用的整句原译对，其他阶段移除完整旧轮次；system、当前请求、纠错反馈和活动 tool_calls/results 链不拆分。单次正文超限不截断；实际溢出时可在去除旧历史后额外重试一次。窗口来源、降级及边界见[上下文压缩契约](docs/superpowers/specs/2026-11-19-translation-context.md)。embedding 单文本协议不变。
 
 - 主翻译恢复 2.0.2 的共享 ChatSession、温度 0.3、最多三次尝试与 3/6 秒退避，跨批保留实际 user/assistant 历史；不同项目/运行不共享。user 项为 id、源文、retrieved_context，RAG 按批读取并遵循 EMBEDDING_TOP_K，不附加独立邻句字段，TRANSLATE_CONTEXT_WINDOW 已移除。完整 glossary/简介/风格加载不变，追加的响应协议只增加联合双语 split。调用身份为 semantic-bilingual-events-v2-shared-session；内部缓存仍验证实际 RAG 输入，命中不请求模型，部分续跑不伪造历史。详见 [会话兼容契约](docs/superpowers/specs/2026-11-15-translation-session-compatibility.md)。
 - 上述缓存命中只适用于内部续跑。显式 subtitle-translation translate 每次从原始输入/采用稿重建翻译与联合断句，PROOFREAD=1 时重新校对；不从 .beautified.json、文本检查点或定时投影恢复旧译文/校对结果，不需 FORCE_REBUILD。--only-* 保持独立操作；glossary/采用稿、ASR、场景、检索及原生 MFA 声学缓存可复用，pipeline/batch 内部缓存/generation/锁/发布规则不变。

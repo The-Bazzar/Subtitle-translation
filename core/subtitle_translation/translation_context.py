@@ -3,34 +3,8 @@
 import json
 from collections import deque
 
-from .model_context import configured_limit, discover, estimate, log_cached_public_limit
+from .model_context import estimate
 from .project_logging import log
-
-
-def window_for(llm):
-    config = llm.cfg()
-    model = (config.get("request_kwargs") or {}).get("model") or llm.model_name()
-    value = configured_limit(config, model)
-    if value is not None:
-        log_cached_public_limit(config, getattr(llm, "provider", "?"), model, value)
-        return value
-    if callable(getattr(llm, "resolve_key", None)):
-        discovered = discover(llm)
-        if discovered:
-            return discovered
-    endpoint = config.get("url", "").rstrip("/")
-    if (endpoint in {"https://api.deepseek.com", "https://api.deepseek.com/v1"}
-            and model in {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"}):
-        return 1_000_000
-    if endpoint == "https://api.openai.com/v1" and model in {"gpt-4.1-mini", "gpt-4.1-mini-2025-04-14"}:
-        return 1_047_576
-    if endpoint == "https://generativelanguage.googleapis.com/v1beta/openai" and model == "gemini-3.5-flash":
-        return 1_048_576
-    if endpoint == "https://openrouter.ai/api/v1" and model == "anthropic/claude-sonnet-4.6":
-        return 1_000_000
-    log("INFO", f"Unknown model context length for provider={getattr(llm, 'provider', '?')!r} "
-                f"model={model!r}; using a 32768-token planning budget")
-    return 32768
 
 
 class TranslationContext:

@@ -78,7 +78,7 @@ WhisperX JSON -> glossary/source_review -> joint bilingual translation
 SRT 是检查输出，不是输入缓存。原始识别 JSON 不被修订稿覆盖。
 主翻译按 2.0.2 的调用方式共享同项目会话：跨批保留已发送请求和译文，温度 0.3，最多三次尝试。
 联合翻译/断句默认每批 20 个完整句段（TRANSLATE_BATCH_SIZE），降低单轮响应负担；校对批量未指定时仍取其一半，默认 10。已有 .env 的显式批量不自动更改。
-所有文本 LLM 阶段默认查询当前 provider 的模型元数据获取窗口，并在约 80% 时压缩可移除的历史。翻译保留近期原译对；其他阶段按完整对话轮次裁剪，保留完整术语库、当前请求和工具结果链，不额外调用摘要模型。接口不提供窗口时有日志提示并使用回退预算；特殊部署可在 providers.json 的 model_info 列表中覆盖。单次正文已经过大时不会静默截断。详见[上下文预算](docs/superpowers/specs/2026-11-19-translation-context.md)。
+所有文本 LLM 阶段按模型窗口预算，在约 80% 时压缩可移除的历史。翻译保留近期原译对；其他阶段按完整对话轮次裁剪，保留完整术语库、当前请求和工具结果链，不额外调用摘要模型。接口不提供窗口时有日志提示并使用回退预算；特殊部署可在 providers.json 的 model_info 列表中覆盖。单次正文已经过大时不会静默截断。详见[上下文预算](docs/superpowers/specs/2026-11-19-translation-context.md)。
 RAG 按批检索并使用 EMBEDDING_TOP_K，完整 glossary 常驻 system；user 项恢复为 id、源文及 retrieved_context，只在响应中新增双语 split_events。
 每批按检索、LLM 请求、保存检查点的顺序执行，不预取全部批次；MFA 路径的 glossary 也保留原有 embedding/RAG 输入。
 纯译文校对共享独立的项目内会话，温度 0.2，按 event 数量组织完整句批次；逐 event 检索，最多三次尝试，超限先缩小批次，再尝试去除动态 RAG。
@@ -86,8 +86,9 @@ RAG 按批检索并使用 EMBEDDING_TOP_K，完整 glossary 常驻 system；user
 详见 [翻译与校对会话契约](docs/superpowers/specs/2026-11-15-translation-session-compatibility.md)。
 ASS/SRT 序列化按各自精度取整并正确进位，不改变内部词轴。
 
-上下文元数据补充来源为 OpenRouter 的公开 `/api/v1/models`：当前 provider 缺失窗口时匿名读取目录，查询时忽略 vendor 前缀，只精确比较 model_id；同名条目的窗口若不一致则不采用。目录结果仅是标称窗口，日志明确提示实际部署限制尚未验证；已有部署元数据或人工覆盖仍优先。不向公开目录发送项目内容、模型查询参数或 provider 密钥。未知模型首次查到窗口后，程序会将数值和来源保存到本地 providers.json 的对应 provider/model_info，后续运行直接读取。失败和估算值不写回；删除自动条目或它的 context_length 后，下次运行可重新查询。
+窗口先读 providers.json 的 model_info；缺失才匿名查询 OpenRouter 公开 `/api/v1/models?output_modalities=all`，不查询各 provider 的 /models。目录仅比较去掉 vendor 前缀后的精确 model_id；同名条目的窗口若不一致则不采用。目录值是标称窗口，不代表实际部署限制。未命中时仅以 32768 tokens 规划。不向公开目录发送项目内容、模型查询参数或 provider 密钥。实际模型请求成功且查到窗口后，程序会按实际请求 ID 保存到本地 providers.json 的对应 provider/model_info，后续运行直接读取。不扫描 .env 或 default_model 的配置清单；未调用的模型和直接复用阶段缓存不会新增条目。失败和估算值不写回；删除自动条目或它的 context_length 后，下次运行可重新查询。
 包内 provider 示例为已核实的云端默认模型预填目录窗口。复制模板后，这些正整数按显式覆盖处理；若部署限制不同，可修改或删去对应的 `context_length` 恢复自动查询。本机模型示例只预填 ID。
+公开目录失败或未命中窗口的日志不代表简介翻译失败。
 
 ## 单独校对
 
