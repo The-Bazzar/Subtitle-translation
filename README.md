@@ -65,6 +65,7 @@ WhisperX JSON -> glossary/source_review -> joint bilingual translation
 ```
 
 - glossary 是唯一自动源文编辑阶段，保留语义、否定、数量、实体和玩梗；不确定则保留实际候选。
+- source_review 不为了流畅度重写句式。英文采用稿会校验局部词改及词序；超出范围的条目重试后仍不合格则用原文。
 - translate 同一次响应返回整句译文和成对源/目标字幕片段，按完整上下文语义断句。
   不独立调用 split，不要求 LLM 计算字符位置、事件 ID、时间或严格拼接等式。
 - 本地只读定位源片段，生成稳定事件 ID/范围。没有有效片段但整句译文有效时保留整句双语内容；
