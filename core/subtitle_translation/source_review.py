@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
-import uuid
 import math
 import re
+import uuid
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .artifacts import atomic_write_json, atomic_write_text, json_sha256, read_json_object, text_sha256
 
 
 REVIEW_SCHEMA = 1
-REVIEW_POLICY = "text-adoption-v1"
+REVIEW_POLICY = "text-adoption-v2-local-edits"
+_WORD_PATTERN = re.compile(r"[^\W_]+(?:['\u2019][^\W_]+)*")
 
 REVIEW_PROTOCOL = """SOURCE TEXT ADOPTION AND SUBTITLE EDITING:
 This stage has text candidates and context, NOT access to the audio. Do not claim
 to have verified what the speaker actually said. Agreement is not proof of truth.
 Select the most defensible text and make minimal readability/grammar edits only
 when meaning, negation, quantity, names and expressive intent remain unchanged.
+Keep the speaker's sentence structure, word order, and clause order. Fix only
+local issues such as punctuation, a word form, or a clearly misheard short term.
+Do not paraphrase, move words or clauses, or reconstruct awkward phrasing. If
+making the sentence smoother would require restructuring it, keep it unchanged.
 Preserve deliberate jokes, quotations, dialect, wordplay and expressive repetition.
 If intent or a proposed correction is uncertain, keep the candidate verbatim.
 Do not generate subtitle boundaries, timestamps or target-language translations.
@@ -53,7 +59,21 @@ def validate_units(units: list[SourceUnit]) -> None:
         raise ValueError("source review requires valid provenance and coarse ranges")
 
 
-def validate_review(row: dict, unit: SourceUnit, source_key: str) -> dict:
+def _validate_local_edit(original: str, edited: str, basis: str) -> None:
+    before = _WORD_PATTERN.findall(original.casefold().replace("\u2019", "'"))
+    after = _WORD_PATTERN.findall(edited.casefold().replace("\u2019", "'"))
+    changes = [(a, b, c, d) for tag, a, b, c, d
+               in SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes() if tag != "equal"]
+    budget = 2 if basis == "readability" else 4
+    if sum(max(b - a, d - c) for a, b, c, d in changes) > budget:
+        raise ValueError("English source edit exceeds the local word-change budget")
+    removed = {word for a, b, _, _ in changes for word in before[a:b]}
+    inserted = {word for _, _, c, d in changes for word in after[c:d]}
+    if removed & inserted:
+        raise ValueError("English source edit moves existing words")
+
+
+def validate_review(row: dict, unit: SourceUnit, source_key: str, *, language: str | None = None) -> dict:
     if (set(row) != {"id", source_key, "decision", "basis", "reason"}
             or type(row["id"]) is not int or row["id"] != unit.id):
         raise ValueError("invalid source review fields or ID")
@@ -68,6 +88,8 @@ def validate_review(row: dict, unit: SourceUnit, source_key: str) -> dict:
     elif decision == "edit":
         if text == unit.text or basis not in {"context", "readability"} or not reason.strip():
             raise ValueError("edits require changed text and an explicit editing basis")
+        if (language if language is not None else source_key) == "en":
+            _validate_local_edit(unit.text, text, basis)
     else:
         raise ValueError("invalid review decision")
     return {
@@ -93,7 +115,7 @@ def review_input_identity(units: list[SourceUnit], language: str, glossary: str,
     })
 
 
-def _validate_items(items: list[dict], units: list[SourceUnit]) -> None:
+def _validate_items(items: list[dict], units: list[SourceUnit], language: str) -> None:
     if not isinstance(items, list) or len(items) != len(units):
         raise ValueError("review artifact lost source units")
     for item, unit in zip(items, units):
@@ -109,7 +131,7 @@ def _validate_items(items: list[dict], units: list[SourceUnit]) -> None:
         else:
             row = {"id": item["id"], "source": item["text"], "decision": item.get("decision"),
                    "basis": item.get("basis"), "reason": item.get("reason")}
-            if validate_review(row, unit, "source") != item:
+            if validate_review(row, unit, "source", language=language) != item:
                 raise ValueError("invalid review artifact")
 
 
@@ -137,7 +159,7 @@ def publish_review(
     if (set(provenance) - {"provider", "model", "prompt_sha256", "input_file_sha256"}
             or any(not isinstance(value, str) for value in provenance.values())):
         raise ValueError("invalid source review provenance fields")
-    _validate_items(items, units)
+    _validate_items(items, units, language)
     generation = uuid.uuid4().hex
     root = pointer_path.parent / ".asr_work" / "source_review" / identity / generation
     root.mkdir(parents=True, exist_ok=False)
@@ -185,9 +207,9 @@ def load_review(pointer_path: Path, identity: str, glossary: str, units: list[So
         if (payload["schema_version"] != REVIEW_SCHEMA or payload["policy"] != REVIEW_POLICY
                 or payload["input_sha256"] != identity or payload["generation"] != manifest["generation"]):
             return None
-        _validate_items(payload["items"], units)
         if not isinstance(payload.get("language"), str):
             return None
+        _validate_items(payload["items"], units, payload["language"])
         text, ranges = compose_adopted_text(payload["items"], payload["language"])
         if payload["text"] != text or payload["text_sha256"] != text_sha256(text) or payload.get("source_map") != ranges:
             return None

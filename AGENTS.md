@@ -123,6 +123,8 @@ batch 不接受 `-j`、`--jobs`、`--io-jobs` 或 `MaxJobs`，容量自动计算
 
 ## LLM and Data Contracts
 
+source_review 必须保留说话人的句式及分句顺序，不为流畅度复述。英文采用稿在接收、发布及读取时检查局部词改：readability 至多 2 个词级变更，context 至多 4 个词级变更，拒绝移动已有词；标点与大小写不计入词数。失败仍只重试该项，无法修正则保留原始文本和来源时间。旧采用稿策略不再命中，原始识别与不可变历史快照不改。详见[局部改动校验](docs/superpowers/specs/2026-11-23-source-review-local-edits.md)。
+
 模型窗口只有两个数据来源：本地 providers.json 的 model_info，以及 OpenRouter 公开目录。不得向实际模型 provider 的 /models 或 Gemini 原生接口请求窗口；未知值只使用 32768-token 规划预算，不写入文件。
 
 包内 providers.example.json 的云端默认模型可预填经公开目录核实的窗口；正整数是显式覆盖。没有可核实部署窗口的本机模型仅列出 ID，省略 context_length 以保留自动查询。

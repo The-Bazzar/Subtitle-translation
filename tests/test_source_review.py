@@ -70,6 +70,53 @@ class SourceReviewTests(unittest.TestCase):
         with self.reply(lambda _: self.fail("matching dual artifacts must be reused")):
             self.assertEqual(self.build(), result)
 
+    def test_clause_rewrite_retries_only_that_item_then_keeps_original(self):
+        original = "The new process makes their ability to detect smaller defects even greater."
+        rewritten = "The new process makes it even easier for them to detect smaller defects."
+        self.transcript.segments.append(t.TranscriptSegment(2, 3, 7, original))
+        t.save_transcript(self.transcript, str(self.path))
+
+        def respond(payload):
+            response = self.keep(payload)
+            for item in response["items"]:
+                if item["id"] == 2:
+                    item.update(en=rewritten, decision="edit", basis="readability", reason="Smoother wording.")
+            return response
+
+        with self.reply(respond):
+            result = self.build()
+        self.assertEqual([[item["id"] for item in request["items"]] for request, _ in self.calls], [[1, 2], [2]])
+        self.assertEqual([item["decision"] for item in result["items"]], ["keep", "fallback"])
+        self.assertEqual(result["items"][1]["text"], original)
+        self.assertEqual(result["items"][1]["input_range"], [3, 7])
+
+    def test_word_order_is_protected_for_both_editing_bases(self):
+        unit = review.SourceUnit(1, "She only checked the files.", 0, 1, "fixture:1")
+        for basis in ("readability", "context"):
+            row = {"id": 1, "en": "She checked only the files.", "decision": "edit", "basis": basis,
+                   "reason": "Move the adverb."}
+            with self.subTest(basis=basis), self.assertRaisesRegex(ValueError, "moves existing words"):
+                review.validate_review(row, unit, "en")
+
+    def test_local_punctuation_grammar_and_terminology_edits_are_allowed(self):
+        for original, edited, basis in (
+            ("hello there", "Hello, there!", "readability"),
+            ("She walks to store.", "She walked to the store.", "readability"),
+            ("We tested the new glide sensor.", "We tested the new glide-sense sensor.", "context"),
+        ):
+            unit = review.SourceUnit(1, original, 0, 1, "fixture:1")
+            row = {"id": 1, "en": edited, "decision": "edit", "basis": basis, "reason": "Local correction."}
+            with self.subTest(basis=basis, original=original):
+                self.assertEqual(review.validate_review(row, unit, "en")["text"], edited)
+
+    def test_prior_policy_snapshot_is_not_reused(self):
+        with patch.object(review, "REVIEW_POLICY", "text-adoption-v1"), self.reply(self.keep):
+            old = self.build()
+        with self.reply(self.keep):
+            new = self.build()
+        self.assertNotEqual(old["input_sha256"], new["input_sha256"])
+        self.assertEqual(len(self.calls), 2)
+
     def test_terminology_file_alone_does_not_skip_source_review(self):
         with self.reply(self.keep):
             result = self.build()
